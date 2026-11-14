@@ -1,0 +1,21 @@
+# Started by kronik.service's Wants=, not Requires=: failed setup leaves
+# Wasm available without retaining host capabilities. This short-lived root
+# setup pins a stable-user-owned namespace; it is not a privileged daemon.
+# A matching pin survives helper restarts; explicit stopped setup removes
+# only a namespace whose root-only creation record still matches.
+[Unit]
+Description=Kronik: the user namespace of the non-root daemon (ADR 0060)
+Before=kronik.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=@KRONIK@ userns pin
+# Keep the owned pin across helper restarts; explicit stopped setup unpins it.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX
+# No mount namespacing here: the owned /run pin must be visible to the
+# daemon's separate mount namespace. Fixture units use their exact owned pin
+# path/bind instead of altering the host-global production pin.

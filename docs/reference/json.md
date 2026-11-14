@@ -43,6 +43,10 @@ against both.
 | --- | --- |
 | `kronik serve` | no JSON: the daemon; it refuses --json |
 | `kronik doctor` | [`Report`](#report), from the CLI itself |
+| `kronik serve --init` | [`InitOutput`](#initoutput), from the CLI itself |
+| `kronik userns pin` | [`UsernsReport`](#usernsreport), from the CLI itself |
+| `kronik userns unpin` | [`UsernsReport`](#usernsreport), from the CLI itself |
+| `kronik userns status` | [`UsernsReport`](#usernsreport), from the CLI itself |
 | `kronik restore` | [`RestoreOutput`](#restoreoutput), from the CLI itself |
 | `kronik upgrade check` | [`UpgradeCheckOutput`](#upgradecheckoutput), from the CLI itself |
 | `kronik init` | [`Created`](#created), from the CLI itself |
@@ -165,6 +169,36 @@ against both.
     },
     {
       "$ref": "#/components/schemas/TopicList"
+    }
+  ]
+}
+```
+
+### Action
+
+```json
+{
+  "description": "What a command did, or with `--dry-run` would do.",
+  "oneOf": [
+    {
+      "const": "created",
+      "description": "A namespace was pinned where there was none.",
+      "type": "string"
+    },
+    {
+      "const": "kept",
+      "description": "The pinned namespace had the right owner and maps.",
+      "type": "string"
+    },
+    {
+      "const": "removed",
+      "description": "The pinned namespace was removed.",
+      "type": "string"
+    },
+    {
+      "const": "absent",
+      "description": "Nothing was pinned.",
+      "type": "string"
     }
   ]
 }
@@ -490,7 +524,7 @@ against both.
       "type": "string"
     },
     "name": {
-      "description": "Stable: config, kernel, runsc, kvm, cgroup, root, run_dir, caps,\nsandbox, disk, clock, tls, dns01_hook, wildcard, ship, export,\nkey_source, secrets.",
+      "description": "Stable: config, kernel, runsc, kvm, cgroup, root, runc, netns,\nrun_dir, caps, sandbox, disk, clock, tls, dns01_hook, wildcard, ship,\nexport, key_source, secrets; with `--rootless` also userns, uid_view,\nsubid, pin and delegate, and service_identity when a root invocation\nbecomes the service user; microvm where a microVM tool bundle is\ninstalled and the root service runs.",
       "type": "string"
     },
     "status": {
@@ -2615,6 +2649,34 @@ against both.
 }
 ```
 
+### DoctorWarning
+
+```json
+{
+  "description": "A warning of `kronik doctor`, as `serve --init` saw it.",
+  "properties": {
+    "check": {
+      "description": "The check: `delegate`, `sandbox`, `caps`, ...",
+      "type": "string"
+    },
+    "hint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "message": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "check",
+    "message"
+  ],
+  "type": "object"
+}
+```
+
 ### EffectSecret
 
 ```json
@@ -2946,6 +3008,7 @@ against both.
             "REASON_REQUIRED",
             "REPLAY_DIVERGED",
             "ROLLBACK_SCHEMA_CHANGED",
+            "ROOTLESS_UNAVAILABLE",
             "ROUTE_CONFLICT",
             "ROUTE_NOT_FOUND",
             "RUNC_MISSING",
@@ -4087,6 +4150,40 @@ against both.
 }
 ```
 
+### InitOutput
+
+```json
+{
+  "properties": {
+    "dry_run": {
+      "type": "boolean"
+    },
+    "mode": {
+      "$ref": "#/components/schemas/Mode"
+    },
+    "steps": {
+      "items": {
+        "$ref": "#/components/schemas/StepOutput"
+      },
+      "type": "array"
+    },
+    "warnings": {
+      "description": "What `kronik doctor` warned about once the service was running\n(absent: nothing, or a dry run). A warning is not a failure: the install\nsucceeded, but nothing here proves that sandboxes work.",
+      "items": {
+        "$ref": "#/components/schemas/DoctorWarning"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "dry_run",
+    "mode",
+    "steps"
+  ],
+  "type": "object"
+}
+```
+
 ### InputSummary
 
 ```json
@@ -4347,6 +4444,59 @@ against both.
     "subjects",
     "keys",
     "erased"
+  ],
+  "type": "object"
+}
+```
+
+### KronikUser
+
+```json
+{
+  "description": "The `kronik` user and its subordinate ranges.",
+  "properties": {
+    "gid": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "name": {
+      "type": "string"
+    },
+    "subgid": {
+      "description": "`[start, count]` of its /etc/subgid range.",
+      "items": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "maxItems": 2,
+      "minItems": 2,
+      "type": "array"
+    },
+    "subuid": {
+      "description": "`[start, count]` of its /etc/subuid range.",
+      "items": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "maxItems": 2,
+      "minItems": 2,
+      "type": "array"
+    },
+    "uid": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "name",
+    "uid",
+    "gid",
+    "subuid",
+    "subgid"
   ],
   "type": "object"
 }
@@ -4655,6 +4805,19 @@ against both.
     "name"
   ],
   "type": "object"
+}
+```
+
+### Mode
+
+```json
+{
+  "description": "Which service `--init` installs: the root service of v0.1 to v0.4 or the\nnonroot one. `DEFAULT_MODE` says which is meant without a flag.",
+  "enum": [
+    "rootless",
+    "root"
+  ],
+  "type": "string"
 }
 ```
 
@@ -6984,6 +7147,26 @@ against both.
 }
 ```
 
+### StepOutput
+
+```json
+{
+  "properties": {
+    "action": {
+      "type": "string"
+    },
+    "what": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "action",
+    "what"
+  ],
+  "type": "object"
+}
+```
+
 ### SwitchInfo
 
 ```json
@@ -7660,6 +7843,118 @@ against both.
     "passed",
     "checked_wall_ms",
     "dry_run"
+  ],
+  "type": "object"
+}
+```
+
+### UsernsReport
+
+```json
+{
+  "description": "What `kronik userns pin|unpin|status --json` prints.",
+  "properties": {
+    "action": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/Action"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What `pin` or `unpin` did (with `--dry-run`: would do); absent for\n`status`."
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "gid_map": {
+      "items": {
+        "items": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maxItems": 3,
+        "minItems": 3,
+        "type": "array"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "maps_error": {
+      "description": "Why the maps could not be read: only the owner and root may.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "matches": {
+      "description": "Whether the owner and maps are what `user` gives (absent when either\nis unknown).",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "owner": {
+      "description": "The uid that owns the pinned namespace.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "path": {
+      "description": "Where the namespace is pinned: /run/kronik-userns/user.",
+      "type": "string"
+    },
+    "pinned": {
+      "description": "Whether a user namespace is pinned there now (with `--dry-run`:\nbefore the command).",
+      "type": "boolean"
+    },
+    "uid_map": {
+      "description": "Its maps as `[inside, outside, count]` lines.",
+      "items": {
+        "items": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maxItems": 3,
+        "minItems": 3,
+        "type": "array"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "user": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/KronikUser"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The `kronik` user and its ranges, when they are set up."
+    },
+    "user_error": {
+      "description": "Why the `kronik` user or its ranges are missing.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "path",
+    "dry_run",
+    "pinned"
   ],
   "type": "object"
 }

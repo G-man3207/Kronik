@@ -150,6 +150,7 @@ without a file the defaults below apply.
 | `--disk-reserve <SIZE>` | `log.disk_reserve` | `512MiB`; `$KRONIK_DISK_RESERVE`. Below this much free space new inputs and changes are refused; `0B` turns it off |
 | `--otel-endpoint <URL>` | `otel.endpoint` | off; `$KRONIK_OTEL_ENDPOINT` (an OTLP/HTTP collector for spans and metrics, M28) |
 | `--concurrency <N>` | | `64` |
+| `--rootless` | | off. Run as the nonroot service (M21, [ADR 0060](../adr/0060-non-root-daemon-user-namespace.md)): bind the listeners and take the data directory's lock, empty every capability set, serve the API through a capability-free acceptor that reads the callers' true uids, and enter the pinned Kronik user namespace. The unit that `serve --init --rootless` writes passes it. It stops with `ROOTLESS_UNAVAILABLE` as root, with differing real, effective and saved user ids, and in a user namespace whose uid map is not the host's (a rootless container, a nested user namespace). Without it, `serve` starts as before M21, as root or as an ordinary user. With `--init`: install the nonroot service instead of the default root one |
 | `--log-format text\|json` | | `text`; `$KRONIK_LOG_FORMAT` (`json`: one JSON object per line) |
 
 `kronik serve --help` lists every option.
@@ -212,19 +213,45 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_export_dropped_total` | counter | Records in batches the sink refused for good and the export skipped, by stream. |
 | `kronik_export_gaps_total` | counter | Log ranges retention deleted before an export stream read them, by stream. |
 
-`kronik serve --init [--domain <NAME>]... [--acme-email <EMAIL>] [--dry-run]`
-sets a host up, as root (M6): it writes the configuration file, creates the
-data directory, the master key (mode 0600) and the `kronik` group, and
-installs, enables and starts the systemd unit `deploy/systemd/kronik.service`,
-which runs the daemon with the group `kronik`, so the API socket is open to
-that group. With `--domain` the file asks for a TLS certificate by ACME for
-those names (`--acme-email` receives the CA's notices); without it the
-gateway serves plain HTTP on port 80. Each step checks the host first, so
-running it again changes nothing, and `--dry-run` prints the plan.
+`kronik serve --init [--root | --rootless] [--domain <NAME>]... [--acme-email <EMAIL>] [--master-key-file <PATH>] [--dry-run] [--json]`
+sets a host up, as root (M6, M21). By default it installs the root service of
+v0.1 to v0.4: it writes the configuration file, creates the `kronik` group, the
+data directory (mode 0700) and the master key (mode 0600), and installs and
+starts `kronik.service`, the unit of v0.4.1 unchanged (a host that v0.4.1 set
+up is left as it is; v0.4.0's unit differs in one comment line, which a rerun
+rewrites). `--root` names this service explicitly. `--rootless` installs the
+nonroot service instead (M21, [ADR 0062](../adr/0062-non-root-systemd-units.md)):
+it writes the configuration file, creates the `kronik` group and user with their
+subordinate id ranges, the data directory (mode 0700, owned by `kronik`) and the
+master key (mode 0600, root-only; the unit passes it to the daemon as a systemd
+credential), installs and starts `kronik.service` and the one-shot
+`kronik-userns.service` that pins the daemon's user namespace, and then checks
+the running service's identity, capabilities and namespace. The unit starts the
+daemon as `kronik serve --rootless`. The API socket is open to the group
+`kronik`, and the audit trail records true host caller uids. A host that lacks
+what the nonroot service needs (systemd 255 or newer, cgroup v2, user
+namespaces) stops `--rootless` with an error that names `--root`; it never gets
+the root service by itself. An existing installation of the other kind is
+refused with `ROOTLESS_UNAVAILABLE`, before anything changes, and the operations
+guide says how to move one. With `--domain` the file asks for a TLS certificate
+by ACME for those names (`--acme-email` receives the CA's notices); without it
+the gateway serves plain HTTP on port 80. `--master-key-file` selects the key
+file for both the key step and the nonroot unit's credential; the root service
+reads `[keys] master_key_file` from the configuration, so with `--root` the
+flag must name the file the configuration already names (otherwise the key
+step and the daemon would use two different keys, and `--init` refuses it).
+Each step checks the host
+first, so running it again changes nothing, and `--dry-run` prints the plan, as
+`{dry_run, mode, steps}` with `--json`. A run that installs ends by running
+`kronik doctor` against the running service: a failed check fails the install,
+and the warnings it printed are repeated at the end of the output, with their
+hints (`warnings`, a list of `{check, message, hint}`, in the JSON). A warning is
+not a failure, and nothing in the install proves that sandboxes work: the first
+foreign actor you add is the real proof.
 
 ## kronik doctor
 
-`kronik doctor [--config <PATH>]`
+`kronik doctor [--config <PATH>] [--rootless]`
 
 Checks what this host can run (M6): the configuration file, the kernel,
 gVisor's `runsc`, KVM, cgroups, whether it runs as root, and for foreign
@@ -238,6 +265,16 @@ includes a catalog code and a hint; a pass or a warning may omit a hint.
 The checks of what only foreign actors need warn rather than fail, unless
 the configuration asks for what is missing (`platform = "kvm"`); the
 [operations guide](../guides/operations.md#kronik-doctor) lists them all.
+Where a microVM tool bundle is installed and the root service runs, `microvm`
+warns when the daemon has no delegated cgroup leaf and prints the drop-in
+that adds it (the microVM level is experimental).
+With `--rootless` (M21) it also checks what the nonroot service needs
+(`userns`, `uid_view`, `subid`, `pin` and `delegate`) and runs the network
+namespace and sandbox checks under the service's identity: as root it first
+becomes the `kronik` user, with the unit's supplementary groups (the
+user's memberships and the unit's `SupplementaryGroups=`, for example the
+group of `/dev/kvm`), and when it cannot, those two checks say that they
+are not proven instead of counting a root smoke as proof for the service.
 The exit code is 1 when a check fails, so a provisioning script can stop on
 it; `--json` gives the report as data.
 
@@ -247,8 +284,8 @@ $ kronik doctor
                 hint: kronik serve --init writes /etc/kronik/kronik.toml
   pass  kernel  Linux 6.12.111+deb13-cloud-amd64
   pass  runsc   /usr/local/bin/runsc release-20261019.0
-  warn  kvm     /dev/kvm: No such file or directory (os error 2); platform systrap only (KVM_UNAVAILABLE)
-                hint: fine for most hosts: foreign actors use systrap without KVM
+  warn  kvm     /dev/kvm: No such file or directory (os error 2); gVisor's platform systrap only, and no isolation microvm (KVM_UNAVAILABLE)
+                hint: fine for most hosts: foreign actors use gVisor with systrap without KVM; only the experimental isolation microvm needs it
   pass  cgroup  cgroup v2 with cpu, memory and pids
   pass  root    running as root, as the daemon does in v0.1
   pass  runc    /usr/bin/runc: isolation trusted is available
@@ -286,6 +323,29 @@ that fails leaves the directory as it was:
   `MASTER_KEY_MISSING` or `MASTER_KEY_MISMATCH`;
 - a sealed value whose key no backup provides (or sealed values and no
   backup at all): `KEYSTORE_INCOMPLETE`.
+
+Run as root against a nonroot installation (a data directory owned by the
+`kronik` user, M21), restore first does what only root can do, since only
+root may read a root-only key source: it reads the master key, the credentials
+of an S3 remote and the keystore backup. Then it gives up root, for good, and
+finishes as the directory's owner: the downloads, the checks of the
+directory's own stores and the install. The key material stays in protected
+memory across the drop; as root it writes nothing and reads in the directory
+only the key file and the envelope of a KMS source, by name, and no file in
+the directory is owned by root. The remote is read by the owner after that, so a
+`file://` target must be readable by the `kronik` user; the credentials of an
+S3 remote are read once, by root and before the drop (a token file may be
+root-only), and cannot be refreshed, so temporary credentials must last as
+long as the restore takes (a restore that
+outlives them stops with the provider's answer and installs nothing). The
+owner checks the directory's stores on copies in `$TMPDIR`, so a `TMPDIR`
+that only root can write fails the restore after the root phase, with nothing
+installed. `--dry-run` as root asks the remote as root, so it cannot tell
+whether the owner can read a `file://` target; the real run says so before it
+writes anything. Against a root-owned directory, or as the owning user, it
+works as before. It refuses
+a directory owned by anyone else, and a missing directory when a Kronik user
+namespace is pinned.
 
 Then the result is moved into place with renames: the old `state.db` is
 removed first and the new one put in place last. A restore interrupted
@@ -328,7 +388,10 @@ Next     kronik serve --data-dir /var/lib/kronik
 
 Checks this binary against a data directory before it replaces the one
 that is running (M6). Offline and read-only apart from the report: the
-old daemon may keep running. It replays the last `--window` of logical
+old daemon may keep running. Run as root against a nonroot installation,
+it reads the key as root and then drops to the directory's owner, who
+checks the directory's stores against the key and opens its keystore, so
+the report is not owned by root. It replays the last `--window` of logical
 time (default `6h`) with this binary's engine and the same code hashes.
 Fuel is not compared. Sealed values open with the directory's privacy
 keystore and the same `[keys]` configuration as `serve`. Select the matching
@@ -1969,12 +2032,23 @@ built-in store, or, for a name linked to an external secret manager, from the
 node's cache or the backend (`SECRET_UNAVAILABLE` while the backend does not
 answer and nothing is cached; the next start retries). A link made later is
 seen by the next start. `trusted` runs plain runc with a warning, a
-seccomp filter and no user namespace: it is not a security boundary;
-`microvm` is `NOT_IMPLEMENTED`. `--fork-mode` (M14) says how forks answer
-calls to it: `recorded` (the default) matches production's recordings;
-`sandbox` (gVisor only) checkpoints the actor with every snapshot, and each
-continuous fork gets a copy from the nearest checkpoint, with no network
-and its own disk, deleted with the fork; its answers are graded `forked`.
+seccomp filter and no user namespace: it is not a security boundary.
+`microvm` (M20) is **experimental**: it has not yet booted on KVM hardware,
+and every add answers with a warning that says so. Its VMM runs as the
+daemon's own user under a launcher of Kronik's (not Firecracker's jailer),
+and its sandbox forks all resume one snapshot, so values a program holds in
+memory repeat across forks (the
+[operations guide](../guides/operations.md#foreign-actors) says what that
+means). It runs the image in a
+Firecracker VM with a pinned guest kernel and no network device; it needs a
+usable `/dev/kvm` and the pinned tool bundle in `[foreign] microvm_dir`, and
+without KVM the add is `KVM_UNAVAILABLE` (use `gvisor`) and nothing is
+written. `--fork-mode` (M14) says how forks answer calls to it: `recorded`
+(the default) matches production's recordings; `sandbox` (gVisor, or the
+experimental microVM) checkpoints the actor
+with every snapshot, and each continuous fork gets a copy from the nearest
+checkpoint, with no network and its own disk, deleted with the fork; its
+answers are graded `forked`.
 To change the mode, remove and add the actor again. Errors:
 `FOREIGN_EXISTS`, `IMAGE_INVALID`, `RUNSC_MISSING`, `RUNC_MISSING`,
 `SECRET_NOT_FOUND`, `SECRET_UNAVAILABLE`, `SCOPE_MISSING`, `UNAVAILABLE` when the image's new
@@ -2017,7 +2091,13 @@ crashed or was killed left behind: runsc containers, network namespaces,
 bridge sockets, every `bundle/config.json` (they hold secret values),
 including those of fork copies (M14), partial checkpoints, and the cgroup
 parent, and unmounts runsc's `null-netns`. Refused with
-`UNAVAILABLE` while a daemon holds `[foreign] run_dir`, and without root.
+`UNAVAILABLE` while a daemon holds `[foreign] run_dir` or the data
+directory's lock. Run it as root or as the nonroot service user (the unit's
+`ExecStopPost=` does): as root against a nonroot installation (a data
+directory owned by the `kronik` user) it first becomes that owner, and as the
+service user it enters the pinned Kronik user namespace when a runtime
+directory exists, so it leaves no file owned by root and needs no host
+capability. A runtime directory that is gone is not recreated.
 The data directory comes from `--data-dir`, `KRONIK_DATA_DIR` or the
 configuration, as for `serve`. What it could not remove or list is printed
 as a warning on stderr, counted in `failed` (`--json`), and makes the exit
@@ -2050,6 +2130,53 @@ deleted. Needs `operate`.
 
 ```sh
 kronik foreign remove echo --reason "retire the owned echo fixture" --dry-run
+```
+
+## kronik userns pin
+
+`kronik userns pin [--user <NAME>] [--dry-run] [--json]`
+
+Host setup for the nonroot daemon (M21, ADR 0060). As root, creates the Kronik
+user namespace, owned by the `kronik` user, with id 0 mapped to that user and
+ids 1-65535 to its range in `/etc/subuid` and `/etc/subgid`, and pins it at
+`/run/kronik-userns/user`. A namespace already pinned there with the same owner
+and maps, and a matching root-only creation record, is kept; any other
+namespace or file at that path is refused, never replaced or adopted.
+`kronik-userns.service` runs it before `kronik.service`. The identity files
+must be root-owned and not writable by others, and the user must not be
+root. Without user namespaces, the user or a safe range:
+`ROOTLESS_UNAVAILABLE`. A local command: `--url` and `--token` are refused.
+`--dry-run` shows the plan and changes nothing.
+
+```sh
+kronik userns pin --dry-run
+```
+
+## kronik userns unpin
+
+`kronik userns unpin [--user <NAME>] [--dry-run] [--json]`
+
+As root, removes the pinned namespace, but only one whose root-only creation
+record and unchanged identity still match: a replacement or an unrelated file
+at that path is left alone. The service unit stopping does not unpin it, so a
+restart of the pin unit never strands a running daemon in another namespace.
+Change the `kronik` user's identity only with the daemon and its consumers
+stopped. `--dry-run` validates the record and changes nothing.
+
+```sh
+kronik userns unpin --dry-run
+```
+
+## kronik userns status
+
+`kronik userns status [--user <NAME>] [--json]`
+
+Whether a namespace is pinned, its owner and maps, the `kronik` user's ranges,
+and whether they match, so that the daemon can enter it. Any user may run it;
+only the owner and root can read the maps.
+
+```sh
+kronik userns status --json
 ```
 
 ## kronik stubs set

@@ -225,6 +225,299 @@ fn init_dry_run_prints_the_plan_and_changes_nothing() {
     );
 }
 
+/// Whether this host can take the nonroot service: the prerequisites that
+/// `serve --init` checks before it plans anything (systemd 255 or newer,
+/// cgroup v2, user namespaces).
+fn nonroot_host() -> bool {
+    let systemd = Command::new("systemctl")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|text| text.split_whitespace().nth(1)?.parse::<u32>().ok());
+    systemd.is_some_and(|version| version >= 255)
+        && Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+        && std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .is_some_and(|max| max != 0)
+}
+
+/// A plain `serve --init` plans the root service of v0.4.0 on any host, and
+/// the nonroot service is opt-in with `--rootless`: it is planned where the
+/// host can run it, and otherwise the command stops with an error that names
+/// the root service. Missing prerequisites never install the root service by
+/// themselves.
+#[test]
+fn the_default_init_plans_the_root_service_and_rootless_is_opt_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("kronik.toml");
+    // The key is outside the data directory, as the nonroot service requires.
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\ndata_dir = {:?}\n[keys]\nmaster_key_file = {:?}\n",
+            data,
+            dir.path().join("master.key")
+        ),
+    )
+    .unwrap();
+    // The default: the root service, no user, pin or subordinate range.
+    let out = kronik(&[
+        "serve",
+        "--init",
+        "--dry-run",
+        "--json",
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let plan: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(plan["mode"], "root");
+    assert_eq!(plan["dry_run"], true);
+    let steps = plan["steps"].to_string();
+    assert!(!steps.contains("kronik-userns.service"), "{steps}");
+    assert!(!steps.contains("system user kronik"), "{steps}");
+    assert!(!data.exists());
+    // `--rootless` on a host without systemd on its path: the error names the
+    // root service, whatever this machine is.
+    let empty = dir.path().join("empty-path");
+    std::fs::create_dir(&empty).unwrap();
+    let out = command()
+        .args([
+            "serve",
+            "--init",
+            "--rootless",
+            "--dry-run",
+            "--json",
+            "--config",
+        ])
+        .arg(&config)
+        .env("PATH", &empty)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("ROOTLESS_UNAVAILABLE"), "{text}");
+    assert!(text.contains("kronik serve --init --root"), "{text}");
+    assert!(!data.exists());
+    if nonroot_host() {
+        let out = kronik(&[
+            "serve",
+            "--init",
+            "--rootless",
+            "--dry-run",
+            "--json",
+            "--config",
+            config.to_str().unwrap(),
+        ]);
+        assert!(out.status.success(), "{out:?}");
+        let plan: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(plan["mode"], "rootless");
+        let steps = plan["steps"].to_string();
+        assert!(steps.contains("kronik-userns.service"), "{steps}");
+        assert!(!data.exists());
+    }
+}
+
+#[test]
+fn root_init_json_plan_does_not_create_a_minimal_keys_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("kronik.toml");
+    std::fs::write(&config, format!("[server]\ndata_dir = {:?}\n", data)).unwrap();
+    let out = kronik(&[
+        "serve",
+        "--init",
+        "--root",
+        "--dry-run",
+        "--json",
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["mode"], "root");
+    assert_eq!(value["dry_run"], true);
+    assert!(value["steps"].as_array().unwrap().len() >= 3);
+    assert!(!data.exists());
+    let selected = dir.path().join("selected.key");
+    // The root unit starts the daemon with the configuration alone, so a key
+    // file the configuration does not name would be used by the key step and
+    // not by the daemon: refused, with the way out.
+    let out = kronik(&[
+        "serve",
+        "--init",
+        "--root",
+        "--dry-run",
+        "--json",
+        "--master-key-file",
+        selected.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success(), "{out:?}");
+    let refusal: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(refusal["error"]["code"], "BAD_REQUEST", "{refusal}");
+    let message = refusal["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(&format!(
+            "--master-key-file {} would not reach the root service: its unit starts the daemon with the configuration alone, and the configuration names ",
+            selected.display()
+        )),
+        "{message}"
+    );
+    assert!(
+        refusal["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("[keys] master_key_file"),
+        "{refusal}"
+    );
+    // The file the configuration names is accepted, and the plan names it.
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\ndata_dir = {:?}\n[keys]\nmaster_key_file = {:?}\n",
+            data, selected
+        ),
+    )
+    .unwrap();
+    let out = kronik(&[
+        "serve",
+        "--init",
+        "--root",
+        "--dry-run",
+        "--json",
+        "--master-key-file",
+        selected.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        value["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["what"]
+                .as_str()
+                .unwrap()
+                .contains(selected.to_str().unwrap())),
+        "{value}"
+    );
+    assert!(!data.exists());
+    assert!(!selected.exists());
+}
+
+#[test]
+fn init_environment_dry_run_names_effective_source_without_persisting_seed() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("kronik.toml");
+    let base = format!(
+        "[server]\ndata_dir = {:?}\n[foreign]\nmicrovm_dir = {:?}\n",
+        data,
+        dir.path().join("no-tools")
+    );
+    std::fs::write(&config, &base).unwrap();
+    let args = [
+        "serve",
+        "--init",
+        "--root",
+        "--dry-run",
+        "--json",
+        "--config",
+        config.to_str().unwrap(),
+    ];
+    let implicit = command()
+        .args(args)
+        .env("KRONIK_MASTER_KEY", "07".repeat(32))
+        .output()
+        .unwrap();
+    assert!(implicit.status.success(), "{implicit:?}");
+    let plan: serde_json::Value = serde_json::from_slice(&implicit.stdout).unwrap();
+    assert!(
+        plan["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["what"]
+                .as_str()
+                .unwrap()
+                .contains("env master key from KRONIK_MASTER_KEY (no key file)")),
+        "{plan}"
+    );
+    assert!(!data.exists());
+    std::fs::write(&config, format!("{base}\n[keys]\nsource = \"env\"\n")).unwrap();
+    let explicit = command()
+        .args(args)
+        .env("KRONIK_MASTER_KEY", "07".repeat(32))
+        .output()
+        .unwrap();
+    assert!(explicit.status.success(), "{explicit:?}");
+    assert!(!data.exists());
+}
+
+#[test]
+fn stopped_cleanup_missing_runtime_is_idempotent_but_never_bypasses_data_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let run = dir.path().join("missing-run");
+    std::fs::create_dir(&data).unwrap();
+    let config = dir.path().join("kronik.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\ndata_dir = {:?}\n[foreign]\nrun_dir = {:?}\n",
+            data, run
+        ),
+    )
+    .unwrap();
+    let held = kronik_privacy::key_source::lock_data(&data).unwrap();
+    let args = [
+        "foreign",
+        "cleanup",
+        "--json",
+        "--config",
+        config.to_str().unwrap(),
+    ];
+    let refused = kronik(&args);
+    assert!(!refused.status.success(), "{refused:?}");
+    let error: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "UNAVAILABLE", "{error}");
+    assert!(!run.exists());
+    drop(held);
+    let private_config = data.join("foreign/actors/echo/bundle/config.json");
+    std::fs::create_dir_all(private_config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &private_config,
+        b"{\"env\":[\"SECRET=private-test-value\"]}",
+    )
+    .unwrap();
+    for iteration in 0..2 {
+        let out = kronik(&args);
+        assert!(out.status.success(), "{out:?}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["failed"], 0);
+        assert_eq!(value["sandboxes"], 0);
+        assert_eq!(value["configs"], if iteration == 0 { 1 } else { 0 });
+        assert!(
+            !private_config.exists(),
+            "a dead pin is not needed to remove owned secret config"
+        );
+        assert!(!run.exists(), "cleanup must not recreate runtime state");
+    }
+    // Without a data directory there is no lock to take and nothing of the
+    // daemon's to clean: that is still a success, as it was before the lock.
+    std::fs::remove_dir_all(&data).unwrap();
+    let out = kronik(&args);
+    assert!(out.status.success(), "{out:?}");
+    assert!(!data.exists() && !run.exists());
+}
+
 /// `GET /` over TLS to `addr`, trusting only `root`.
 fn https_get(addr: &str, root: &rcgen::Certificate) -> String {
     use std::sync::Arc;
@@ -367,30 +660,30 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
         .iter()
         .map(|c| c["name"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        names,
-        [
-            "config",
-            "kernel",
-            "runsc",
-            "kvm",
-            "cgroup",
-            "root",
-            "runc",
-            "netns",
-            "run_dir",
-            "caps",
-            "sandbox",
-            "disk",
-            "clock",
-            "tls",
-            "ship",
-            "export",
-            "key_source",
-            "secrets",
-            "retention"
-        ]
-    );
+    // Plain doctor, as root or as an ordinary user, lists what it always did:
+    // the nonroot service's checks come with --rootless only.
+    let expected = [
+        "config",
+        "kernel",
+        "runsc",
+        "kvm",
+        "cgroup",
+        "root",
+        "runc",
+        "netns",
+        "run_dir",
+        "caps",
+        "sandbox",
+        "disk",
+        "clock",
+        "tls",
+        "ship",
+        "export",
+        "key_source",
+        "secrets",
+        "retention",
+    ];
+    assert_eq!(names, expected);
     assert_eq!(status(&report, "config")["status"], "pass");
     assert_eq!(status(&report, "tls")["status"], "pass", "{report}");
     assert_ne!(status(&report, "kvm")["status"], "fail", "{report}");
@@ -482,6 +775,41 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
     assert!(!ok);
     assert_eq!(status(&report, "config")["status"], "fail");
     assert_eq!(report["checks"].as_array().unwrap().len(), 19);
+}
+
+#[test]
+fn explicit_rootless_doctor_never_counts_a_root_smoke_as_service_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("kronik.toml");
+    std::fs::write(
+        &config,
+        "[foreign]\nrunsc_path = \"/no-such-kronik-runsc\"\n",
+    )
+    .unwrap();
+    let out = kronik(&[
+        "--json",
+        "doctor",
+        "--rootless",
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    for name in ["userns", "uid_view", "subid", "pin", "delegate"] {
+        assert!(status(&report, name)["status"].is_string(), "{report}");
+    }
+    if kronik_foreign::sys::is_root() {
+        let identity = status(&report, "service_identity");
+        if identity["status"] != "pass" {
+            assert_ne!(status(&report, "netns")["status"], "pass", "{report}");
+            assert_ne!(status(&report, "sandbox")["status"], "pass", "{report}");
+        } else {
+            assert!(
+                identity["message"].as_str().unwrap().contains("host uid"),
+                "{report}"
+            );
+        }
+    }
 }
 
 #[test]

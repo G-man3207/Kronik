@@ -20,7 +20,9 @@
 pub mod blobs;
 pub mod fetch;
 pub mod image;
+pub mod microvm;
 pub mod oci;
+pub mod subid;
 pub mod sys;
 
 mod bridge;
@@ -28,13 +30,19 @@ mod checkpoint;
 mod layout;
 mod logs;
 mod manager;
+mod microvm_assets;
+mod microvm_checkpoint;
+mod microvm_sys;
 mod runtime;
+
+pub use runtime::container_id;
 mod supervisor;
 
 pub use checkpoint::Copy;
 pub use image::{ImageError, ImageRef};
 pub use manager::{
-    AddPlan, AddRequest, Cleaned, Foreign, ForeignConfig, Host, Isolation, LogTail, Platform,
-    RUN_LOCK, TESTED_RUNSC, TRUSTED_WARNING,
+    AddPlan, AddRequest, Cleaned, Foreign, ForeignConfig, Host, Isolation, LogTail,
+    MICROVM_WARNING, Platform, Privilege, RUN_LOCK, TESTED_RUNSC, TRUSTED_WARNING, cleanup,
+    lock_run_dir,
 };
 pub use supervisor::{LastExit, State, Status};

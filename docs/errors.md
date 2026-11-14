@@ -78,6 +78,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`REASON_REQUIRED`](#reason_required) | 400 | M1 | The mutation has no reason |
 | [`REPLAY_DIVERGED`](#replay_diverged) | 500 | M2 | Replay did not reproduce the recorded history |
 | [`ROLLBACK_SCHEMA_CHANGED`](#rollback_schema_changed) | 409 | M3 | The schema version changed since that deployment |
+| [`ROOTLESS_UNAVAILABLE`](#rootless_unavailable) | 503 | M21 | The rootless service boundary is unavailable |
 | [`ROUTE_CONFLICT`](#route_conflict) | 409 | M1 | Another actor type already serves this route |
 | [`ROUTE_NOT_FOUND`](#route_not_found) | 404 | M1 | No deployed route matches the request |
 | [`RUNC_MISSING`](#runc_missing) | 503 | M7 | runc is not installed |
@@ -365,6 +366,7 @@ Typical causes:
 - The image or its configuration is wrong, so the sandbox keeps failing to start.
 - `foreign add`: the registry (or the layout directory) did not answer within `[foreign] pull_timeout`. Check that it is reachable, or raise `pull_timeout`, and add the actor again.
 - Another daemon holds `[foreign] run_dir`, so this one runs no foreign actors.
+- An explicit microVM actor has missing or unverifiable pinned tools, a root image that cannot be formatted, insufficient disk reserve, or an existing data drive that is not a private, fully allocated 1 GiB regular file. Inspect the retained formatter/startup diagnostics; do not truncate or replace existing data to make admission pass.
 
 To fix it, check the foreign actor's state and its logs:
 
@@ -582,11 +584,13 @@ Default hint: Set `platform = "auto"` or `"systrap"` under `[foreign]`, or enabl
 
 The configuration or the operation needs KVM, but `/dev/kvm` is missing or not usable. Everything in v0.1 works without KVM (I11): foreign actors run in gVisor with the `systrap` platform by default.
 
-Typical cause: `platform = "kvm"` under `[foreign]` in `/etc/kronik/kronik.toml` on a VPS without KVM.
+This applies either to gVisor's explicit `platform = "kvm"` or to an actor declared with `isolation = "microvm"`, the experimental Firecracker level (M20).
 
-To fix it, set `platform = "auto"` or `platform = "systrap"` under `[foreign]`, or run on a host with `/dev/kvm`. `kronik doctor` shows whether the host has KVM:
+MicroVM admission checks the real KVM API and VM-creation operation; an existing pathname alone is not proof. Missing hardware is an error, not a successful boot test. Never reinterpret a microVM snapshot as a gVisor checkpoint.
 
-    kronik doctor
+For gVisor, select `platform = "auto"` or `"systrap"`. For a microVM, use a host with a usable existing `/dev/kvm`, or explicitly choose `isolation = "gvisor"` instead; changing the gVisor platform does not change a microVM declaration. Kronik does not create a device, load a module or silently weaken isolation. Check the selected service identity and its device access:
+
+    kronik doctor --rootless
 
 See also: [`isolation-level`](concepts/glossary.md#isolation-level).
 
@@ -662,9 +666,9 @@ HTTP status 501, milestone M1. Not available in this version.
 
 Default hint: Use what this version supports; `kronik --version` shows the version.
 
-The operation is part of Kronik's design but not available in this version, for example the `microvm` isolation level, which is reserved in v0.1, or an API endpoint that a later milestone adds.
+The requested operation is not implemented by this version. This is not the error for microVM admission: its missing-KVM and missing-tool failures use KVM_UNAVAILABLE and FOREIGN_UNAVAILABLE.
 
-To fix it, use what this version supports, for example the `gvisor` isolation level instead of `microvm`. `kronik --version` shows which version you run:
+Check the command's supported operations and `kronik --version`; an unavailable feature must not be replaced silently by a weaker isolation or different operation:
 
     kronik --version
 
@@ -830,6 +834,29 @@ To fix it, fix forward: propose a corrected version that keeps or raises the cur
     kronik propose ./dist/billing.wasm --window 1h --reason "fix the invoice total"
 
 See also: [`deployment`](concepts/glossary.md#deployment), [`proposal`](concepts/glossary.md#proposal).
+
+## ROOTLESS_UNAVAILABLE
+
+HTTP status 503, milestone M21. The rootless service boundary is unavailable.
+
+Default hint: Run `kronik doctor --rootless` under the service identity; repair its owned namespace pin and delegated cgroup, then retry.
+
+The nonroot service cannot establish its owned user namespace, safely hand over its data directory or use a delegated cgroup, or `kronik serve --init` refuses the installation it found. Typical causes are a missing or mismatched namespace pin, unavailable user namespaces, missing subordinate IDs, an unexpected data owner, a unit without writable delegation, or an existing installation of the other kind (root or nonroot).
+
+No host capability is retained to make this work, no actor resource limit is removed, and no weaker backend or root service is selected automatically. A daemon whose foreign boundary is unavailable can still serve Wasm after clearing its startup capabilities. A rejected setup or offline handover must be repaired before retrying.
+
+`kronik serve --rootless` also stops with this code, before it creates or binds anything, where it could not report its API callers' real uids: when it runs as root, when its real, effective and saved user ids differ, and in a user namespace whose uid map is not the host's identity map, as in a rootless container or a nested user namespace. The message says which. Those hosts are not supported for the nonroot unit: use the root service (`kronik serve --init --root`). `kronik doctor --rootless` shows the same condition as `uid_view` before the service is started.
+
+Run the diagnosis under the actual service identity and its owned unit:
+
+    kronik doctor --rootless
+    kronik userns status --json
+
+Repair the root-controlled stable-user/subordinate-ID setup and the unit's `Delegate=yes` configuration. A matching pin is kept. A mismatched pin is never replaced automatically: stop its consumers and use explicit, ownership-checked unpin/setup before changing identity. Never remove a replacement or preexisting pin belonging to another runner.
+
+`kronik serve --init` never converts an existing installation in place. Keep a root installation with `kronik serve --init --root` and a nonroot one with `kronik serve --init --rootless`. To move to the other kind, ship the data (or take a snapshot), run `kronik serve --init` with the other kind's flag against an empty data directory and `kronik restore` into it. Foreign actors' data directories and checkpoints are local and are not part of a restore.
+
+See also: [`FOREIGN_UNAVAILABLE`](#foreign_unavailable), [`isolation-level`](concepts/glossary.md#isolation-level).
 
 ## ROUTE_CONFLICT
 

@@ -29,17 +29,19 @@ const COPY_READY: Duration = Duration::from_secs(20);
 
 /// `meta.json` of a checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Meta {
-    name: String,
-    lsn: u64,
-    image: String,
-    platform: String,
+pub(crate) struct Meta {
+    pub(crate) name: String,
+    pub(crate) lsn: u64,
+    pub(crate) image: String,
+    pub(crate) platform: String,
     /// The runsc release that took it (design §3); empty in older ones.
     #[serde(default)]
-    runsc: String,
-    port: u32,
-    at_ms: u64,
-    bytes: u64,
+    pub(crate) runsc: String,
+    pub(crate) port: u32,
+    pub(crate) at_ms: u64,
+    pub(crate) bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) microvm: Option<crate::microvm_checkpoint::MicrovmMeta>,
 }
 
 fn dir_name(lsn: u64) -> String {
@@ -115,12 +117,12 @@ pub(crate) fn copy_tree(from: &Path, to: &Path) -> io::Result<u64> {
     Ok(bytes)
 }
 
-fn private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn private_dir(path: &Path) -> io::Result<()> {
     std::fs::create_dir_all(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
     let _ = std::fs::remove_file(path);
     let mut f = std::fs::OpenOptions::new()
@@ -139,7 +141,7 @@ fn err(what: &str, e: impl std::fmt::Display) -> String {
 /// The copy's container id: fixed length, so no id is a prefix of another
 /// (runsc resolves ids by prefix), and new per start, so a copy being
 /// stopped never takes a newer copy's id, namespace or disk with it.
-fn copy_key(fork: &str, name: &str) -> String {
+pub(crate) fn copy_key(fork: &str, name: &str) -> String {
     static STARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = STARTS.fetch_add(1, Ordering::Relaxed);
     let h = blake3::hash(format!("{fork}\0{name}\0{n}").as_bytes()).to_hex();
@@ -147,7 +149,7 @@ fn copy_key(fork: &str, name: &str) -> String {
 }
 
 impl Foreign {
-    fn checkpoints_dir(&self, name: &str) -> PathBuf {
+    pub(crate) fn checkpoints_dir(&self, name: &str) -> PathBuf {
         self.ctx.paths.actor(name).join("checkpoints")
     }
 
@@ -192,7 +194,7 @@ impl Foreign {
     ) -> Result<Checkpoint, String> {
         let actor = crate::manager::lock(&self.actors).get(name).cloned();
         let a = actor.ok_or_else(|| format!("{name} is not running in this daemon"))?;
-        if !matches!(a.runtime.engine, Engine::Runsc { .. }) {
+        if a.runtime.engine == Engine::Runc {
             return Err(format!("{name} runs under runc, which has no checkpoints"));
         }
         if a.status().state != State::Running {
@@ -216,14 +218,21 @@ impl Foreign {
         // holds the data and the sandbox's memory, which its limit bounds
         // (review M14 M2).
         if let Some(room) = budget {
-            let data = self.ctx.paths.data_dir(name);
-            let bytes = self
-                .ctx
-                .env
-                .blocking("foreign-checkpoint-size", move || dir_bytes(&data))
-                .await
-                .unwrap_or(0)
-                .saturating_add(a.decl.memory_bytes);
+            let bytes = if a.runtime.engine == Engine::Firecracker {
+                let rootfs = self.ctx.paths.bundle(name).join("root.ext4");
+                let root_bytes = std::fs::metadata(rootfs).map_err(|e| e.to_string())?.len();
+                crate::microvm::DATA_BYTES
+                    .saturating_add(a.decl.memory_bytes)
+                    .saturating_add(root_bytes)
+            } else {
+                let data = self.ctx.paths.data_dir(name);
+                self.ctx
+                    .env
+                    .blocking("foreign-checkpoint-size", move || dir_bytes(&data))
+                    .await
+                    .unwrap_or(0)
+                    .saturating_add(a.decl.memory_bytes)
+            };
             if bytes > room {
                 return Err(format!(
                     "{name}'s data and memory take up to {bytes} bytes, more than the {room} \
@@ -253,6 +262,9 @@ impl Foreign {
         lsn: u64,
         tmp: &Path,
     ) -> Result<Checkpoint, String> {
+        if a.runtime.engine == Engine::Firecracker {
+            return self.checkpoint_microvm(a, name, lsn, tmp).await;
+        }
         let env = &self.ctx.env;
         let root = self.checkpoints_dir(name);
         let final_dir = root.join(dir_name(lsn));
@@ -316,12 +328,13 @@ impl Foreign {
             image: a.decl.image.clone(),
             platform: match &a.runtime.engine {
                 Engine::Runsc { platform } => platform.clone(),
-                Engine::Runc => String::new(),
+                Engine::Runc | Engine::Firecracker => String::new(),
             },
             runsc: String::new(),
             port: a.decl.port,
             at_ms: env.clock.wall_ms(),
             bytes,
+            microvm: None,
         };
         let keep = self.cfg.checkpoints_kept.max(1);
         let (root2, tmp) = (root.clone(), tmp.to_path_buf());
@@ -369,6 +382,9 @@ impl Foreign {
             &std::fs::read(ck.join("meta.json")).map_err(|e| err("checkpoint meta.json", e))?,
         )
         .map_err(|e| err("checkpoint meta.json", e))?;
+        if meta.microvm.is_some() {
+            return self.start_microvm_copy(spec, meta).await;
+        }
         let key = copy_key(&spec.fork, &spec.name);
         let id = format!("kronik-copy-{key}");
         let netns = self.ctx.paths.netns_dir().join(format!("copy-{key}"));
@@ -434,6 +450,7 @@ impl Foreign {
             dir,
             log: log.clone(),
             stopped: AtomicBool::new(false),
+            vm: None,
         });
         {
             let mut all = crate::manager::lock(&self.copies);
@@ -502,7 +519,7 @@ fn copy_spec(spec: &mut serde_json::Value, data: &Path, netns: &Path, cgroup: &s
 }
 
 /// Deletes the oldest checkpoints beyond `keep`.
-fn prune(root: &Path, keep: usize) {
+pub(crate) fn prune(root: &Path, keep: usize) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -521,20 +538,21 @@ fn prune(root: &Path, keep: usize) {
 }
 
 /// A fork's copy of a foreign actor.
-pub struct Copy(Arc<CopyInner>);
+pub struct Copy(pub(crate) Arc<CopyInner>);
 
 pub(crate) struct CopyInner {
-    env: Env,
-    name: String,
-    id: String,
-    runtime: Runtime,
-    dialer: Dialer,
-    pool: Pool,
-    netns: PathBuf,
-    sock_dir: PathBuf,
-    dir: PathBuf,
-    log: PathBuf,
-    stopped: AtomicBool,
+    pub(crate) env: Env,
+    pub(crate) name: String,
+    pub(crate) id: String,
+    pub(crate) runtime: Runtime,
+    pub(crate) dialer: Dialer,
+    pub(crate) pool: Pool,
+    pub(crate) netns: PathBuf,
+    pub(crate) sock_dir: PathBuf,
+    pub(crate) dir: PathBuf,
+    pub(crate) log: PathBuf,
+    pub(crate) stopped: AtomicBool,
+    pub(crate) vm: Option<Arc<crate::microvm::Vm>>,
 }
 
 impl CopyInner {
@@ -561,13 +579,26 @@ impl CopyInner {
             self.sock_dir.clone(),
             self.dir.clone(),
         );
+        let vm = self.vm.clone();
         async move {
-            let _ = run_quick(&env, runtime.kill(&id, "KILL", &log), QUICK).await;
-            let _ = run_quick(&env, runtime.delete(&id, &log), QUICK).await;
+            if let Some(vm) = &vm {
+                let _ = vm.child.kill().await;
+                if env.timeout(QUICK, vm.child.wait()).await.is_err() {
+                    tracing::error!(name = %name, "microVM copy did not reap; retaining its backing files");
+                    return;
+                }
+            } else {
+                let _ = run_quick(&env, runtime.kill(&id, "KILL", &log), QUICK).await;
+                let _ = run_quick(&env, runtime.delete(&id, &log), QUICK).await;
+            }
             let _ = env
                 .blocking("foreign-copy-cleanup", move || {
-                    let _ = crate::sys::delete_netns(&netns);
-                    let _ = std::fs::remove_dir_all(&sock);
+                    if let Some(vm) = vm {
+                        let _ = vm.remove_files();
+                    } else {
+                        let _ = crate::sys::delete_netns(&netns);
+                        let _ = std::fs::remove_dir_all(&sock);
+                    }
                     let _ = std::fs::remove_dir_all(&dir);
                 })
                 .await;

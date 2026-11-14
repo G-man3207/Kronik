@@ -39,6 +39,12 @@ pub(crate) enum Dialer {
         netns: PathBuf,
         port: u16,
     },
+    Vsock {
+        /// Firecracker's hybrid-vsock UDS, in its fixed private jail.
+        socket: PathBuf,
+        /// The VM's cgroup: the socket's peer must be a process of it.
+        cgroup: String,
+    },
 }
 
 /// Kept-alive connections of one actor.
@@ -123,7 +129,73 @@ pub(crate) async fn dial(env: &Env, pool: &Pool, d: &Dialer) -> Result<Sender, S
             let stream = tokio::net::TcpStream::from_std(std_stream).map_err(|e| e.to_string())?;
             handshake(env, stream).await
         }
+        Dialer::Vsock { socket, cgroup } => {
+            let stream = env
+                .timeout(DIAL_TIMEOUT, async {
+                    use tokio::io::AsyncReadExt as _;
+                    let mut stream =
+                        vsock(env, socket, cgroup, kronik_guest_init::VSOCK_PORT).await?;
+                    let mut ready = [0; kronik_guest_init::READY.len()];
+                    stream
+                        .read_exact(&mut ready)
+                        .await
+                        .map_err(|e| format!("guest TCP readiness: {e}"))?;
+                    if ready.as_slice() != kronik_guest_init::READY {
+                        return Err("invalid guest TCP readiness acknowledgement".into());
+                    }
+                    Ok::<_, String>(stream)
+                })
+                .await
+                .map_err(|_| "microVM vsock connect timed out")??;
+            handshake(env, stream).await
+        }
     }
+}
+
+/// Firecracker's bounded hybrid transport, used only for the two fixed guest
+/// ports. The application READY acknowledgement is separate from its `OK`.
+pub(crate) async fn vsock(
+    env: &Env,
+    socket: &std::path::Path,
+    cgroup: &str,
+    port: u32,
+) -> Result<tokio::net::UnixStream, String> {
+    env.timeout(DIAL_TIMEOUT, async {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // Before any byte is sent: the socket's name is the VMM's to choose.
+        let mut stream = crate::microvm::connect_vmm_socket(env, socket, cgroup)
+            .await
+            .map_err(|e| format!("connecting to microVM vsock: {}", e.into_message()))?;
+        stream
+            .write_all(format!("CONNECT {port}\n").as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut line = Vec::with_capacity(24);
+        loop {
+            let byte = stream.read_u8().await.map_err(|e| e.to_string())?;
+            if byte == b'\n' {
+                break;
+            }
+            if line.len() == 24 {
+                return Err("oversized microVM vsock reply".to_owned());
+            }
+            line.push(byte);
+        }
+        let port = line
+            .strip_prefix(b"OK ")
+            .filter(|p| !p.is_empty() && p.len() <= 10 && p.iter().all(u8::is_ascii_digit))
+            .ok_or("invalid microVM vsock reply")?;
+        let port: u32 = std::str::from_utf8(port)
+            .map_err(|_| "invalid microVM vsock port")?
+            .parse()
+            .map_err(|_| "invalid microVM vsock port")?;
+        if port == 0 {
+            return Err("invalid microVM vsock port".into());
+        }
+        Ok(stream)
+    })
+    .await
+    .map_err(|_| "microVM vsock connect timed out")?
 }
 
 /// Runs `runsc port-forward --stream` against `listener` and returns the
@@ -254,14 +326,22 @@ pub(crate) async fn send(
     loop {
         let Some(mut s) = pool.take() else { break };
         if s.ready().await.is_err() {
+            if matches!(dialer, Dialer::Vsock { .. }) {
+                return Err(NetError::Io("guest connection closed after READY".into()));
+            }
             continue;
         }
         match s.try_send_request(request).await {
             Ok(resp) => return finish(pool, s, resp, max).await,
-            Err(mut e) => match e.take_message() {
-                Some(back) => request = back,
-                None => return Err(NetError::Io(e.into_error().to_string())),
-            },
+            Err(mut e) => {
+                if matches!(dialer, Dialer::Vsock { .. }) {
+                    return Err(NetError::Io(e.into_error().to_string()));
+                }
+                match e.take_message() {
+                    Some(back) => request = back,
+                    None => return Err(NetError::Io(e.into_error().to_string())),
+                }
+            }
         }
     }
     let mut s = dial(env, pool, dialer)
@@ -270,7 +350,7 @@ pub(crate) async fn send(
     match s.try_send_request(request).await {
         Ok(resp) => finish(pool, s, resp, max).await,
         Err(mut e) => {
-            let sent = e.take_message().is_none();
+            let sent = matches!(dialer, Dialer::Vsock { .. }) || e.take_message().is_none();
             let msg = e.into_error().to_string();
             Err(if sent {
                 NetError::Io(msg)
@@ -453,5 +533,86 @@ mod tests {
             matches!(&err, NetError::Connect(m) if m.starts_with("FOREIGN_UNAVAILABLE: echo:")),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_vsock_peer_outside_the_vms_cgroup_is_refused_before_a_byte_is_sent() {
+        use tokio::io::AsyncReadExt as _;
+        let env = Env::real(tokio::runtime::Handle::current());
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("vsock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let error = crate::bridge::vsock(&env, &socket, "/some/other/vm", 10_000)
+            .await
+            .unwrap_err();
+        assert!(error.contains("not in the VM's cgroup"), "{error}");
+        // The server saw the connection and no byte of it.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut seen = Vec::new();
+        stream.read_to_end(&mut seen).await.unwrap();
+        assert!(seen.is_empty(), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn vsock_requires_tcp_ready_and_never_retries_an_uncertain_http_send() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let env = Env::real(tokio::runtime::Handle::current());
+        let directory = tempfile::tempdir().unwrap();
+        for ready in [false, true] {
+            let socket = directory.path().join(format!("vsock-{ready}"));
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = env.spawn("test-vsock-boundary", async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut line = Vec::new();
+                loop {
+                    let byte = stream.read_u8().await.unwrap();
+                    line.push(byte);
+                    assert!(line.len() <= 32);
+                    if byte == b'\n' {
+                        break;
+                    }
+                }
+                assert_eq!(line, b"CONNECT 10000\n");
+                stream.write_all(b"OK 1234\n").await.unwrap();
+                if ready {
+                    stream.write_all(kronik_guest_init::READY).await.unwrap();
+                    assert_eq!(stream.read_u8().await.unwrap(), b'P');
+                }
+                // Before READY no request is allowed; after receiving an HTTP
+                // byte the outcome is uncertain, not a safe reconnect/retry.
+                drop(stream);
+                listener
+            });
+            let result = env
+                .timeout(
+                    Duration::from_secs(1),
+                    send(
+                        &env,
+                        &Pool::default(),
+                        &Dialer::Vsock {
+                            socket,
+                            // The fake VMM is this process.
+                            cgroup: crate::sys::own_cgroup()
+                                .expect("these tests need a cgroup v2 host (a `0::` line in /proc/self/cgroup)"),
+                        },
+                        "echo",
+                        request("foreign://echo/x", b"", 1024),
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap_err();
+            if ready {
+                assert!(matches!(result, NetError::Io(_)), "{result:?}");
+            } else {
+                assert!(matches!(result, NetError::Connect(_)), "{result:?}");
+            }
+            let listener = server.await.unwrap();
+            assert!(
+                env.timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
     }
 }

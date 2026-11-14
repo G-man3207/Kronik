@@ -13,6 +13,8 @@
 # Needs root, runsc (/usr/local/bin/runsc), curl, python3, the components
 # from scripts/build-examples-ts.sh (examples/dist/billing-ts*.wasm) and the
 # image from scripts/build-foreign-examples.sh (built here if missing).
+# External owned mode also needs KRONIK_DEMO_{SOCKET,HTTP,DATA_DIR,RUN_DIR,
+# OWNER_TOKEN,FIXTURE,PAYMENTS_IMAGE}; it never stops/removes that daemon/data.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -31,10 +33,37 @@ api_key="demo-key-$(date +%s%N | sha256sum | cut -c1-16)"
 for f in "$bin" "$billing" "$ledger" "$eu_vat"; do
     [ -e "$f" ] || { echo "missing $f (cargo build --release; scripts/build-examples-ts.sh)" >&2; exit 2; }
 done
-[ -e "$layout/index.json" ] || scripts/build-foreign-examples.sh --only fake-payments
+if [ -z "${KRONIK_DEMO_SOCKET:-}" ] && [ ! -e "$layout/index.json" ]; then
+    scripts/build-foreign-examples.sh --only fake-payments
+fi
 
+external=0
 sock="$dir/api.sock"
 gw="http://127.0.0.1:$port"
+data="$dir/data"
+run="$dir/run"
+image=""
+if [ -z "${KRONIK_DEMO_SOCKET:-}" ]; then
+    image="oci-layout:$(realpath "$layout")"
+fi
+if [ -n "${KRONIK_DEMO_SOCKET:-}" ]; then
+    : "${KRONIK_DEMO_HTTP:?external daemon needs its HTTP URL}"
+    : "${KRONIK_DEMO_DATA_DIR:?external daemon needs its owned data directory}"
+    : "${KRONIK_DEMO_RUN_DIR:?external daemon needs its owned runtime directory}"
+    : "${KRONIK_DEMO_OWNER_TOKEN:?external daemon needs its ownership token}"
+    : "${KRONIK_DEMO_PAYMENTS_IMAGE:?external daemon needs its visible payments image}"
+    : "${KRONIK_DEMO_FIXTURE:?external daemon needs its trusted fixture manifest}"
+    bash scripts/check-rootless.sh --fixture "$KRONIK_DEMO_FIXTURE"
+    [ "$(cat "$KRONIK_DEMO_DATA_DIR/.kronik-proof-owner")" = "$KRONIK_DEMO_OWNER_TOKEN" ] ||
+        { echo "wrong external fixture owner" >&2; exit 2; }
+    [ ! -e "$dir" ] || { echo "evidence directory already exists: $dir" >&2; exit 2; }
+    external=1
+    sock=$KRONIK_DEMO_SOCKET
+    gw=$KRONIK_DEMO_HTTP
+    data=$KRONIK_DEMO_DATA_DIR
+    run=$KRONIK_DEMO_RUN_DIR
+    image=$KRONIK_DEMO_PAYMENTS_IMAGE
+fi
 pid=""
 cleanup() {
     if [ -n "$pid" ]; then
@@ -43,10 +72,11 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
-if [ -d "$dir" ]; then
+if [ "$external" = 0 ] && [ -d "$dir" ]; then
     umount "$dir/run/runsc/null-netns" 2>/dev/null || true
     rm -rf "$dir"
 fi
+umask 077
 mkdir -p "$dir"
 
 step() { printf '\n== %s (%ss)\n' "$1" "$(( $(date +%s) - started ))"; }
@@ -65,30 +95,48 @@ http() { # METHOD PATH [JSON] -> "<status> <body>"
 }
 invoice() { # CUSTOMER COUNTRY ID -> "<status> <body>" of finalize
     local c="$1"
-    [ "$(http PUT "/billing/$c" "{\"name\":\"$c\",\"country\":\"$2\",\"vat_id\":null}" | cut -d' ' -f1)" -lt 300 ] ||
+    [ "$(http PUT "/$billing_kind/$c" "{\"name\":\"$c\",\"country\":\"$2\",\"vat_id\":null}" | cut -d' ' -f1)" -lt 300 ] ||
         fail "customer $c"
-    r=$(api POST "/v1/actors/billing/$c/messages" \
-        '{"name":"configure","content_type":"application/json","text":"{\"api_key_secret\":\"payments-api-key\"}","reason":"demo"}')
+    r=$(api POST "/v1/actors/$billing_kind/$c/messages" \
+        "{\"name\":\"configure\",\"content_type\":\"application/json\",\"text\":\"{\\\"api_key_secret\\\":\\\"$secret\\\"}\",\"reason\":\"demo\"}")
     [ "$(field "$r" 'v["outcome"]["kind"]')" = committed ] || fail "configure $c: $r"
-    [ "$(http POST "/billing/$c/invoices/$3" \
+    [ "$(http POST "/$billing_kind/$c/invoices/$3" \
         '{"currency":"EUR","lines":[{"description":"widgets","quantity":4,"unit_price":2500}]}' | cut -d' ' -f1)" -lt 300 ] ||
         fail "invoice $c/$3"
-    http POST "/billing/$c/invoices/$3/finalize"
+    http POST "/$billing_kind/$c/invoices/$3/finalize"
 }
 
-step "serve, with [foreign] run_dir under $dir"
-printf '[server]\ndata_dir = "%s/data"\n\n[foreign]\nrun_dir = "%s/run"\n' "$dir" "$dir" >"$dir/kronik.toml"
-setsid "$bin" serve --config "$dir/kronik.toml" --http-listen "127.0.0.1:$port" \
-    --admin-listen 127.0.0.1:0 --api-socket "$sock" >>"$dir/serve.log" 2>&1 &
-pid=$!
-for _ in $(seq 400); do
-    curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null 2>&1 && break
-    sleep 0.05
-done
+step "serve, with owned foreign runtime"
+if [ "$external" = 0 ]; then
+    printf '[server]\ndata_dir = "%s/data"\n\n[foreign]\nrun_dir = "%s/run"\n' "$dir" "$dir" >"$dir/kronik.toml"
+    setsid "$bin" serve --config "$dir/kronik.toml" --http-listen "127.0.0.1:$port" \
+        --admin-listen 127.0.0.1:0 --api-socket "$sock" >>"$dir/serve.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 400); do
+        curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null 2>&1 && break
+        sleep 0.05
+    done
+fi
 
+manifest=$(api POST /v1/deployments "{\"wasm_base64\":\"$(b64 "$billing")\",\"dry_run\":true,\"reason\":\"demo manifest\"}")
+billing_kind=$(field "$manifest" 'v["deployment"]["kind"]')
+manifest=$(api POST /v1/deployments "{\"wasm_base64\":\"$(b64 "$ledger")\",\"dry_run\":true,\"reason\":\"demo manifest\"}")
+ledger_kind=$(field "$manifest" 'v["deployment"]["kind"]')
+secret="payments-key-${KRONIK_DEMO_OWNER_TOKEN:-standalone}"
+if [ "$external" = 1 ]; then
+    api GET /v1/deployments >"$dir/preexisting-deployments.json"
+    python3 -c 'import json,sys; wanted=set(sys.argv[2:]); assert not any(k["kind"] in wanted for d in json.load(open(sys.argv[1]))["deployments"] for k in d["kinds"]), "refusing to overwrite an existing kind"' \
+        "$dir/preexisting-deployments.json" "$billing_kind" "$ledger_kind" || fail "external demo kinds exist"
+    api GET /v1/foreign >"$dir/preexisting-foreign.json"
+    python3 -c 'import json,sys; assert not any(a["name"]=="payments.internal" for a in json.load(open(sys.argv[1]))["foreign"])' \
+        "$dir/preexisting-foreign.json" || fail "external payments actor exists"
+    api GET /v1/secrets >"$dir/preexisting-secrets.json"
+    python3 -c 'import json,sys; assert not any(s["name"]==sys.argv[2] for s in json.load(open(sys.argv[1]))["secrets"])' \
+        "$dir/preexisting-secrets.json" "$secret" || fail "external payments secret exists"
+fi
 step "fake-payments as the foreign actor payments.internal (gVisor)"
-api PUT /v1/secrets/payments-api-key "{\"text\":\"$api_key\",\"reason\":\"demo: the payments API key\"}" >/dev/null
-r=$(api POST /v1/foreign "{\"name\":\"payments.internal\",\"image\":\"oci-layout:$(realpath "$layout")\",\"port\":8080,\"cpu_millis\":1000,\"memory_bytes\":268435456,\"secrets\":[\"PAYMENTS_API_KEY=payments-api-key\"],\"reason\":\"demo: the payments service\"}")
+api PUT "/v1/secrets/$secret" "{\"text\":\"$api_key\",\"reason\":\"demo: the payments API key\"}" >/dev/null
+r=$(api POST /v1/foreign "{\"name\":\"payments.internal\",\"image\":\"$image\",\"port\":8080,\"cpu_millis\":1000,\"memory_bytes\":268435456,\"secrets\":[\"PAYMENTS_API_KEY=$secret\"],\"reason\":\"demo: the payments service\"}")
 [ "$(field "$r" 'v["foreign"]["status"]["state"]')" = running ] || fail "foreign add: $r"
 echo "payments.internal: $(field "$r" 'v["foreign"]["image"]'), $(field "$r" 'v["foreign"]["isolation"]') ($(field "$r" 'v["foreign"]["platform"]'))"
 
@@ -98,8 +146,8 @@ for w in "$billing" "$ledger"; do
     echo "deployed $(field "$r" 'v["deployment"]["kind"]') $(field "$r" 'v["deployment"]["code_hash"]')"
 done
 epoch0=$(field "$r" 'v["deployment"]["epoch"]')
-api POST /v1/grants '{"kind":"billing","capability":"foreign:payments.internal","delivery":"idempotency-keyed","reason":"demo: billing charges invoices"}' >/dev/null
-api POST /v1/grants '{"kind":"billing","capability":"secret:payments-api-key","reason":"demo: the charges carry the API key"}' >/dev/null
+api POST /v1/grants "{\"kind\":\"$billing_kind\",\"capability\":\"foreign:payments.internal\",\"delivery\":\"idempotency-keyed\",\"reason\":\"demo: billing charges invoices\"}" >/dev/null
+api POST /v1/grants "{\"kind\":\"$billing_kind\",\"capability\":\"secret:$secret\",\"reason\":\"demo: the charges carry the API key\"}" >/dev/null
 
 step "invoices: Swedish, German, Finnish and US customers, and a declined card"
 for c in se-1:SE se-2:SE se-3:SE de-1:DE de-2:DE fi-1:FI us-1:US; do
@@ -110,7 +158,7 @@ done
 out=$(invoice declined-1 SE inv-1)
 [ "${out%% *}" = 500 ] || fail "a declined card must fail the turn: $out"
 echo "declined-1: $(field "${out#* }" 'v["error"]["message"]')"
-out=$(http GET /ledger/declined-1)
+out=$(http GET "/$ledger_kind/declined-1")
 echo "ledger/declined-1: ${out#* }"
 # The failed turn's compensation reversed the posting: a post and its
 # reverse, and nothing left on the balance.
@@ -152,14 +200,18 @@ total=$(field "${out#* }" 'v["total"]')
 echo "de-3: total $total"
 [ "$total" = 11900 ] || fail "German VAT after promote: $total"
 
-step "stop: the sandbox stops with the daemon; the API key never reached the log"
-# While it runs, the key is in the sandbox's config.json (mode 0600, the
-# program's environment); it is deleted with the sandbox.
-cleanup
-pid=""
-[ -z "$(runsc --root "$dir/run/runsc" list -quiet 2>/dev/null)" ] || fail "a sandbox outlived the daemon"
-if grep -rqa "$api_key" "$dir/data" "$dir/serve.log"; then fail "the API key leaked"; fi
-echo "no sandbox left; the key is not in $dir/data or serve.log"
+step "cleanup only the demo's sandbox; the external daemon keeps running"
+if [ "$external" = 0 ]; then
+    cleanup
+    pid=""
+    [ -z "$(runsc --root "$run/runsc" list -quiet 2>/dev/null)" ] || fail "a sandbox outlived the daemon"
+else
+    api DELETE /v1/foreign/payments.internal '{"reason":"owned demo cleanup"}' >"$dir/foreign-cleanup.json"
+    [ "$(field "$(cat "$dir/foreign-cleanup.json")" 'v["removed"]["name"]')" = payments.internal ] || fail "owned sandbox cleanup failed"
+    [ "$(field "$(api GET /v1/health)" 'v["status"]')" = ok ] || fail "external daemon stopped"
+fi
+if grep -rqa "$api_key" "$data" "$dir"/*.log 2>/dev/null; then fail "the API key leaked"; fi
+echo "the demo sandbox is stopped; external daemon and data were not removed"
 
 echo
 echo "PASS demo/billing.sh in $(( $(date +%s) - started ))s"

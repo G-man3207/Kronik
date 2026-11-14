@@ -715,12 +715,12 @@ class CiInventoryTest(unittest.TestCase):
         self.check("# scripts/ci.sh unknown\nrun: scripts/ci.sh # all defaults\n")
 
     def test_required_hyphenated_steps_keep_inventory_boundaries(self):
-        script = "set -- foreign foreign-rootless microvm\n"
-        self.check("run: scripts/ci.sh foreign foreign-rootless microvm\n", script)
+        script = "set -- foreign foreign-extra other-job\n"
+        self.check("run: scripts/ci.sh foreign foreign-extra other-job\n", script)
         with self.assertRaisesRegex(ValueError, "missing"):
-            self.check("run: scripts/ci.sh foreign microvm\n", script)
+            self.check("run: scripts/ci.sh foreign other-job\n", script)
         with self.assertRaisesRegex(ValueError, "unknown"):
-            self.check("run: scripts/ci.sh foreign foreign-rootles microvm\n", script)
+            self.check("run: scripts/ci.sh foreign foreign-extr other-job\n", script)
 
     def test_missing_step_and_no_calls_fail(self):
         for workflow in ("run: scripts/ci.sh fmt test", "# no CI calls"):

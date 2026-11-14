@@ -22,7 +22,9 @@ pub enum Isolation {
     Gvisor,
     /// Plain runc on the host kernel: only for images you trust.
     Trusted,
-    /// Firecracker: reserved, not implemented in v0.1.
+    /// Firecracker microVM (M20), experimental: not yet booted on KVM
+    /// hardware. Needs a usable /dev/kvm and the pinned tool bundle; without
+    /// KVM the add is refused with KVM_UNAVAILABLE (use gvisor).
     Microvm,
 }
 
@@ -68,7 +70,8 @@ pub enum ForeignCommand {
         secrets: Vec<String>,
         /// What forks do with calls to it: `recorded` (default) matches
         /// them against recordings; `sandbox` answers changed calls from a
-        /// copy restored from the nearest checkpoint (M14; gvisor only).
+        /// copy restored from the nearest checkpoint (M14; gvisor, or the
+        /// experimental microvm).
         #[arg(long, value_enum)]
         fork_mode: Option<ForkMode>,
         #[command(flatten)]
@@ -93,8 +96,9 @@ pub enum ForeignCommand {
     /// With the daemon stopped (crashed or killed): delete what its
     /// sandboxes left behind, such as containers, network namespaces,
     /// bridge sockets and config.json files with secret values. The
-    /// systemd unit runs it as ExecStopPost=. Local, as root; refused while
-    /// a daemon holds [foreign] run_dir.
+    /// systemd unit runs it as ExecStopPost=. Local, as root or as the data
+    /// directory's owner (the nonroot service's user); refused while a
+    /// daemon holds [foreign] run_dir.
     Cleanup {
         /// The configuration file [default: /etc/kronik/kronik.toml if it
         /// exists].
@@ -105,6 +109,9 @@ pub enum ForeignCommand {
         #[arg(long, value_name = "PATH", env = "KRONIK_DATA_DIR")]
         data_dir: Option<PathBuf>,
     },
+    /// Child-only fixed Firecracker launcher.
+    #[command(hide = true)]
+    LaunchMicrovm { manifest: PathBuf },
 }
 
 pub(super) fn foreign(ctx: &Ctx, command: ForeignCommand) -> Result<ExitCode, Error> {
@@ -137,6 +144,11 @@ pub(super) fn foreign(ctx: &Ctx, command: ForeignCommand) -> Result<ExitCode, Er
         ForeignCommand::Logs { name, tail } => logs(ctx, &name, tail),
         ForeignCommand::Remove { name, mutation } => remove(ctx, &name, &mutation),
         ForeignCommand::Cleanup { config, data_dir } => cleanup(ctx, config, data_dir),
+        ForeignCommand::LaunchMicrovm { manifest } => {
+            kronik_foreign::microvm::launch(&manifest)
+                .map_err(|e| local(ErrorCode::Unavailable, e.to_string(), ""))?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -169,13 +181,36 @@ fn cleanup(
         )
     })?;
     let data_dir = data_dir.unwrap_or_else(|| config.server.data_dir.clone());
-    if !kronik_foreign::sys::is_root() {
-        return Err(local(
-            ErrorCode::Unavailable,
-            "kronik foreign cleanup needs root, like the daemon's sandboxes".into(),
-            "Run it as root (systemd's ExecStopPost= does).",
-        ));
-    }
+    // A running daemon holds the data directory's lock. A missing directory has
+    // none to take and nothing of the daemon's in it, and the runtime directory
+    // is cleaned as before.
+    let _ownership = match kronik_privacy::key_source::lock_data(&data_dir) {
+        Ok(ownership) => Some(ownership),
+        Err(kronik_privacy::key_source::KeySourceError::Io(e))
+            if e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            None
+        }
+        Err(e) => return Err(Error::from(e.api_error())),
+    };
+    // A missing runtime needs no pin, but private secret files still need offline cleanup.
+    let runtime_exists = config
+        .foreign
+        .run_dir
+        .try_exists()
+        .map_err(|e| local(ErrorCode::Unavailable, e.to_string(), ""))?;
+    crate::cli::userns::as_data_dir_owner(&data_dir).map_err(Error::from)?;
+    let cgroup = if runtime_exists {
+        crate::cli::userns::enter_if_pinned().map_err(|e| {
+            local(
+                ErrorCode::RootlessUnavailable,
+                e,
+                "Restore the service's owned namespace pin before cleaning up an existing runtime.",
+            )
+        })?
+    } else {
+        None
+    };
     // What could not be removed is logged as a warning: show it.
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -193,11 +228,11 @@ fn cleanup(
         })?;
     let cleaned = rt.block_on(async {
         let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
-        let foreign = kronik_foreign::Foreign::new(
-            env,
-            crate::serve::foreign_config(&config, data_dir, Vec::new()),
-        );
-        foreign.cleanup().await
+        let mut foreign_config = crate::serve::foreign_config(&config, data_dir, Vec::new());
+        if let Some(cgroup) = cgroup {
+            foreign_config.privilege = kronik_foreign::Privilege::Userns { cgroup };
+        }
+        kronik_foreign::cleanup(env, foreign_config).await
     });
     let cleaned = cleaned.map_err(|why| {
         local(

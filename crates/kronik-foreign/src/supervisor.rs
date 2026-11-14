@@ -112,6 +112,8 @@ pub(crate) struct Ctx {
     pub paths: Paths,
     pub blobs: BlobStore,
     pub fetch: FetchOptions,
+    pub microvm_dir: PathBuf,
+    pub disk_reserve: u64,
     /// `[foreign] pull_timeout`.
     pub pull_timeout: Duration,
     pub timings: Timings,
@@ -162,7 +164,7 @@ impl Ctx {
     }
 
     pub fn cgroup_path(&self, name: &str) -> String {
-        format!("{}/{name}", self.cgroup_parent)
+        format!("{}/{}", self.cgroup_parent, container_id(name))
     }
 
     /// [`crate::fetch::pull`], given up after `pull_timeout` (a registry
@@ -286,6 +288,7 @@ pub struct Status {
 pub(crate) struct Actor {
     pub decl: pb::ForeignActor,
     pub runtime: Runtime,
+    pub cgroup: String,
     pub dialer: Dialer,
     pub pool: Pool,
     status: Mutex<Status>,
@@ -307,17 +310,29 @@ pub(crate) struct Actor {
     /// bundle's `config.json` is deleted once the sandbox runs (it holds
     /// the injected secret values).
     pub spec: Mutex<Vec<u8>>,
+    pub vm: Mutex<Option<Arc<crate::microvm::Vm>>>,
 }
 
 impl Actor {
     pub fn new(
         ctx: &Ctx,
         decl: pb::ForeignActor,
-        runtime: Runtime,
+        mut runtime: Runtime,
         secrets: Option<SecretSource>,
     ) -> Arc<Actor> {
         let name = decl.name.clone();
         let port = u16::try_from(decl.port).unwrap_or(0);
+        // An old checkpoint/stop must never address a removed-and-readded VM.
+        let cgroup = if runtime.engine == crate::runtime::Engine::Firecracker {
+            let id = format!(
+                "kronik-foreign-{:032x}",
+                u128::from_le_bytes(ctx.env.random_bytes())
+            );
+            runtime.root.push(&id);
+            format!("{}/{}", ctx.cgroup_parent, id)
+        } else {
+            ctx.cgroup_path(&name)
+        };
         let dialer = match runtime.engine {
             crate::runtime::Engine::Runsc { .. } => Dialer::PortForward {
                 runtime: runtime.clone(),
@@ -330,10 +345,15 @@ impl Actor {
                 netns: ctx.paths.netns(&name),
                 port,
             },
+            crate::runtime::Engine::Firecracker => Dialer::Vsock {
+                socket: runtime.root.join("jail/vsock.sock"),
+                cgroup: cgroup.clone(),
+            },
         };
         Arc::new(Actor {
             decl,
             runtime,
+            cgroup,
             dialer,
             pool: Pool::default(),
             status: Mutex::new(Status {
@@ -351,6 +371,7 @@ impl Actor {
             finished: Notify::new(),
             done: AtomicBool::new(false),
             spec: Mutex::new(Vec::new()),
+            vm: Mutex::new(None),
             secrets: Mutex::new(secrets),
             calls: tokio::sync::RwLock::new(()),
         })
@@ -554,18 +575,55 @@ async fn watch(a: &Actor, child: &Arc<dyn Process>) -> Watch {
     }
 }
 
-/// `TERM`, `KILL` after the grace period, then clean up.
+/// `TERM`, `KILL` after the grace period, then clean up. A microVM is asked to
+/// stop over its control port instead (ADR 0096), and how its stop went is
+/// logged: whether the guest acknowledged `STOP`, how long after that the VMM
+/// exited, and whether it had to be killed.
 async fn stop_running(ctx: &Ctx, a: &Actor, child: Arc<dyn Process>) {
     let id = container_id(a.name());
     let log = ctx.paths.log(a.name());
-    let _ = run_quick(&ctx.env, a.runtime.kill(&id, "TERM", &log), COMMAND_TIMEOUT).await;
-    if ctx
+    let vm = lock(&a.vm).clone();
+    let acknowledged = match &vm {
+        Some(vm) => match vm.shutdown(&ctx.env).await {
+            Ok(()) => Some(ctx.env.clock.monotonic()),
+            Err(error) => {
+                tracing::warn!(foreign = a.name(), %error, "the microVM did not acknowledge STOP");
+                None
+            }
+        },
+        None => {
+            let _ = run_quick(&ctx.env, a.runtime.kill(&id, "TERM", &log), COMMAND_TIMEOUT).await;
+            None
+        }
+    };
+    let exited = ctx
         .env
         .timeout(ctx.timings.stop_grace, child.wait())
         .await
-        .is_err()
-    {
-        let _ = run_quick(&ctx.env, a.runtime.kill(&id, "KILL", &log), COMMAND_TIMEOUT).await;
+        .is_ok();
+    if !exited {
+        if vm.is_some() {
+            let _ = child.kill().await;
+        } else {
+            let _ = run_quick(&ctx.env, a.runtime.kill(&id, "KILL", &log), COMMAND_TIMEOUT).await;
+        }
+    }
+    if vm.is_some() {
+        match acknowledged {
+            Some(at) => tracing::info!(
+                foreign = a.name(),
+                acknowledged = true,
+                exit_ms = ctx.env.clock.monotonic().saturating_sub(at).as_millis() as u64,
+                forced = !exited,
+                "microVM stopped"
+            ),
+            None => tracing::warn!(
+                foreign = a.name(),
+                acknowledged = false,
+                forced = !exited,
+                "microVM stopped"
+            ),
+        }
     }
     cleanup(ctx, a, Some(child)).await;
 }
@@ -577,7 +635,7 @@ async fn cleanup(ctx: &Ctx, a: &Actor, child: Option<Arc<dyn Process>>) -> bool 
     let id = container_id(&name);
     let log = ctx.paths.log(&name);
     let events = PathBuf::from("/sys/fs/cgroup")
-        .join(ctx.cgroup_path(&name).trim_start_matches('/'))
+        .join(a.cgroup.trim_start_matches('/'))
         .join("memory.events");
     let oom = std::fs::read_to_string(&events)
         .ok()
@@ -587,7 +645,11 @@ async fn cleanup(ctx: &Ctx, a: &Actor, child: Option<Arc<dyn Process>>) -> bool 
         })
         .and_then(Result::ok)
         .is_some_and(|n| n > 0);
-    if let Err(e) = run_quick(&ctx.env, a.runtime.delete(&id, &log), COMMAND_TIMEOUT).await {
+    let vm = lock(&a.vm).take();
+    if vm.is_none()
+        && a.runtime.engine != crate::runtime::Engine::Firecracker
+        && let Err(e) = run_quick(&ctx.env, a.runtime.delete(&id, &log), COMMAND_TIMEOUT).await
+    {
         tracing::warn!(foreign = %name, error = %e, "deleting the container failed");
     }
     if let Some(child) = child
@@ -598,6 +660,17 @@ async fn cleanup(ctx: &Ctx, a: &Actor, child: Option<Arc<dyn Process>>) -> bool 
             .is_err()
     {
         let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    if let Some(vm) = vm {
+        let _ = ctx
+            .env
+            .blocking("foreign-vm-cleanup", move || {
+                if let Err(e) = vm.remove_files() {
+                    tracing::warn!(error = %e, "deleting the microVM jail failed");
+                }
+            })
+            .await;
     }
     a.pool.clear();
     let netns = ctx.paths.netns(&name);
@@ -674,11 +747,14 @@ pub(crate) async fn injected_secrets(
 
 /// Starts the sandbox and waits until a bridge connection succeeds.
 async fn start(ctx: &Arc<Ctx>, a: &Arc<Actor>) -> Result<Arc<dyn Process>, String> {
+    // A production restart waits for any checkpoint of this instance to finish.
+    let _start_gate = a.calls.read().await;
     let env = &ctx.env;
     if !crate::runtime::is_executable(&a.runtime.program) {
         let code = match a.runtime.engine {
             crate::runtime::Engine::Runsc { .. } => "RUNSC_MISSING",
             crate::runtime::Engine::Runc => "RUNC_MISSING",
+            crate::runtime::Engine::Firecracker => "FOREIGN_UNAVAILABLE",
         };
         return Err(format!(
             "{code}: {} is not an executable file",
@@ -705,20 +781,27 @@ async fn start(ctx: &Arc<Ctx>, a: &Arc<Actor>) -> Result<Arc<dyn Process>, Strin
     {
         let ctx = ctx.clone();
         let decl = a.decl.clone();
+        let cgroup = a.cgroup.clone();
         let spec = env
-            .blocking("foreign-prepare", move || prepare(&ctx, &decl, env_vars))
+            .blocking("foreign-prepare", move || {
+                prepare(&ctx, &decl, env_vars, cgroup)
+            })
             .await
             .ok_or("the prepare task was dropped")??;
         *lock(&a.spec) = spec;
     }
-    let spawned = env
-        .procs
-        .spawn(a.runtime.run(
-            &ctx.paths.bundle(&name),
-            &container_id(&name),
-            &ctx.paths.log(&name),
-        ))
-        .await;
+    let spawned = if a.runtime.engine == crate::runtime::Engine::Firecracker {
+        start_microvm(ctx, a).await
+    } else {
+        env.procs
+            .spawn(a.runtime.run(
+                &ctx.paths.bundle(&name),
+                &container_id(&name),
+                &ctx.paths.log(&name),
+            ))
+            .await
+            .map_err(|e| e.to_string())
+    };
     let child = match spawned {
         Ok(child) => child,
         Err(e) => {
@@ -746,6 +829,80 @@ async fn start(ctx: &Arc<Ctx>, a: &Arc<Actor>) -> Result<Arc<dyn Process>, Strin
             Err(e)
         }
     }
+}
+
+async fn start_microvm(ctx: &Arc<Ctx>, a: &Arc<Actor>) -> Result<Arc<dyn Process>, String> {
+    let env = &ctx.env;
+    let directory = ctx.microvm_dir.clone();
+    let assets = env
+        .blocking("foreign-vm-assets", move || {
+            let assets = crate::microvm_assets::Assets::load(&directory)?;
+            assets.require_exec_mount()?;
+            Ok::<_, String>(assets)
+        })
+        .await
+        .ok_or("microVM asset task was dropped")??;
+    let config = crate::microvm::guest_config(&lock(&a.spec), a.decl.port as u16, a.name())?;
+    let bundle = ctx.paths.bundle(a.name());
+    let rootfs = bundle.join("root.ext4");
+    let manifest = a
+        .decl
+        .image
+        .rsplit_once('@')
+        .ok_or("microVM image is not pinned")?
+        .1;
+    crate::microvm_assets::rootfs(
+        env,
+        &assets,
+        &bundle.join("rootfs"),
+        &rootfs,
+        manifest,
+        ctx.disk_reserve,
+    )
+    .await?;
+    let data = ctx.paths.actor(a.name()).join("data.ext4");
+    crate::microvm_assets::data(
+        env,
+        &assets,
+        &ctx.paths.data_dir(a.name()),
+        &data,
+        config.uid,
+        config.gid,
+        ctx.disk_reserve,
+    )
+    .await?;
+    let root = a.runtime.root.join("jail");
+    let instance = a
+        .runtime
+        .root
+        .file_name()
+        .ok_or("microVM runtime has no instance identity")?;
+    let output = ctx.paths.actor(a.name()).join(".microvm").join(instance);
+    let vm = crate::microvm::Vm::spawn(
+        env,
+        crate::microvm::Start {
+            assets: &assets,
+            root: &root,
+            output: &output,
+            rootfs: &rootfs,
+            data: &data,
+            config: &config,
+            cgroup: &a.cgroup,
+            cpu_millis: a.decl.cpu_millis,
+            memory_bytes: a.decl.memory_bytes,
+            log: &ctx.paths.log(a.name()),
+            restore: false,
+        },
+    )
+    .await?;
+    let child = vm.child.clone();
+    *lock(&a.vm) = Some(vm.clone());
+    if let Err(error) = vm.boot(env).await {
+        let _ = child.kill().await;
+        cleanup(ctx, a, Some(child)).await;
+        return Err(format!("{error}; see `kronik foreign logs {}`", a.name()));
+    }
+    Ok(child)
 }
 
 async fn ready(ctx: &Ctx, a: &Actor, child: &Arc<dyn Process>) -> Result<(), String> {
@@ -861,6 +1018,7 @@ fn prepare(
     ctx: &Ctx,
     decl: &pb::ForeignActor,
     env_vars: Vec<(String, String)>,
+    cgroup: String,
 ) -> Result<Vec<u8>, String> {
     let name = &decl.name;
     let p = &ctx.paths;
@@ -898,10 +1056,16 @@ fn prepare(
     }
     set_mode(&bundle, 0o700)?;
 
+    let microvm = decl.isolation == pb::Isolation::Microvm as i32;
+    if !microvm && p.actor(name).join("data.ext4").exists() {
+        return Err("persistent data belongs to a microVM; refusing to start a different backend with stale directory data".into());
+    }
     let netns = p.netns(name);
-    crate::sys::delete_netns(&netns).map_err(|e| io("removing", &netns, e))?;
-    crate::sys::create_netns(&netns)
-        .map_err(|e| io("creating the network namespace", &netns, e))?;
+    if !microvm {
+        crate::sys::delete_netns(&netns).map_err(|e| io("removing", &netns, e))?;
+        crate::sys::create_netns(&netns)
+            .map_err(|e| io("creating the network namespace", &netns, e))?;
+    }
 
     let overrides = oci::Overrides {
         cpu_millis: decl.cpu_millis,
@@ -913,8 +1077,8 @@ fn prepare(
             destination: "/data".into(),
             read_only: false,
         }],
-        cgroups_path: Some(ctx.cgroup_path(name)),
-        netns: Some(netns),
+        cgroups_path: Some(cgroup),
+        netns: (!microvm).then_some(netns),
         hostname: name.clone(),
         syscall_filter: decl.isolation == pb::Isolation::Trusted as i32,
     };

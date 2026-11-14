@@ -28,6 +28,11 @@ existing encrypted store.
    through its documented separate key source, never argv or this runbook.
    KMS restore installs and validates the shipped ciphertext envelope before
    publishing encrypted stores. Do not use `--force` against live data.
+   Run as root against the directory of the nonroot service (owned by the
+   `kronik` user), the command reads the key and the remote's credentials
+   as root, gives up root, and finishes as `kronik`: a `file://` source must
+   be readable by that user, and the command says so before it writes
+   anything. `--dry-run` as root cannot tell.
 3. Refuse `MASTER_KEY_MISSING`, `MASTER_KEY_MISMATCH`, `KEY_SOURCE_UNAVAILABLE`
    or `KEYSTORE_INCOMPLETE` until the actual source/key problem is resolved.
    `--allow-missing-keys` and `--without-keystore` explicitly accept unreadable

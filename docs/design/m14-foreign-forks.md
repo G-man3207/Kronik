@@ -51,8 +51,11 @@ copy ids have a fixed length.
 empty value from an older record means the same) or `sandbox`. `kronik
 foreign add <name> ... --fork-mode sandbox`; the API's `ForeignAddRequest`
 and `ForeignView` carry `fork_mode`. `sandbox` needs `isolation = gvisor`
-(runc has no checkpoint): `trusted` with `sandbox` is `BAD_REQUEST`. To
-change the mode, remove and add the actor again (its data directory stays).
+or, since M20, `microvm`; `trusted` with `sandbox` remains `BAD_REQUEST`.
+The gVisor-specific mechanics below are preserved; the full Firecracker
+memory/state/drive variant is specified in
+[ADR 0096](../adr/0096-microvm-snapshot-and-vsock-lifecycle.md).
+To change the mode, remove and add the actor again (its data stays).
 `[foreign] checkpoints_kept` (default 3) bounds the checkpoints per actor.
 
 ## 3. Checkpoints, in step with snapshots

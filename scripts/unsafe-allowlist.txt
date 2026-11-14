@@ -1,15 +1,18 @@
 # The files that may contain `unsafe` code or `allow(unsafe_code)` (the
 # Definition of done: `unsafe` only in allowlisted modules with a
 # justification). `scripts/ci.sh hygiene` fails on unsafe code in any other
-# file under crates/, sdk/rust/, vendor/raft/src/ or vendor/raft-proto/src/,
-# and on an entry here that no longer has any. The workspace denies
-# `unsafe_code`; each first-party file also says why at its `allow`.
-# One file per line: the path, then the reason.
+# file under crates/, sdk/rust/, vendor/raft/src/, vendor/raft-proto/src/ or
+# examples/foreign-probe/src/, and on an entry here that no longer has any.
+# The workspace denies `unsafe_code`; each first-party file also says why at
+# its `allow`. One file per line: the path, then the reason.
 crates/kronik-runtime/src/engine.rs   Wasmtime's Component::deserialize_file loads precompiled code from Kronik's own cache; the engine version is in the file name and Wasmtime checks the artifact's fingerprint
 crates/kronik-store/src/sql/ffi.rs    the SQLite C API that rusqlite does not wrap: the session extension (changesets), the VFS clock hook and the table filter for sessions
-crates/kronik-foreign/src/sys.rs      the Linux system calls of the gVisor sandboxes: unshare and setns for network namespaces, ioctl to bring loopback up, umount2, geteuid
+crates/kronik-foreign/src/sys.rs      Linux namespace pinning and id maps, network namespaces, real-host Unix peer credentials, the service uid transition, capability clearing and the private cgroup/mount/pivot_root jail of the microVM launcher
 crates/kronik-privacy/src/key_memory.rs dedicated page-aligned locked key mappings; audited references, zeroization and unmapping
 crates/kronik-privacy/src/keystore/ffi.rs public SQLite FILESTAT45/sqlite3_str extraction and scoped BorrowedFd/fstat on the same live Connection; never opens, duplicates or closes database descriptors
 crates/kronik-core/src/env/real/exchange.rs owned Linux one-shot process groups, fixed fd3/CLOEXEC isolation, nonblocking pipes and kill-before-reap supervision
 crates/kronik-keyhelper/src/platform.rs optional Linux GNU PKCS11 helper protections and verified module/protocol descriptor ownership; no module loading in daemon
 sdk/rust/src/lib.rs                   the `bindings` module that wit-bindgen generates for the kronik:actor world, which the guest's export! needs
+crates/kronik-guest-init/src/sys.rs   Linux guest PID1 mount/device/capability/fork/exec/signal/reboot and bounded AF_VSOCK operations on live buffers and owned descriptors
+crates/kronik-foreign/src/microvm_sys.rs KVM device/version/create ioctls, checked disk reservation/reflink/noreplace and confined OCI timestamp restoration
+examples/foreign-probe/src/sys.rs   hostile actor's SysV shared-memory positive/negative controls; IPC_EXCL allocation and only its own IPC_RMID cleanup

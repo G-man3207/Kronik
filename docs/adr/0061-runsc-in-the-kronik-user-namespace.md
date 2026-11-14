@@ -1,0 +1,30 @@
+# 0061. Foreign runtime namespaces and delegated cgroup leaves
+
+- **Status:** Accepted (2026-11-13). Implemented; the runtime acceptance under Consequences and proof has not been run on this revision.
+- **Date:** 2026-11-07
+
+## Deviation from the build brief
+
+The brief says "`runsc` runs in rootless mode where the kernel allows it". This ADR does not use `runsc --rootless`; it runs `runsc` (and `runc`) as namespace root in the pinned user namespace of ADR 0060 and passes no `--rootless` override. The findings that led here come from earlier design experiments and have not been repeated on this revision: `runsc --rootless` refuses `--network=sandbox` and refuses `create` and `restore` (the M14 sandbox copies); a single-uid namespace runs and limits correctly but breaks images that chown `/data` to a non-root id (Postgres `initdb` fails); a pinned namespace with a subordinate range ran Postgres, the bridge, blocked egress and checkpoint/restore. The literal reading of the brief would therefore remove the loopback-only network namespace and port-forward bridge of ADR 0003, the resource limits and the M14 copies. This is a deviation from the brief's sentence; the maintainer ratified it on 2026-11-13 (the brief is the owner's to amend).
+
+## Context
+
+ADR 0060 supplies namespace-local root without initial-user-namespace root. Existing foreign actor lifecycle, HTTP outcome semantics, data ownership and checkpoint gates must remain intact.
+
+## Decision
+
+The daemon and its child runtimes operate as mapped UID 0 inside the validated Kronik namespace. Network namespaces remain private, contain only loopback, and are created on dedicated short-lived threads. Namespace bind mounts are confined to the daemon's private mount namespace. No bridge retry is added after an HTTP request may have reached an actor.
+
+The systemd unit delegates its own cgroup v2 subtree. Before threads or the API acceptor are created, the daemon moves into `<delegated>/daemon`, leaving the delegated parent free of processes so its child controllers can be enabled. On systemd 257 with `ProtectControlGroups=private`, the discovered parent can be `/`; on systemd 255 the discovered path is the service's actual host-relative cgroup path. Paths are discovered from `/proc/self/cgroup`, not hard-coded to either representation. Writable delegation is checked again after namespace entry. Missing delegation means foreign unavailability; it never means unbounded execution.
+
+The root template is the unit of v0.4.1, byte for byte (v0.4.0's differs from it in one comment line), and delegates nothing: a delegation would move where an existing installation's gVisor sandboxes get their cgroups (the daemon's own cgroup ends in `/daemon` only when it has a leaf; otherwise they go under `/kronik/<hash>`, as in v0.4.0). Root must not infer delegation from writable files: it can write cgroups belonging to unrelated shell/SSH units. Direct root `serve` therefore never creates a cgroup leaf; its microVM backend requires an already allocated owned leaf, which a root installation that wants microVMs adds itself with a drop-in, `Delegate=yes` and `DelegateSubgroup=daemon`, without a private cgroup namespace ([systemd 255 resource-control; `DelegateSubgroup=` added in 254](https://www.freedesktop.org/software/systemd/man/255/systemd.resource-control.html); older versions ignore it with a warning). The operations guide has the drop-in, `kronik doctor` warns when a microVM tool bundle is installed and the root service has no leaf, and adding a microVM actor without one is refused with the same advice. Existing Wasm/gVisor root operation remains available and unchanged. The nonroot template retains the manual leaf move rather than rooting its 257 private cgroup view at a subgroup without the delegated parent controllers.
+
+The fixed Firecracker child launcher accepts only its validated manifest inputs. It creates private mount/network/IPC/UTS/PID namespaces (the VMM is init of its own PID namespace; ADR 0095) and, after joining its limited cgroup, a private cgroup namespace rooted there. It installs mandatory CPU/memory/swap/pids limits in a new child of the delegated parent and moves itself there. Its private root exposes only the pinned Firecracker/kernel/initrd, read-only root disk, its writable data disk/output directory and existing `/dev/kvm`. It pivots away from and detaches the old root, clears capabilities, enables no-new-privileges, and arms parent-death termination with a parent-identity race check. There is no host device creation, network interface, generic bind/exec interface, or ignored limit failure. Guest RAM and VMM overhead are distinct resource inputs (ADR 0095).
+
+Existing actor/global-drain gates, exact checkpoint LSN, fork-owned cleanup and the ForeignHost/ForeignCopy lifecycle remain authoritative. Namespace ownership must also hold for Postgres data and restored/copied sandboxes, not only simple root-owned images. Trusted/runc remains an explicit isolation choice, never a rootless-error fallback.
+
+Do not add a runc `--rootless` override merely because the daemon lacks host authority. In [runc v1.2.5's auto-selection](https://raw.githubusercontent.com/opencontainers/runc/v1.2.5/rootless_linux.go), effective UID 0 inside a user namespace selects the rootless cgroup manager for the cgroupfs driver. That cgroup decision is distinct from whether the process's effective UID is nonzero. This source evidence supports preserving the existing runtime flags; it is not a claim that the installed runc or delegated limits have passed the required positive rootless suite.
+
+## Consequences and proof
+
+Rootless is a host-authority property, not a promise that every child uses a similarly named runtime flag. Real runsc/runc start, resource limits, Postgres persistence, checkpoint/fork copies, malicious actors and actual KVM boot remain required behavioral acceptance. Namespace/cgroup path and escape regressions supplement, not replace, that execution. No such acceptance was run during source integration.

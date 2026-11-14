@@ -86,6 +86,18 @@ impl Isolation {
 /// The warning every `trusted` add carries.
 pub const TRUSTED_WARNING: &str = "isolation trusted runs the image with plain runc and the host kernel: only use it for images you trust";
 
+/// The warning of every `isolation microvm` add (M20): the level ships as
+/// an experimental opt-in until a real KVM host has run its proofs (ADR 0095).
+pub const MICROVM_WARNING: &str = "isolation microvm is experimental: it has not yet booted on KVM hardware, its VMM runs as the daemon's own user, and its sandbox forks repeat the memory of one snapshot; use gvisor for actors you rely on";
+
+/// The foreign boundary established before the daemon starts any threads.
+#[derive(Debug, Clone)]
+pub enum Privilege {
+    Root,
+    Userns { cgroup: String },
+    Unavailable(String),
+}
+
 /// The daemon's settings for foreign actors.
 #[derive(Debug, Clone)]
 pub struct ForeignConfig {
@@ -99,11 +111,19 @@ pub struct ForeignConfig {
     /// Registries (`host:port`) pulled over plain HTTP. Tests only; not in
     /// `kronik.toml`.
     pub insecure_registries: Vec<String>,
+    /// Directory of the verified, pinned microVM tool bundle.
+    pub microvm_dir: PathBuf,
+    /// Minimum free bytes retained on persistent storage.
+    pub disk_reserve: u64,
+    pub privilege: Privilege,
     /// `[foreign] layout_dirs`: directories whose `oci-layout:` images an
     /// `operate` token may add; any other directory needs `admin` (§4).
     pub layout_dirs: Vec<PathBuf>,
     /// `[foreign] pull_timeout`: the longest one image fetch may take.
     pub pull_timeout: Duration,
+    /// `[foreign] start_timeout`: how long a started sandbox may take to answer
+    /// on its port.
+    pub start_timeout: Duration,
     /// `[foreign] checkpoints_kept`: checkpoints per actor (M14).
     pub checkpoints_kept: usize,
 }
@@ -234,7 +254,7 @@ pub struct Foreign {
     reconcile: tokio::sync::Mutex<bool>,
     /// The lock on `run_dir` (held for the daemon's life), or why this
     /// daemon runs no foreign actors: another daemon holds it (§3).
-    run_lock: Result<std::fs::File, String>,
+    run_lock: Result<Option<std::fs::File>, String>,
     /// Why `foreign/` could not be prepared (the move to `actors/`): no
     /// actor starts and adds are refused, so none runs on an empty `/data`.
     layout: Result<(), String>,
@@ -244,16 +264,39 @@ pub struct Foreign {
 /// deletes every sandbox and namespace under it.
 pub const RUN_LOCK: &str = "foreign.lock";
 
-/// Takes the lock on `run` (exclusive, released when the process exits).
-fn lock_run_dir(run: &std::path::Path) -> Result<std::fs::File, String> {
+/// Takes the same runtime lock for a daemon or quiescent installer ownership handover.
+///
+/// The file is opened without following a link and must be a regular file with
+/// one link that belongs to the caller. Its mode is not a reason to refuse it:
+/// earlier versions created it with the process's umask, so under the root
+/// unit's `UMask=0007` it is `0660`, and it survives a restart in `/run`
+/// (`RuntimeDirectoryPreserve=restart`), so an upgraded installation has one.
+/// It is set to `0600` on the descriptor instead.
+pub fn lock_run_dir(run: &std::path::Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
     let path = run.join(RUN_LOCK);
     std::fs::create_dir_all(run).map_err(|e| format!("creating {}: {e}", run.display()))?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .map_err(|e| format!("opening {}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("checking {}: {e}", path.display()))?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != crate::sys::euid() {
+        return Err(format!(
+            "{} must be a single-link regular file that belongs to the user of this daemon",
+            path.display()
+        ));
+    }
+    if metadata.mode() & 0o777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("making {} private: {e}", path.display()))?;
+    }
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => Err(format!(
@@ -290,12 +333,18 @@ impl Drop for Foreign {
     }
 }
 
+/// Offline cleanup never recreates a lost runtime directory, migrates data or
+/// starts background work. The CLI retains the daemon data-directory FD lock.
+pub async fn cleanup(env: Env, cfg: ForeignConfig) -> Result<Cleaned, String> {
+    Foreign::create(env, cfg, true).cleanup().await
+}
+
 impl Foreign {
     pub fn new(env: Env, cfg: ForeignConfig) -> Arc<Foreign> {
-        Foreign::with_timings(env, cfg, Timings::default())
+        Foreign::create(env, cfg, false)
     }
 
-    pub(crate) fn with_timings(env: Env, cfg: ForeignConfig, timings: Timings) -> Arc<Foreign> {
+    fn create(env: Env, cfg: ForeignConfig, cleanup: bool) -> Arc<Foreign> {
         let paths = Paths {
             data: cfg.data_dir.join("foreign"),
             run: cfg.run_dir.clone(),
@@ -310,19 +359,37 @@ impl Foreign {
                 insecure_registries: cfg.insecure_registries.clone(),
                 max_new_bytes: None,
             },
+            microvm_dir: cfg.microvm_dir.clone(),
+            disk_reserve: cfg.disk_reserve,
             pull_timeout: cfg.pull_timeout,
-            timings,
-            cgroup_parent: format!("/kronik/{}", &instance.as_str()[..8]),
+            timings: Timings {
+                start_timeout: cfg.start_timeout,
+                ..Timings::default()
+            },
+            cgroup_parent: match &cfg.privilege {
+                Privilege::Userns { cgroup } => cgroup.trim_end_matches('/').to_owned(),
+                _ => crate::sys::own_cgroup()
+                    .ok()
+                    .and_then(|p| p.strip_suffix("/daemon").map(str::to_owned))
+                    .unwrap_or_else(|| format!("/kronik/{}", &instance.as_str()[..8])),
+            },
             injected: Mutex::new(BTreeMap::new()),
             fetching: tokio::sync::RwLock::new(()),
             gc_pending: std::sync::atomic::AtomicBool::new(false),
             gc_wake: Arc::new(tokio::sync::Notify::new()),
             adding: Mutex::new(BTreeMap::new()),
         };
-        let run_lock = lock_run_dir(&ctx.paths.run);
+        let run_lock = if cleanup && !ctx.paths.run.exists() {
+            Ok(None)
+        } else {
+            lock_run_dir(&ctx.paths.run).map(Some)
+        };
         // Under the run lock: no other daemon moves or starts actors from
         // here meanwhile.
-        let layout = match &run_lock {
+        let layout = if cleanup {
+            Ok(())
+        } else {
+            match &run_lock {
             Err(_) => Ok(()),
             Ok(_) => crate::layout::migrate(&ctx.paths.data)
                 // Before any runtime call (cleanup at start included).
@@ -333,8 +400,9 @@ impl Foreign {
                         ctx.paths.data.display()
                     )
                 }),
+        }
         };
-        if run_lock.is_ok() && layout.is_ok() {
+        if !cleanup && run_lock.is_ok() && layout.is_ok() {
             // Partial blobs of fetches a stopped or killed daemon left.
             let n = ctx.blobs.remove_temps();
             if n > 0 {
@@ -354,6 +422,9 @@ impl Foreign {
             tracing::error!(why, "foreign actors are off in this daemon");
         }
         let foreign = Arc::new(foreign);
+        if cleanup {
+            return foreign;
+        }
         // Runs a garbage collection round that a fetch made skip, once the
         // fetch is over; ends with the manager (its `Drop` wakes it).
         let (weak, wake) = (Arc::downgrade(&foreign), foreign.ctx.gc_wake.clone());
@@ -375,7 +446,12 @@ impl Foreign {
     /// Why this daemon runs no foreign actors, if it does not.
     pub fn off(&self) -> Option<String> {
         let lock = self.run_lock.as_ref().err();
-        lock.or(self.layout.as_ref().err()).cloned()
+        lock.or(self.layout.as_ref().err())
+            .cloned()
+            .or_else(|| match &self.cfg.privilege {
+                Privilege::Unavailable(why) => Some(why.clone()),
+                _ => None,
+            })
     }
 
     fn runsc(&self, platform: &str) -> Runtime {
@@ -399,6 +475,11 @@ impl Foreign {
     fn runtime_for(&self, decl: &pb::ForeignActor) -> Runtime {
         match Isolation::from_pb(decl.isolation) {
             Some(Isolation::Trusted) => self.runc(),
+            Some(Isolation::Microvm) => Runtime {
+                engine: Engine::Firecracker,
+                program: self.cfg.microvm_dir.join("firecracker"),
+                root: self.ctx.paths.run.join("microvm"),
+            },
             _ => self.runsc(if decl.platform.is_empty() {
                 "systrap"
             } else {
@@ -452,11 +533,25 @@ impl Foreign {
         let mut warnings = Vec::new();
         let platform = match isolation {
             Isolation::Microvm => {
-                return Err(ApiError::new(
-                    ErrorCode::NotImplemented,
-                    "isolation microvm (Firecracker) is reserved and not implemented in v0.1; \
-                     use gvisor",
-                ));
+                crate::microvm::Resources::new(cpu_millis, memory_bytes).map_err(bad)?;
+                crate::microvm_sys::kvm().map_err(|e| {
+                    ApiError::new(
+                        ErrorCode::KvmUnavailable,
+                        format!("isolation microvm (experimental) needs a usable /dev/kvm: {e}"),
+                    )
+                    .with_hint("Use isolation gvisor, the default, on hosts without /dev/kvm.")
+                })?;
+                crate::microvm_assets::Assets::load(&self.cfg.microvm_dir)
+                    .and_then(|assets| assets.require_exec_mount()).map_err(|e|
+                    ApiError::new(ErrorCode::ForeignUnavailable, e)
+                        .with_hint("Install the pinned microVM tool bundle built by scripts/build-microvm-tools.sh."))?;
+                crate::microvm::require_leaf(&self.cfg.privilege, crate::sys::own_cgroup())
+                    .map_err(|e| {
+                        ApiError::new(ErrorCode::ForeignUnavailable, e)
+                            .with_hint(crate::microvm::root_leaf_advice())
+                    })?;
+                warnings.push(MICROVM_WARNING.to_owned());
+                "firecracker".to_owned()
             }
             Isolation::Trusted => {
                 if find_runc().is_none() {
@@ -498,10 +593,10 @@ impl Foreign {
         };
         let fork_mode = match req.fork_mode.as_deref() {
             None | Some("recorded") => "recorded",
-            Some("sandbox") if isolation == Isolation::Gvisor => "sandbox",
+            Some("sandbox") if isolation != Isolation::Trusted => "sandbox",
             Some("sandbox") => {
                 return Err(bad(
-                    "fork_mode sandbox needs isolation gvisor: runc has no checkpoints",
+                    "fork_mode sandbox needs isolation gvisor or microvm: runc has no checkpoints",
                 ));
             }
             Some(other) => {
@@ -843,7 +938,7 @@ impl Foreign {
     /// `config.json` (which holds secret values) and the cgroup parent.
     /// Refused while a daemon holds `run_dir`; works when the layout of
     /// `foreign/` could not be prepared (it touches no actor's data).
-    pub async fn cleanup(&self) -> Result<Cleaned, String> {
+    async fn cleanup(&self) -> Result<Cleaned, String> {
         if let Err(why) = &self.run_lock {
             return Err(why.clone());
         }
@@ -855,6 +950,12 @@ impl Foreign {
     /// `rmdir` of `/sys/fs/cgroup/kronik/<instance>`: it fails, harmlessly,
     /// while a sandbox's cgroup is still in it.
     fn remove_cgroup_parent(&self) {
+        // A delegated service cgroup belongs to systemd, not this manager.
+        let root = self.ctx.paths.run.join("runsc");
+        let instance = blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex();
+        if self.ctx.cgroup_parent != format!("/kronik/{}", &instance.as_str()[..8]) {
+            return;
+        }
         let dir = std::path::Path::new("/sys/fs/cgroup")
             .join(self.ctx.cgroup_parent.trim_start_matches('/'));
         let _ = std::fs::remove_dir(dir);
@@ -866,7 +967,26 @@ impl Foreign {
         let env = &self.ctx.env;
         let mut cleaned = Cleaned::default();
         for rt in [self.runsc("systrap"), self.runc()] {
-            if !is_executable(&rt.program) || !rt.root.exists() {
+            if !rt.root.exists() {
+                continue;
+            }
+            if !is_executable(&rt.program) {
+                let has_state = std::fs::read_dir(&rt.root)
+                    .map(|mut entries| {
+                        entries.any(|e| {
+                            e.map_or(true, |e| {
+                                e.file_name().to_str().is_some_and(|name| {
+                                    name.starts_with("kronik-foreign-")
+                                        || name.starts_with("kronik-copy-")
+                                })
+                            })
+                        })
+                    })
+                    .unwrap_or(true);
+                if has_state {
+                    tracing::error!(runtime = %rt.program.display(), "runtime missing; retaining its sandbox state for diagnosis");
+                    cleaned.failed += 1;
+                }
                 continue;
             }
             let out = self
@@ -905,6 +1025,23 @@ impl Foreign {
                 }
             }
         }
+        let microvm_safe = match crate::microvm::cleanup_stale(
+            env,
+            &self.ctx.paths.run.join("microvm"),
+            &self.ctx.cgroup_parent,
+        )
+        .await
+        {
+            Ok(count) => {
+                cleaned.sandboxes += count as u64;
+                true
+            }
+            Err(error) => {
+                tracing::error!(%error, "recovering leftover microVMs failed; backing files retained");
+                cleaned.failed += 1;
+                false
+            }
+        };
         let netns = self.ctx.paths.netns_dir();
         let sock = self.ctx.paths.sock_root();
         let actors = self.ctx.paths.actors();
@@ -938,6 +1075,20 @@ impl Foreign {
                 let mut configs = 0;
                 if let Ok(entries) = std::fs::read_dir(&actors) {
                     for e in entries.flatten() {
+                        if e.file_type().is_ok_and(|kind| !kind.is_dir() && !kind.is_symlink()) {
+                            continue;
+                        }
+                        if microvm_safe {
+                            let output = e.path().join(".microvm");
+                            match std::fs::remove_dir_all(&output) {
+                                Ok(()) => configs += 1,
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                                Err(error) => {
+                                    failed += 1;
+                                    tracing::warn!(path=%output.display(), %error, "removing interrupted microVM snapshot outputs failed");
+                                }
+                            }
+                        }
                         if std::fs::remove_file(e.path().join("bundle/config.json")).is_ok() {
                             configs += 1;
                         }
@@ -967,6 +1118,16 @@ impl Foreign {
                 for fork in dirs(&branches) {
                     for actor in dirs(&fork.join("foreign")) {
                         for copy in dirs(&actor) {
+                            if microvm_safe && copy.join("data.ext4").exists() {
+                                match std::fs::remove_dir_all(&copy) {
+                                    Ok(()) => configs += 1,
+                                    Err(error) => {
+                                        failed += 1;
+                                        tracing::warn!(path=%copy.display(), %error, "removing a stopped microVM copy failed");
+                                    }
+                                }
+                                continue;
+                            }
                             if std::fs::remove_file(copy.join("bundle/config.json")).is_ok() {
                                 configs += 1;
                             }
@@ -1001,7 +1162,7 @@ impl Foreign {
             self.cleanup_leftovers().await;
             *cleaned = true;
         }
-        if let Err(why) = &self.layout {
+        if let Some(why) = self.off() {
             tracing::error!(why, "no foreign actor starts");
             return;
         }
@@ -1077,7 +1238,9 @@ impl Foreign {
 
     /// The cgroup of `name` under the cgroup v2 root (tests and doctor).
     pub fn cgroup_path(&self, name: &str) -> String {
-        self.ctx.cgroup_path(name)
+        lock(&self.actors)
+            .get(name)
+            .map_or_else(|| self.ctx.cgroup_path(name), |actor| actor.cgroup.clone())
     }
 
     /// The network namespace file of `name` (tests).
@@ -1196,6 +1359,97 @@ mod tests {
         lock_run_dir(tmp.path()).unwrap();
     }
 
+    /// What an in-place upgrade of an installation of v0.4.0 finds: the lock was
+    /// created with the process's umask and survives a restart.
+    #[test]
+    fn a_lock_file_of_an_earlier_version_is_adopted_and_made_private() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let name = run.join(RUN_LOCK);
+        // 0660 is what the root unit's UMask=0007 leaves; the others are the usual umasks.
+        for mode in [0o660, 0o664, 0o666, 0o644, 0o640, 0o600] {
+            std::fs::write(&name, b"").unwrap();
+            std::fs::set_permissions(&name, std::fs::Permissions::from_mode(mode)).unwrap();
+            let inode = name.metadata().unwrap().ino();
+            let lock = lock_run_dir(&run).unwrap_or_else(|e| panic!("{mode:o}: {e}"));
+            assert_eq!(name.metadata().unwrap().mode() & 0o7777, 0o600, "{mode:o}");
+            assert_eq!(
+                name.metadata().unwrap().ino(),
+                inode,
+                "the same file is kept"
+            );
+            // And it is a lock: a second daemon is refused.
+            let second = lock_run_dir(&run).unwrap_err();
+            assert!(
+                second.contains("another kronik serve"),
+                "{mode:o}: {second}"
+            );
+            drop(lock);
+            std::fs::remove_file(&name).unwrap();
+        }
+        // A lock that does not exist yet is made private.
+        drop(lock_run_dir(&run).unwrap());
+        assert_eq!(name.metadata().unwrap().mode() & 0o7777, 0o600);
+    }
+
+    /// Another user's file is not ours to lock, whatever its mode: it could be
+    /// held by that user to keep the daemon's foreign actors off.
+    #[test]
+    fn a_lock_file_that_belongs_to_another_user_is_refused_and_left_alone() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if crate::sys::euid() != 0 {
+            assert!(
+                std::env::var("KRONIK_FOREIGN_TESTS").as_deref() != Ok("require"),
+                "KRONIK_FOREIGN_TESTS=require, but giving a file to another user needs root"
+            );
+            eprintln!("skipped: giving a file to another user needs root");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let name = run.join(RUN_LOCK);
+        for mode in [0o666, 0o664, 0o600] {
+            std::fs::write(&name, b"").unwrap();
+            std::fs::set_permissions(&name, std::fs::Permissions::from_mode(mode)).unwrap();
+            std::os::unix::fs::chown(&name, Some(65534), Some(65534)).unwrap();
+            let error = lock_run_dir(&run).unwrap_err();
+            assert!(
+                error.contains("belongs to the user of this daemon"),
+                "{mode:o}: {error}"
+            );
+            let after = name.metadata().unwrap();
+            assert_eq!(
+                (after.uid(), after.mode() & 0o7777),
+                (65534, mode),
+                "left as it was"
+            );
+            std::fs::remove_file(&name).unwrap();
+        }
+    }
+
+    #[test]
+    fn runtime_lock_rejects_links_without_changing_the_linked_file() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, b"retained canary").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let inode = outside.metadata().unwrap().ino();
+        let run = tmp.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let name = run.join(RUN_LOCK);
+        symlink(&outside, &name).unwrap();
+        assert!(lock_run_dir(&run).is_err());
+        std::fs::remove_file(&name).unwrap();
+        std::fs::hard_link(&outside, &name).unwrap();
+        assert!(lock_run_dir(&run).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"retained canary");
+        assert_eq!(outside.metadata().unwrap().ino(), inode);
+    }
+
     fn config(data: &std::path::Path) -> ForeignConfig {
         ForeignConfig {
             data_dir: data.join("data"),
@@ -1203,8 +1457,12 @@ mod tests {
             runsc_path: "/nonexistent/runsc".into(),
             platform: Platform::Auto,
             insecure_registries: Vec::new(),
+            microvm_dir: "/nonexistent/microvm".into(),
+            disk_reserve: 0,
+            privilege: Privilege::Root,
             layout_dirs: Vec::new(),
             pull_timeout: Duration::from_secs(5),
+            start_timeout: Duration::from_secs(30),
             checkpoints_kept: 3,
         }
     }
@@ -1239,6 +1497,19 @@ mod tests {
         let error = f.logs("echo", 1, Vec::new()).await.unwrap_err();
         assert_eq!(error.code, ErrorCode::SecretUnavailable);
         assert!(error.message.contains("REDACTION_OUTPUT_LIMIT"));
+    }
+
+    #[tokio::test]
+    async fn actor_layout_marker_is_not_a_failed_microvm_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(tmp.path());
+        let actors = cfg.data_dir.join("foreign/actors");
+        std::fs::create_dir_all(&actors).unwrap();
+        let marker = actors.join(".layout");
+        std::fs::write(&marker, b"retained layout marker").unwrap();
+        let manager = Foreign::create(Env::real(tokio::runtime::Handle::current()), cfg, true);
+        assert_eq!(manager.cleanup_leftovers().await.failed, 0);
+        assert_eq!(std::fs::read(marker).unwrap(), b"retained layout marker");
     }
 
     /// A runtime's state file holds the spec with resolved secret values,

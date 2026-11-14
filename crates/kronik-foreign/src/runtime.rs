@@ -15,6 +15,8 @@ pub(crate) enum Engine {
     Runsc { platform: String },
     /// Plain runc (`trusted`).
     Runc,
+    /// Firecracker has its own typed API; no OCI runtime commands are used.
+    Firecracker,
 }
 
 /// One runtime binary with its state directory (`--root`).
@@ -29,7 +31,7 @@ pub(crate) struct Runtime {
 /// digits of the name's BLAKE3 hash. runsc resolves ids by prefix, so ids
 /// must not be prefixes of each other, as `kronik-foreign-pay` was of
 /// `kronik-foreign-payments` (docs/design/m7-foreign.md §3).
-pub(crate) fn container_id(name: &str) -> String {
+pub fn container_id(name: &str) -> String {
     format!(
         "kronik-foreign-{}",
         &blake3::hash(name.as_bytes()).to_hex()[..16]
@@ -97,6 +99,7 @@ impl Runtime {
         let quiet = match self.engine {
             Engine::Runsc { .. } => "-quiet",
             Engine::Runc => "-q",
+            Engine::Firecracker => unreachable!("Firecracker state is not an OCI runtime root"),
         };
         let mut spec = self.spec(
             vec!["list".into(), quiet.into()],

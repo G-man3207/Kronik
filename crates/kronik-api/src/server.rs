@@ -53,17 +53,31 @@ pub type Mount = Arc<
 
 /// Binds the socket, replacing a stale socket file, with mode 0660.
 pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
+    prepare_socket(path)?;
+    let listener = UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    Ok(listener)
+}
+
+/// [`bind`] without the runtime: the non-root daemon binds before it
+/// starts one, and hands the listener to its acceptor process.
+pub fn bind_std(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    prepare_socket(path)?;
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    Ok(listener)
+}
+
+/// The socket's directory exists and no stale socket file is in the way.
+fn prepare_socket(path: &Path) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
-    Ok(listener)
 }
 
 fn response(status: u16, content_type: &'static str, body: Vec<u8>) -> hyper::Response<Body> {
@@ -186,6 +200,42 @@ pub async fn serve_with(
             None,
         ));
     }
+}
+
+/// Like [`serve_with`], for connections accepted elsewhere, each with its
+/// peer's host uid (`u32::MAX`: unknown): the non-root daemon's acceptor
+/// process reads it in the initial user namespace, where `SO_PEERCRED` is
+/// not translated. Serves until `conns` ends, then fails.
+pub async fn serve_accepted(
+    mut conns: tokio::sync::mpsc::Receiver<(std::os::unix::net::UnixStream, u32)>,
+    api: Arc<Api>,
+    mount: Option<(&'static str, Mount)>,
+) -> std::io::Result<()> {
+    while let Some((stream, uid)) = conns.recv().await {
+        let stream = match stream
+            .set_nonblocking(true)
+            .and_then(|()| tokio::net::UnixStream::from_std(stream))
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "dropping an API connection");
+                continue;
+            }
+        };
+        let identity = if uid == u32::MAX {
+            "unix:uid=unknown".to_owned()
+        } else {
+            format!("unix:uid={uid}")
+        };
+        tokio::spawn(serve_connection(
+            stream,
+            identity,
+            api.clone(),
+            mount.clone(),
+            None,
+        ));
+    }
+    Err(std::io::Error::other("the API socket's acceptor stopped"))
 }
 
 /// The API and `mount` on TCP, where every request needs a bearer token;
@@ -442,5 +492,56 @@ mod event_cursor_tests {
             hyper::header::HeaderValue::from_static("bad\tcursor"),
         );
         assert!(event_cursor_header(&headers).is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod acceptor_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[tokio::test]
+    async fn transferred_uid_is_not_recomputed_and_acceptor_eof_is_fatal() {
+        let data = tempfile::tempdir().unwrap();
+        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+        let node = kronik_sched::start_local(env, data.path(), Default::default())
+            .await
+            .unwrap();
+        let api = Arc::new(Api::new(node));
+        let mount: Mount = Arc::new(|captured, _| {
+            Box::pin(
+                async move { response(200, "text/plain", captured.caller.token_id.into_bytes()) },
+            )
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(serve_accepted(rx, api, Some(("/identity", mount))));
+        let (client, accepted) = std::os::unix::net::UnixStream::pair().unwrap();
+        tx.send((accepted, 4242)).await.unwrap();
+        client.set_nonblocking(true).unwrap();
+        let mut client = tokio::net::UnixStream::from_std(client).unwrap();
+        client
+            .write_all(b"GET /identity HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut answer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            answer.ends_with(b"unix:uid=4242"),
+            "{}",
+            String::from_utf8_lossy(&answer)
+        );
+        drop(tx);
+        let stopped = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stopped.is_err(),
+            "acceptor death cannot leave a serving daemon"
+        );
     }
 }

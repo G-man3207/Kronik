@@ -1900,6 +1900,7 @@ dependencies = [
  "kronik-ship",
  "kronik-testhost",
  "kronik-ui",
+ "libc",
  "prost",
  "rcgen",
  "rmcp",
@@ -2063,6 +2064,7 @@ dependencies = [
  "hyper-util",
  "kronik-core",
  "kronik-effects",
+ "kronik-guest-init",
  "kronik-privacy",
  "kronik-proto",
  "libc",
@@ -2134,6 +2136,15 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "x509-parser",
+]
+
+[[package]]
+name = "kronik-guest-init"
+version = "0.5.0-dev"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2330,6 +2341,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "zeroize",
  "zstd",
 ]
 

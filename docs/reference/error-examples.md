@@ -278,8 +278,9 @@ kronik keys rewrap --reason "rewrap the owned fixture after provider repair"
 
 ## KVM_UNAVAILABLE
 
-An owned foreign fixture explicitly requires KVM on a host without usable KVM.
-Select an actually supported isolation backend; do not relabel systrap as KVM.
+An owned foreign fixture explicitly requires KVM (`platform = "kvm"` or
+`isolation = "microvm"`) on a host without usable KVM. Select an actually
+supported isolation backend (`gvisor`); do not relabel systrap as KVM.
 
 ```sh
 kronik doctor --config /owned/fixture/kvm-required.toml
@@ -425,6 +426,17 @@ its old state semantics. Evaluate an actual rollback-by-replay proposal.
 
 ```sh
 kronik rollback 3 --by-replay --reason "evaluate the fixture schema rollback"
+```
+
+## ROOTLESS_UNAVAILABLE
+
+The nonroot service's owned user namespace cannot be established on an owned
+installation, for example because the `kronik` user has no subordinate id range
+or the pin belongs to another identity. Repair the root-controlled setup; never
+loosen the pin's ownership or choose another namespace to hide the error.
+
+```sh
+kronik userns pin --dry-run
 ```
 
 ## ROUTE_CONFLICT

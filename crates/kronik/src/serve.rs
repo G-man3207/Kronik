@@ -12,6 +12,7 @@ use anyhow::Context as _;
 use clap::Args;
 use kronik_api::Api;
 use kronik_core::env::Env;
+use kronik_core::error::{ApiError, ErrorCode};
 use kronik_gateway::{Gateway, GatewayConfig};
 use kronik_sched::{NodeConfig, start_local};
 
@@ -53,6 +54,17 @@ pub struct ServeArgs {
     /// setting both is an error.
     #[arg(long, env = "KRONIK_MASTER_KEY_FILE")]
     master_key_file: Option<PathBuf>,
+    /// Run as the nonroot service (M21): bind every listener and take the
+    /// data directory's lock, empty all capability sets, hand the API socket
+    /// to a capability-free acceptor that reads the callers' true uids, and
+    /// enter the pinned Kronik user namespace. The unit that
+    /// `serve --init --rootless` writes sets it, and the daemon refuses to
+    /// start where it cannot keep its promises (as root, or in a rootless
+    /// container or a nested user namespace). Without it `serve` starts as it
+    /// did before M21, as root or as an ordinary user. With `--init`: install
+    /// the nonroot service rather than the root one (the default).
+    #[arg(long)]
+    rootless: bool,
     /// Below this much free space on the log's file system, new inputs and
     /// changes are refused, e.g. `512MiB`; `0B` turns it off [file:
     /// log.disk_reserve].
@@ -91,10 +103,42 @@ pub struct ServeArgs {
 }
 
 impl ServeArgs {
-    /// The configuration file, if any, with the flags in place.
-    fn config(&self) -> anyhow::Result<Config> {
-        let (config, _file) = Config::find(self.config.as_deref())?;
-        let config = config.with(Overrides {
+    /// `--init` and what it needs, for main: host setup is a flag mode of
+    /// `serve` that binds nothing, so it runs before the daemon starts.
+    pub(crate) fn init_args(
+        &self,
+    ) -> Option<(crate::init::InitArgs, Option<&Path>, Option<&Path>)> {
+        self.init.init.then(|| {
+            let mut init = self.init.clone();
+            init.rootless = self.rootless;
+            init.overrides = Box::new(self.init_overrides());
+            (
+                init,
+                self.config.as_deref(),
+                // The key the host is set up with, not the one the file
+                // records: a key given only by the environment still has to
+                // reach init, which reads it once instead of re-reading it.
+                self.master_key_file.as_deref(),
+            )
+        })
+    }
+
+    /// Whether this process's command line spells `name` (`--name VALUE` or
+    /// `--name=VALUE`): what `--init` persists is what the operator wrote, not
+    /// what an `env =` attribute supplied.
+    fn flag_given(name: &str) -> bool {
+        std::env::args().skip(1).any(|argument| {
+            argument == name
+                || argument
+                    .strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
+    }
+
+    /// The flags that override the configuration file: the daemon's, and, for
+    /// `--init`, the ones a generated file is written from.
+    fn overrides(&self) -> Overrides {
+        Overrides {
             data_dir: self.data_dir.clone(),
             api_socket: self.api_socket.clone(),
             http_listen: self.http_listen,
@@ -104,7 +148,49 @@ impl ServeArgs {
             master_key_file: self.master_key_file.clone(),
             disk_reserve: self.disk_reserve,
             otel_endpoint: self.otel_endpoint.clone(),
-        });
+        }
+    }
+
+    /// [`Self::overrides`], but only the flags this command line spells: the
+    /// installed unit does not inherit the installer's environment, so a
+    /// value that came only from there is not the service's to keep.
+    fn init_overrides(&self) -> Overrides {
+        let all = self.overrides();
+        Overrides {
+            data_dir: Self::flag_given("--data-dir")
+                .then_some(all.data_dir)
+                .flatten(),
+            api_socket: Self::flag_given("--api-socket")
+                .then_some(all.api_socket)
+                .flatten(),
+            http_listen: Self::flag_given("--http-listen")
+                .then_some(all.http_listen)
+                .flatten(),
+            admin_listen: Self::flag_given("--admin-listen")
+                .then_some(all.admin_listen)
+                .flatten(),
+            api_listen: Self::flag_given("--api-listen")
+                .then_some(all.api_listen)
+                .flatten(),
+            gateway_timeout: Self::flag_given("--gateway-timeout-ms")
+                .then_some(all.gateway_timeout)
+                .flatten(),
+            master_key_file: Self::flag_given("--master-key-file")
+                .then_some(all.master_key_file)
+                .flatten(),
+            disk_reserve: Self::flag_given("--disk-reserve")
+                .then_some(all.disk_reserve)
+                .flatten(),
+            otel_endpoint: Self::flag_given("--otel-endpoint")
+                .then_some(all.otel_endpoint)
+                .flatten(),
+        }
+    }
+
+    /// The configuration file, if any, with the flags in place.
+    fn config(&self) -> anyhow::Result<Config> {
+        let (config, _file) = Config::find(self.config.as_deref())?;
+        let config = config.with(self.overrides());
         // The overrides are checked as the file's values are.
         config.otel.check().map_err(anyhow::Error::msg)?;
         config.check_audit_hold().map_err(anyhow::Error::msg)?;
@@ -206,21 +292,202 @@ impl ServeArgs {
 }
 
 pub fn run(args: ServeArgs) -> anyhow::Result<()> {
+    // `serve --rootless`, the nonroot service, binds its listeners, takes the
+    // data directory's lock and gives up its host authority while it still
+    // has one thread, before the logger and the runtime start. Plain `serve`,
+    // as root or as an ordinary user, does what it did before M21.
+    let started = args.rootless.then(|| {
+        args.config()
+            .and_then(|config| Early::start(&config).map(|early| (config, early)))
+    });
+    // When the early start fails there is no logger yet: install it to report why.
     init_tracing(args.log_format);
     let test_flags = args.test_flags();
     if !test_flags.is_empty() {
         tracing::warn!(flags = ?test_flags, "test-only flags are set; never use them in production");
     }
-    if args.init.init {
-        return crate::init::run_init(&args.init, args.config.as_deref());
+    let (config, early) = match started {
+        Some(started) => started?,
+        None => (args.config()?, Early::default()),
+    };
+    if let Some(kronik_foreign::Privilege::Unavailable(why)) = &early.privilege {
+        tracing::warn!(why, "foreign actors are unavailable");
     }
-    let config = args.config()?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("kronik")
         .build()
         .context("starting the tokio runtime")?;
-    rt.block_on(serve(args, config))
+    rt.block_on(serve(args, config, early))
+}
+
+/// What `kronik serve --rootless` sets up while the process has one thread
+/// (ADR 0060): the TCP listeners, bound while the service still holds the
+/// unit's `CAP_NET_BIND_SERVICE` for ports 80 and 443; the data directory's
+/// lock; the API socket's acceptor, the cgroup leaf and the Kronik user
+/// namespace, after the capabilities are gone. Plain `serve` has none of it:
+/// every field is `None` and `serve` binds and locks where it always did.
+#[derive(Default)]
+struct Early {
+    gateway: Option<std::net::TcpListener>,
+    api_tcp: Option<std::net::TcpListener>,
+    /// /metrics and /healthz are auxiliary: without the port Kronik serves
+    /// anyway and says why.
+    admin: Option<std::io::Result<std::net::TcpListener>>,
+    /// The API socket's connections, read in the initial user namespace.
+    acceptor: Option<kronik_foreign::sys::Acceptor>,
+    privilege: Option<kronik_foreign::Privilege>,
+    /// The data directory's lock, held from before the first bind until the
+    /// node takes it over; it is never released and taken again.
+    ownership: Option<kronik_privacy::key_source::DataOwnership>,
+}
+
+/// A TCP listener as tokio's own `bind` makes it (backlog 1024), ready for
+/// `from_std`.
+fn tcp_listen(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(addr)?;
+    rustix::net::listen(&listener, 1024)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+/// The checks of the configuration that stop `serve` before it does
+/// anything; the API's TCP address, if any.
+fn preflight(config: &Config) -> anyhow::Result<Option<SocketAddr>> {
+    // A flag can set it too, so the file's check is not enough.
+    let api_listen = config.api_listen().map_err(anyhow::Error::msg)?;
+    config.check().map_err(anyhow::Error::msg)?;
+    // The master key is the KRONIK_MASTER_KEY material, or a key file (the
+    // flag, KRONIK_MASTER_KEY_FILE or [keys] master_key_file). Both set is
+    // ambiguous, so refuse to start rather than silently pick one.
+    if config.keys.master_key_file.is_some()
+        && std::env::var_os(kronik_privacy::MASTER_KEY_ENV).is_some()
+    {
+        anyhow::bail!(
+            "KRONIK_MASTER_KEY and a master key file (--master-key-file, \
+             KRONIK_MASTER_KEY_FILE or [keys] master_key_file) are both \
+             set; remove one of them"
+        );
+    }
+    Ok(api_listen)
+}
+
+impl Early {
+    fn start(config: &Config) -> anyhow::Result<Early> {
+        // Before anything is created, locked or bound: a nonroot service that
+        // cannot keep its promises does not start at all.
+        kronik_foreign::sys::acceptor_view().map_err(refusal)?;
+        let api_listen = preflight(config)?;
+        restrict_data_dir(&config.server.data_dir, &config.server.api_socket)?;
+        let ownership = kronik_privacy::key_source::lock_data(&config.server.data_dir)?;
+        let http_listen = config.http_listen();
+        let gateway = tcp_listen(http_listen)
+            .with_context(|| format!("binding the gateway on {http_listen}"))?;
+        let api_tcp = api_listen
+            .map(|addr| tcp_listen(addr).with_context(|| format!("binding the API on {addr}")))
+            .transpose()?;
+        let admin = tcp_listen(config.server.admin_listen);
+        let (acceptor, privilege) = nonroot_boundary(config)?;
+        Ok(Early {
+            gateway: Some(gateway),
+            api_tcp,
+            admin: Some(admin),
+            acceptor: Some(acceptor),
+            privilege: Some(privilege),
+            ownership: Some(ownership),
+        })
+    }
+}
+
+/// The refusal of the nonroot service, as the stable `ROOTLESS_UNAVAILABLE`
+/// error: its message says what to change, and `kronik doctor --rootless`
+/// reports the same condition before the service is started.
+fn refusal(why: kronik_foreign::sys::AcceptorRefusal) -> anyhow::Error {
+    ApiError::new(ErrorCode::RootlessUnavailable, why.to_string())
+        .with_hint("Run `kronik doctor --rootless` as the service user to see this check before starting the service.")
+        .into()
+}
+
+/// The non-root daemon's start (ADR 0060): the API
+/// socket and its acceptor, which keeps reading the callers' host uids in
+/// the initial namespace; the cgroup leaf; then the Kronik user namespace.
+/// Without the namespace or a delegated cgroup the daemon still serves,
+/// and foreign actors answer FOREIGN_UNAVAILABLE with the reason.
+fn nonroot_boundary(
+    config: &Config,
+) -> anyhow::Result<(kronik_foreign::sys::Acceptor, kronik_foreign::Privilege)> {
+    use kronik_foreign::Privilege::{Unavailable, Userns};
+    use kronik_foreign::subid::USERNS_PIN;
+    use kronik_foreign::sys;
+    let api_socket = &config.server.api_socket;
+    let unix = kronik_api::server::bind_std(api_socket)
+        .with_context(|| format!("binding the API on {}", api_socket.display()))?;
+    sys::clear_capabilities().context("dropping all host capabilities after listener binding")?;
+    // Before the acceptor forks, so that it starts in the leaf too: the
+    // delegated cgroup may hold no process once it has controllers on.
+    let leaf = sys::cgroup_leaf();
+    let acceptor = sys::Acceptor::spawn(std::os::fd::OwnedFd::from(unix))
+        .context("starting the API socket's acceptor")?;
+    let pin = Path::new(USERNS_PIN);
+    let privilege = if !pin.exists() {
+        Unavailable(format!(
+            "the daemon is not root, and no Kronik user namespace is pinned at {USERNS_PIN}: \
+             start kronik-userns.service (`kronik userns pin`)"
+        ))
+    } else {
+        let uid = rustix::process::geteuid().as_raw();
+        let entered = crate::cli::userns::kronik_user("", Some(uid))
+            .and_then(|user| sys::enter_userns(pin, &user.maps()).map_err(|e| e.to_string()));
+        match (entered, leaf) {
+            (Err(why), _) => Unavailable(format!(
+                "the daemon is not root, and it cannot enter the Kronik user namespace: {why}"
+            )),
+            (Ok(()), Ok(Some(cgroup))) if sys::cgroup_delegated(&cgroup) => Userns { cgroup },
+            (Ok(()), Ok(Some(cgroup))) => Unavailable(format!(
+                "the cgroup {cgroup} is not writable inside the Kronik user namespace"
+            )),
+            (Ok(()), Ok(None)) => Unavailable(format!(
+                "no delegated cgroup: the daemon's cgroup {:?} is not writable for it; run it \
+                 in kronik.service (Delegate=yes)",
+                sys::own_cgroup().unwrap_or_default()
+            )),
+            (Ok(()), Err(e)) => Unavailable(format!("no cgroup leaf: {e}")),
+        }
+    };
+    Ok((acceptor, privilege))
+}
+
+/// Hands the acceptor's connections to the runtime from a thread of its
+/// own (its `recv` blocks).
+fn accept_channel(
+    acceptor: kronik_foreign::sys::Acceptor,
+) -> anyhow::Result<tokio::sync::mpsc::Receiver<(std::os::unix::net::UnixStream, u32)>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    std::thread::Builder::new()
+        .name("kronik-api-accept".into())
+        .spawn(move || {
+            loop {
+                match acceptor.recv() {
+                    Ok((fd, uid)) => {
+                        if tx.blocking_send((fd.into(), uid)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "the API socket's acceptor stopped");
+                        return;
+                    }
+                }
+            }
+        })
+        .context("starting the API socket's accept thread")?;
+    Ok(rx)
+}
+
+/// The API's Unix socket: bound by a root daemon, or fed by the acceptor.
+enum UnixApi {
+    Listener(tokio::net::UnixListener),
+    Accepted(tokio::sync::mpsc::Receiver<(std::os::unix::net::UnixStream, u32)>),
 }
 
 /// The foreign actors' settings of `config` (serve and `foreign cleanup`).
@@ -241,7 +508,11 @@ pub(crate) fn foreign_config(
         insecure_registries,
         layout_dirs: config.foreign.layout_dirs.clone(),
         pull_timeout: config.foreign.pull_timeout.0,
+        start_timeout: config.foreign.start_timeout.0,
         checkpoints_kept: config.foreign.checkpoints_kept,
+        privilege: kronik_foreign::Privilege::Root,
+        microvm_dir: config.foreign.microvm_dir.clone(),
+        disk_reserve: config.log.disk_reserve.0,
     }
 }
 
@@ -302,7 +573,7 @@ fn connection_caps(open_files: usize) -> (usize, usize) {
     ((spare * 3).clamp(16, 1024), spare.clamp(4, 256))
 }
 
-async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
+async fn serve(args: ServeArgs, config: Config, early: Early) -> anyhow::Result<()> {
     // No core dumps or ptrace by other users: the process holds the master
     // key, secrets and plain subject data (PR_SET_DUMPABLE 0).
     if let Err(e) =
@@ -312,34 +583,24 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
     }
     let open_files = raise_open_files();
     let (gateway_connections, api_connections) = connection_caps(open_files);
-    // A flag can set it too, so the file's check is not enough.
-    let api_listen = config.api_listen().map_err(anyhow::Error::msg)?;
-    config.check().map_err(anyhow::Error::msg)?;
-    // The master key is the KRONIK_MASTER_KEY material, or a key file (the
-    // flag, KRONIK_MASTER_KEY_FILE or [keys] master_key_file). Both set is
-    // ambiguous, so refuse to start rather than silently pick one.
-    if config.keys.master_key_file.is_some()
-        && std::env::var_os(kronik_privacy::MASTER_KEY_ENV).is_some()
-    {
-        anyhow::bail!(
-            "KRONIK_MASTER_KEY and a master key file (--master-key-file, \
-             KRONIK_MASTER_KEY_FILE or [keys] master_key_file) are both \
-             set; remove one of them"
-        );
-    }
+    let api_listen = preflight(&config)?;
     let env = Env::real(tokio::runtime::Handle::current());
     let data_dir = config.server.data_dir.clone();
-    restrict_data_dir(&data_dir, &config.server.api_socket)?;
+    // `--rootless` did this before it took the lock.
+    if early.ownership.is_none() {
+        restrict_data_dir(&data_dir, &config.server.api_socket)?;
+    }
     // Foreign actors (M7): the node starts them after recovering the log and
     // before re-running open turns; they stop when the daemon stops.
-    let foreign = kronik_foreign::Foreign::new(
-        env.clone(),
-        foreign_config(
-            &config,
-            data_dir.clone(),
-            args.test_insecure_registry.clone(),
-        ),
+    let mut foreign_config = foreign_config(
+        &config,
+        data_dir.clone(),
+        args.test_insecure_registry.clone(),
     );
+    if let Some(privilege) = early.privilege {
+        foreign_config.privilege = privilege;
+    }
+    let foreign = kronik_foreign::Foreign::new(env.clone(), foreign_config);
     let node_config = NodeConfig {
         foreign: kronik_effects::foreign::ForeignSlot(Some(Arc::new(kronik_foreign::Host(
             foreign.clone(),
@@ -363,9 +624,13 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
         disk_reserve: config.log.disk_reserve.0,
         ..NodeConfig::default()
     };
-    let node = start_local(env.clone(), &data_dir, node_config)
-        .await
-        .with_context(|| format!("recovering {}", data_dir.display()))?;
+    let node = match early.ownership {
+        Some(ownership) => {
+            kronik_sched::start_local_locked(env.clone(), &data_dir, node_config, ownership).await
+        }
+        None => start_local(env.clone(), &data_dir, node_config).await,
+    }
+    .with_context(|| format!("recovering {}", data_dir.display()))?;
     struct NativeExecutionGuard(Option<Arc<kronik_sched::Node>>);
     impl Drop for NativeExecutionGuard {
         fn drop(&mut self) {
@@ -543,9 +808,11 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
         .transpose()
         .map_err(|e| anyhow::anyhow!("gateway TLS: {e}"))?;
     let http_listen = config.http_listen();
-    let tcp = tokio::net::TcpListener::bind(http_listen)
-        .await
-        .with_context(|| format!("binding the gateway on {http_listen}"))?;
+    let tcp = match early.gateway {
+        Some(listener) => tokio::net::TcpListener::from_std(listener),
+        None => tokio::net::TcpListener::bind(http_listen).await,
+    }
+    .with_context(|| format!("binding the gateway on {http_listen}"))?;
     let bound = tcp.local_addr().unwrap_or(http_listen);
     let tokens_db = data_dir.join("keys").join("tokens.db");
     let mut tokens =
@@ -613,15 +880,24 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
     }
     let api = Arc::new(api.with_event_feed(event_feed));
     let api_socket = &config.server.api_socket;
-    let unix = kronik_api::server::bind(api_socket)
-        .with_context(|| format!("binding the API on {}", api_socket.display()))?;
-    let api_tcp = match api_listen {
-        Some(addr) => Some(
+    let unix = match early.acceptor {
+        Some(acceptor) => UnixApi::Accepted(accept_channel(acceptor)?),
+        None => UnixApi::Listener(
+            kronik_api::server::bind(api_socket)
+                .with_context(|| format!("binding the API on {}", api_socket.display()))?,
+        ),
+    };
+    let api_tcp = match (early.api_tcp, api_listen) {
+        (Some(listener), _) => Some(
+            tokio::net::TcpListener::from_std(listener)
+                .context("binding the API from its early listener")?,
+        ),
+        (None, Some(addr)) => Some(
             tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("binding the API on {addr}"))?,
         ),
-        None => None,
+        (None, None) => None,
     };
     let api_tcp_bound = api_tcp
         .as_ref()
@@ -667,7 +943,11 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
     };
     // Without configured OIDC, an unavailable auxiliary admin port is nonfatal.
     let admin_listen = config.server.admin_listen;
-    let admin = match tokio::net::TcpListener::bind(admin_listen).await {
+    let admin = match early.admin {
+        Some(early_admin) => early_admin.and_then(tokio::net::TcpListener::from_std),
+        None => tokio::net::TcpListener::bind(admin_listen).await,
+    };
+    let admin = match admin {
         Ok(listener) => Some(listener),
         Err(error) if config.oidc.is_some() => {
             return Err(error).context("binding the configured OIDC admin listener");
@@ -688,12 +968,22 @@ async fn serve(args: ServeArgs, config: Config) -> anyhow::Result<()> {
             }
         }
     };
+    let unix_api = async move {
+        match unix {
+            UnixApi::Listener(listener) => {
+                kronik_api::server::serve_with(listener, api, Some(mcp)).await
+            }
+            UnixApi::Accepted(conns) => {
+                kronik_api::server::serve_accepted(conns, api, Some(mcp)).await
+            }
+        }
+    };
     let mut stopping = false;
     let served = tokio::select! {
         biased;
         msg = node.wait_fatal() => Err(anyhow::anyhow!("storage failure: {msg}")),
         r = kronik_gateway::server::serve_with_tls(tcp, gateway, tls, gateway_connections) => r.context("gateway listener failed"),
-        r = kronik_api::server::serve_with(unix, api, Some(mcp)) => r.context("API listener failed"),
+        r = unix_api => r.context("API listener failed"),
         r = api_tcp => r.context("TCP API listener failed"),
         r = admin => r.context("admin listener failed"),
         _ = tokio::signal::ctrl_c() => {
@@ -954,6 +1244,25 @@ mod tests {
     }
 
     #[test]
+    fn init_forwards_the_selected_file_key_without_reloading_it() {
+        let args = Serve::parse_from([
+            "kronik",
+            "--init",
+            "--config",
+            "/fixture/kronik.toml",
+            "--master-key-file",
+            "/fixture/selected-master.key",
+        ])
+        .args;
+        let (_, config, selected_key) = args.init_args().unwrap();
+        assert_eq!(config, Some(std::path::Path::new("/fixture/kronik.toml")));
+        assert_eq!(
+            selected_key,
+            Some(std::path::Path::new("/fixture/selected-master.key"))
+        );
+    }
+
+    #[test]
     fn test_flags_lists_the_set_test_hooks() {
         let flags = |argv: &[&str]| {
             Serve::parse_from([&["kronik"], argv].concat())
@@ -990,6 +1299,19 @@ mod tests {
         for format in [super::LogFormat::Text, super::LogFormat::Json] {
             tracing::subscriber::with_default(super::log_subscriber(format, Some(spec)), &f);
         }
+    }
+
+    #[test]
+    fn rootless_is_a_flag_of_serve_and_conflicts_with_root_of_init() {
+        let parse = |argv: &[&str]| Serve::try_parse_from([&["kronik"], argv].concat());
+        assert!(!parse(&[]).unwrap().args.rootless);
+        assert!(parse(&["--rootless"]).unwrap().args.rootless);
+        let init = parse(&["--init", "--rootless"]).unwrap().args;
+        let (init_args, _, _) = init.init_args().unwrap();
+        assert!(init_args.rootless && !init_args.root);
+        assert!(parse(&["--init", "--root", "--rootless"]).is_err());
+        // --root without --init stays refused, as before.
+        assert!(parse(&["--root"]).is_err());
     }
 
     #[test]

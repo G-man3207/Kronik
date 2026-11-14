@@ -341,36 +341,88 @@ Prefer a preview domain wherever previews take traffic from browsers.
 
 ## Root
 
-In v0.1 the daemon and `runsc` run as root under systemd, with the
-hardening that systemd allows. `kronik serve --init` (M6) installs the unit
-`deploy/systemd/kronik.service`: it runs the daemon as root with the group
-`kronik` and the umask 0007, keeps the data directory `/var/lib/kronik` at
-mode 0700 and the socket directory `/run/kronik` at mode 0750, and sets
-`ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `NoNewPrivileges`,
-`ProtectClock`, `ProtectKernelModules`, `ProtectKernelLogs`,
-`RestrictRealtime`, `LockPersonality` and `SystemCallArchitectures=native`.
-[ADR 0027](../adr/0027-systemd-unit-hardening.md) gives the evidence for
-each setting.
+`kronik serve --init` installs the root service of v0.1 to v0.4. Its opt-in
+alternative, `kronik serve --init --rootless` (M21), uses root only for setup
+and installs the nonroot `kronik` service. Its design is accepted
+([ADR 0060](../adr/0060-non-root-daemon-user-namespace.md),
+[ADR 0061](../adr/0061-runsc-in-the-kronik-user-namespace.md),
+[ADR 0062](../adr/0062-non-root-systemd-units.md) and
+[ADR 0065](../adr/0065-api-peer-identity-acceptor.md)), but the installed
+proofs of [ADR 0064](../adr/0064-foreign-isolation-conformance.md) have not
+been run on this revision, and the service is untested on Ubuntu 24.04:
+Kronik checks `user.max_user_namespaces` and
+`kernel.unprivileged_userns_clone` and does not handle that distribution's
+AppArmor restriction on unprivileged user namespaces.
 
-The unit names no `User=` on purpose: root is the default, and with an
-explicit `User=` systemd drops `CAP_SETUID` from the daemon, which `runsc`
-needs to start a sandbox (`kronik doctor`'s `caps` check finds this).
-It also leaves out `RestrictSUIDSGID`, which makes `openat2` fail, and
-`runsc restore` needs it for the sandbox copies forks talk to (M14). Image
-unpacking clears setuid and setgid bits, so no setid file comes from an
-image, and checkpoints and copies of an actor's data clear them too. The
-risk that remains: a program in a sandbox that runs as root can set them
-on files in its own `/data`, which leaves root-owned setid files in the
-data directory. Only root can reach them there (mode 0700 parents), and
-executing one inside the service gains nothing under `NoNewPrivileges`.
+The daemon runs as `kronik` with the group `kronik` and the umask 0007. Its
+API acceptor stays in the initial user namespace with that host uid and no
+capability, so Unix peer uids remain real host identities in the audit trail
+and for token attribution. Before the logger and the runtime start, the
+daemon binds its ports and then empties all capability sets, including when
+foreign isolation is unavailable and only Wasm actors can run.
 
-`/run/kronik` is mode 0750 with group `kronik`: whoever may use the API
-socket can list it. The runtime state of the sandboxes beneath it
-(`runsc/`, `runc/`) is mode 0700, because a runtime's state file holds the
-container's environment, resolved secret values included. Only root can
-read it.
+The sandboxes need root inside a namespace, not on the host. A short-lived,
+root-controlled setup (`kronik userns pin`, run by `kronik-userns.service`)
+pins a user namespace owned by `kronik`, with namespace root mapped to that
+user and ids 1 to 65535 to its subordinate range. At start the daemon checks
+the namespace's type, owner and exact maps through one open descriptor and
+enters that descriptor; namespace root is the nonzero host uid, never host
+root. `runsc` and `runc` then run as namespace root inside it. The brief's M21
+says "`runsc` runs in rootless mode where the kernel allows it"; Kronik does
+not use `runsc --rootless`, whose limits ADR 0061 describes. The maintainers
+ratified that deviation from the brief's wording on 2026-11-13. A missing pin
+or delegation gives typed foreign unavailability (`FOREIGN_UNAVAILABLE` with
+the reason), never an automatic trusted runtime or a root fallback.
 
-Rootless operation comes after v0.1, with M21. Started by hand,
-`kronik serve` runs as the user that starts it, and
-that user needs write access to the data directory and to the socket's
-directory (by default `/var/lib/kronik` and `/run/kronik`).
+`serve --init` (or `serve --init --root`) installs the separate root service,
+which keeps the hardening decisions of
+[ADR 0027](../adr/0027-systemd-unit-hardening.md). Both
+modes keep strict host file system protection, no-new-privileges and private
+runtime storage. `RestrictSUIDSGID` stays out because M14's `runsc restore`
+needs `openat2`.
+
+Image unpacking clears setuid and setgid bits, as do gVisor directory
+checkpoints and copies. A sandbox can still set them in its own persistent
+directory: in the nonroot installation namespace-root ownership maps to the
+service uid, and a root installation can leave root-owned files. Keep those
+private trees private and never copy their modes into a public or executable
+location. A microVM's guest inode modes stay inside its opaque drive; they
+are not host setid files.
+
+`/run/kronik` is mode 0750 with group `kronik`: whoever may use the API socket
+can list it. The runtime state of the sandboxes beneath it (`runsc/`, `runc/`)
+is mode 0700, because a runtime's state file holds the container's
+environment, resolved secret values included. Only the service user and host
+root can read it, not every member of the API group.
+
+The nonroot service is `kronik serve --rootless` (M21,
+[ADR 0060](../adr/0060-non-root-daemon-user-namespace.md)); the unit that
+`serve --init --rootless` writes passes the flag. The daemon needs write access to the
+data directory and to the socket's directory (by default `/var/lib/kronik` and
+`/run/kronik`). While it still has one thread it takes the data directory's
+lock and binds its listeners, then empties all its capability sets and sets
+`no_new_privs`, moves into a `daemon` leaf of its cgroup when that cgroup is
+delegated to it, and starts a small acceptor process that stays in the initial
+user namespace without any capability and hands each API connection over
+together with its caller's host uid, so the audit trail and token attribution
+keep real uids. Last it enters the pinned Kronik user namespace if one exists.
+Foreign actors need both the namespace and the delegated cgroup. Without them
+it still serves Wasm actors, and foreign actors answer `FOREIGN_UNAVAILABLE`
+with the reason; it never falls back to a weaker backend or to unbounded
+resources. `kronik userns
+status` shows the namespace.
+
+`--rootless` fails closed. It stops with `ROOTLESS_UNAVAILABLE`, before it
+creates or binds anything, where it cannot keep the promise above: as root;
+when the real, effective and saved user ids are not one and the same; and in a
+user namespace whose uid map is not the host's identity map, such as a
+rootless container or a nested user namespace. There the kernel would
+translate every API caller's uid, and the audit trail and token attribution
+would name the wrong users. Rootless containers and nested user namespaces are
+not supported for the nonroot unit: use the root service (`serve --init
+--root`). `kronik doctor --rootless` reports the same condition as `uid_view`
+before the service is started.
+
+Plain `kronik serve`, without `--rootless`, starts as it did before M21, as
+root or as an ordinary user: it takes no early lock, forks no acceptor, empties
+no capability set, does not set `no_new_privs` and does not enter a namespace.

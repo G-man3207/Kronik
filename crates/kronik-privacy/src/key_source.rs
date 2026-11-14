@@ -7,6 +7,7 @@ mod pkcs11;
 pub(crate) mod providers;
 pub use ownership::DataOwnership;
 
+use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -16,12 +17,14 @@ use kronik_core::env::Env;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize as _, Zeroizing};
 
+use crate::owned_tree::{self, Ancestors, Dir};
 use crate::{MasterKey, PrivacyError, encrypted_stores};
 pub use config::{Keys, Source};
 
 const SCHEMA: &str = "kronik.wrapped-key/v1";
 const PURPOSE: &str = "kronik master v1";
-const MAX_ENVELOPE: u64 = 65_536;
+/// The largest wrapped-key envelope that is read.
+pub const MAX_ENVELOPE: u64 = 65_536;
 pub const SOURCE_MARKER: &str = "key-source.json";
 
 #[derive(Debug, thiserror::Error)]
@@ -177,10 +180,45 @@ impl Wrapped {
 impl KeySource {
     pub async fn load(
         env: Env,
-        mut config: Keys,
+        config: Keys,
         data: &Path,
         create: bool,
     ) -> Result<Arc<Self>, KeySourceError> {
+        let (config, master, wrapped) = Self::read_key(&env, config, data, create, true).await?;
+        Ok(Arc::new(Self {
+            env,
+            config,
+            data: data.to_path_buf(),
+            master,
+            wrapped: RwLock::new(wrapped),
+            change: tokio::sync::Mutex::new(()),
+        }))
+    }
+
+    /// The master key of the configured source, and nothing else: the data
+    /// directory's stores are not copied or opened. A restore that runs as
+    /// root needs a key only root can read (a root-only file, a KMS provider's
+    /// credentials), and must not read the stores of a directory that
+    /// another user owns; it checks them with [`validate_staged_stores`]
+    /// afterwards, as the directory's owner.
+    pub async fn load_master(
+        env: &Env,
+        config: Keys,
+        data: &Path,
+    ) -> Result<MasterKey, KeySourceError> {
+        Self::read_key(env, config, data, false, false)
+            .await
+            .map(|(_, master, _)| master)
+    }
+
+    async fn read_key(
+        env: &Env,
+        mut config: Keys,
+        data: &Path,
+        create: bool,
+        check_stores: bool,
+    ) -> Result<(Keys, MasterKey, Option<Wrapped>), KeySourceError> {
+        let env = env.clone();
         protect_process()?;
         config.check_environment()?;
         let deadline = operation_deadline(&env, &config)?;
@@ -190,13 +228,13 @@ impl KeySource {
         let keys = data.join("keys");
         let (master, wrapped) = if config.source.is_kms() {
             let path = config.envelope_path(data)?;
-            match read_envelope(&path) {
+            match read_envelope_in(data, &path) {
                 Ok(bytes) => {
                     let wrapped = Wrapped::parse(&bytes, &config)?;
                     let master = unwrap_retry(&env, &config, &wrapped, deadline).await?;
                     if create {
                         master.validate_stores(&keys)?;
-                    } else {
+                    } else if check_stores {
                         validate_staged_stores(&master, &keys)?;
                     }
                     (master, Some(wrapped))
@@ -213,29 +251,32 @@ impl KeySource {
                     }
                     let bytes = wrapped.bytes()?;
                     // Creation never replaces a file that appeared meanwhile.
-                    write_envelope(&env, &path, &bytes, false)?;
+                    write_envelope_in(&env, data, &path, &bytes, false)?;
                     (master, Some(wrapped))
                 }
                 Err(e) => return Err(e.into()),
             }
         } else {
             let fresh = create.then(|| env.random_bytes::<32>());
-            let (master, _) = MasterKey::open(&config.key_path(data), &keys, fresh)?;
+            let (master, _) = if check_stores || create {
+                MasterKey::open(&config.key_path(data), &keys, fresh)?
+            } else {
+                // Only the key: a key file inside the tree of another user is
+                // read by name through descriptors, as `keys wrap` reads its
+                // old key (a link in its place is an error, not followed).
+                (
+                    read_old_key_as(data, &config.key_path(data), Caller::this_process())?,
+                    false,
+                )
+            };
             if create {
                 master.validate_stores(&keys)?;
-            } else {
+            } else if check_stores {
                 validate_staged_stores(&master, &keys)?;
             }
             (master, None)
         };
-        Ok(Arc::new(Self {
-            env,
-            config,
-            data: data.to_path_buf(),
-            master,
-            wrapped: RwLock::new(wrapped),
-            change: tokio::sync::Mutex::new(()),
-        }))
+        Ok((config, master, wrapped))
     }
 
     pub fn master(&self) -> &MasterKey {
@@ -352,6 +393,30 @@ pub async fn wrap_existing(
     reason: impl FnOnce(&MasterKey, &Path) -> String,
     dry_run: bool,
 ) -> Result<KeyStatus, KeySourceError> {
+    wrap_existing_as(
+        Caller::this_process(),
+        env,
+        config,
+        data,
+        old_file,
+        remove_file,
+        reason,
+        dry_run,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wrap_existing_as(
+    who: Caller,
+    env: &Env,
+    config: &Keys,
+    data: &Path,
+    old_file: &Path,
+    remove_file: bool,
+    reason: impl FnOnce(&MasterKey, &Path) -> String,
+    dry_run: bool,
+) -> Result<KeyStatus, KeySourceError> {
     let _ownership = lock_data(data)?;
     protect_process()?;
     config.check().map_err(KeySourceError::Config)?;
@@ -359,17 +424,20 @@ pub async fn wrap_existing(
         return Err(KeySourceError::Config("wrap needs a KMS source".into()));
     }
     let path = config.envelope_path(data)?;
-    match std::fs::metadata(&path) {
-        Ok(_) => {
+    match exists_as(data, &path, who) {
+        Ok(true) => {
             return Err(KeySourceError::Config(
                 "a wrapped key already exists; use keys rewrap".into(),
             ));
         }
+        Ok(false) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let (master, _) = MasterKey::open(old_file, &data.join("keys"), None)?;
-    let stage = stage_stores(&data.join("keys"))?;
+    // An old key file inside the service's tree is not read through a link or
+    // a special file that the service user put in its place.
+    let master = read_old_key_as(data, old_file, who)?;
+    let stage = stage_stores_as(&data.join("keys"), who)?;
     master.validate_stores(stage.path())?;
     let deadline = operation_deadline(env, config)?;
     let wrapped = encrypt_retry(env, config, &master, deadline).await?;
@@ -390,21 +458,86 @@ pub async fn wrap_existing(
         let marker = serde_json::json!({"source":wrapped.source,"key":wrapped.key,
             "id":blake3::hash(&bytes).to_hex().to_string(),
             "reason":reason(&master, stage.path()),"wall_ms":env.clock.wall_ms()});
-        write_envelope(
+        write_envelope_as(
             env,
+            data,
             &data.join("keys").join(SOURCE_MARKER),
             &serde_json::to_vec(&marker).map_err(|_| KeySourceError::InvalidEnvelope)?,
             true,
+            who,
         )?;
-        write_envelope(env, &path, &bytes, false)?;
+        write_envelope_as(env, data, &path, &bytes, false, who)?;
         if remove_file && std::env::var_os(crate::MASTER_KEY_ENV).is_none() {
+            remove_key_file(data, old_file, who).map_err(|e| removal_failed(old_file, &e))?;
+        }
+    }
+    Ok(status)
+}
+
+/// The old key of `keys wrap`. A file in the tree of another user is read by
+/// name through descriptors: it must be a regular file with one link, and a
+/// link planted for it (or for `keys`) is an error and never followed. A file
+/// outside the data directory is the operator's and is read by path, as is
+/// everything in the caller's own tree. `KRONIK_MASTER_KEY` wins over a file,
+/// as it does for [`MasterKey::open`].
+fn read_old_key_as(data: &Path, old_file: &Path, who: Caller) -> Result<MasterKey, KeySourceError> {
+    let keys = data.join("keys");
+    if std::env::var_os(crate::MASTER_KEY_ENV).is_some() {
+        return Ok(MasterKey::open(old_file, &keys, None)?.0);
+    }
+    match reach(data, old_file, who)? {
+        Reach::Path => Ok(MasterKey::open(old_file, &keys, None)?.0),
+        Reach::Name(dir, name) => {
+            let bytes = match dir.read_regular(&name, 4096) {
+                Ok(bytes) => Zeroizing::new(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(PrivacyError::KeyMissing(format!(
+                        "no master key: {} does not exist and KRONIK_MASTER_KEY is not set",
+                        old_file.display()
+                    ))
+                    .into());
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let source = format!("file {}", old_file.display());
+            let text =
+                std::str::from_utf8(&bytes).map_err(|_| PrivacyError::BadKey(source.clone()))?;
+            Ok(MasterKey::from_hex(text, source)?)
+        }
+    }
+}
+
+/// The old key file is removed last, after the wrapped key and the source marker
+/// are written, so a failure to remove it is a failure of a wrap that is done: say
+/// so, because running the command again would only answer that a wrapped key
+/// exists.
+fn removal_failed(old_file: &Path, why: &std::io::Error) -> KeySourceError {
+    KeySourceError::Config(format!(
+        "the master key is wrapped (the wrapped key and the source marker are written), but the old key file {} could not be removed: {why}. Check the wrapped key (`kronik keys status` once the service runs), then remove the old file by hand; running `keys wrap` again would only say that a wrapped key exists",
+        old_file.display()
+    ))
+}
+
+/// Removes the old key file (and flushes its directory): by name when it lies
+/// in the tree of another user, where a link in its place is removed and not
+/// followed; by path when it is the operator's file outside the data
+/// directory. Whether it is one or the other is decided by [`reach`], and a
+/// failure to reach it is a failure to remove it: with `keys` swapped for a link
+/// to another directory, this must not delete the `master.key` that lies there.
+fn remove_key_file(data: &Path, old_file: &Path, who: Caller) -> std::io::Result<()> {
+    match reach(data, old_file, who)? {
+        Reach::Name(dir, name) => {
+            dir.unlink(&name)?;
+            dir.sync()
+        }
+        Reach::Path => {
             std::fs::remove_file(old_file)?;
             if let Some(parent) = old_file.parent() {
                 std::fs::File::open(parent)?.sync_all()?;
             }
+            Ok(())
         }
     }
-    Ok(status)
 }
 
 /// Offline validation must not create SQLite WAL sidecars in the source.
@@ -414,17 +547,200 @@ pub fn validate_staged_stores(master: &MasterKey, keys: &Path) -> Result<(), Key
     Ok(())
 }
 
+/// The largest store file that is staged.
+const MAX_STORE: u64 = 1 << 36;
+
+/// How a process reaches a file below a data directory. A privileged process
+/// that works in the tree of the nonroot service must not follow what is in
+/// it: the service user can swap any entry for a symbolic link, a FIFO, a
+/// socket or a hard link, and `keys` is the entry that matters. So when the
+/// data directory belongs to another user than the one the process runs as,
+/// every file below it is reached by name through descriptors
+/// ([`owned_tree`]); in the process's own tree (the daemon's, or a root
+/// installation's, where only root can have made a link) paths work as they
+/// always did.
+enum Reach {
+    Path,
+    Name(Dir, OsString),
+}
+
+/// Who reaches into a data directory, and what the directories on the way to
+/// it must be. In production it is this process, and the directories must
+/// belong to root or to it with no write access for anyone else; the tests
+/// play other users with other numbers.
+#[derive(Clone, Copy)]
+struct Caller {
+    euid: u32,
+    ancestors: Ancestors,
+}
+
+impl Caller {
+    fn this_process() -> Caller {
+        let euid = rustix::process::geteuid().as_raw();
+        Caller {
+            euid,
+            ancestors: Ancestors::ControlledBy(euid),
+        }
+    }
+}
+
+/// How `path` is reached. A path that is not below `data` is the operator's own
+/// file (the old key of `keys wrap` from `--master-key-file`) and is reached by
+/// path: that is decided by its spelling alone, before anything is opened, so
+/// that nothing the service user can change decides which way a file is
+/// reached. (A spelling with `..` cannot be told apart from one below `data`
+/// without following links, so in another user's tree it is refused.) A path
+/// below `data` is reached by name when the tree belongs to another user, and
+/// every failure on the way, a refused link first of all, is an error: no
+/// caller may go on by path after one.
+fn reach(data: &Path, path: &Path, who: Caller) -> std::io::Result<Reach> {
+    let Ok(relative) = path.strip_prefix(data) else {
+        if path.components().any(|c| matches!(c, Component::ParentDir))
+            && Dir::open(data)?.belongs_to_another_than(who.euid)?
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} has a `..` in it; name the file without it, so that it is not mistaken for one outside {}",
+                    path.display(),
+                    data.display()
+                ),
+            ));
+        }
+        return Ok(Reach::Path);
+    };
+    if !Dir::open(data)?.belongs_to_another_than(who.euid)? {
+        return Ok(Reach::Path);
+    }
+    // Another user's tree. The open above followed the links of the data
+    // directory's own path; this one starts at `/`, follows none, and passes
+    // only directories that root and the caller can change.
+    let anchor = Dir::open_absolute(data, who.ancestors, None).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "{e}. This data directory belongs to another user, and root reaches into such a directory only through directories that root alone can change: run the command as the user who owns it, or give the data directory a path that root controls"
+            ),
+        )
+    })?;
+    let name = relative
+        .file_name()
+        .ok_or_else(|| {
+            std::io::Error::other(format!("{} is the data directory itself", path.display()))
+        })?
+        .to_owned();
+    let parent = anchor.open_below(
+        relative.parent().unwrap_or(Path::new("")),
+        Ancestors::Any,
+        None,
+    )?;
+    Ok(Reach::Name(parent, name))
+}
+
+/// [`read_envelope`] of a file below `data`, safe in the nonroot service's tree.
+pub fn read_envelope_in(data: &Path, path: &Path) -> std::io::Result<Vec<u8>> {
+    read_envelope_as(data, path, Caller::this_process())
+}
+
+fn read_envelope_as(data: &Path, path: &Path, who: Caller) -> std::io::Result<Vec<u8>> {
+    match reach(data, path, who)? {
+        Reach::Path => read_envelope(path),
+        Reach::Name(dir, name) => dir.read_regular(&name, MAX_ENVELOPE),
+    }
+}
+
+/// Whether `path` below `data` exists (a link counts as existing), safe in the
+/// nonroot service's tree.
+pub fn exists_in(data: &Path, path: &Path) -> std::io::Result<bool> {
+    exists_as(data, path, Caller::this_process())
+}
+
+fn exists_as(data: &Path, path: &Path, who: Caller) -> std::io::Result<bool> {
+    match reach(data, path, who)? {
+        Reach::Path => path.try_exists(),
+        Reach::Name(dir, name) => Ok(dir.entry(&name)?.is_some()),
+    }
+}
+
+/// [`write_envelope`] for a file below `data`. In the nonroot service's tree
+/// the file is made by name in the directory that holds it (which must exist),
+/// given to that directory's owner before it appears, and never written
+/// through a link.
+pub fn write_envelope_in(
+    env: &Env,
+    data: &Path,
+    path: &Path,
+    bytes: &[u8],
+    replace: bool,
+) -> std::io::Result<()> {
+    write_envelope_as(env, data, path, bytes, replace, Caller::this_process())
+}
+
+fn write_envelope_as(
+    env: &Env,
+    data: &Path,
+    path: &Path,
+    bytes: &[u8],
+    replace: bool,
+    who: Caller,
+) -> std::io::Result<()> {
+    let (dir, name) = match reach(data, path, who)? {
+        Reach::Path => return write_envelope(env, path, bytes, replace),
+        Reach::Name(dir, name) => (dir, name),
+    };
+    let owner = dir.stat()?;
+    let temp = OsString::from(format!(
+        ".wrapped-{}",
+        crate::hex(&env.random_bytes::<16>())
+    ));
+    let result = (|| {
+        let mut file = dir.create_file(&temp, 0o600)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        owned_tree::chown_file(&file, owner.uid, owner.gid)?;
+        if replace {
+            dir.rename(&temp, &name)?;
+        } else {
+            dir.link(&temp, &name)?;
+            dir.unlink(&temp)?;
+        }
+        dir.sync()
+    })();
+    let _ = dir.unlink(&temp);
+    result
+}
+
 fn stage_stores(keys: &Path) -> Result<tempfile::TempDir, KeySourceError> {
-    let stage = tempfile::tempdir()?;
+    stage_stores_as(keys, Caller::this_process())
+}
+
+fn stage_stores_as(keys: &Path, who: Caller) -> Result<tempfile::TempDir, KeySourceError> {
+    // Copies of a service's databases, kept private to the caller.
+    let stage = tempfile::Builder::new()
+        .prefix("kronik-stores-")
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir()?;
+    let data = keys.parent().unwrap_or(Path::new("/"));
     for file in [
         "secrets.db",
         "secrets.db-wal",
         "keystore.db",
         "keystore.db-wal",
     ] {
-        match std::fs::copy(keys.join(file), stage.path().join(file)) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // A data directory or `keys` that is not there holds no stores.
+        let copied = reach(data, &keys.join(file), who).and_then(|reached| match reached {
+            Reach::Path => std::fs::copy(keys.join(file), stage.path().join(file)).map(drop),
+            Reach::Name(dir, name) => std::fs::File::create_new(stage.path().join(file))
+                .and_then(|mut to| dir.copy_regular(&name, &mut to, MAX_STORE))
+                .map(drop),
+        });
+        match copied {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A store that is not there is not staged; a copy that was
+                // begun for it is not left behind.
+                let _ = std::fs::remove_file(stage.path().join(file));
+            }
             Err(e) => return Err(e.into()),
         }
     }

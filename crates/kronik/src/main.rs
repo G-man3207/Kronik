@@ -96,6 +96,16 @@ fn main() -> ExitCode {
         }
         Command::Client(command) => return cli::run(command, &cli.client),
     };
+    if let Some((init, config, master_key_file)) = args.init_args() {
+        if let Some(exit) = cli.client.refuse_remote("serve --init") {
+            return exit;
+        }
+        if cli.client.socket.is_some() {
+            eprintln!("error: kronik serve --init takes no --socket");
+            return ExitCode::from(2);
+        }
+        return init::run(&init, config, master_key_file, cli.client.json);
+    }
     if cli.client.given() {
         eprintln!(
             "error: kronik serve takes none of --socket, --url, --token and --json, which are for the client commands; its own API socket is --api-socket (see kronik serve --help)"

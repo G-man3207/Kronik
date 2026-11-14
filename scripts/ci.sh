@@ -128,7 +128,8 @@ for entry in pathlib.Path("scripts/unsafe-allowlist.txt").read_text().splitlines
         if not why.strip():
             bad.append(f"scripts/unsafe-allowlist.txt: {path} has no reason")
         allowed[path] = why.strip()
-files = [f for root in ("crates", "sdk/rust/src", "vendor/raft/src", "vendor/raft-proto/src")
+files = [f for root in ("crates", "sdk/rust/src", "vendor/raft/src", "vendor/raft-proto/src",
+                        "examples/foreign-probe/src")
          for f in pathlib.Path(root).rglob("*.rs") if "target" not in f.parts]
 for f in sorted(files):
     src = code(f.read_text())
@@ -339,7 +340,30 @@ step_foreign() {
         return 0
     fi
     scripts/build-foreign-examples.sh
+    # The hostile actor (M21's malicious foreign actor, bounded for CI): the
+    # foreign tests run it, root in a gVisor sandbox, against the host's
+    # listeners, files, processes and devices and a neighbouring sandbox
+    # (a_hostile_actor_reaches_nothing_of_the_host_or_its_neighbour). The full
+    # proof under the installed nonroot service is the isolation workflow.
+    scripts/build-foreign-examples.sh --only foreign-probe
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --test foreign -- --test-threads=1
+    # The isolation work's tests that need root or user and mount namespaces,
+    # which an unprivileged run skips: the rehearsals of the microVM launcher
+    # (all of `sys::tests` of kronik-foreign: what the launcher does in
+    # namespaces of its own), the nonroot installer's hand-over of a data
+    # directory to another user, and root's work in a tree that another user
+    # owns (the key source), and a restore as root that gives up root before it
+    # writes. With require, a host that cannot run them fails here instead of
+    # leaving them absent from every run.
+    KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik-foreign --lib sys::tests
+    KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --bin kronik data_directory_tests
+    KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik-privacy --lib key_source::tests
+    # `kronik restore` as root into the nonroot service's directory, with the
+    # real drop of privileges: it needs root, a second uid and a private
+    # mount namespace in which /etc is a small tree the test writes with that
+    # user (no copy of the host's /etc).
+    KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --bin kronik restore::tests
+    KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --test restore_drop
 }
 
 # Identity replay of every example app (the Definition of done: "Identity

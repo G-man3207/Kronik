@@ -46,9 +46,37 @@ scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples,
 scripts/ci.sh clippy test    # selected steps
 ```
 
-`scripts/ci.sh` exits non-zero if any step fails. The `foreign` step needs
-root and `runsc` and is skipped with a message otherwise; without
-libfaketime, `identity` skips `todo-ts` the same way. The `action` step
+`scripts/ci.sh` exits non-zero if any step fails. The M20 and M21 isolation
+checks are explicit and are not CI steps: they need root, runsc, systemd 255
+or newer and free numeric ids, the microVM ones also `/dev/kvm`, and the
+wrapper expects an Ubuntu 24.04 host (the brief's install target). They change
+their host, so they run only on a disposable one: the manual `isolation`
+workflow runs them on GitHub-hosted runners and keeps their evidence
+([ADR 0133](docs/adr/0133-isolation-proofs-on-hosted-runners.md);
+`scripts/isolation-ci.py` is its driver, and refuses its host-changing steps
+anywhere else).
+`scripts/build-microvm-tools.sh` builds the pinned
+microVM tool bundle, `scripts/proof-rootless.sh` (and the commands of
+[ADR 0064](docs/adr/0064-foreign-isolation-conformance.md)) runs the
+conformance harness and the escape probe. The two explicit drivers,
+`rootless_boundary` and `isolation_fixture`, are built by name
+(`cargo test -p kronik --no-run --test isolation_fixture`; ADR 0064 gives
+their arguments) and are never run by `cargo test`. The `foreign` step
+needs root and `runsc` and is skipped with a message otherwise; without
+libfaketime, `identity` skips `todo-ts` the same way. Run as root, the
+`foreign` step also runs, under `KRONIK_FOREIGN_TESTS=require`, the
+rehearsals of the microVM launcher (`sys::tests` of `kronik-foreign`), the
+installer's hand-over of a data directory to another user, the key
+source's work in a tree that another user owns and `kronik restore` as root
+into the nonroot service's directory (`--test restore_drop`, which really
+gives up root), so that a host that cannot run them fails the step instead
+of leaving them out. It also builds the hostile `foreign-probe` image and runs
+M21's malicious actor, bounded for CI: root in its gVisor sandbox under the
+root daemon, the probe tries the host's TCP, UDP, Unix and abstract-socket
+listeners, its files, processes and devices, writes into its directories and a
+neighbouring sandbox, and must fail at all of it while its own controls work
+(about ten seconds). The full proof, under the installed nonroot service with
+SysV, demo and microVM checks, is the manual `isolation` workflow. The `action` step
 installs checksum-verified actionlint 1.7.12 into `target/tools/` and lints
 the actual workflows and composite action; a download or lint failure
 fails the step. Its YAML structure checks of the workflows need PyYAML

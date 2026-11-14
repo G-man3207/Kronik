@@ -35,7 +35,7 @@ class GithubFixtureTest(unittest.TestCase):
         # cannot stand in for its real events, so it still starts only for one
         # manifest path.
         automatic = {"push", "pull_request", "pull_request_target", "schedule", "workflow_run"}
-        for name in ("ci.yml", "nightly.yml", "release.yml"):
+        for name in ("ci.yml", "nightly.yml", "release.yml", "isolation.yml"):
             workflow = yaml.load((ROOT / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
             self.assertIn("workflow_dispatch", workflow["on"], name)
             self.assertTrue(automatic.isdisjoint(workflow["on"]), name)
@@ -47,6 +47,34 @@ class GithubFixtureTest(unittest.TestCase):
         self.assertEqual(set(flow["jobs"]), {"propose", "verify", "promote"})
         self.assertIn("head.repo.full_name == github.repository", flow["jobs"]["propose"]["if"])
         self.assertEqual(flow["jobs"]["promote"]["environment"]["name"], "kronik-production")
+
+    def test_the_isolation_proofs_keep_their_evidence_and_pin_every_action(self):
+        # ADR 0133: the M21 job twice (R1 active and lifted), the microVM tool
+        # bundle, then M20; every job keeps its evidence whatever happened and
+        # fails unless every proof left a pass. Every action is pinned by commit.
+        text = (ROOT / ".github/workflows/isolation.yml").read_text()
+        workflow = yaml.load(text, Loader=yaml.BaseLoader)
+        self.assertEqual(set(workflow["jobs"]), {"m21", "microvm-tools", "m20"})
+        self.assertEqual(workflow["jobs"]["m21"]["strategy"]["matrix"]["userns"], ["restricted", "lifted"])
+        self.assertEqual(workflow["jobs"]["m20"]["needs"], "microvm-tools")
+        for name, job in workflow["jobs"].items():
+            uploads = [step for step in job["steps"] if step.get("uses", "").startswith("actions/upload-artifact@")]
+            self.assertEqual(len(uploads), 1, name)
+            self.assertEqual(uploads[0]["if"], "always()", name)
+            self.assertEqual(uploads[0]["with"]["if-no-files-found"], "error", name)
+            if name != "microvm-tools":
+                verify = [step for step in job["steps"] if "isolation-ci.py verify" in step.get("run", "")]
+                self.assertEqual(len(verify), 1, name)
+                self.assertEqual(verify[0]["if"], "always()", name)
+            for step in job["steps"]:
+                if "actions/checkout@" in step.get("uses", ""):
+                    self.assertEqual(step["with"]["persist-credentials"], "false", name)
+        for line in text.splitlines():
+            if "uses:" in line:
+                reference = line.split("uses:", 1)[1].split("#", 1)[0].strip()
+                action, _, version = reference.partition("@")
+                self.assertRegex(version, r"^[0-9a-f]{40}$", line)
+                self.assertRegex(line, r"# v\d+\.\d+\.\d+$", line)
 
     def test_manifest_accepts_only_two_real_pinned_components(self):
         with tempfile.TemporaryDirectory() as directory:
