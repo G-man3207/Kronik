@@ -1322,8 +1322,20 @@ impl World {
                 match text.split(' ').next().unwrap_or_default() {
                     "fail" => failed,
                     "trap" => trapped,
-                    // A re-run's send-now without a recorded result.
-                    "stream" => failed && o.message.contains("outcome is unknown"),
+                    // A re-run's send-now without a recorded result is
+                    // outcome-unknown (I17), which `stream` does not
+                    // handle: the turn ends EFFECT_OUTCOME_UNKNOWN, whatever
+                    // the guest said (`mark_unknown_outcome`). C5 checks
+                    // that the unknown send is a re-run's.
+                    "stream" => {
+                        o.kind == pb::OutcomeKind::EffectOutcomeUnknown as i32
+                            && o.error_code == "EFFECT_OUTCOME_UNKNOWN"
+                            && o.message.contains("send-now: the outcome is unknown")
+                            && t.effects.iter().any(|e| {
+                                e.kind == "connection.send-now"
+                                    && e.status == pb::EffectStatus::OutcomeUnknown as i32
+                            })
+                    }
                     "send-to" | "kick" | "now-to" => {
                         trapped
                             && (o.error_code == "CONNECTION_NOT_HELD"
@@ -1614,17 +1626,30 @@ impl World {
                     for e in t.effects.iter().filter(|e| e.kind == KIND) {
                         note(&t.execution_id, e);
                         // A re-run: its TurnBegin is from before a restart.
-                        let Some(begin) = begun.get(&t.execution_id) else {
-                            continue;
-                        };
-                        let Some(restart) = starts.iter().find(|s| **s >= *begin && **s < *lsn)
-                        else {
+                        let restart = begun
+                            .get(&t.execution_id)
+                            .and_then(|begin| starts.iter().find(|s| **s >= *begin && **s < *lsn));
+                        // Only a re-run, whose send has no recorded result,
+                        // may not know its outcome (I17).
+                        if e.status == unknown && restart.is_none() {
+                            self.violation(format!(
+                                "C5: send-now {} of {} at lsn {lsn} is outcome-unknown, but the turn never ran again after a restart",
+                                e.ordinal, t.execution_id
+                            ));
+                        }
+                        let Some(restart) = restart else {
                             continue;
                         };
                         self.st().conns.stats.now_reruns += 1;
                         let recorded = results
                             .get(&(t.execution_id.clone(), e.ordinal))
                             .is_some_and(|at| at.iter().any(|l| l <= restart));
+                        if recorded && e.status == unknown {
+                            self.violation(format!(
+                                "C5: send-now {} of {} at lsn {lsn} is outcome-unknown, though its result was recorded before the restart at lsn {restart}",
+                                e.ordinal, t.execution_id
+                            ));
+                        }
                         // Without a result, a re-run must not call the hub.
                         if !recorded && (e.status == ok || e.status == timeout) {
                             self.violation(format!(
