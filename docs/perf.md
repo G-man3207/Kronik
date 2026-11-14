@@ -508,17 +508,23 @@ The four tests took 17 s together.
 ### Results (VPS sizes, 2026-11-14)
 
 The test VPS's sizes (`KRONIK_M25_FULL=1`), on the development machine
-(debug build) and on the test machine (4 vCPU, 7 GiB; release build for
-glibc 2.35, the daemon confined to two CPUs and 4 GiB as on the 2-vCPU VPS,
-the client on the other two):
+(debug build) and on the test machine (4 vCPU, 7 GiB; the daemon confined to
+two CPUs and 4 GiB as on the 2-vCPU VPS, the client on the other two). The
+test machine ran the release's static musl build, with musl's allocator, of
+the M25 work based on `main` at `f725254a` (`cargo zigbuild --locked --release -p
+kronik --target x86_64-unknown-linux-musl --config 'profile.release.strip =
+"symbols"'`, the pins of `scripts/install-zig.sh`; SHA-256
+`d15e3efa031cbe33de72f290c0ac030e79fbe5d408927dc05ca905133a42bdd1`), at 19:01
+UTC:
 
 | What | Sizes | Development machine | Test machine |
 | --- | --- | --- | --- |
-| Upload | 30 MB, 300 MB | +1.5 MiB, +4.2 MiB | +1.4 MiB, +2.9 MiB |
-| Fetch | 4 MB, 40 MB | +3.9 MiB, +6.4 MiB | +1.2 MiB, +1.5 MiB |
-| Response | 100 MB, 1 GB | +1.5 MiB, +5.3 MiB | +0.0 MiB, +0.0 MiB |
+| Upload | 30 MB, 300 MB | +1.5 MiB, +4.2 MiB | +1.6 MiB, +1.6 MiB |
+| Fetch | 4 MB, 40 MB | +3.9 MiB, +6.4 MiB | +0.4 MiB, +0.4 MiB |
+| Response | 100 MB, 1 GB | +1.5 MiB, +5.3 MiB | +1.4 MiB, +1.4 MiB |
 
-All four tests passed, in 34 s and 17 s. A growth of 0 means the peak of
+All four tests passed, in 34 s and 28 s. An earlier run on the test machine
+with a glibc 2.35 build of the same work grew the peak by at most 2.9 MiB. A growth of 0 means the peak of
 the warm-up request (a 2 MiB response) was not exceeded: a gigabyte
 streamed through one frame at a time.
 
