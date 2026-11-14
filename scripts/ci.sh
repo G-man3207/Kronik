@@ -4,6 +4,7 @@
 #
 # Usage: scripts/ci.sh [STEP...]
 # Steps: fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny,
+# musl (the release target, linked against the release's zig and musl),
 # foreign (needs root and runsc; skipped with a message otherwise, a failure
 # with KRONIK_FOREIGN_TESTS=require),
 # identity (without libfaketime, todo-ts is skipped with a message too),
@@ -406,6 +407,21 @@ step_identity() {
     KRONIK_BIN="$kronik" scripts/identity-examples.sh "${only[@]}"
 }
 
+# The static release binary's target, linked as scripts/release.sh links it:
+# cargo-zigbuild with the release's pinned zig and its musl, in a debug build,
+# which links the same symbols as the release's at a fraction of its time. A
+# libc function that zig's musl does not have, which compiles against the
+# libc crate and works on glibc, is an undefined symbol here (renameat2 was
+# one). x86_64 only: musl's set of functions does not depend on the
+# architecture.
+step_musl() {
+    local tools zig_dir
+    tools="$(mkdir -p "${CARGO_TARGET_DIR:-target}/tools" && cd "${CARGO_TARGET_DIR:-target}/tools" && pwd)"
+    zig_dir="$(scripts/install-zig.sh "$tools")"
+    rustup target add x86_64-unknown-linux-musl
+    PATH="$zig_dir:$tools/bin:$PATH" cargo zigbuild --locked -p kronik --target x86_64-unknown-linux-musl
+}
+
 # The GitHub Action and pure-Python boundary tests. Install the pinned,
 # checksum-verified actionlint rather than silently skipping it.
 step_action() {
@@ -418,14 +434,14 @@ step_action() {
 }
 
 if [ "$#" -eq 0 ]; then
-    set -- fmt clippy hygiene test docs book examples ts sdks dst deny foreign identity action
+    set -- fmt clippy hygiene test docs book examples ts sdks dst deny musl foreign identity action
 fi
 
 for step in "$@"; do
     case "$step" in
-        fmt | clippy | hygiene | test | docs | book | examples | ts | sdks | dst | deny | foreign | identity | action) ;;
+        fmt | clippy | hygiene | test | docs | book | examples | ts | sdks | dst | deny | musl | foreign | identity | action) ;;
         *)
-            echo "error: unknown step '$step'; expected fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, foreign, identity or action" >&2
+            echo "error: unknown step '$step'; expected fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, identity or action" >&2
             exit 2
             ;;
     esac

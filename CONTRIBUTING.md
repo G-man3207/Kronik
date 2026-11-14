@@ -42,7 +42,7 @@ step. These are development dependencies, not daemon/runtime requirements.
 Run the same checks as CI before you push:
 
 ```sh
-scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, foreign, identity and action
+scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, identity and action
 scripts/ci.sh clippy test    # selected steps
 ```
 
@@ -137,9 +137,13 @@ The Release workflow was already manual. See
 [ADR 0110](docs/adr/0110-manual-github-workflows.md).
 
 CI runs the steps of `scripts/ci.sh` in parallel jobs, each step once: fmt,
-clippy, hygiene, docs, book and deny; test; dst; foreign; examples, ts, sdks
-and identity, in one job because identity replays the examples the others
-build; and action. A job runs its steps in the script's order. The hygiene
+clippy, hygiene, docs, book and deny; test; dst; musl; foreign; examples, ts,
+sdks and identity, in one job because identity replays the examples the others
+build; and action. The musl step links `kronik` for the static release target
+(`x86_64-unknown-linux-musl`) with the release's pinned zig and cargo-zigbuild
+(`scripts/install-zig.sh`, which `scripts/release.sh` uses too), in a debug
+build: a libc function that zig's musl does not have, which compiles and works
+on glibc, is an undefined symbol there and not first in the release. A job runs its steps in the script's order. The hygiene
 step checks both with `scripts/check-ci-steps.py`, so a new default step in
 `scripts/ci.sh` must also go into one of the jobs.
 

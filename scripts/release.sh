@@ -31,10 +31,8 @@ if ! command -v cargo >/dev/null 2>&1 && [ -f "${CARGO_HOME:-$HOME/.cargo}/env" 
     . "${CARGO_HOME:-$HOME/.cargo}/env"
 fi
 
-zig_version=0.17.0
-zig_sha256_x86_64=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
-zig_sha256_aarch64=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8
-zigbuild_version=0.24.0
+# zig and cargo-zigbuild are pinned in scripts/install-zig.sh, which the CI's
+# musl step uses too.
 cyclonedx_version=0.5.9
 targets=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl)
 with_keyhelper="${KRONIK_RELEASE_KEYHELPER:-no}"
@@ -54,29 +52,16 @@ export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git show -s --format=%ct HEAD)}"
 [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]] || { echo "invalid SOURCE_DATE_EPOCH" >&2; exit 1; }
 
-# zig, checked against its pinned SHA-256.
 host="$(uname -m)"
 if [ "$with_keyhelper" = yes ] && [ "$host" != x86_64 ]; then
     echo "the optional GNU helper must be built on the supported x86_64 GNU host" >&2
     exit 1
 fi
-zig_sha256_var="zig_sha256_$host"
-zig_dir="$tools/zig-$host-linux-$zig_version"
-if [ ! -x "$zig_dir/zig" ]; then
-    mkdir -p "$tools"
-    archive="$tools/zig-$host-linux-$zig_version.tar.xz"
-    curl -fsSL -o "$archive" "https://ziglang.org/download/$zig_version/zig-$host-linux-$zig_version.tar.xz"
-    echo "${!zig_sha256_var}  $archive" | sha256sum -c -
-    tar -xJf "$archive" -C "$tools"
-    rm "$archive"
-fi
-[ "$("$zig_dir/zig" version)" = "$zig_version" ] || { echo "wrong pinned Zig version" >&2; exit 1; }
+# zig, checked against its pinned SHA-256, and cargo-zigbuild, pinned.
+zig_dir="$(scripts/install-zig.sh "$tools")"
 export PATH="$zig_dir:$tools/bin:$PATH"
 
-# cargo-zigbuild and cargo-cyclonedx, pinned.
-if [ "$(cargo-zigbuild --version 2>/dev/null)" != "cargo-zigbuild $zigbuild_version" ]; then
-    cargo install --locked --root "$tools" --version "$zigbuild_version" cargo-zigbuild
-fi
+# cargo-cyclonedx, pinned.
 if [ "$(cargo cyclonedx --version 2>/dev/null)" != "cargo-cyclonedx-cyclonedx $cyclonedx_version" ]; then
     cargo install --locked --root "$tools" --version "$cyclonedx_version" cargo-cyclonedx
 fi

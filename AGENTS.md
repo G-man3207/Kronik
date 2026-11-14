@@ -92,7 +92,7 @@ The full list is in `CONTRIBUTING.md`. In short:
 ## Running CI locally
 
 ```sh
-scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, foreign, identity and action, as in CI
+scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, identity and action, as in CI
 scripts/ci.sh clippy test    # selected steps
 ```
 
@@ -109,6 +109,10 @@ and `cargo-deny`. Some steps need more:
 - `book` downloads the pinned mdBook and `action` the pinned actionlint, both
   checksum-verified; a failed download or check fails the step. `action` also
   needs PyYAML and HTTPS access.
+- `musl` links `kronik` for `x86_64-unknown-linux-musl` as the release does,
+  with the release's pinned zig and cargo-zigbuild
+  (`scripts/install-zig.sh`, into `target/tools`, checksum-verified; network
+  access on first use), so a libc function that musl lacks fails here.
 - `foreign` needs root and gVisor's `runsc` (`scripts/install-runsc.sh`) and
   is skipped with a message without them, unless
   `KRONIK_FOREIGN_TESTS=require`. When it runs, it also needs Docker for the
