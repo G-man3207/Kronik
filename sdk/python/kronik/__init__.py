@@ -2,13 +2,17 @@
 
 from .actor import ActorSpec, Route, actor
 from .connections import Closed, Connections, Frame, IncomingFrame, OpenRequest, OutcomeUnknown
-from .ctx import ConnectionOps, Crypto, Ctx, Http, Log, Random, Secrets, Sql, State, Timers
+from .ctx import BlobReader, Blobs, BlobWriter, ConnectionOps, Crypto, Ctx, Http, Log, Random, Secrets, Sql, State, Timers
 from .errors import KronikError, Rejected
-from .http import FetchResponse, Message, Request, Secret, SecretHeader, Timer
+from .http import BlobRef, FetchResponse, Message, Request, Secret, SecretHeader, Timer
 from .sql import SqlRows
 
 __all__ = [
     "ActorSpec",
+    "BlobReader",
+    "BlobRef",
+    "BlobWriter",
+    "Blobs",
     "Closed",
     "ConnectionOps",
     "Connections",

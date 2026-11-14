@@ -6,9 +6,11 @@
 # "content_type": ...}; the body (bytes, str, or a value as JSON) and the
 # content type (default: what follows from the body) are optional.
 
+import io
+
 from .connections import send_now_failure, to_wit_frame
-from .errors import host_error
-from .http import FetchResponse, Message, Secret, SecretHeader, encode_body, parse_json, text, to_json
+from .errors import KronikError, host_error
+from .http import BLOB_CALL_BYTES, BLOB_FRAME_BYTES, BlobRef, FetchResponse, Message, Secret, SecretHeader, encode_body, parse_json, text, to_json
 from .sql import SqlRows, has_order_by, to_sql
 
 
@@ -120,17 +122,26 @@ class Sql:
 class Http:
     """Outgoing HTTP, recorded as effects (see `kronik explain effect`). Needs the capability `http:<host>`."""
 
-    def __init__(self, h):
+    def __init__(self, h, blobs):
         self._h = h
+        self._blobs = blobs
 
-    def fetch(self, request):
-        """Sends `request` and waits for the FetchResponse.
+    def fetch(self, request, **fields):
+        """Sends a request and waits for the FetchResponse.
 
-        `request` is a dict: `url`, and optionally `method` (default GET),
-        `headers` (name to str, or a SecretHeader from `ctx.secret(name).header()`)
-        and `body` (bytes, str, or a value sent as JSON, which also sets content-type).
+        `request` is a dict, or the URL with the other fields as keywords
+        (`fetch(url, method="POST", body=b)`): `url`, and optionally `method`
+        (default GET), `headers` (name to str, or a SecretHeader from
+        `ctx.secret(name).header()`) and `body` (bytes, str, a value sent as JSON,
+        which also sets content-type, or a BlobRef, streamed from the blob store
+        as `application/octet-stream` unless the headers say otherwise).
         """
+        if isinstance(request, str):
+            request = dict(fields, url=request)
+        elif fields:
+            raise TypeError("fetch takes a dict, or a URL and keywords, not both")
         hc = self._h.http_client
+        types = self._h.types
         headers = []
         has_content_type = False
         for name, value in (request.get("headers") or {}).items():
@@ -140,16 +151,157 @@ class Http:
             else:
                 value = hc.HeaderValue_Text(value)
             headers.append(hc.RequestHeader(name, value))
-        body = b""
-        if "body" in request:
-            body, content_type = encode_body(request["body"])
+        body = types.HttpBody_Inline(b"")
+        if isinstance(request.get("body"), BlobRef):
+            blob = request["body"]
+            body = types.HttpBody_Blob(types.BlobRef(blob.hash, blob.size))
+            if not has_content_type:
+                headers.append(hc.RequestHeader("content-type", hc.HeaderValue_Text("application/octet-stream")))
+        elif "body" in request:
+            data, content_type = encode_body(request["body"])
+            body = types.HttpBody_Inline(data)
             if not has_content_type:
                 headers.append(hc.RequestHeader("content-type", hc.HeaderValue_Text(content_type)))
-        req = hc.Request(request.get("method") or "GET", request["url"], headers, self._h.types.HttpBody_Inline(body))
+        req = hc.Request(request.get("method") or "GET", request["url"], headers, body)
         try:
-            return FetchResponse(hc.fetch(req))
+            return FetchResponse(hc.fetch(req), self._blobs.read_all)
         except self._h.Err as e:
             raise host_error("fetch", e.value) from None
+
+
+class Blobs:
+    """The turn's blobs (see `kronik explain blob`): read the ones the turn got
+    (its request's or a fetch response's body) and the ones it wrote, in ranges
+    or with a reader, and write new ones. The host checks every call
+    (`BLOB_NOT_HELD`)."""
+
+    def __init__(self, h):
+        self._h = h
+
+    def _get(self, blob, offset, n):
+        try:
+            return bytes(self._h.blobs.get(self._h.types.BlobRef(blob.hash, blob.size), offset, n))
+        except self._h.Err as e:
+            raise host_error("blob", e.value) from None
+
+    def get(self, blob, offset, n):
+        """Up to `n` bytes of `blob` from `offset`: fewer only at its end, none at
+        or past it. One host call moves at most 1 MiB; this makes as many as `n`
+        needs."""
+        if offset < 0 or n < 0:
+            raise KronikError("blob.range", f"no such range of a blob: offset {offset}, length {n}", "", "blob")
+        end = min(blob.size, offset + n)
+        parts = []
+        at = offset
+        while at < end:
+            chunk = self._get(blob, at, min(BLOB_CALL_BYTES, end - at))
+            if not chunk:
+                break
+            parts.append(chunk)
+            at += len(chunk)
+        return b"".join(parts)
+
+    def read_all(self, blob):
+        """The whole blob: a lazy body. It must fit in the guest's memory (64 MiB by default)."""
+        return self.get(blob, 0, blob.size)
+
+    def reader(self, blob):
+        """A seekable binary file (`io.RawIOBase`) that reads `blob`; wrap it in
+        `io.BufferedReader` to read lines."""
+        return BlobReader(self, blob)
+
+    def writer(self):
+        """A writer of a new blob, tagged with the turn's default subject:
+        `write()` its bytes, then `finish()` to get the BlobRef, which the turn
+        may use as a response or fetch body."""
+        return BlobWriter(self._h, self._h.blobs.Writer())
+
+
+class BlobReader(io.RawIOBase):
+    """Reads one blob as a seekable binary file; see Blobs.reader. It fetches
+    whole 64 KiB frames (a read is charged for every frame it touches) and
+    serves small reads from the last ones it fetched."""
+
+    def __init__(self, blobs, blob):
+        super().__init__()
+        self._blobs = blobs
+        self.blob = blob
+        self._pos = 0
+        self._block_at = 0
+        self._block = b""
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def readinto(self, b):
+        view = memoryview(b).cast("B")
+        if not view or self._pos >= self.blob.size:
+            return 0
+        rel = self._pos - self._block_at
+        if not 0 <= rel < len(self._block):
+            self._block_at = self._pos - self._pos % BLOB_FRAME_BYTES
+            want = self._pos - self._block_at + len(view)
+            want = min(BLOB_CALL_BYTES, -(-want // BLOB_FRAME_BYTES) * BLOB_FRAME_BYTES)
+            self._block = self._blobs._get(self.blob, self._block_at, want)
+            rel = self._pos - self._block_at
+            if rel >= len(self._block):
+                return 0
+        n = min(len(view), len(self._block) - rel)
+        view[:n] = self._block[rel : rel + n]
+        self._pos += n
+        return n
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        base = {io.SEEK_SET: 0, io.SEEK_CUR: self._pos, io.SEEK_END: self.blob.size}[whence]
+        if base + offset < 0:
+            raise ValueError("negative seek position")
+        self._pos = base + offset
+        return self._pos
+
+    def tell(self):
+        return self._pos
+
+
+class BlobWriter:
+    """Writes one blob in parts; `finish()` ends it and returns its BlobRef.
+    Bytes go to the host as whole 64 KiB frames (calls of at most 1 MiB);
+    what is short of a frame waits for the next write or `finish()`."""
+
+    def __init__(self, h, writer):
+        self._h = h
+        self._writer = writer
+        self._pending = b""
+
+    def _send(self, data):
+        for at in range(0, len(data), BLOB_CALL_BYTES):
+            try:
+                self._writer.write(data[at : at + BLOB_CALL_BYTES])
+            except self._h.Err as e:
+                raise host_error("blob", e.value) from None
+
+    def write(self, data):
+        """Appends bytes, or a str as UTF-8, of any length; returns how many bytes."""
+        data = data.encode() if isinstance(data, str) else bytes(data)
+        n = len(data)
+        if self._pending:
+            data = self._pending + data
+        whole = len(data) - len(data) % BLOB_FRAME_BYTES
+        self._send(data[:whole])
+        self._pending = data[whole:]
+        return n
+
+    def finish(self):
+        """Ends the blob and returns its BlobRef; the writer takes no more bytes."""
+        self._send(self._pending)
+        self._pending = b""
+        try:
+            blob = self._writer.finish()
+        except self._h.Err as e:
+            raise host_error("blob", e.value) from None
+        return BlobRef(blob.hash, blob.size)
 
 
 class Crypto:
@@ -296,14 +448,15 @@ class Log:
 class Ctx:
     """A turn's access to the host: the names Kronik's SDKs share (`state`,
     `sql`, `send`, `call`, `http.fetch`, `crypto`, `timers`, `now`, `random`,
-    `causal_id`, `secret`, `subject`, `log`) and helpers for outputs."""
+    `causal_id`, `secret`, `subject`, `log`, `blobs`) and helpers for outputs."""
 
     def __init__(self, h):
         self._h = h
         self.state = State(h)
         self.log = Log(h)
         self.sql = Sql(h, self.log)
-        self.http = Http(h)
+        self.blobs = Blobs(h)
+        self.http = Http(h, self.blobs)
         self.crypto = Crypto(h)
         self.secrets = Secrets(h)
         self.timers = Timers(h)
@@ -371,6 +524,13 @@ class Ctx:
     def text(self, status, body):
         """An HTTP response with a text body."""
         return self._http(status, "text/plain; charset=utf-8", body.encode())
+
+    def blob(self, status, blob, content_type="application/octet-stream"):
+        """An HTTP response whose body is `blob` (one the turn got or wrote): the
+        gateway streams it from the blob store."""
+        t = self._h.types
+        body = t.HttpBody_Blob(t.BlobRef(blob.hash, blob.size))
+        return t.Output_Http(t.HttpResponse(status, [t.Header("content-type", content_type)], body))
 
     def status(self, status):
         """An HTTP response with no body, such as 404."""

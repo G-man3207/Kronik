@@ -46,9 +46,39 @@ def parse_json(data, what, topic):
         raise KronikError("json", f"{what} is not the expected JSON", str(e), topic) from None
 
 
-def _inline(body):
-    # A blob body (from M25) is empty here.
-    return body.value if isinstance(body.value, bytes) else b""
+BLOB_CALL_BYTES = 1 << 20
+"""The most bytes one blob call moves: 1 MiB."""
+
+BLOB_FRAME_BYTES = 1 << 16
+"""A blob's frame: the store reads and checks whole frames, and a read is
+charged for every frame it touches, so readers fetch whole frames."""
+
+
+@dataclass(frozen=True)
+class BlobRef:
+    """A blob: a large body kept outside the log and named by its hash (see
+    `kronik explain blob`). A handler gets one as `req.blob` or `res.blob`, or
+    from `ctx.blobs.writer().finish()`, and may use it in the turn that got
+    it: read it (`ctx.blobs`), answer with it (`ctx.blob`), or send it
+    (`ctx.http.fetch(url, body=blob)`). `hash` is `b3:<hex>`, or `b3s:<hex>`
+    for a data subject's blob; `size` its size in bytes."""
+
+    hash: str
+    size: int
+
+
+def _split_body(body):
+    """An HTTP body's (inline bytes, None) or (None, BlobRef)."""
+    value = body.value
+    if isinstance(value, _BYTES):
+        return bytes(value), None
+    return None, BlobRef(value.hash, value.size)
+
+
+def _whole(blob, read, what):
+    if read is None:
+        raise KronikError("blob", f"{what} is a blob that this value cannot read", "", "blob")
+    return read(blob)
 
 
 def _header(headers, name):
@@ -61,16 +91,27 @@ class Request:
 
     `query` is the raw query string without `?`, `params` the route
     parameters (such as `key` for `/notes/{key}`), `headers` a list of
-    `(name, value)`, `body` the body's bytes.
+    `(name, value)`, `body` the body's bytes, and `blob` the body's BlobRef
+    when the gateway stored a large body as one (else None).
     """
 
-    def __init__(self, req):
+    def __init__(self, req, read=None):
         self.method = req.method
         self.path = req.path
         self.query = req.query
         self.params = dict(req.params)
         self.headers = [(h.name, h.value) for h in req.headers]
-        self.body = _inline(req.body)
+        self._inline, self.blob = _split_body(req.body)
+        self._read = read
+
+    @property
+    def body(self):
+        """The body's bytes. A blob body is read on first use, whole, within the
+        guest's memory limit (64 MiB by default); read a larger one in parts with
+        `ctx.blobs.reader(req.blob)`."""
+        if self._inline is None:
+            self._inline = _whole(self.blob, self._read, "the request body")
+        return self._inline
 
     def param(self, name):
         """The route parameter `name`, or None."""
@@ -140,12 +181,23 @@ class Secret:
 
 
 class FetchResponse:
-    """The response to `ctx.http.fetch`: `status`, `headers` as `(name, value)`, `body` bytes."""
+    """The response to `ctx.http.fetch`: `status`, `headers` as `(name, value)`,
+    `body` bytes, and `blob` the body's BlobRef when the host stored a large
+    response as one (else None)."""
 
-    def __init__(self, res):
+    def __init__(self, res, read=None):
         self.status = res.status
         self.headers = list(res.headers)
-        self.body = _inline(res.body)
+        self._inline, self.blob = _split_body(res.body)
+        self._read = read
+
+    @property
+    def body(self):
+        """The body's bytes. A blob body is read on first use, whole, within the
+        guest's memory limit; read a larger one with `ctx.blobs.reader(res.blob)`."""
+        if self._inline is None:
+            self._inline = _whole(self.blob, self._read, "the response body")
+        return self._inline
 
     @property
     def ok(self):

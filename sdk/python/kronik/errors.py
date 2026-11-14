@@ -58,6 +58,12 @@ _MESSAGES = {
         "denied": ("crypto denied", "secret-handle"),
         "unsupported": ("crypto not supported", "NOT_IMPLEMENTED"),
     },
+    "blob": {
+        "not-held": ("the turn neither holds nor borrows this blob", "BLOB_NOT_HELD"),
+        "quota-exceeded": ("over the actor's blob quota", "blob"),
+        "erased": ("the blob belonged to an erased subject", "SUBJECT_ERASED"),
+        "invalid": ("blob call outside its limits", "blob"),
+    },
 }
 
 
@@ -71,7 +77,7 @@ def variant_tag(value):
 def host_error(area, payload):
     """Turns the error value of a failing host call (`Err.value`) into a KronikError.
 
-    `payload` is a WIT variant for `sql`, `fetch`, `call` and `crypto`, a string for `reveal`.
+    `payload` is a WIT variant for `sql`, `fetch`, `call`, `crypto` and `blob`, a string for `reveal`.
     """
     if area == "reveal":
         detail = str(payload)

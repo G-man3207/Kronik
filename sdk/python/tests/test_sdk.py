@@ -11,7 +11,7 @@ sys.path.insert(0, str(SDK))
 
 from enum import Enum  # noqa: E402
 
-from kronik import Connections, Frame, KronikError, OutcomeUnknown, Rejected, Route, actor  # noqa: E402
+from kronik import BlobRef, Connections, Ctx, Frame, KronikError, OutcomeUnknown, Rejected, Route, actor  # noqa: E402
 from kronik._export import connection_closed, connection_frame, handle, open_connection  # noqa: E402
 from kronik.connections import IncomingFrame, OpenRequest, closed_of, send_now_failure, to_wit_frame  # noqa: E402
 from kronik.ctx import actor_ref, wit_message  # noqa: E402
@@ -42,6 +42,8 @@ types = SimpleNamespace(
     Header=_variant("Header", "name", "value"),
     HttpResponse=_variant("HttpResponse", "status", "headers", "body"),
     HttpBody_Inline=_variant("HttpBody_Inline", "value"),
+    HttpBody_Blob=_variant("HttpBody_Blob", "value"),
+    BlobRef=_variant("BlobRef", "hash", "size"),
     HttpRequest=_variant("HttpRequest", "method", "path", "query", "params", "headers", "body"),
     Incoming=_variant("Incoming", "sender", "msg"),
 )
@@ -55,6 +57,60 @@ def fake_host(writes):
         state=SimpleNamespace(get=lambda k: None, set=lambda k, v: writes.append((k, v))),
         context=SimpleNamespace(self_ref=lambda: types.ActorRef("counter", "alice")),
     )
+
+
+BlobError_NotHeld = _variant("BlobError_NotHeld")
+BlobError_Invalid = _variant("BlobError_Invalid", "value")
+MIB = 1 << 20
+
+
+class FakeBlobs:
+    """The host's blobs in memory, with its 1 MiB limit per call."""
+
+    def __init__(self):
+        self.store = {}
+        self.calls = []
+
+    def add(self, data):
+        ref = types.BlobRef("b3:" + format(len(self.store), "064x"), len(data))
+        self.store[ref.hash] = data
+        return ref
+
+    def get(self, ref, offset, n):
+        self.calls.append(("get", offset, n))
+        if n > MIB:
+            raise Err(BlobError_Invalid("more than 1 MiB in one call"))
+        if ref.hash not in self.store:
+            raise Err(BlobError_NotHeld())
+        return self.store[ref.hash][offset : offset + n]
+
+    def Writer(self):  # noqa: N802 (the WIT resource's class)
+        blobs = self
+
+        class Writer:
+            def __init__(self):
+                self.parts = []
+
+            def write(self, chunk):
+                blobs.calls.append(("write", len(chunk)))
+                if len(chunk) > MIB:
+                    raise Err(BlobError_Invalid("more than 1 MiB in one call"))
+                self.parts.append(bytes(chunk))
+
+            def finish(self):
+                return blobs.add(b"".join(self.parts))
+
+        return Writer()
+
+
+def blob_host(blobs, fetch=None):
+    hc = SimpleNamespace(
+        Request=_variant("Request", "method", "url", "headers", "body"),
+        RequestHeader=_variant("RequestHeader", "name", "value"),
+        HeaderValue_Text=_variant("HeaderValue_Text", "value"),
+        fetch=fetch,
+    )
+    return SimpleNamespace(types=types, Err=Err, blobs=blobs, http_client=hc)
 
 
 def http_input(method="POST", query="", body=b""):
@@ -385,3 +441,92 @@ class WitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BlobTests(unittest.TestCase):
+    def test_a_blob_request_body_is_read_lazily_in_parts(self):
+        blobs = FakeBlobs()
+        data = bytes(range(256)) * (10 * MIB // 4 // 256)
+        ref = blobs.add(data)
+        seen = {}
+        spec = actor(kind="a", schema_version=0, http=lambda req, ctx: (seen.update(blob=req.blob, calls=len(blobs.calls), n=len(req.body)), ctx.none())[1])
+        req = types.HttpRequest("POST", "/x", "", [], [], types.HttpBody_Blob(ref))
+        handle(spec, blob_host(blobs), types.Input_Http(req))
+        self.assertEqual(seen["blob"].size, len(data))
+        self.assertEqual(seen["calls"], 0)
+        self.assertEqual(seen["n"], len(data))
+        self.assertEqual([c for c in blobs.calls if c[0] == "get"], [("get", 0, MIB), ("get", MIB, MIB), ("get", 2 * MIB, len(data) - 2 * MIB)])
+
+    def test_reader_reads_seeks_and_reads_lines(self):
+        import io
+
+        blobs = FakeBlobs()
+        ref = blobs.add(b"one\ntwo\nthree\n")
+        b = Ctx(blob_host(blobs)).blobs
+        r = b.reader(BlobRef(ref.hash, ref.size))
+        self.assertEqual(io.BufferedReader(r).readlines(), [b"one\n", b"two\n", b"three\n"])
+        r.seek(4)
+        self.assertEqual(r.read(3), b"two")
+        r.seek(-6, io.SEEK_END)
+        self.assertEqual(r.read(), b"three\n")
+        self.assertEqual(b.get(BlobRef(ref.hash, ref.size), 8, 100), b"three\n")
+        self.assertEqual(b.get(BlobRef(ref.hash, ref.size), 100, 5), b"")
+
+    def test_reader_fetches_whole_frames(self):
+        blobs = FakeBlobs()
+        data = bytes(range(256)) * (3 * 65536 // 256)
+        ref = blobs.add(data)
+        r = Ctx(blob_host(blobs)).blobs.reader(BlobRef(ref.hash, ref.size))
+        got = b"".join(iter(lambda: r.read(1024), b""))
+        self.assertEqual(got, data)
+        # Each frame once, whole: a read is charged for every frame it touches.
+        self.assertEqual(blobs.calls, [("get", 0, 65536), ("get", 65536, 65536), ("get", 131072, 65536)])
+
+    def test_writer_splits_large_writes_and_finishes(self):
+        blobs = FakeBlobs()
+        w = Ctx(blob_host(blobs)).blobs.writer()
+        self.assertEqual(w.write(b"x" * (2 * MIB + 5)), 2 * MIB + 5)
+        w.write("é")
+        ref = w.finish()
+        self.assertIsInstance(ref, BlobRef)
+        self.assertEqual(ref.size, 2 * MIB + 7)
+        # Whole frames go at once; the rest waits for finish.
+        self.assertEqual([c for c in blobs.calls if c[0] == "write"], [("write", MIB), ("write", MIB), ("write", 7)])
+
+    def test_blob_errors_name_their_codes(self):
+        b = Ctx(blob_host(FakeBlobs())).blobs
+        with self.assertRaises(KronikError) as e:
+            b.get(BlobRef("b3:" + "0" * 64, 10), 0, 10)
+        self.assertEqual(e.exception.topic, "BLOB_NOT_HELD")
+        self.assertEqual(host_error("blob", BlobError_Invalid("more than 1 MiB")).kind, "blob.invalid")
+
+    def test_fetch_sends_a_blob_and_reads_a_blob_response(self):
+        blobs = FakeBlobs()
+        upload = blobs.add(b"report")
+        answer = blobs.add(b"big answer")
+        sent = []
+
+        def fetch(req):
+            sent.append(req)
+            return SimpleNamespace(status=200, headers=[("content-type", "text/plain")], body=types.HttpBody_Blob(answer))
+
+        ctx = Ctx(blob_host(blobs, fetch))
+        res = ctx.http.fetch("https://x.example/up", method="POST", body=BlobRef(upload.hash, upload.size))
+        self.assertEqual(sent[0].body, types.HttpBody_Blob(types.BlobRef(upload.hash, 6)))
+        self.assertEqual([(h.name, h.value.value) for h in sent[0].headers], [("content-type", "application/octet-stream")])
+        self.assertEqual(res.blob, BlobRef(answer.hash, 10))
+        self.assertEqual(res.text(), "big answer")
+        with self.assertRaises(TypeError):
+            ctx.http.fetch({"url": "https://x.example/"}, method="POST")
+
+    def test_a_blob_response(self):
+        ctx = Ctx(blob_host(FakeBlobs()))
+        out = ctx.blob(200, BlobRef("b3:" + "1" * 64, 3), "application/pdf")
+        body = types.HttpBody_Blob(types.BlobRef("b3:" + "1" * 64, 3))
+        self.assertEqual(out, types.Output_Http(types.HttpResponse(200, [types.Header("content-type", "application/pdf")], body)))
+
+    def test_a_request_without_a_reader_cannot_read_its_blob(self):
+        req = Request(types.HttpRequest("GET", "/x", "", [], [], types.HttpBody_Blob(types.BlobRef("b3:" + "2" * 64, 1))))
+        with self.assertRaises(KronikError) as e:
+            req.body
+        self.assertIn("is a blob", str(e.exception))

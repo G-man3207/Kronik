@@ -20,7 +20,7 @@ def handle(spec, h, input):
         if isinstance(input, t.Input_Http):
             if spec.http is None:
                 raise Rejected(unhandled(ctx.self().kind, "HTTP requests", "http", "actor"))
-            return spec.http(Request(input.value), ctx)
+            return spec.http(Request(input.value, ctx.blobs.read_all), ctx)
         if isinstance(input, t.Input_Message):
             if spec.message is None:
                 raise Rejected(unhandled(ctx.self().kind, "messages", "message", "message"))
