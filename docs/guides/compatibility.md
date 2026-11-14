@@ -174,14 +174,34 @@ python3 scripts/verify-compatibility.py \
 
 The work directory must not exist. The command copies, never upgrades in
 place, each immutable corpus; runs real `upgrade check`; compares the original
-state/log integrity hashes; requires **all nine original roots**, not merely a
-positive root count, in the upgrade check and isolated/continuous identity
-replays; and verifies the historical key-backed result. It also deploys each
-release's genuine old counter and SQL components into a fresh fixture, checks
-committed state transitions, replays their five real inputs in both modes,
-consumes the public versioned diff, and runs the versioned public policy
-semantic cases. Any mismatch exits nonzero. The existing CI caller uses the
-already-built candidate; it must never regenerate producer output during CI.
+state/log integrity hashes; requires **every original root** (nine in each
+case before v0.5.0), not merely a positive root count, in the upgrade check
+and isolated/continuous identity replays; and verifies the historical
+key-backed result. It also deploys each release's genuine old counter and SQL
+components into a fresh fixture, checks committed state transitions, replays
+their five real inputs in both modes, consumes the public versioned diff, and
+runs the versioned public policy semantic cases. Any mismatch exits nonzero.
+The existing CI caller uses the already-built candidate; it must never
+regenerate producer output during CI.
+
+A corpus from v0.5.0 on also holds the record kinds that release added,
+long-lived connections and blobs (`scenarios` in its manifest), and the
+verifier checks them as well:
+
+- Its original roots include their root inputs, and each identity replay
+  must replay every kind's roots with no divergent turn (the diff's `kinds`),
+  each connection's open, frames and close with no frame changed, its
+  `send-now` frames from their recording, and the fetch from its recording.
+- The candidate must read every blob back byte for byte (the SHA-256 of its
+  content, which the manifest records), hold it `live` and whole (`kronik
+  blobs inspect --verify`), keep it for every reason the producer's node did
+  (the log, a hold, the pending timer's or the saved call's pin, the
+  snapshot), report the same holds and the same pending timer, collect none of
+  them, and find no drift between its pins and its rows (`kronik blobs gc
+  --dry-run --verify`).
+- It must show the room's messages, closes and closed connections as the
+  producer saw them, and each connection's frame counts and close must agree
+  with its client's transcript in the manifest.
 
 An older WIT component may instead receive a real nonzero
 `IMPORT_NOT_ALLOWED` response identifying its old package/interface version and
@@ -329,10 +349,36 @@ candidate:
    index's `producer_binary_sha256`.
 4. From a clean environment and a new work directory with a neutral name, run
    `scripts/compatibility-corpus.py produce --release vX.Y.Z --emit-files` with
-   that binary, the maintained `tests/guests/counter.wasm` and `notes.wasm`, the
-   tag's commit from `git rev-parse vX.Y.Z^{commit}` as `--revision`, and a
-   free fixture port. Promote its output with
-   `scripts/promote-compatibility-corpus.py` into `tests/compatibility/vX.Y.Z`.
+   that binary, the maintained `tests/guests/counter.wasm` and `notes.wasm`
+   (from v0.5.0, and only then, also `--media tests/guests/media.wasm --room
+   tests/guests/room.wasm`), the tag's commit from `git rev-parse
+   vX.Y.Z^{commit}` as `--revision`, and a free fixture port. Promote its
+   output with `scripts/promote-compatibility-corpus.py` into
+   `tests/compatibility/vX.Y.Z`.
+
+   From v0.5.0 the scenario adds connection and blob records. Its
+   configuration has no `[blobs]` table: blobs are always on from v0.5.0,
+   which refuses the development builds' `enabled` switch.
+   - The room (`room/compat`): a WebSocket member with the subject `user:7`
+     says something to the room, has a frame echoed and streams three frames
+     with `send-now`; a member without a subject has a frame echoed and says
+     `bye`, so the actor closes it; the operator closes an SSE follower; the
+     first member closes as a client. The script waits for each frame, so
+     each client's transcript (the frames it sent and received) is exact, and
+     no connection is open in the corpus.
+   - Blobs, at a 64 KiB threshold for the `media` kind, each at most 300 KB:
+     an upload; a document of 150 KB that a fetch from a local server records
+     as a blob (`http:127.0.0.1` is granted); a blob a turn writes and answers
+     with; a blob put by one actor, sent on a message to another that retains
+     it, then released by the first; a timer due in 50 years whose message
+     carries a blob; and a call whose reply carries the caller's blob, which
+     the caller keeps.
+   - The manifest records each blob's hash, size, SHA-256 and roots, the
+     holds and the pending timer, the transcripts, the room's state, the
+     closed connections, and the root inputs of each kind.
+   - A call answered with a blob that the callee wrote is in the script but
+     off (`CALLEE_WRITTEN_REPLY`) until the release the corpus is produced
+     from answers one; earlier builds fail the caller.
 5. Store the tag's four contract sources under `vX.Y.Z/contracts/` and its two
    guest components under `components/` (`git show vX.Y.Z:<path>`), and add the
    case to `releases.json` and the tag to `published_releases`. Take the root
