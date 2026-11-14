@@ -582,7 +582,15 @@ impl CopyInner {
         let vm = self.vm.clone();
         async move {
             if let Some(vm) = &vm {
+                // The whole cgroup, not only the process this daemon started:
+                // another process of the VM that is still exiting keeps the
+                // group busy, and `remove_files` refuses a busy group, which
+                // left the copy's jail, cgroup and data behind for good.
                 let _ = vm.child.kill().await;
+                if let Err(error) = vm.kill(&env).await {
+                    tracing::error!(name = %name, %error, "microVM copy did not exit; retaining its backing files");
+                    return;
+                }
                 if env.timeout(QUICK, vm.child.wait()).await.is_err() {
                     tracing::error!(name = %name, "microVM copy did not reap; retaining its backing files");
                     return;
@@ -591,10 +599,13 @@ impl CopyInner {
                 let _ = run_quick(&env, runtime.kill(&id, "KILL", &log), QUICK).await;
                 let _ = run_quick(&env, runtime.delete(&id, &log), QUICK).await;
             }
+            let copy = name.clone();
             let _ = env
                 .blocking("foreign-copy-cleanup", move || {
                     if let Some(vm) = vm {
-                        let _ = vm.remove_files();
+                        if let Err(error) = vm.remove_files() {
+                            tracing::warn!(name = %copy, %error, "deleting a microVM copy's jail failed");
+                        }
                     } else {
                         let _ = crate::sys::delete_netns(&netns);
                         let _ = std::fs::remove_dir_all(&sock);
