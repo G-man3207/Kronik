@@ -487,7 +487,9 @@ from `/` without following a link anywhere, never created, and below it only
 real directories on its file system and regular files with one link, the
 wrapped key at most 1 MiB. A link to a file that only root may read, a
 FIFO that would hang the restore, or a linked directory in the bucket fails
-the restore instead.
+the restore instead. (A mount on the way is crossed: on a host whose
+`/etc/fuse.conf` has `user_allow_other`, a FUSE mount of the bucket's owner
+that stalls could still hang the restore until it is interrupted.)
 
 On a nonroot installation, check the host with `sudo kronik doctor --rootless`.
 Plain `kronik doctor` run as root checks the host as root, by path, also in the

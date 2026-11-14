@@ -1805,7 +1805,10 @@ pub(crate) fn isolate(jail: &MicrovmJail<'_>, kvm: &Path) -> io::Result<()> {
 /// The size of a jail root's own file system (see [`mount_jail_root`]).
 pub(crate) const JAIL_ROOT_BYTES: u64 = 1 << 20;
 /// Its inodes: the placeholders, `dev`, `out`, the sockets and the pivot's
-/// `.old` take fewer than twenty.
+/// `.old` take fewer than twenty. Kronik only connects to the VM over vsock
+/// (`/vsock.sock`) and never listens for a connection from the guest, so no
+/// per-port socket (`/vsock.sock_<port>`, which Firecracker would connect to)
+/// is made there.
 const JAIL_ROOT_INODES: u64 = 64;
 
 /// Mounts a small tmpfs of its own on the jail root `root`, in the caller's
