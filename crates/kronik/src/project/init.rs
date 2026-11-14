@@ -53,7 +53,7 @@ const TS_CONFIG: &str = r#"{
     "target": "es2022",
     "module": "esnext",
     "moduleResolution": "bundler",
-    "lib": ["es2022"],
+    "lib": ["es2022", "esnext.disposable"],
     "types": [],
     "strict": true,
     "noEmit": true,
