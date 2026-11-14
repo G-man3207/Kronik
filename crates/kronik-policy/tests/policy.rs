@@ -86,6 +86,7 @@ fn every_fixture_gives_its_expected_policy_under_the_default_rules() {
         names,
         [
             "diff-approximate-payments.json",
+            "diff-connections.json",
             "diff-counter-plus-2.json",
             "diff-forked-postgres.json",
             "diff-identity.json",

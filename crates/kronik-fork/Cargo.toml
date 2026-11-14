@@ -31,6 +31,9 @@ tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+# The pinned JSON Schema validator of kronik-api's schema tests: the
+# connection replay tests check their real diffs against diff-v1.schema.json.
+boon = { workspace = true }
 kronik-core = { workspace = true, features = ["real"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

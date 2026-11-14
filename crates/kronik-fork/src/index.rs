@@ -299,6 +299,9 @@ impl ProductionIndex {
                             .find_map(|h| h.value.as_ref().and_then(|v| v.subject.clone())),
                     }
                 }
+                // M24 §4.10: the connection's subject, from the recorded
+                // input, as the node derives the turn's default subject.
+                Some(pb::input::Kind::Connection(c)) => kronik_proto::connection::input_subject(c),
                 _ => None,
             };
             let start_lsn = begins

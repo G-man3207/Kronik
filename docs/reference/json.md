@@ -990,6 +990,10 @@ against both.
       "description": "The fork: `p-<12 hex>` for a proposal, else the name it was created with.",
       "type": "string"
     },
+    "frames": {
+      "$ref": "#/components/schemas/DiffFrames",
+      "description": "Long-lived connections (M24, ADR 0116): what the root inputs sent to WebSocket and SSE connections, production against the fork. Absent when the window has no connection input and no compared turn sent a frame, and in diffs written before M24."
+    },
     "grounding": {
       "description": "One entry per external target, sorted by kind, host and route.",
       "items": {
@@ -1530,6 +1534,354 @@ against both.
 }
 ```
 
+### DiffFrameChange
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "change": {
+      "enum": [
+        "added",
+        "removed",
+        "changed"
+      ]
+    },
+    "code": {
+      "additionalProperties": false,
+      "description": "A close's code on each side, when they differ. Absent otherwise.",
+      "properties": {
+        "fork": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "prod": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "prod",
+        "fork"
+      ],
+      "type": "object"
+    },
+    "connections": {
+      "description": "The first 5 of them, live ones first.",
+      "items": {
+        "pattern": "^c-[0-9a-f]{32}$",
+        "type": "string"
+      },
+      "maxItems": 5,
+      "type": "array"
+    },
+    "data": {
+      "description": "The frame's data, or a close's reason: JSON Pointer operations when both sides are JSON (`ignore_json_paths` applies), otherwise one operation at `\"\"` with each side's value. A value with a subject is redacted, as everywhere in the diff.",
+      "items": {
+        "$ref": "#/components/schemas/DiffBodyOp"
+      },
+      "type": "array"
+    },
+    "event": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fork": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "event": {
+                      "type": "string"
+                    },
+                    "id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "event",
+                    "id"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "prod": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "event": {
+                      "type": "string"
+                    },
+                    "id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "event",
+                    "id"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "prod",
+            "fork"
+          ],
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The SSE `event:` and `id:` fields of an event frame on each side (null for any other operation), when they differ; null otherwise."
+    },
+    "index": {
+      "$ref": "#/components/schemas/DiffCount",
+      "description": "The operation's position in the root input's tree: its turns in causal order, and in each turn the frames it sent with `send-now`, then its buffered sends, broadcasts and closes in call order. Seqs are never compared."
+    },
+    "kind": {
+      "additionalProperties": false,
+      "description": "`text`, `binary`, `event` or `close` on each side; null when that side has no operation at this position.",
+      "properties": {
+        "fork": {
+          "enum": [
+            "text",
+            "binary",
+            "event",
+            "close",
+            "unspecified",
+            null
+          ]
+        },
+        "prod": {
+          "enum": [
+            "text",
+            "binary",
+            "event",
+            "close",
+            "unspecified",
+            null
+          ]
+        }
+      },
+      "required": [
+        "prod",
+        "fork"
+      ],
+      "type": "object"
+    },
+    "send_now": {
+      "additionalProperties": false,
+      "description": "Whether each side's frame went out with `send-now`. Absent when neither did.",
+      "properties": {
+        "fork": {
+          "type": "boolean"
+        },
+        "prod": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "prod",
+        "fork"
+      ],
+      "type": "object"
+    },
+    "targets": {
+      "$ref": "#/components/schemas/DiffCount",
+      "description": "How many connections the operation names, live or not (production's, else the fork's)."
+    }
+  },
+  "required": [
+    "index",
+    "change",
+    "targets",
+    "connections",
+    "kind",
+    "event",
+    "data"
+  ],
+  "type": "object"
+}
+```
+
+### DiffFrameItem
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "frames": {
+      "description": "The changed operations, at most 20.",
+      "items": {
+        "$ref": "#/components/schemas/DiffFrameChange"
+      },
+      "maxItems": 20,
+      "type": "array"
+    },
+    "input": {
+      "description": "The root input's label, such as `connection frame WEBSOCKET /chat/{key}/ws` or `POST /chat/{key}/say`: never a connection id, a path or data.",
+      "type": "string"
+    },
+    "open": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fork": {
+              "type": "string"
+            },
+            "prod": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "prod",
+            "fork"
+          ],
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "An open input's answer on each side when it changed: `accept`, `refuse <status>` (the refusal's HTTP status), or `fail <error code>` when the open turn did not commit. Null otherwise."
+    },
+    "root_lsn": {
+      "$ref": "#/components/schemas/DiffCount"
+    },
+    "turn_fork": {
+      "$ref": "#/components/schemas/DiffTurnId"
+    },
+    "turn_prod": {
+      "$ref": "#/components/schemas/DiffTurnId"
+    }
+  },
+  "required": [
+    "root_lsn",
+    "input",
+    "turn_prod",
+    "turn_fork",
+    "open",
+    "frames"
+  ],
+  "type": "object"
+}
+```
+
+### DiffFrames
+
+```json
+{
+  "additionalProperties": false,
+  "description": "Long-lived connections in the replay (M24 §7.5): built like `responses`, from isolated replay (from continuous replay when it runs alone).",
+  "properties": {
+    "changed": {
+      "$ref": "#/components/schemas/DiffCount",
+      "description": "Replayed root inputs whose outgoing operations or open answer differ: the inputs of `items`."
+    },
+    "inputs": {
+      "additionalProperties": false,
+      "description": "The connection root inputs of the window, by event.",
+      "properties": {
+        "close": {
+          "$ref": "#/components/schemas/DiffCount"
+        },
+        "frame": {
+          "$ref": "#/components/schemas/DiffCount"
+        },
+        "open": {
+          "$ref": "#/components/schemas/DiffCount"
+        }
+      },
+      "required": [
+        "open",
+        "frame",
+        "close"
+      ],
+      "type": "object"
+    },
+    "items": {
+      "description": "The changed inputs, in root LSN order, at most 200.",
+      "items": {
+        "$ref": "#/components/schemas/DiffFrameItem"
+      },
+      "maxItems": 200,
+      "type": "array"
+    },
+    "send_now": {
+      "additionalProperties": false,
+      "description": "The fork's `connection.send-now` answers (M24 §7.3): from the recording (exact or approximate), or by the connection model (synthetic, simulator `connection`). Neither counts in `grounding` or `summary.confidence`.",
+      "properties": {
+        "modeled": {
+          "$ref": "#/components/schemas/DiffCount"
+        },
+        "recorded": {
+          "$ref": "#/components/schemas/DiffCount"
+        }
+      },
+      "required": [
+        "recorded",
+        "modeled"
+      ],
+      "type": "object"
+    },
+    "sent": {
+      "additionalProperties": false,
+      "description": "Outgoing frame targets: every live target of a send or broadcast, and every `send-now` answered `ok`.",
+      "properties": {
+        "fork": {
+          "$ref": "#/components/schemas/DiffCount"
+        },
+        "prod": {
+          "$ref": "#/components/schemas/DiffCount"
+        }
+      },
+      "required": [
+        "prod",
+        "fork"
+      ],
+      "type": "object"
+    },
+    "skipped": {
+      "$ref": "#/components/schemas/DiffCount",
+      "description": "Continuous replay: frame and close inputs that were not run because the fork's actor never accepted their connection (the fork refused the open production accepted). Their production turns are missing in the fork."
+    },
+    "unchanged": {
+      "$ref": "#/components/schemas/DiffCount",
+      "description": "Replayed root inputs (connection inputs, and any input whose tree sent frames) whose outgoing operations and open answer are identical."
+    }
+  },
+  "required": [
+    "inputs",
+    "unchanged",
+    "changed",
+    "skipped",
+    "sent",
+    "send_now",
+    "items"
+  ],
+  "type": "object"
+}
+```
+
 ### DiffGroundingRow
 
 ```json
@@ -1759,6 +2111,23 @@ against both.
         "fixed",
         "new_orphans",
         "outcome_unknown"
+      ],
+      "type": "object"
+    },
+    "frames": {
+      "additionalProperties": false,
+      "description": "Root inputs of this kind counted in `frames` (M24): connection inputs and inputs that sent frames. Absent for a kind without them.",
+      "properties": {
+        "changed": {
+          "$ref": "#/components/schemas/DiffCount"
+        },
+        "unchanged": {
+          "$ref": "#/components/schemas/DiffCount"
+        }
+      },
+      "required": [
+        "unchanged",
+        "changed"
       ],
       "type": "object"
     },
@@ -2218,6 +2587,14 @@ against both.
     "errors_introduced": {
       "$ref": "#/components/schemas/DiffSampleList"
     },
+    "frames_changed": {
+      "$ref": "#/components/schemas/DiffSampleList",
+      "description": "The fork's root turns of the inputs in `frames.items` (M24). Absent when empty."
+    },
+    "frames_skipped": {
+      "$ref": "#/components/schemas/DiffSampleList",
+      "description": "The production turns of the inputs counted in `frames.skipped` (M24): the fork has none. Absent when empty."
+    },
     "origins": {
       "$ref": "#/components/schemas/DiffSampleList"
     },
@@ -2531,6 +2908,10 @@ against both.
     "forked": {
       "$ref": "#/components/schemas/DiffCount",
       "description": "Answers of the fork's copies of foreign actors (M14)."
+    },
+    "frames_changed": {
+      "$ref": "#/components/schemas/DiffCount",
+      "description": "`frames.changed` (M24). Absent when 0."
     },
     "live": {
       "$ref": "#/components/schemas/DiffCount",

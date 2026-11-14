@@ -143,6 +143,11 @@ Call `get_diff` with `{"proposal": "<id>"}` for the whole diff
   denies it.
 - `responses`: HTTP answers that changed, as JSON diffs of status, headers
   and body.
+- `frames`, when present: what the root inputs sent to WebSocket and SSE
+  connections. `frames.changed` counts the inputs whose outgoing frames or
+  whose open answers differ. Each item shows the changed frames as JSON
+  diffs of their data. `frames.skipped` counts the inputs of connections
+  that the fork's code never accepted, which continuous replay does not run.
 - `effects`: calls to the outside world that were added, removed or
   changed, with the changed fields (`url`, `method`, `header:<name>`,
   `body`).

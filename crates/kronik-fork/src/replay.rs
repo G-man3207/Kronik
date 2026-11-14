@@ -418,6 +418,10 @@ struct Runner {
     /// a restart, closed at the next start): by causal key, the error code
     /// and message the fork records instead of running the guest.
     unrun: Mutex<HashMap<Vec<u8>, (String, String)>>,
+    /// Continuous replay: the production LSNs of the frame and close inputs
+    /// it did not run, because the fork's actor never accepted their
+    /// connection (M24 §7.2, ADR 0116 point 5), in log order.
+    skipped: Mutex<Vec<Lsn>>,
 }
 
 /// A call the fork served its recorded timeout (the fork gate's `call`).
@@ -445,6 +449,7 @@ impl Runner {
         Arc::new(Runner {
             base,
             ran: Mutex::new(std::collections::BTreeSet::new()),
+            skipped: Mutex::new(Vec::new()),
             setup,
             store,
             prefix,
@@ -626,7 +631,8 @@ impl Runner {
                         .timer_pending(&p.actor.kind, &p.actor.key, t.timer_id)?
                 }
                 _ => false,
-            } || self.resend_not_needed(&p);
+            } || self.resend_not_needed(&p)
+                || self.connection_not_held(&p)?;
             if !skip {
                 self.clone().run(p, order, dispatch.clone()).await?;
             }
@@ -668,6 +674,52 @@ impl Runner {
                     .as_ref()
                     .is_some_and(|o| o.kind == pb::OutcomeKind::Committed as i32)
         })
+    }
+
+    /// A frame or close input of a connection that the fork's actor never
+    /// accepted, in continuous replay (M24 §7.2, ADR 0116 point 5): the
+    /// connection's open is a root input of the window, and the fork's store
+    /// has no row of it for this actor, live or closed, because the fork's
+    /// code refused the open (or its open turn failed). Such an input is not
+    /// run, so the fork's actor never gets frames of a connection it did not
+    /// accept; it is counted as skipped, and its production turn is missing
+    /// in the fork. A connection opened before the window is production's
+    /// as the fork's store holds it, and runs as in production; so does a
+    /// resend after the close of a connection the fork accepted. Isolated
+    /// replay runs every input against production's state, which holds the
+    /// connection.
+    fn connection_not_held(&self, p: &Pending) -> Result<bool, ReplayError> {
+        use pb::connection_input::Event;
+        if self.isolated || !p.key.path.is_empty() {
+            return Ok(false);
+        }
+        let Some(c) = kronik_proto::connection::input(Some(&p.input)) else {
+            return Ok(false);
+        };
+        if !matches!(c.event, Some(Event::Frame(_) | Event::Close(_))) {
+            return Ok(false);
+        }
+        let index = &self.setup.index;
+        let opened_in_window = c
+            .connection
+            .strip_prefix(kronik_proto::connection::ID_PREFIX)
+            .and_then(|root| index.root_turn_lsn(root))
+            .is_some_and(|lsn| lsn > index.fork_lsn);
+        if !opened_in_window {
+            return Ok(false);
+        }
+        let held = self
+            .store
+            .db()
+            .connection_any(&c.connection)?
+            .is_some_and(|row| row.actor == p.actor);
+        if held {
+            return Ok(false);
+        }
+        if let Some((lsn, _)) = index.turn(&p.key) {
+            lock(&self.skipped).push(lsn);
+        }
+        Ok(true)
     }
 
     /// Queues what the store holds pending (continuous replay): its timers
@@ -3810,6 +3862,7 @@ impl Continuous {
         *lock(&runner.timers) = timers;
         *lock(&runner.taint) = std::mem::take(&mut *lock(&self.runner.taint));
         *lock(&runner.ran) = std::mem::take(&mut *lock(&self.runner.ran));
+        *lock(&runner.skipped) = std::mem::take(&mut *lock(&self.runner.skipped));
         runner.timer_seq.store(
             self.runner.timer_seq.load(Ordering::Relaxed),
             Ordering::Relaxed,
@@ -3824,6 +3877,13 @@ impl Continuous {
 
     pub fn turns(&self) -> Vec<ForkTurn> {
         lock(&self.runner.turns).clone()
+    }
+
+    /// The production LSNs of the connection inputs the fork did not run,
+    /// because its actor never accepted their connection (M24 §7.2), in log
+    /// order: `frames.skipped` of the diff.
+    pub fn skipped(&self) -> Vec<Lsn> {
+        lock(&self.runner.skipped).clone()
     }
 
     /// Keeps the turns `keep` returns true for; it may change them (a

@@ -1,0 +1,797 @@
+{
+  "schema": "kronik.diff/v1",
+  "fork": "p-7h3k2a9c1d0e",
+  "proposal_id": "p-7h3k2a9c1d0e",
+  "base": {
+    "branch": "main",
+    "fork_lsn": 1200,
+    "from_lsn": 1201,
+    "to_lsn": 1800
+  },
+  "code": {
+    "before": [
+      {
+        "kind": "chat",
+        "code_hash": "b3:aaaaaaaaaaaa",
+        "schema_version": 0
+      }
+    ],
+    "after": [
+      {
+        "kind": "chat",
+        "code_hash": "b3:cccccccccccc",
+        "schema_version": 0
+      }
+    ]
+  },
+  "options": {
+    "mode": "both",
+    "sample": 1.0,
+    "ignore_headers": [],
+    "ignore_json_paths": [],
+    "fuel_threshold": 0.02,
+    "stubs": [],
+    "live_allowlist": [],
+    "no_pii": false
+  },
+  "summary": {
+    "root_inputs": 263,
+    "replayed": 263,
+    "sample": 1.0,
+    "turns_prod": 263,
+    "turns_fork": 263,
+    "divergent_turns": 12,
+    "origins": 12,
+    "consequences": 0,
+    "exact": 0,
+    "approximate": 0,
+    "synthetic": 0,
+    "live": 0,
+    "forked": 0,
+    "pii_masked": 0,
+    "pii_unverified": 0,
+    "unverifiable": 0,
+    "frames_changed": 12,
+    "confidence": 1.0,
+    "verified_through_lsn": 1800,
+    "changed": true
+  },
+  "kinds": [
+    {
+      "kind": "chat",
+      "code": "changed",
+      "root_inputs": 263,
+      "turns_prod": 263,
+      "turns_fork": 263,
+      "divergent_turns": 12,
+      "origins": 12,
+      "consequences": 0,
+      "responses": {
+        "unchanged": 0,
+        "changed": 0
+      },
+      "frames": {
+        "unchanged": 251,
+        "changed": 12
+      },
+      "effects": {
+        "added": 0,
+        "removed": 0,
+        "changed": 0
+      },
+      "actors_changed": 0,
+      "errors": {
+        "introduced": 0,
+        "fixed": 0,
+        "new_orphans": 0,
+        "outcome_unknown": 0
+      }
+    }
+  ],
+  "causes": [
+    {
+      "kind": "chat",
+      "input": "connection frame WEBSOCKET /chat/{key}/ws",
+      "origins": 12,
+      "consequences": 0,
+      "root_inputs": 12,
+      "samples": [
+        "p-7h3k2a9c1d0e:r1302.0",
+        "p-7h3k2a9c1d0e:r1322.0",
+        "p-7h3k2a9c1d0e:r1342.0",
+        "p-7h3k2a9c1d0e:r1362.0",
+        "p-7h3k2a9c1d0e:r1382.0"
+      ]
+    }
+  ],
+  "grounding": [],
+  "responses": {
+    "unchanged": 0,
+    "changed": 0,
+    "items": []
+  },
+  "frames": {
+    "inputs": {
+      "open": 12,
+      "frame": 240,
+      "close": 11
+    },
+    "unchanged": 251,
+    "changed": 12,
+    "skipped": 0,
+    "sent": {
+      "prod": 4800,
+      "fork": 4800
+    },
+    "send_now": {
+      "recorded": 30,
+      "modeled": 0
+    },
+    "items": [
+      {
+        "root_lsn": 1302,
+        "input": "connection frame WEBSOCKET /chat/{key}/ws",
+        "turn_prod": "main:1302",
+        "turn_fork": "p-7h3k2a9c1d0e:r1302.0",
+        "open": null,
+        "frames": [
+          {
+            "index": 0,
+            "change": "changed",
+            "targets": 20,
+            "connections": [
+              "c-8ab8d71c047739fb124968395a8ff55e",
+              "c-9fe761269348a240d951d3f026bf90f0",
+              "c-8b83443d3a3d39a42f470026db2daaa0",
+              "c-9209a8224e617abf6aa1c43739d8482b",
+              "c-d4b6a30f885fa56290ac0aec052ecd71"
+            ],
+            "kind": {
+              "prod": "event",
+              "fork": "event"
+            },
+            "event": null,
+            "data": [
+              {
+                "op": "add",
+                "path": "/body",
+                "prod": null,
+                "fork": {
+                  "redacted": true,
+                  "subject": "s:2182ef8d17fe",
+                  "hash": "k:b257d972487c6a48"
+                }
+              },
+              {
+                "op": "remove",
+                "path": "/text",
+                "prod": {
+                  "redacted": true,
+                  "subject": "s:2182ef8d17fe",
+                  "hash": "k:b257d972487c6a48"
+                },
+                "fork": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "root_lsn": 1322,
+        "input": "connection frame WEBSOCKET /chat/{key}/ws",
+        "turn_prod": "main:1322",
+        "turn_fork": "p-7h3k2a9c1d0e:r1322.0",
+        "open": null,
+        "frames": [
+          {
+            "index": 0,
+            "change": "changed",
+            "targets": 20,
+            "connections": [
+              "c-8ab8d71c047739fb124968395a8ff55e",
+              "c-9fe761269348a240d951d3f026bf90f0",
+              "c-8b83443d3a3d39a42f470026db2daaa0",
+              "c-9209a8224e617abf6aa1c43739d8482b",
+              "c-d4b6a30f885fa56290ac0aec052ecd71"
+            ],
+            "kind": {
+              "prod": "event",
+              "fork": "event"
+            },
+            "event": null,
+            "data": [
+              {
+                "op": "add",
+                "path": "/body",
+                "prod": null,
+                "fork": {
+                  "redacted": true,
+                  "subject": "s:1673b08bf16a",
+                  "hash": "k:3a1cb05206d438de"
+                }
+              },
+              {
+                "op": "remove",
+                "path": "/text",
+                "prod": {
+                  "redacted": true,
+                  "subject": "s:1673b08bf16a",
+                  "hash": "k:3a1cb05206d438de"
+                },
+                "fork": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "root_lsn": 1342,
+        "input": "connection frame WEBSOCKET /chat/{key}/ws",
+        "turn_prod": "main:1342",
+        "turn_fork": "p-7h3k2a9c1d0e:r1342.0",
+        "open": null,
+        "frames": [
+          {
+            "index": 0,
+            "change": "changed",
+            "targets": 20,
+            "connections": [
+              "c-8ab8d71c047739fb124968395a8ff55e",
+              "c-9fe761269348a240d951d3f026bf90f0",
+              "c-8b83443d3a3d39a42f470026db2daaa0",
+              "c-9209a8224e617abf6aa1c43739d8482b",
+              "c-d4b6a30f885fa56290ac0aec052ecd71"
+            ],
+            "kind": {
+              "prod": "event",
+              "fork": "event"
+            },
+            "event": null,
+            "data": [
+              {
+                "op": "add",
+                "path": "/body",
+                "prod": null,
+                "fork": {
+                  "redacted": true,
+                  "subject": "s:93cadeba3282",
+                  "hash": "k:e6046bd6497ce537"
+                }
+              },
+              {
+                "op": "remove",
+                "path": "/text",
+                "prod": {
+                  "redacted": true,
+                  "subject": "s:93cadeba3282",
+                  "hash": "k:e6046bd6497ce537"
+                },
+                "fork": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "root_lsn": 1362,
+        "input": "connection frame WEBSOCKET /chat/{key}/ws",
+        "turn_prod": "main:1362",
+        "turn_fork": "p-7h3k2a9c1d0e:r1362.0",
+        "open": null,
+        "frames": [
+          {
+            "index": 0,
+            "change": "changed",
+            "targets": 20,
+            "connections": [
+              "c-8ab8d71c047739fb124968395a8ff55e",
+              "c-9fe761269348a240d951d3f026bf90f0",
+              "c-8b83443d3a3d39a42f470026db2daaa0",
+              "c-9209a8224e617abf6aa1c43739d8482b",
+              "c-d4b6a30f885fa56290ac0aec052ecd71"
+            ],
+            "kind": {
+              "prod": "event",
+              "fork": "event"
+            },
+            "event": null,
+            "data": [
+              {
+                "op": "add",
+                "path": "/body",
+                "prod": null,
+                "fork": {
+                  "redacted": true,
+                  "subject": "s:e8be68321eed",
+                  "hash": "k:24452786bbc8045c"
+                }
+              },
+              {
+                "op": "remove",
+                "path": "/text",
+                "prod": {
+                  "redacted": true,
+                  "subject": "s:e8be68321eed",
+                  "hash": "k:24452786bbc8045c"
+                },
+                "fork": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "root_lsn": 1382,
+        "input": "connection frame WEBSOCKET /chat/{key}/ws",
+        "turn_prod": "main:1382",
+        "turn_fork": "p-7h3k2a9c1d0e:r1382.0",
+        "open": null,
+        "frames": [
+          {
+            "index": 0,
+            "change": "changed",
+            "targets": 20,
+            "connections": [
+              "c-8ab8d71c047739fb124968395a8ff55e",
+              "c-9fe761269348a240d951d3f026bf90f0",
+              "c-8b83443d3a3d39a42f470026db2daaa0",
+              "c-9209a8224e617abf6aa1c43739d8482b",
+              "c-d4b6a30f885fa56290ac0aec052ecd71"
+            ],
+            "kind": {
+              "prod": "event",
+              "fork": "event"
+            },
+            "event": null,
+            "data": [
+              {
+                "op": "add",
+                "path": "/body",
+                "prod": null,
+                "fork": {
+                  "redacted": true,
+                  "subject": "s:2182ef8d17fe",
+                  "hash": "k:24460813a2c3eb48"
+                }
+              },
+              {
+                "op": "remove",
+                "path": "/text",
+                "prod": {
+                  "redacted": true,
+                  "subject": "s:2182ef8d17fe",
+                  "hash": "k:24460813a2c3eb48"
+                },
+                "fork": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "root_lsn": 1402,
+        "input": "connection frame WEBSOCKET /chat/{key}/ws",
+        "turn_prod": "main:1402",
+        "turn_fork": "p-7h3k2a9c1d0e:r1402.0",
+        "open": null,
+        "frames": [
+          {
+            "index": 0,
+            "change": "changed",
+            "targets": 20,
+            "connections": [
+              "c-8ab8d71c047739fb124968395a8ff55e",
+              "c-9fe761269348a240d951d3f026bf90f0",
+              "c-8b83443d3a3d39a42f470026db2daaa0",
+              "c-9209a8224e617abf6aa1c43739d8482b",
+              "c-d4b6a30f885fa56290ac0aec052ecd71"
+            ],
+            "kind": {
+              "prod": "event",
+              "fork": "event"
+            },
+            "event": null,
+            "data": [
+              {
+                "op": "add",
+                "path": "/body",
+                "prod": null,
+                "fork": {
+                  "redacted": true,
+                  "subject": "s:1673b08bf16a",
+                  "hash": "k:0eef9f8bfb89a432"
+                }
+              },
+              {
+                "op": "remove",
+                "path": "/text",
+                "prod": {
+                  "redacted": true,
+                  "subject": "s:1673b08bf16a",
+                  "hash": "k:0eef9f8bfb89a432"
+                },
+                "fork": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "root_lsn": 1422,
+        "input": "connection frame WEBSOCKET /chat/{key}/ws",
+        "turn_prod": "main:1422",
+        "turn_fork": "p-7h3k2a9c1d0e:r1422.0",
+        "open": null,
+        "frames": [
+          {
+            "index": 0,
+            "change": "changed",
+            "targets": 20,
+            "connections": [
+              "c-8ab8d71c047739fb124968395a8ff55e",
+              "c-9fe761269348a240d951d3f026bf90f0",
+              "c-8b83443d3a3d39a42f470026db2daaa0",
+              "c-9209a8224e617abf6aa1c43739d8482b",
+              "c-d4b6a30f885fa56290ac0aec052ecd71"
+            ],
+            "kind": {
+              "prod": "event",
+              "fork": "event"
+            },
+            "event": null,
+            "data": [
+              {
+                "op": "add",
+                "path": "/body",
+                "prod": null,
+                "fork": {
+                  "redacted": true,
+                  "subject": "s:93cadeba3282",
+                  "hash": "k:b95dab384f070835"
+                }
+              },
+              {
+                "op": "remove",
+                "path": "/text",
+                "prod": {
+                  "redacted": true,
+                  "subject": "s:93cadeba3282",
+                  "hash": "k:b95dab384f070835"
+                },
+                "fork": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "root_lsn": 1442,
+        "input": "connection frame WEBSOCKET /chat/{key}/ws",
+        "turn_prod": "main:1442",
+        "turn_fork": "p-7h3k2a9c1d0e:r1442.0",
+        "open": null,
+        "frames": [
+          {
+            "index": 0,
+            "change": "changed",
+            "targets": 20,
+            "connections": [
+              "c-8ab8d71c047739fb124968395a8ff55e",
+              "c-9fe761269348a240d951d3f026bf90f0",
+              "c-8b83443d3a3d39a42f470026db2daaa0",
+              "c-9209a8224e617abf6aa1c43739d8482b",
+              "c-d4b6a30f885fa56290ac0aec052ecd71"
+            ],
+            "kind": {
+              "prod": "event",
+              "fork": "event"
+            },
+            "event": null,
+            "data": [
+              {
+                "op": "add",
+                "path": "/body",
+                "prod": null,
+                "fork": {
+                  "redacted": true,
+                  "subject": "s:e8be68321eed",
+                  "hash": "k:77b5a9b95d8efcb5"
+                }
+              },
+              {
+                "op": "remove",
+                "path": "/text",
+                "prod": {
+                  "redacted": true,
+                  "subject": "s:e8be68321eed",
+                  "hash": "k:77b5a9b95d8efcb5"
+                },
+                "fork": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "root_lsn": 1462,
+        "input": "connection frame WEBSOCKET /chat/{key}/ws",
+        "turn_prod": "main:1462",
+        "turn_fork": "p-7h3k2a9c1d0e:r1462.0",
+        "open": null,
+        "frames": [
+          {
+            "index": 0,
+            "change": "changed",
+            "targets": 20,
+            "connections": [
+              "c-8ab8d71c047739fb124968395a8ff55e",
+              "c-9fe761269348a240d951d3f026bf90f0",
+              "c-8b83443d3a3d39a42f470026db2daaa0",
+              "c-9209a8224e617abf6aa1c43739d8482b",
+              "c-d4b6a30f885fa56290ac0aec052ecd71"
+            ],
+            "kind": {
+              "prod": "event",
+              "fork": "event"
+            },
+            "event": null,
+            "data": [
+              {
+                "op": "add",
+                "path": "/body",
+                "prod": null,
+                "fork": {
+                  "redacted": true,
+                  "subject": "s:2182ef8d17fe",
+                  "hash": "k:57dea8935298c46f"
+                }
+              },
+              {
+                "op": "remove",
+                "path": "/text",
+                "prod": {
+                  "redacted": true,
+                  "subject": "s:2182ef8d17fe",
+                  "hash": "k:57dea8935298c46f"
+                },
+                "fork": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "root_lsn": 1482,
+        "input": "connection frame WEBSOCKET /chat/{key}/ws",
+        "turn_prod": "main:1482",
+        "turn_fork": "p-7h3k2a9c1d0e:r1482.0",
+        "open": null,
+        "frames": [
+          {
+            "index": 0,
+            "change": "changed",
+            "targets": 20,
+            "connections": [
+              "c-8ab8d71c047739fb124968395a8ff55e",
+              "c-9fe761269348a240d951d3f026bf90f0",
+              "c-8b83443d3a3d39a42f470026db2daaa0",
+              "c-9209a8224e617abf6aa1c43739d8482b",
+              "c-d4b6a30f885fa56290ac0aec052ecd71"
+            ],
+            "kind": {
+              "prod": "event",
+              "fork": "event"
+            },
+            "event": null,
+            "data": [
+              {
+                "op": "add",
+                "path": "/body",
+                "prod": null,
+                "fork": {
+                  "redacted": true,
+                  "subject": "s:1673b08bf16a",
+                  "hash": "k:afd49c696ae3ba92"
+                }
+              },
+              {
+                "op": "remove",
+                "path": "/text",
+                "prod": {
+                  "redacted": true,
+                  "subject": "s:1673b08bf16a",
+                  "hash": "k:afd49c696ae3ba92"
+                },
+                "fork": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "root_lsn": 1502,
+        "input": "connection frame WEBSOCKET /chat/{key}/ws",
+        "turn_prod": "main:1502",
+        "turn_fork": "p-7h3k2a9c1d0e:r1502.0",
+        "open": null,
+        "frames": [
+          {
+            "index": 0,
+            "change": "changed",
+            "targets": 20,
+            "connections": [
+              "c-8ab8d71c047739fb124968395a8ff55e",
+              "c-9fe761269348a240d951d3f026bf90f0",
+              "c-8b83443d3a3d39a42f470026db2daaa0",
+              "c-9209a8224e617abf6aa1c43739d8482b",
+              "c-d4b6a30f885fa56290ac0aec052ecd71"
+            ],
+            "kind": {
+              "prod": "event",
+              "fork": "event"
+            },
+            "event": null,
+            "data": [
+              {
+                "op": "add",
+                "path": "/body",
+                "prod": null,
+                "fork": {
+                  "redacted": true,
+                  "subject": "s:93cadeba3282",
+                  "hash": "k:1af2485124cf39e9"
+                }
+              },
+              {
+                "op": "remove",
+                "path": "/text",
+                "prod": {
+                  "redacted": true,
+                  "subject": "s:93cadeba3282",
+                  "hash": "k:1af2485124cf39e9"
+                },
+                "fork": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "root_lsn": 1522,
+        "input": "connection frame WEBSOCKET /chat/{key}/ws",
+        "turn_prod": "main:1522",
+        "turn_fork": "p-7h3k2a9c1d0e:r1522.0",
+        "open": null,
+        "frames": [
+          {
+            "index": 0,
+            "change": "changed",
+            "targets": 20,
+            "connections": [
+              "c-8ab8d71c047739fb124968395a8ff55e",
+              "c-9fe761269348a240d951d3f026bf90f0",
+              "c-8b83443d3a3d39a42f470026db2daaa0",
+              "c-9209a8224e617abf6aa1c43739d8482b",
+              "c-d4b6a30f885fa56290ac0aec052ecd71"
+            ],
+            "kind": {
+              "prod": "event",
+              "fork": "event"
+            },
+            "event": null,
+            "data": [
+              {
+                "op": "add",
+                "path": "/body",
+                "prod": null,
+                "fork": {
+                  "redacted": true,
+                  "subject": "s:e8be68321eed",
+                  "hash": "k:3732a5dd4b60f541"
+                }
+              },
+              {
+                "op": "remove",
+                "path": "/text",
+                "prod": {
+                  "redacted": true,
+                  "subject": "s:e8be68321eed",
+                  "hash": "k:3732a5dd4b60f541"
+                },
+                "fork": null
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "effects": {
+    "added": 0,
+    "removed": 0,
+    "changed": 0,
+    "items": []
+  },
+  "state": {
+    "isolated": [],
+    "continuous": []
+  },
+  "cumulative": {
+    "actors_changed": 0,
+    "items": []
+  },
+  "errors": {
+    "introduced": 0,
+    "fixed": 0,
+    "new_orphans": 0,
+    "outcome_unknown": 0,
+    "items": []
+  },
+  "resources": {
+    "fuel": {
+      "prod": {
+        "p50": 40000,
+        "p95": 52000,
+        "p99": 61000
+      },
+      "fork": {
+        "p50": 40000,
+        "p95": 52000,
+        "p99": 61000
+      }
+    },
+    "memory": {
+      "prod": {
+        "p50": 1114112,
+        "p95": 1179648,
+        "p99": 1179648
+      },
+      "fork": {
+        "p50": 1114112,
+        "p95": 1179648,
+        "p99": 1179648
+      }
+    },
+    "fuel_p99_change": 0.0,
+    "memory_p99_change": 0.0
+  },
+  "samples": {
+    "origins": [
+      "p-7h3k2a9c1d0e:r1302.0",
+      "p-7h3k2a9c1d0e:r1322.0",
+      "p-7h3k2a9c1d0e:r1342.0",
+      "p-7h3k2a9c1d0e:r1362.0",
+      "p-7h3k2a9c1d0e:r1382.0",
+      "p-7h3k2a9c1d0e:r1402.0",
+      "p-7h3k2a9c1d0e:r1422.0",
+      "p-7h3k2a9c1d0e:r1442.0",
+      "p-7h3k2a9c1d0e:r1462.0",
+      "p-7h3k2a9c1d0e:r1482.0",
+      "p-7h3k2a9c1d0e:r1502.0",
+      "p-7h3k2a9c1d0e:r1522.0"
+    ],
+    "consequences": [],
+    "responses_changed": [],
+    "effects_changed": [],
+    "errors_introduced": [],
+    "synthetic": [],
+    "frames_changed": [
+      "p-7h3k2a9c1d0e:r1302.0",
+      "p-7h3k2a9c1d0e:r1322.0",
+      "p-7h3k2a9c1d0e:r1342.0",
+      "p-7h3k2a9c1d0e:r1362.0",
+      "p-7h3k2a9c1d0e:r1382.0",
+      "p-7h3k2a9c1d0e:r1402.0",
+      "p-7h3k2a9c1d0e:r1422.0",
+      "p-7h3k2a9c1d0e:r1442.0",
+      "p-7h3k2a9c1d0e:r1462.0",
+      "p-7h3k2a9c1d0e:r1482.0",
+      "p-7h3k2a9c1d0e:r1502.0",
+      "p-7h3k2a9c1d0e:r1522.0"
+    ]
+  },
+  "expected_policy": {
+    "outcome": "allow",
+    "fired": []
+  }
+}

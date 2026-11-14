@@ -877,11 +877,17 @@ impl Proposals {
             .as_ref()
             .map(Continuous::turns)
             .unwrap_or_default();
+        let skipped = live
+            .continuous
+            .as_ref()
+            .map(Continuous::skipped)
+            .unwrap_or_default();
         let view = match (&live.continuous, &prod) {
             (Some(c), Some(p)) => Some(diff::ContinuousView {
                 turns: &turns,
                 fork: &c.store,
                 prod: p,
+                skipped: &skipped,
             }),
             _ => None,
         };

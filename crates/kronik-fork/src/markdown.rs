@@ -201,6 +201,10 @@ pub fn summary(d: &Diff, policy: Option<&Value>, http_grants: &[&str]) -> String
         num(r.changed),
         num(r.unchanged)
     );
+    // Counts only, never a frame's data, target or route (M24 §7.5).
+    if let Some(f) = &d.frames {
+        let _ = writeln!(o, "| Frames | {} |", frame_counts(f));
+    }
     let _ = writeln!(
         o,
         "| Effects | {} added, {} removed, {} changed |",
@@ -612,6 +616,9 @@ fn render_details(o: &mut String, d: &Diff) {
             }
         }
     }
+    if let Some(f) = &d.frames {
+        render_frames(o, f);
+    }
     let e = &d.effects;
     if e.added + e.removed + e.changed > 0 {
         let _ = writeln!(o, "\n## Effects\n");
@@ -725,6 +732,8 @@ fn render_details(o: &mut String, d: &Diff) {
         ("Origins", &sm.origins),
         ("Consequences", &sm.consequences),
         ("Changed responses", &sm.responses_changed),
+        ("Changed frames", &sm.frames_changed),
+        ("Skipped connection inputs", &sm.frames_skipped),
         ("Changed effects", &sm.effects_changed),
         ("Introduced errors", &sm.errors_introduced),
         ("Synthetic effects", &sm.synthetic),
@@ -754,6 +763,85 @@ fn render_details(o: &mut String, d: &Diff) {
         for (name, ids) in cats {
             if let Some(first) = ids.first() {
                 let _ = writeln!(o, "- {name}: {} (`kronik trace {first}`)", ids.len());
+            }
+        }
+    }
+}
+
+/// The counts of the `frames` section (M24 §7.5), for both renderings.
+fn frame_counts(f: &crate::diff::Frames) -> String {
+    format!(
+        "{} changed, {} unchanged, {} skipped; sent: production {}, fork {}; send-now: {} recorded, {} modeled",
+        num(f.changed),
+        num(f.unchanged),
+        num(f.skipped),
+        num(f.sent.prod),
+        num(f.sent.fork),
+        num(f.send_now.recorded),
+        num(f.send_now.modeled)
+    )
+}
+
+/// The "Frames" section (M24 §7.5): the counts, then each changed input
+/// with its open's answer and its changed operations.
+fn render_frames(o: &mut String, f: &crate::diff::Frames) {
+    let _ = writeln!(o, "\n## Frames\n");
+    let i = &f.inputs;
+    let _ = writeln!(
+        o,
+        "{} of {} connection inputs and inputs that sent frames send changed frames ({} open, {} frame and {} close inputs in the window).\n",
+        num(f.changed),
+        num(f.changed + f.unchanged),
+        num(i.open),
+        num(i.frame),
+        num(i.close)
+    );
+    let _ = writeln!(o, "{}.", frame_counts(f));
+    for item in &f.items {
+        let _ = writeln!(
+            o,
+            "\n- `{}` (root LSN {}, {} → {})",
+            item.input, item.root_lsn, item.turn_prod, item.turn_fork
+        );
+        if let Some(open) = &item.open {
+            let _ = writeln!(o, "  - open: {} → {}", open.prod, open.fork);
+        }
+        for c in &item.frames {
+            let side = |k: &Option<String>| k.clone().unwrap_or_else(|| "∅".into());
+            let now = match &c.send_now {
+                Some(n) if n.prod == n.fork => " (send-now)".to_owned(),
+                Some(n) => format!(" (send-now: {} → {})", n.prod, n.fork),
+                None => String::new(),
+            };
+            let _ = writeln!(
+                o,
+                "  - operation {} {}: {} → {}{now}, {} targets",
+                c.index,
+                c.change,
+                side(&c.kind.prod),
+                side(&c.kind.fork),
+                num(c.targets)
+            );
+            if let Some(e) = &c.event {
+                let _ = writeln!(o, "    - event: {} → {}", val(&e.prod), val(&e.fork));
+            }
+            if let Some(code) = &c.code {
+                let st = |x: Option<u32>| x.map_or("∅".to_string(), |v| v.to_string());
+                let _ = writeln!(o, "    - code: {} → {}", st(code.prod), st(code.fork));
+            }
+            for b in &c.data {
+                let path = if b.path.is_empty() {
+                    "(data)"
+                } else {
+                    b.path.as_str()
+                };
+                let _ = writeln!(
+                    o,
+                    "    - {} `{path}`: {} → {}",
+                    b.op,
+                    val(&b.prod),
+                    val(&b.fork)
+                );
             }
         }
     }

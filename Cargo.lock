@@ -2090,6 +2090,7 @@ version = "0.5.0-dev"
 dependencies = [
  "base64 0.22.1",
  "blake3",
+ "boon",
  "kronik-core",
  "kronik-effects",
  "kronik-gateway",

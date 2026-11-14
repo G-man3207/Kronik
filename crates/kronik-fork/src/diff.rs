@@ -210,6 +210,9 @@ pub struct Summary {
     /// never compared with production nor counted as divergent.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub preview_inputs: u64,
+    /// `frames.changed` (M24); absent when 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub frames_changed: u64,
     pub confidence: f64,
     pub verified_through_lsn: Lsn,
     pub changed: bool,
@@ -283,6 +286,93 @@ pub struct Responses {
     pub unchanged: u64,
     pub changed: u64,
     pub items: Vec<ResponseItem>,
+}
+
+/// The connection root inputs of the window, by event (M24 §7.5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameInputs {
+    pub open: u64,
+    pub frame: u64,
+    pub close: u64,
+}
+
+/// How the fork's `connection.send-now` effects were answered (M24 §7.3):
+/// from the recording (exact or approximate), or by the connection model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendNowAnswers {
+    pub recorded: u64,
+    pub modeled: u64,
+}
+
+/// One changed outgoing connection operation of a root input's tree: a
+/// frame (`send`, `broadcast` or `send-now`) or a close (M24 §7.4, §7.5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameChange {
+    /// The operation's position in the tree: its turns in causal order,
+    /// each with its `send-now` frames, then its buffered operations.
+    pub index: u64,
+    /// `added`, `removed` or `changed`.
+    pub change: Cow<'static, str>,
+    /// How many connections the operation names (production's, else the
+    /// fork's).
+    pub targets: u64,
+    /// The first 5 of them.
+    pub connections: Vec<String>,
+    /// `text`, `binary`, `event` or `close` on each side; null when that
+    /// side has no operation here.
+    pub kind: ProdFork<Option<String>>,
+    /// Whether each side's frame went out with `send-now`; absent when
+    /// neither did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_now: Option<ProdFork<bool>>,
+    /// The SSE `event:` and `id:` fields on each side, when they differ;
+    /// null otherwise.
+    pub event: Option<ProdFork<Value>>,
+    /// The data (a close's reason): JSON pointer operations when both sides
+    /// are JSON, else one operation at `""`. Values with a subject are
+    /// redacted.
+    pub data: Vec<BodyOp>,
+    /// A close's code on each side, when they differ; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<ProdFork<Option<u32>>>,
+}
+
+/// A root input whose tree sends other frames, or whose open is answered
+/// otherwise, in the fork (M24 §7.5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameItem {
+    pub root_lsn: Lsn,
+    /// The input's label (`kronik_fork::index::input_label`): never a
+    /// connection id, path or data.
+    pub input: String,
+    pub turn_prod: String,
+    pub turn_fork: String,
+    /// `accept`, `refuse <status>` or `fail <error code>` on each side, when
+    /// the open's answer changed; null otherwise.
+    pub open: Option<ProdFork<String>>,
+    /// The changed operations, at most 20.
+    pub frames: Vec<FrameChange>,
+}
+
+/// The `frames` section (M24 §7.5, ADR 0116): what the root inputs sent to
+/// long-lived connections, production against the fork. Absent when the
+/// window has no connection input and no turn sent a frame.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Frames {
+    pub inputs: FrameInputs,
+    /// Replayed root inputs (connection inputs, and any input whose tree
+    /// sent frames) whose operations and open answer are identical.
+    pub unchanged: u64,
+    pub changed: u64,
+    /// Continuous replay: frame and close inputs not run because the fork's
+    /// actor never accepted their connection (§7.2).
+    pub skipped: u64,
+    /// Outgoing frame targets: every live target of a send or broadcast,
+    /// and every `send-now` answered `ok`.
+    pub sent: ProdFork<u64>,
+    pub send_now: SendNowAnswers,
+    /// The changed inputs, in root LSN order, at most 200.
+    pub items: Vec<FrameItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,6 +509,13 @@ pub struct Samples {
     /// Requests sent to a preview fork (M11).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preview: Vec<PreviewSample>,
+    /// The fork's root turns of the inputs in `frames.items` (M24).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames_changed: Vec<String>,
+    /// The production turns of the inputs counted in `frames.skipped`
+    /// (M24 §7.2): the fork has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames_skipped: Vec<String>,
 }
 
 /// A request sent to a preview fork: its root turn, method, route pattern
@@ -487,6 +584,10 @@ pub struct KindReport {
     pub consequences: u64,
     /// HTTP root inputs served by this kind.
     pub responses: KindResponses,
+    /// Root inputs of this kind counted in `frames` (M24); absent for a
+    /// kind without connections or frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<KindResponses>,
     /// External effects of this kind's turns.
     pub effects: KindEffects,
     /// Actors of this kind whose state differs (isolated or continuous).
@@ -512,6 +613,11 @@ pub struct Diff {
     pub causes: Vec<Cause>,
     pub grounding: Vec<GroundingRow>,
     pub responses: Responses,
+    /// Long-lived connections (M24, ADR 0116). Absent when the window has
+    /// no connection input and no turn sent a frame, and in diffs written
+    /// before M24.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<Frames>,
     pub effects: Effects,
     pub state: State,
     pub cumulative: Cumulative,
@@ -1043,6 +1149,9 @@ struct TurnView {
     timers: Vec<(i32, u64, i64, Vec<u8>)>,
     effects: Vec<(u32, String, String, Vec<u8>)>,
     sql: Vec<Vec<u8>>,
+    /// The outgoing connection operations, `send-now` frames included,
+    /// normalized and without their seqs (M24 §7.4, [`conn_ops`]).
+    connection_ops: Vec<Vec<u8>>,
 }
 
 fn view(t: &pb::TurnRecord, n: &Norm) -> TurnView {
@@ -1141,6 +1250,9 @@ fn view(t: &pb::TurnRecord, n: &Norm) -> TurnView {
         effects: t
             .effects
             .iter()
+            // A `send-now` is compared as the frame it sent, with the
+            // buffered operations below (M24 §7.4).
+            .filter(|e| e.kind != SEND_NOW)
             .map(|e| {
                 (
                     e.ordinal,
@@ -1165,6 +1277,7 @@ fn view(t: &pb::TurnRecord, n: &Norm) -> TurnView {
                     .map(|s| s.statement.clone().into_bytes()),
             )
             .collect(),
+        connection_ops: conn_ops(t).iter().map(|op| op.key(n)).collect(),
     }
 }
 
@@ -1185,6 +1298,273 @@ fn committed(t: &pb::TurnRecord) -> bool {
 /// unknown): writes are undone and the input is answered with an error.
 fn failed(t: &pb::TurnRecord) -> bool {
     !committed(t)
+}
+
+// ---------------------------------------------------------------------------
+// Long-lived connections (M24 §7.4, §7.5, ADR 0116).
+
+/// The kind of the `connection.send-now` effect (M24 §6.2). It is not
+/// [`external`]: its answer says nothing about a system outside, so it
+/// counts in no grounding and no confidence (§7.3).
+const SEND_NOW: &str = "connection.send-now";
+
+/// Changed operations listed per item of `frames.items`.
+const MAX_FRAME_CHANGES: usize = 20;
+
+/// Targets listed per changed operation.
+const MAX_FRAME_TARGETS: usize = 5;
+
+/// One outgoing connection operation of a turn, as the diff compares it: a
+/// frame the turn sent with `send-now`, or a buffered send, broadcast or
+/// close. Never its seqs, which an earlier change shifts (ADR 0116 point 2),
+/// nor a `send-now`'s answer.
+struct ConnOp {
+    send_now: bool,
+    /// The live targets, then those that no live connection had.
+    connections: Vec<String>,
+    dropped: Vec<String>,
+    /// The targets the frame went to: a send's live ones, or the one of a
+    /// `send-now` answered `ok`; 0 for a close.
+    delivered: u64,
+    /// `text`, `binary`, `event` or `close`.
+    kind: &'static str,
+    /// A frame's data, or a close's reason.
+    data: Option<pb::Sealable>,
+    /// An SSE event's `event:` and `id:` fields.
+    event: String,
+    id: String,
+    /// A close's code.
+    code: Option<u32>,
+}
+
+impl ConnOp {
+    /// The bytes compared: every field but `delivered`, the data normalized
+    /// like a body (`ignore_json_paths`) and with its subject.
+    fn key(&self, n: &Norm) -> Vec<u8> {
+        let mut v = Vec::new();
+        let mut put = |b: &[u8]| {
+            v.extend_from_slice(&(b.len() as u64).to_le_bytes());
+            v.extend_from_slice(b);
+        };
+        put(if self.send_now {
+            b"send-now"
+        } else {
+            b"buffered"
+        });
+        put(self.kind.as_bytes());
+        for list in [&self.connections, &self.dropped] {
+            put(&(list.len() as u64).to_le_bytes());
+            for c in list {
+                put(c.as_bytes());
+            }
+        }
+        put(self
+            .data
+            .as_ref()
+            .and_then(|d| d.subject.as_deref())
+            .unwrap_or("")
+            .as_bytes());
+        put(&n.body_key(self.data.as_ref()));
+        put(self.event.as_bytes());
+        put(self.id.as_bytes());
+        put(&self.code.map_or(Vec::new(), |c| c.to_le_bytes().to_vec()));
+        v
+    }
+
+    /// The targets it names, live ones first.
+    fn targets(&self) -> impl Iterator<Item = &String> {
+        self.connections.iter().chain(&self.dropped)
+    }
+
+    /// The SSE fields of an event frame; null for any other operation.
+    fn event_json(&self) -> Value {
+        if self.kind == "event" {
+            json!({"event": self.event, "id": self.id})
+        } else {
+            Value::Null
+        }
+    }
+}
+
+/// The frame a `send-now` effect record sent (its `ConnectionSendRequest`,
+/// tagged with the request's subject), or `None` for a record without one
+/// (a denial).
+fn send_now_op(e: &pb::EffectRecord) -> Option<ConnOp> {
+    let request = e.request.as_ref()?;
+    let r = pb::ConnectionSendRequest::decode(sealable_bytes(Some(request))?).ok()?;
+    let delivered = u64::from(e.status == pb::EffectStatus::Ok as i32);
+    Some(ConnOp {
+        send_now: true,
+        connections: vec![r.connection],
+        dropped: Vec::new(),
+        delivered,
+        kind: kronik_proto::connection::frame_kind_name(r.kind),
+        data: Some(pb::Sealable {
+            subject: request.subject.clone(),
+            value: Some(pb::sealable::Value::Plain(r.data)),
+        }),
+        event: r.event,
+        id: r.id,
+        code: None,
+    })
+}
+
+/// A turn's outgoing connection operations in the order they went out: its
+/// `send-now` frames, in ordinal order, as it sent them, then its buffered
+/// operations, in call order, when it committed (M24 §4.5).
+fn conn_ops(t: &pb::TurnRecord) -> Vec<ConnOp> {
+    let mut out: Vec<ConnOp> = t
+        .effects
+        .iter()
+        .filter(|e| e.kind == SEND_NOW)
+        .filter_map(send_now_op)
+        .collect();
+    for op in &t.connection_ops {
+        out.push(match &op.op {
+            Some(pb::connection_op::Op::Send(f)) => ConnOp {
+                send_now: false,
+                connections: op.connections.clone(),
+                dropped: op.dropped.clone(),
+                delivered: op.connections.len() as u64,
+                kind: kronik_proto::connection::frame_kind_name(f.kind),
+                data: f.data.clone(),
+                event: f.event.clone(),
+                id: f.id.clone(),
+                code: None,
+            },
+            Some(pb::connection_op::Op::Close(c)) => ConnOp {
+                send_now: false,
+                connections: op.connections.clone(),
+                dropped: op.dropped.clone(),
+                delivered: 0,
+                kind: "close",
+                data: c.reason.clone(),
+                event: String::new(),
+                id: String::new(),
+                code: Some(c.code),
+            },
+            // Refused by validation; compared as what it is, nothing.
+            None => ConnOp {
+                send_now: false,
+                connections: op.connections.clone(),
+                dropped: op.dropped.clone(),
+                delivered: 0,
+                kind: "unspecified",
+                data: None,
+                event: String::new(),
+                id: String::new(),
+                code: None,
+            },
+        });
+    }
+    out
+}
+
+/// The open's answer for `frames.items[].open`: `accept`, `refuse <status>`
+/// (the refusal's HTTP response) or `fail <error code>` (the open turn did
+/// not commit).
+fn open_answer(t: &pb::TurnRecord) -> String {
+    let o = t.outcome.clone().unwrap_or_default();
+    if o.kind != pb::OutcomeKind::Committed as i32 {
+        return format!("fail {}", o.error_code);
+    }
+    match &o.output {
+        Some(pb::outcome::Output::Accept(_)) => "accept".into(),
+        Some(pb::outcome::Output::Http(r)) => format!("refuse {}", r.status),
+        _ => "fail".into(),
+    }
+}
+
+/// A JSON value of a frame on one side: redacted when the frame has a
+/// subject, like any value with one (§7.5).
+fn frame_value(sealer: &Sealer, s: Option<&pb::Sealable>, v: &Value) -> Value {
+    match s.and_then(|s| s.subject.as_deref()) {
+        Some(subject) if !v.is_null() => {
+            redacted(sealer, subject, &serde_json::to_vec(v).unwrap_or_default())
+        }
+        _ => v.clone(),
+    }
+}
+
+/// The data operations of a changed frame (a close's reason): JSON pointer
+/// operations when both sides are JSON, with the values of a side that has
+/// a subject redacted; otherwise one operation at `""` with each value.
+fn frame_data_ops(n: &Norm, p: Option<&pb::Sealable>, f: Option<&pb::Sealable>) -> Vec<BodyOp> {
+    let json = |s: Option<&pb::Sealable>| sealable_bytes(s).and_then(|b| n.json_body(b));
+    if let (Some(a), Some(b)) = (json(p), json(f)) {
+        let mut out = Vec::new();
+        json_diff("", Some(&a), Some(&b), &mut out);
+        for op in &mut out {
+            op.prod = frame_value(&n.sealer, p, &op.prod);
+            op.fork = frame_value(&n.sealer, f, &op.fork);
+        }
+        return out;
+    }
+    let subject = |s: Option<&pb::Sealable>| s.and_then(|s| s.subject.clone());
+    if n.body_key(p) == n.body_key(f) && subject(p) == subject(f) {
+        return Vec::new();
+    }
+    let op = match (p, f) {
+        (Some(_), None) => "remove",
+        (None, Some(_)) => "add",
+        _ => "replace",
+    };
+    vec![BodyOp {
+        op: op.into(),
+        path: String::new(),
+        prod: sealable_json(&n.sealer, p),
+        fork: sealable_json(&n.sealer, f),
+    }]
+}
+
+/// One position of a tree's operations, production's against the fork's.
+fn frame_change(
+    n: &Norm,
+    index: u64,
+    p: Option<&ConnOp>,
+    f: Option<&ConnOp>,
+) -> Option<FrameChange> {
+    let change = match (p, f) {
+        (Some(a), Some(b)) if a.key(n) == b.key(n) => return None,
+        (Some(_), Some(_)) => "changed",
+        (Some(_), None) => "removed",
+        (None, Some(_)) => "added",
+        (None, None) => return None,
+    };
+    let shown = p.or(f)?;
+    let event = (p.map(ConnOp::event_json) != f.map(ConnOp::event_json)
+        && (p.is_some_and(|o| o.kind == "event") || f.is_some_and(|o| o.kind == "event")))
+    .then(|| ProdFork {
+        prod: p.map_or(Value::Null, ConnOp::event_json),
+        fork: f.map_or(Value::Null, ConnOp::event_json),
+    });
+    let send_now =
+        (p.is_some_and(|o| o.send_now) || f.is_some_and(|o| o.send_now)).then(|| ProdFork {
+            prod: p.is_some_and(|o| o.send_now),
+            fork: f.is_some_and(|o| o.send_now),
+        });
+    let code = (p.and_then(|o| o.code) != f.and_then(|o| o.code)).then(|| ProdFork {
+        prod: p.and_then(|o| o.code),
+        fork: f.and_then(|o| o.code),
+    });
+    Some(FrameChange {
+        index,
+        change: change.into(),
+        targets: shown.targets().count() as u64,
+        connections: shown.targets().take(MAX_FRAME_TARGETS).cloned().collect(),
+        kind: ProdFork {
+            prod: p.map(|o| o.kind.to_owned()),
+            fork: f.map(|o| o.kind.to_owned()),
+        },
+        send_now,
+        event,
+        data: frame_data_ops(
+            n,
+            p.and_then(|o| o.data.as_ref()),
+            f.and_then(|o| o.data.as_ref()),
+        ),
+        code,
+    })
 }
 
 fn external(kind: &str) -> bool {
@@ -1507,6 +1887,11 @@ struct Acc {
     copied: BTreeSet<String>,
     /// Root inputs whose response the continuous view gives.
     deferred: BTreeSet<Lsn>,
+    /// The `frames` section so far (M24 §7.5); its inputs and skipped
+    /// counts are set by `build`.
+    frames: Frames,
+    /// A compared tree was a connection input or sent frames.
+    frames_seen: bool,
 }
 
 /// The actor kind of a turn.
@@ -1592,6 +1977,8 @@ impl Acc {
             by_kind: BTreeMap::new(),
             copied: BTreeSet::new(),
             deferred: BTreeSet::new(),
+            frames: Frames::default(),
+            frames_seen: false,
         }
     }
 
@@ -2190,6 +2577,7 @@ impl Acc {
         if !full {
             return;
         }
+        self.tree_frames(prod, fork, root_lsn);
         // Causal grouping.
         let root_turns: BTreeMap<&str, (Lsn, &pb::TurnRecord)> = pmap
             .values()
@@ -2281,6 +2669,164 @@ impl Acc {
         if let Some(root_lsn) = root_lsn {
             self.tree_state(root_lsn, prod, fork);
         }
+    }
+
+    /// The frames of the root inputs among `prod` and `fork` (M24 §7.5), in
+    /// root LSN order: one isolated tree (`root_lsn` set), or every tree of
+    /// the continuous window.
+    fn tree_frames(
+        &mut self,
+        prod: &[(Lsn, &pb::TurnRecord)],
+        fork: &[ForkTurn],
+        root_lsn: Option<Lsn>,
+    ) {
+        type Tree<'t> = (Vec<(Lsn, &'t pb::TurnRecord)>, Vec<&'t ForkTurn>);
+        let mut trees: BTreeMap<&str, Tree<'_>> = BTreeMap::new();
+        for (l, t) in prod {
+            if let Some(k) = &t.causal_key {
+                trees.entry(k.root.as_str()).or_default().0.push((*l, *t));
+            }
+        }
+        for f in fork {
+            if let Some(k) = &f.record.causal_key {
+                trees.entry(k.root.as_str()).or_default().1.push(f);
+            }
+        }
+        let mut ordered: Vec<(Lsn, (Lsn, &pb::TurnRecord), Tree<'_>)> = trees
+            .into_values()
+            .filter_map(|(p, f)| {
+                let root = p
+                    .iter()
+                    .find(|(_, t)| t.causal_key.as_ref().is_some_and(|k| k.path.is_empty()))
+                    .copied()?;
+                Some((root_lsn.unwrap_or(root.0), root, (p, f)))
+            })
+            .collect();
+        ordered.sort_by_key(|(lsn, ..)| *lsn);
+        for (lsn, root, (p, f)) in ordered {
+            self.frames(lsn, root, &p, &f);
+        }
+    }
+
+    /// One root input's frames: what its tree sent to connections in
+    /// production against the fork, operation by operation (its turns in
+    /// causal order, each turn's in the order they went out), and its open's
+    /// answer. Counted when the input is a connection input or a side sent
+    /// frames; the counts of what was sent always, the comparison only for a
+    /// tree whose turns all ran on the recorded data (as `response`).
+    fn frames(
+        &mut self,
+        root_lsn: Lsn,
+        root: (Lsn, &pb::TurnRecord),
+        prod: &[(Lsn, &pb::TurnRecord)],
+        fork: &[&ForkTurn],
+    ) {
+        let mut sides: BTreeMap<Vec<u8>, (Vec<ConnOp>, Vec<ConnOp>)> = BTreeMap::new();
+        for (_, t) in prod {
+            if let Some(k) = &t.causal_key {
+                sides.entry(causal::encode(k)).or_default().0 = conn_ops(t);
+            }
+        }
+        for f in fork {
+            if let Some(k) = &f.record.causal_key {
+                sides.entry(causal::encode(k)).or_default().1 = conn_ops(&f.record);
+            }
+        }
+        let connection = kronik_proto::connection::input(root.1.input.as_ref());
+        let sent_any = sides.values().any(|(p, f)| !p.is_empty() || !f.is_empty());
+        if connection.is_none() && !sent_any {
+            return;
+        }
+        self.frames_seen = true;
+        for (p, f) in sides.values() {
+            self.frames.sent.prod += p.iter().map(|o| o.delivered).sum::<u64>();
+            self.frames.sent.fork += f.iter().map(|o| o.delivered).sum::<u64>();
+        }
+        for e in fork
+            .iter()
+            .flat_map(|f| &f.record.effects)
+            .filter(|e| e.kind == SEND_NOW)
+        {
+            match pb::Grounding::try_from(e.grounding) {
+                Ok(pb::Grounding::Exact | pb::Grounding::Approximate) => {
+                    self.frames.send_now.recorded += 1;
+                }
+                Ok(pb::Grounding::Synthetic) => self.frames.send_now.modeled += 1,
+                _ => {}
+            }
+        }
+        // What a turn the replay could not run on the recorded data sent is
+        // not a change either (S-16, ADR 0109 points 3-4).
+        if fork.iter().any(|f| unverified_input(f)) {
+            return;
+        }
+        // An input the fork did not run (continuous replay skips the frames
+        // of a connection its actor never accepted) is `skipped`, not a
+        // comparison.
+        let root_key = root.1.causal_key.as_ref().map(causal::encode);
+        let Some(fork_root) = fork
+            .iter()
+            .copied()
+            .find(|f| f.record.causal_key.as_ref().map(causal::encode) == root_key)
+        else {
+            return;
+        };
+        let open = match connection.and_then(|c| c.event.as_ref()) {
+            Some(pb::connection_input::Event::Open(_)) => {
+                let answered = |t: &pb::TurnRecord| {
+                    let v = view(t, &self.norm);
+                    (v.outcome, v.output)
+                };
+                (answered(root.1) != answered(&fork_root.record)).then(|| ProdFork {
+                    prod: open_answer(root.1),
+                    fork: open_answer(&fork_root.record),
+                })
+            }
+            _ => None,
+        };
+        let mut changes = Vec::new();
+        let mut changed = false;
+        let mut index = 0u64;
+        for (p, f) in sides.values() {
+            for i in 0..p.len().max(f.len()) {
+                if let Some(c) = frame_change(&self.norm, index, p.get(i), f.get(i)) {
+                    changed = true;
+                    push_capped(&mut changes, MAX_FRAME_CHANGES, c);
+                }
+                index += 1;
+            }
+        }
+        let kind = kind_of(root.1);
+        if !changed && open.is_none() {
+            self.frames.unchanged += 1;
+            self.kind(kind)
+                .frames
+                .get_or_insert_with(KindResponses::default)
+                .unchanged += 1;
+            return;
+        }
+        self.frames.changed += 1;
+        self.kind(kind)
+            .frames
+            .get_or_insert_with(KindResponses::default)
+            .changed += 1;
+        push_capped(
+            &mut self.samples.frames_changed,
+            MAX_SAMPLES,
+            fork_root.id.clone(),
+        );
+        push_capped(
+            &mut self.frames.items,
+            MAX_ITEMS,
+            FrameItem {
+                root_lsn,
+                input: input_label(root.1.input.as_ref()),
+                turn_prod: prod_id(root.0),
+                turn_fork: fork_root.id.clone(),
+                open,
+                frames: changes,
+            },
+        );
     }
 
     /// Isolated state: the final writes of a tree per actor.
@@ -2710,6 +3256,9 @@ pub struct ContinuousView<'a> {
     pub turns: &'a [ForkTurn],
     pub fork: &'a Store,
     pub prod: &'a Store,
+    /// The production LSNs of the connection inputs the fork did not run
+    /// ([`crate::replay::Continuous::skipped`], M24 §7.2).
+    pub skipped: &'a [Lsn],
 }
 
 /// Everything a diff is built from.
@@ -2951,6 +3500,32 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
         })
         .collect();
     let errors = acc.errors;
+    // Long-lived connections (M24 §7.5): the window's connection inputs,
+    // what continuous replay skipped, and what the compared trees sent.
+    let mut samples = acc.samples;
+    let mut frames = acc.frames;
+    for r in &index.roots {
+        match kronik_proto::connection::input(Some(&r.input)).and_then(|c| c.event.as_ref()) {
+            Some(pb::connection_input::Event::Open(_)) => frames.inputs.open += 1,
+            Some(pb::connection_input::Event::Frame(_)) => frames.inputs.frame += 1,
+            Some(pb::connection_input::Event::Close(_)) => frames.inputs.close += 1,
+            None => {}
+        }
+    }
+    if let Some(c) = &input.continuous {
+        frames.skipped = c.skipped.len() as u64;
+        samples.frames_skipped = c
+            .skipped
+            .iter()
+            .take(MAX_SAMPLES)
+            .map(|l| prod_id(*l))
+            .collect();
+    }
+    let inputs = frames.inputs;
+    let frames = (acc.frames_seen
+        || inputs.open + inputs.frame + inputs.close + frames.skipped > 0)
+        .then_some(frames);
+    let frames_changed = frames.as_ref().map_or(0, |f| f.changed);
     let changed_code: BTreeSet<&str> = kinds
         .iter()
         .filter(|k| matches!(&*k.code, "changed" | "new"))
@@ -2970,6 +3545,7 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
     // a behavior change either. Every other difference stays fail-closed.
     let changed = !acc.divergent.is_empty()
         || acc.responses.changed > 0
+        || frames_changed > 0
         || effects.added + effects.removed + effects.changed > 0
         || !acc.isolated_state.is_empty()
         || !state_continuous.is_empty()
@@ -2994,6 +3570,7 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
         // turn missing below one in the other: it counts once.
         unverifiable: acc.erased_seen.union(&acc.unverifiable).count() as u64,
         preview_inputs: acc.preview_inputs,
+        frames_changed,
         origins: acc.origins,
         consequences: acc.consequences,
         exact,
@@ -3040,6 +3617,7 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
         causes,
         grounding,
         responses: acc.responses,
+        frames,
         effects,
         state: State {
             isolated: acc.isolated_state,
@@ -3051,7 +3629,7 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
         },
         errors,
         resources,
-        samples: acc.samples,
+        samples,
         irreversible: match (input.rebase, &input.continuous) {
             (true, Some(c)) => Some(irreversible(index, c.turns)),
             _ => None,
@@ -3251,5 +3829,181 @@ mod tests {
         assert_eq!(shown["subject"], SQL_CONCEALED);
         assert_eq!(r.outcome.as_ref().unwrap().message, SQL_CONCEALED);
         assert_eq!(r.input, Some(pb::Input::default()), "the input stays");
+    }
+
+    /// M24 §7.3-§7.5: a turn's connection operations compare without their
+    /// seqs and with `ignore_json_paths`. A `send-now` compares as the frame
+    /// it sent, counts as recorded (exact or approximate) or modeled
+    /// (synthetic), and never in grounding. A changed frame shows as JSON
+    /// pointer operations with the values of its subject redacted.
+    #[test]
+    fn connection_operations_compare_without_seqs_and_send_now_is_no_grounding() {
+        let conn = |n: u8| format!("c-{}", format!("{n:x}").repeat(32));
+        let tagged = |b: &[u8]| {
+            Some(pb::Sealable {
+                subject: Some("user:1".into()),
+                value: Some(pb::sealable::Value::Plain(b.to_vec())),
+            })
+        };
+        let send_now = |seq: u64, text: &str, grounding: pb::Grounding| pb::EffectRecord {
+            ordinal: 1,
+            kind: SEND_NOW.into(),
+            target: format!("connection:{}", conn(1)),
+            status: pb::EffectStatus::Ok as i32,
+            grounding: grounding as i32,
+            request: tagged(
+                &pb::ConnectionSendRequest {
+                    connection: conn(1),
+                    seq,
+                    kind: pb::frame::Kind::Text as i32,
+                    data: text.as_bytes().to_vec(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ),
+            ..Default::default()
+        };
+        let ops = |seq: u64, data: &str| {
+            vec![
+                pb::ConnectionOp {
+                    connections: vec![conn(1), conn(2)],
+                    seqs: vec![seq, seq + 1],
+                    op: Some(pb::connection_op::Op::Send(pb::Frame {
+                        kind: pb::frame::Kind::Text as i32,
+                        data: tagged(data.as_bytes()),
+                        ..Default::default()
+                    })),
+                    dropped: vec![conn(3)],
+                },
+                pb::ConnectionOp {
+                    connections: vec![conn(2)],
+                    seqs: vec![],
+                    op: Some(pb::connection_op::Op::Close(pb::ConnectionCloseRequest {
+                        code: 4000,
+                        reason: tagged(b"kicked"),
+                    })),
+                    dropped: vec![],
+                },
+            ]
+        };
+        let turn = |root: &str, effects, connection_ops| pb::TurnRecord {
+            actor: Some(pb::ActorRef {
+                kind: "room".into(),
+                key: "lobby".into(),
+            }),
+            causal_key: Some(pb::CausalKey {
+                root: root.into(),
+                path: vec![],
+            }),
+            input: Some(pb::Input {
+                kind: Some(pb::input::Kind::Connection(pb::ConnectionInput {
+                    connection: conn(1),
+                    protocol: pb::ConnectionProtocol::Websocket as i32,
+                    route: "/room/{key}/ws".into(),
+                    event: Some(pb::connection_input::Event::Frame(pb::ConnectionFrame {
+                        seq: 0,
+                        frame: Some(pb::Frame::default()),
+                    })),
+                    ..Default::default()
+                })),
+            }),
+            effects,
+            connection_ops,
+            outcome: Some(pb::Outcome {
+                kind: pb::OutcomeKind::Committed as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fork = |root: &str, record| ForkTurn {
+            id: format!("f:r{root}.0"),
+            record,
+            lsn: 1,
+            prod_lsn: None,
+            masked: false,
+            pseudonyms: false,
+            erased: false,
+            sql: false,
+            personal: false,
+        };
+        let options = DiffOptions {
+            ignore_json_paths: vec!["$.at".into()],
+            ..DiffOptions::default()
+        };
+        let mut acc = Acc::new(&options, Arc::new(Sealer::plain()));
+
+        // The same operations with other seqs and another ignored `at`.
+        let prod = turn(
+            "1",
+            vec![send_now(5, "tok", pb::Grounding::Live)],
+            ops(6, r#"{"text":"hi","at":1}"#),
+        );
+        let same = turn(
+            "1",
+            vec![send_now(9, "tok", pb::Grounding::Exact)],
+            ops(10, r#"{"text":"hi","at":2}"#),
+        );
+        acc.compare(&[(1, &prod)], &[fork("1", same)], Some(1), true);
+        assert!(acc.divergent.is_empty());
+        assert_eq!((acc.frames.unchanged, acc.frames.changed), (1, 0));
+
+        // Another format, and a `send-now` the connection model answered.
+        let prod = turn(
+            "2",
+            vec![send_now(5, "tok", pb::Grounding::Live)],
+            ops(6, r#"{"text":"hi"}"#),
+        );
+        let other = turn(
+            "2",
+            vec![send_now(5, "tok 0", pb::Grounding::Synthetic)],
+            ops(6, r#"{"body":"hi"}"#),
+        );
+        acc.compare(&[(2, &prod)], &[fork("2", other)], Some(2), true);
+        assert_eq!(acc.divergent.len(), 1);
+        let f = &acc.frames;
+        assert_eq!((f.unchanged, f.changed), (1, 1));
+        assert_eq!((f.send_now.recorded, f.send_now.modeled), (1, 1));
+        // Two live targets of each send, and each `ok` send-now.
+        assert_eq!((f.sent.prod, f.sent.fork), (6, 6));
+        assert!(acc.grounding.is_empty() && acc.effects.changed == 0);
+        let item = &f.items[0];
+        assert_eq!(
+            (item.root_lsn, item.input.as_str(), item.turn_fork.as_str()),
+            (2, "connection frame WEBSOCKET /room/{key}/ws", "f:r2.0")
+        );
+        let [now, send] = item.frames.as_slice() else {
+            panic!("{:?}", item.frames);
+        };
+        assert_eq!((now.index, now.change.as_ref()), (0, "changed"));
+        assert!(now.send_now.as_ref().is_some_and(|s| s.prod && s.fork));
+        assert_eq!(now.data.len(), 1);
+        assert_eq!(now.data[0].path, "");
+        assert_eq!(now.data[0].prod["redacted"], true);
+        assert_eq!((send.index, send.targets), (1, 3));
+        assert_eq!(send.connections, [conn(1), conn(2), conn(3)]);
+        let changes: Vec<(&str, &str, bool, bool)> = send
+            .data
+            .iter()
+            .map(|o| {
+                (
+                    o.op.as_ref(),
+                    o.path.as_str(),
+                    o.prod.get("redacted").is_some(),
+                    o.fork.get("redacted").is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                ("add", "/body", false, true),
+                ("remove", "/text", true, false)
+            ]
+        );
+        assert_eq!(acc.samples.frames_changed, ["f:r2.0"]);
+        assert_eq!(
+            acc.by_kind["room"].frames.map(|k| (k.unchanged, k.changed)),
+            Some((1, 1))
+        );
     }
 }

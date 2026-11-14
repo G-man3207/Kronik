@@ -1326,18 +1326,20 @@ The schema `docs/reference/diff-v1.schema.json` gains:
   | Field | Meaning |
   | --- | --- |
   | `inputs` | The connection root inputs of the window, by event. |
-  | `unchanged`, `changed` | The isolated-replay root inputs (connection inputs, or any input whose tree sent frames) whose operations are identical or differ. |
+  | `unchanged`, `changed` | The isolated-replay root inputs (connection inputs, or any input whose tree sent frames) whose operations and open answer are identical or differ. Continuous replay gives them when it runs alone, and an input it did not run is not among them. |
   | `skipped` | §7.2. |
-  | `sent` | Outgoing frame targets. |
-  | `send_now` | Recorded and modeled answers (§7.3). |
+  | `sent` | Outgoing frame targets: the live targets of every send and broadcast, and every `send-now` answered `ok`. |
+  | `send_now` | The fork's answers (§7.3): `recorded` is exact or approximate, `modeled` is synthetic. |
   | `items` | The changed inputs, in root LSN order, at most 200. |
-  | `items[].open` | `{prod, fork}`, each `"accept"` or `"refuse <status>"`, when the open answer changed; else `null`. |
-  | `items[].frames` | The changed operations, at most 20 per item: `index` is the operation's position in the tree, `change` is `added`, `removed` or `changed`, and `connections` has the first 5 targets. |
-  | `items[].frames[].data` | JSON pointer operations when both payloads are JSON; otherwise one `replace` at `""`. Values with a subject are redacted as `{redacted, subject, hash}` (`DiffValue`). |
+  | `items[].open` | `{prod, fork}`, each `"accept"`, `"refuse <status>"` or `"fail <error code>"` (the open turn did not commit), when the open answer changed; else `null`. |
+  | `items[].frames` | The changed operations, at most 20 per item. `index` is the operation's position in the tree: its turns in causal order, each turn's `send-now` frames first, then its buffered operations. `change` is `added`, `removed` or `changed`, `targets` counts the connections the operation names, and `connections` has the first 5. `kind` is `text`, `binary`, `event` or `close` on each side. `event` holds both sides' SSE `{event, id}` when they differ. `send_now` (`{prod, fork}`, booleans) is present when either side's frame went out with `send-now`, and `code` when a close's code changed. |
+  | `items[].frames[].data` | The frame's data or a close's reason: JSON pointer operations when both payloads are JSON (`ignore_json_paths` applies); otherwise one `replace`, `add` or `remove` at `""`. Values with a subject are redacted as `{redacted, subject, hash}` (`DiffValue`). |
 
 - **`summary.frames_changed`** (absent when 0), **`kinds[].frames`**
   (`{unchanged, changed}`, absent for kinds without connections), and
-  **`samples.frames_changed`** (absent when empty).
+  **`samples.frames_changed`** and **`samples.frames_skipped`** (the
+  production turns, `main:<lsn>`, of the inputs counted in `skipped`).
+  Both lists are absent when empty.
 - **Markdown:** a "Frames" section after "Responses" ("12 of 263
   connection inputs send changed frames"), with the changed items. The
   `--summary` (M10, [ADR 0023](../adr/0023-diff-summary.md)) shows the

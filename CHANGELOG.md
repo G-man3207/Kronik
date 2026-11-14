@@ -10,6 +10,24 @@ until the v1.0 compatibility promise takes effect.
   WebSocket or SSE connections does not handle connections: their frames
   and closes would fail (M24). The API's promote response carries it in
   `warnings`.
+- Replays and proposals compare what actors send to long-lived
+  connections (M24, ADR 0116). Connection inputs replay like HTTP
+  requests, with the connection's subject. Isolated replay runs them
+  against production's state. Continuous replay evolves the fork's own
+  connections, and does not run the frames and closes of a connection the
+  fork's code never accepted: they are counted as skipped, and their
+  production turns are missing in the fork. A turn's outgoing frames and
+  closes are compared without their seqs, frame data normalized like
+  bodies (`ignore_json_paths`). So are an open's answer and the frames sent
+  with `send-now`, whose answers count in no grounding. `kronik.diff/v1`
+  gains the optional `frames` section after `responses`: the connection
+  inputs by event; unchanged, changed and skipped inputs; the frame targets
+  sent on each side; the `send-now` answers recorded and modeled; and the
+  changed inputs with their open answers and JSON Pointer operations on the
+  frames, values with a subject redacted. Also `summary.frames_changed`,
+  `kinds[].frames` and `samples.frames_changed` and `frames_skipped`. The
+  Markdown gets a "Frames" section, and `--summary` gets their counts
+  only. Diffs without connections are unchanged.
 - `connections.send-now` works (M24): with a grant of `connection:send-now`
   (always delivery class `unsafe`; `--delivery` other than `unsafe` and
   `--rate` are refused), an actor sends a frame on its connection during
