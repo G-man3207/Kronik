@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -20,6 +20,10 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use crate::body::ResponseBody;
 use crate::tls::ACME_TLS_ALPN;
 use crate::{Gateway, HttpRequest, HttpResponse, IpNet, RequestKind};
 
@@ -82,45 +86,100 @@ async fn to_request(
     })
 }
 
-fn to_hyper(r: HttpResponse) -> hyper::Response<Full<Bytes>> {
-    let mut b = hyper::Response::builder().status(r.status);
-    for (n, v) in &r.headers {
+/// The one body type of every gateway response: inline bytes, or an SSE
+/// stream's chunks (M24). The client's disconnect drops it, which ends an
+/// SSE stream's driver.
+impl hyper::body::Body for ResponseBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+        match self.get_mut() {
+            ResponseBody::Inline(bytes) => {
+                if bytes.is_empty() {
+                    return Poll::Ready(None);
+                }
+                let data = Bytes::from(std::mem::take(bytes));
+                Poll::Ready(Some(Ok(hyper::body::Frame::data(data))))
+            }
+            ResponseBody::Events(chunks) => chunks
+                .poll_recv(cx)
+                .map(|chunk| chunk.map(|c| Ok(hyper::body::Frame::data(Bytes::from(c))))),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        matches!(self, ResponseBody::Inline(bytes) if bytes.is_empty())
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        match self {
+            ResponseBody::Inline(bytes) => hyper::body::SizeHint::with_exact(bytes.len() as u64),
+            ResponseBody::Events(_) => hyper::body::SizeHint::default(),
+        }
+    }
+}
+
+fn to_hyper(r: HttpResponse) -> hyper::Response<ResponseBody> {
+    with_body(r.status, &r.headers, ResponseBody::Inline(r.body))
+}
+
+fn with_body(
+    status: u16,
+    headers: &[(String, String)],
+    body: ResponseBody,
+) -> hyper::Response<ResponseBody> {
+    let mut b = hyper::Response::builder().status(status);
+    for (n, v) in headers {
         b = b.header(n, v);
     }
-    b.body(Full::new(Bytes::from(r.body))).unwrap_or_else(|e| {
-        let mut resp = hyper::Response::new(Full::new(Bytes::from(format!(
-            "{{\"error\":{{\"code\":\"INTERNAL\",\"message\":\"invalid response from the actor: {e}\"}}}}"
-        ))));
+    b.body(body).unwrap_or_else(|e| {
+        let mut resp = hyper::Response::new(ResponseBody::Inline(
+            format!(
+                "{{\"error\":{{\"code\":\"INTERNAL\",\"message\":\"invalid response from the actor: {e}\"}}}}"
+            )
+            .into_bytes(),
+        ));
         *resp.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
         resp
     })
 }
 
-/// A request on the connection path (M24 §5.3): the open is admitted and
-/// answered; an accepted WebSocket's upgrade then runs on a task that
-/// drives the connection, and one that does not complete in
-/// [`crate::connections::UPGRADE_TIMEOUT`] is abandoned. SSE streams take
-/// a response body of their own, which comes with their slice: until then
-/// they answer 501 before any turn runs.
+/// A request on the connection path (M24 §5.3, §5.4): the open is admitted
+/// and answered. An accepted SSE stream's body is driven by a task that
+/// streams its queued frames (`connections::sse`). An accepted WebSocket's
+/// upgrade runs on a task that drives the connection, and one that does
+/// not complete in [`crate::connections::UPGRADE_TIMEOUT`] is abandoned.
 async fn open_connection(
     gw: &Arc<Gateway>,
     req: HttpRequest,
     kind: RequestKind,
     upgrade: Option<hyper::upgrade::OnUpgrade>,
-) -> HttpResponse {
+) -> hyper::Response<ResponseBody> {
+    let answer = gw.open_connection(req).await;
     if kind == RequestKind::Sse {
-        return error(
-            501,
-            kronik_core::error::ErrorCode::NotImplemented,
-            "SSE streams are not served yet".into(),
+        let Some(conn) = answer.connection else {
+            return to_hyper(answer.response);
+        };
+        let hub = gw.node.hub().clone();
+        let heartbeat = hub.config().sse_heartbeat;
+        // One chunk in flight: the driver learns when hyper took the last.
+        let (chunks, body) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(crate::connections::sse::drive(hub, conn, chunks, heartbeat));
+        return with_body(
+            answer.response.status,
+            &answer.response.headers,
+            ResponseBody::Events(body),
         );
     }
-    let answer = gw.open_connection(req).await;
     let (Some(conn), Some(upgrade)) = (answer.connection.clone(), upgrade) else {
         if let Some(conn) = &answer.connection {
             gw.node.hub().abandon(conn);
         }
-        return answer.response;
+        return to_hyper(answer.response);
     };
     let hub = gw.node.hub().clone();
     let cfg = hub.config().clone();
@@ -141,7 +200,7 @@ async fn open_connection(
             }
         }
     });
-    answer.response
+    to_hyper(answer.response)
 }
 
 /// Serves HTTP/1.1 on one connection, with upgrades for WebSockets (M24).
@@ -160,19 +219,19 @@ where
                 .then(|| hyper::upgrade::on(&mut req));
             let resp = match to_request(req, gw.cfg.max_body, peer).await {
                 Ok(r) => match gw.classify(&r) {
-                    RequestKind::Http => gw.handle(r).await,
+                    RequestKind::Http => to_hyper(gw.handle(r).await),
                     kind => open_connection(&gw, r, kind, upgrade).await,
                 },
-                Err(resp) => resp,
+                Err(resp) => to_hyper(resp),
             };
-            let status = resp.status.to_string();
+            let status = resp.status().as_u16().to_string();
             kronik_metrics::inc("kronik_gateway_requests_total", &[("status", &status)]);
             kronik_metrics::observe(
                 "kronik_gateway_request_duration_seconds",
                 &[("status", &status)],
                 started.elapsed(),
             );
-            Ok::<_, Infallible>(to_hyper(resp))
+            Ok::<_, Infallible>(resp)
         }
     });
     let mut builder = http1::Builder::new();

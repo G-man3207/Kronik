@@ -32,8 +32,15 @@ until the v1.0 compatibility promise takes effect.
   New `[connections]` settings in `kronik.toml` (caps per node, owner and
   client address, frame and queue sizes, timeouts); over a cap an open
   gets `503 CONNECTION_LIMIT` with `retry-after`. `kronik doctor` warns
-  when the open-file limit leaves fewer connections than `max_open`. SSE
-  routes answer `501` until their part lands.
+  when the open-file limit leaves fewer connections than `max_open`.
+- The gateway serves SSE routes (M24): a GET to an `SSE` route opens a
+  connection like a WebSocket upgrade, and an accept answers `200
+  text/event-stream` whose body streams the actor's frames as events (`id:`,
+  `event:`, one `data:` line per line), with a `: keep-alive` comment every
+  `[connections] sse_heartbeat`. A reconnecting browser's `Last-Event-ID`
+  reaches the open turn as a header, so the actor can resume. The actor's
+  close ends the stream; a client that goes away is a client close (1006);
+  a graceful stop sends `retry: 5000` first.
 - Actors can hold connections (M24, in progress): a connection input runs
   the component's `connection-handler`, whose open turn accepts (with a
   subprotocol, headers and the connection's subject) or refuses with an
