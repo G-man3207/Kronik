@@ -194,6 +194,40 @@ pub enum CryptoOutcome {
     Unsupported(String),
 }
 
+/// A `connections.send-now` as the gate gets it (M24 §4.4): the runtime
+/// checked the connection and the frame with `send`'s rules and computed
+/// the frame's seq.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SendNowRequest {
+    pub connection: String,
+    /// Whether a live connection of the turn's actor has the id, as the
+    /// turn's state says. Without one the answer is `closed`, from the
+    /// state, without a `TurnBegin` (ADR 0114, amended).
+    pub live: bool,
+    /// Whether its owner closed it (a committed close, not yet applied).
+    pub closing: bool,
+    /// The frame's outgoing seq (§4.5): the connection's `next_seq` and
+    /// the turn's earlier `ok` send-now frames to it.
+    pub seq: u64,
+    /// The frame, its data tagged with the turn's default subject.
+    pub frame: pb::Frame,
+    /// The turn's default subject at the call, the request's tag.
+    pub subject: Option<String>,
+}
+
+/// `connections.send-now` results (`send-error` in the WIT).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendNowOutcome {
+    /// Handed to the connection's writer after its earlier frames.
+    Ok,
+    /// Not sent: the connection is closed or closing, not live on this
+    /// node, or its queue stayed full for the effect timeout.
+    Closed,
+    /// A re-run found no recorded result (I17): it may have been sent.
+    OutcomeUnknown,
+    Denied(String),
+}
+
 /// Why the gate could not produce a guest-visible result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateError {
@@ -252,6 +286,19 @@ pub trait EffectGate: Send + Sync {
         ordinal: u32,
         name: String,
     ) -> BoxFuture<'static, Result<Result<String, String>, GateError>>;
+    /// `connections.send-now` (M24 §4.4). The node's gate and the fork's
+    /// answer it; a gate without connections (a test stub) fails the turn.
+    fn send_now(
+        &self,
+        _ordinal: u32,
+        _req: SendNowRequest,
+    ) -> BoxFuture<'static, Result<SendNowOutcome, GateError>> {
+        Box::pin(async {
+            Err(GateError::Host(
+                "connections.send-now is not available here".into(),
+            ))
+        })
+    }
 }
 
 /// The u64 id of the timer scheduled by the turn `key` with `ordinal`.

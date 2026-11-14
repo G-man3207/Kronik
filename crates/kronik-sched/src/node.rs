@@ -4488,6 +4488,10 @@ impl Node {
         self.cfg.test_hold_after_call
     }
 
+    pub(crate) fn hold_after_send_now(&self) -> bool {
+        self.cfg.test_hold_after_send_now
+    }
+
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)
     }
@@ -4656,11 +4660,21 @@ impl Node {
                 ErrorCode::BadRequest,
                 format!(
                     "{capability:?} is not a capability (http:<host>, http:*.<domain>, \
-                     foreign:<name>, secret:<name>, secret-reveal:<name>)"
+                     foreign:<name>, secret:<name>, secret-reveal:<name>, \
+                     connection:send-now)"
                 ),
             )
         })?;
-        if (delivery.is_some() || rate.is_some())
+        if cap == Capability::ConnectionSendNow {
+            // M24 §4.4: always unsafe, and paced by its connection.
+            if rate.is_some() || delivery.as_ref().is_some_and(|d| *d != Delivery::Unsafe) {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    "send-now is always unsafe; its pace is the connection's (no --rate, \
+                     and --delivery only unsafe)",
+                ));
+            }
+        } else if (delivery.is_some() || rate.is_some())
             && !matches!(cap, Capability::Http(_) | Capability::Foreign(_))
         {
             return Err(ApiError::new(

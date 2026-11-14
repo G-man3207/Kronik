@@ -21,7 +21,7 @@ use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::{
     CallOutcome, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchHeader, FetchOutcome,
-    FetchRequest, FetchResponse, GateError,
+    FetchRequest, FetchResponse, GateError, SendNowOutcome, SendNowRequest,
 };
 use prost::Message as _;
 use zeroize::{Zeroize as _, Zeroizing};
@@ -2255,6 +2255,115 @@ impl TurnFx {
         Ok(outcome)
     }
 
+    /// `connections.send-now` (M24 §4.4): an `unsafe` effect of kind
+    /// `connection.send-now` on the target `connection:<id>`. An id without
+    /// a live connection answers `closed` and a kind without the grant
+    /// `denied`, both from recorded facts and without an fsync (ADR 0114,
+    /// amended). A re-run returns a recorded result and never sends one it
+    /// lacks (`OUTCOME_UNKNOWN`, I17). A new one appends and fsyncs the
+    /// `TurnBegin` (I14), hands the frame to the connection's writer (the
+    /// hub waits up to the effect timeout for room in its queue) and
+    /// records the result before the guest sees it.
+    async fn send_now(
+        &self,
+        ordinal: u32,
+        req: SendNowRequest,
+    ) -> Result<SendNowOutcome, GateError> {
+        use kronik_proto::connection::{
+            SEND_NOW_KIND as KIND, send_now_fingerprint, send_now_request,
+        };
+        let target = format!("connection:{}", req.connection);
+        let fp = self.node.sealer().effect_fingerprint(
+            req.subject.as_deref(),
+            send_now_fingerprint(&req.connection, &req.frame),
+        );
+        let request = |seq: u64| {
+            tagged(
+                &req.subject,
+                send_now_request(&req.connection, seq, &req.frame).encode_to_vec(),
+            )
+        };
+        if !req.live {
+            let mut rec = self.base(ordinal, KIND, target, fp);
+            rec.status = pb::EffectStatus::Closed as i32;
+            rec.request = request(0);
+            rec.delivery = Delivery::Unsafe.as_str().into();
+            self.note(rec)?;
+            send_now_metric(self.kind(), pb::EffectStatus::Closed);
+            return Ok(SendNowOutcome::Closed);
+        }
+        let cap = kronik_effects::Capability::SEND_NOW;
+        if self.spec.config.grant(self.kind(), cap).is_none() {
+            let e = not_granted(cap);
+            self.note(self.denied(ordinal, KIND, target, e.clone()))?;
+            send_now_metric(self.kind(), pb::EffectStatus::Denied);
+            return Ok(SendNowOutcome::Denied(e));
+        }
+        let ereq = EffectRequest {
+            ordinal,
+            kind: KIND.into(),
+            target: target.clone(),
+            fingerprint: fp.clone(),
+            http: None,
+        };
+        if let Some(rec) = self.recorded(&ereq)? {
+            let outcome = outcome_of_send_now(&rec)?;
+            self.push_recorded(rec);
+            return Ok(outcome);
+        }
+        // A request and a result without a body must fit, as for a fetch.
+        let need = crate::record_budget::fetch_need(
+            send_now_request(&req.connection, req.seq, &req.frame).encoded_len(),
+        );
+        self.admit(ordinal, KIND, need)?;
+        let mut rec = self.base(ordinal, KIND, target, fp);
+        rec.delivery = Delivery::Unsafe.as_str().into();
+        if self.rerun() {
+            // I17: a send-now without a recorded result is not sent again.
+            rec.status = pb::EffectStatus::OutcomeUnknown as i32;
+            rec.error = "outcome unknown: the daemon stopped before the result was recorded".into();
+            rec.request = request(0);
+            self.record(rec).await?;
+            send_now_metric(self.kind(), pb::EffectStatus::OutcomeUnknown);
+            return Ok(SendNowOutcome::OutcomeUnknown);
+        }
+        self.begin().await?;
+        let hub = self.node.hub().clone();
+        let status = hub
+            .send_now(
+                &req.connection,
+                req.seq,
+                req.frame.clone(),
+                self.spec.limits.effect_timeout,
+            )
+            .await;
+        if status == crate::connections::SendNowStatus::Ok && self.node.hold_after_send_now() {
+            hub.written_through(&req.connection, req.seq).await;
+            std::future::pending::<()>().await;
+        }
+        let (status, outcome) = match status {
+            crate::connections::SendNowStatus::Ok => (pb::EffectStatus::Ok, SendNowOutcome::Ok),
+            crate::connections::SendNowStatus::Closed => {
+                (pb::EffectStatus::Closed, SendNowOutcome::Closed)
+            }
+            crate::connections::SendNowStatus::Timeout => {
+                rec.error = "the connection's outgoing queue stayed full for the effect timeout; \
+                             it closes as a slow consumer"
+                    .into();
+                (pb::EffectStatus::Timeout, SendNowOutcome::Closed)
+            }
+        };
+        rec.status = status as i32;
+        rec.request = request(if status == pb::EffectStatus::Ok {
+            req.seq
+        } else {
+            0
+        });
+        self.record(rec).await?;
+        send_now_metric(self.kind(), status);
+        Ok(outcome)
+    }
+
     async fn reveal(
         &self,
         ordinal: u32,
@@ -2386,6 +2495,35 @@ pub fn outcome_of_fetch(rec: &pb::EffectRecord) -> Result<FetchOutcome, GateErro
     )
 }
 
+/// The guest-visible result of a recorded `connection.send-now` (M24): `ok`;
+/// `closed` for `CLOSED` and `TIMEOUT`; `outcome-unknown`; or `denied`.
+pub fn outcome_of_send_now(rec: &pb::EffectRecord) -> Result<SendNowOutcome, GateError> {
+    Ok(
+        match pb::EffectStatus::try_from(rec.status)
+            .map_err(|_| GateError::Host("The recorded send-now status is invalid".into()))?
+        {
+            pb::EffectStatus::Ok => SendNowOutcome::Ok,
+            pb::EffectStatus::Closed | pb::EffectStatus::Timeout => SendNowOutcome::Closed,
+            pb::EffectStatus::OutcomeUnknown => SendNowOutcome::OutcomeUnknown,
+            pb::EffectStatus::Denied => SendNowOutcome::Denied(rec.error.clone()),
+            _ => {
+                return Err(GateError::Host(
+                    "The recorded send-now status is invalid".into(),
+                ));
+            }
+        },
+    )
+}
+
+/// `kronik_connection_send_now_total` by kind and result (the status).
+fn send_now_metric(kind: &str, status: pb::EffectStatus) {
+    let result = kronik_metrics::enum_label(status.as_str_name(), "EFFECT_STATUS_");
+    kronik_metrics::inc(
+        "kronik_connection_send_now_total",
+        &[("kind", kind), ("result", &result)],
+    );
+}
+
 pub fn outcome_of_call(rec: &pb::EffectRecord) -> Result<CallOutcome, GateError> {
     Ok(
         match pb::EffectStatus::try_from(rec.status)
@@ -2489,6 +2627,15 @@ impl EffectGate for Gate {
     ) -> BoxFuture<'static, Result<Result<String, String>, GateError>> {
         let fx = self.0.clone();
         Box::pin(async move { fx.reveal(ordinal, name).await })
+    }
+
+    fn send_now(
+        &self,
+        ordinal: u32,
+        req: SendNowRequest,
+    ) -> BoxFuture<'static, Result<SendNowOutcome, GateError>> {
+        let fx = self.0.clone();
+        Box::pin(async move { fx.send_now(ordinal, req).await })
     }
 }
 

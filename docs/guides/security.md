@@ -40,7 +40,8 @@ repository root says how to report a vulnerability.
   its messages and its timers until the operator grants a capability:
   `http:<host>` or `http:*.<suffix>` for outgoing HTTP, `secret:<name>` to
   use a secret in a header or in `crypto`, `secret-reveal:<name>` to read
-  its value. Without a grant the guest gets `denied` and the denied effect
+  its value, `connection:send-now` to send on a connection before the turn
+  commits (M24). Without a grant the guest gets `denied` and the denied effect
   is recorded. The capabilities that a component asks for in its manifest
   grant nothing. Grants are records in the log, apply per kind (so new code
   of a kind keeps them), carry a delivery class and an optional rate, and
@@ -372,6 +373,9 @@ Prefer a preview domain wherever previews take traffic from browsers.
   client (the forwarded client behind a trusted proxy, an IPv6 /64), and
   their buffers per connection and node-wide (`[connections]`). A client
   that stops reading is closed as a slow consumer within `ping_timeout`.
+- **`connection:send-now`** sends during a turn, before it commits, and
+  needs its grant (always delivery class `unsafe`); buffered `send`,
+  `broadcast` and `close` on the actor's own connections need none.
 
 ## Root
 

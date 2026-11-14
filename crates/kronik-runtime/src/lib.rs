@@ -13,8 +13,8 @@ pub mod turn;
 pub use engine::{CodeError, CodeStore, PoolSize, build_engine};
 pub use host::{
     CallOutcome, ConnectionView, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchHeader,
-    FetchOutcome, FetchRequest, FetchResponse, GateError, LogEvent, SqlError, SqlHost,
-    SqlHostError, SqlRows, SqlValue, StateView, TurnLimits, timer_id,
+    FetchOutcome, FetchRequest, FetchResponse, GateError, LogEvent, SendNowOutcome, SendNowRequest,
+    SqlError, SqlHost, SqlHostError, SqlRows, SqlValue, StateView, TurnLimits, timer_id,
 };
 pub use turn::{Program, RunError, TurnOutput, TurnRequest};
 

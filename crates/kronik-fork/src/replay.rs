@@ -23,9 +23,9 @@ use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::{
     CallOutcome, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchHeader, FetchOutcome,
-    FetchRequest, GateError, Program, TurnLimits, TurnRequest,
+    FetchRequest, GateError, Program, SendNowOutcome, SendNowRequest, TurnLimits, TurnRequest,
 };
-use kronik_sched::effects::{map_call_outcome, outcome_of_fetch};
+use kronik_sched::effects::{map_call_outcome, outcome_of_fetch, outcome_of_send_now};
 use kronik_sched::host::{SqlHandle, SqlTurn};
 use kronik_store::Store;
 use kronik_store::sql::{Limits, MemOpener, SqlPool, TurnOpts};
@@ -3301,6 +3301,86 @@ impl ReplayGate {
         Ok(out)
     }
 
+    /// `connections.send-now` in a fork (M24 §7.3): there is no hub, and
+    /// nothing is written. A kind without the grant is denied, as in
+    /// production. A recording of the same ordinal, kind and connection
+    /// answers: exact for the identical frame, approximate for another one.
+    /// Otherwise the connection model answers: `ok` on a live connection of
+    /// the turn's actor that is not closing in the fork's state, `closed`
+    /// otherwise, also for an id without a live connection (synthetic,
+    /// simulator `connection`).
+    fn send_now(&self, ordinal: u32, req: SendNowRequest) -> Result<SendNowOutcome, GateError> {
+        use kronik_proto::connection::{
+            SEND_NOW_KIND as KIND, send_now_fingerprint, send_now_request,
+        };
+        let target = format!("connection:{}", req.connection);
+        let sealer = &self.runner.setup.privacy.sealer;
+        let plain_fp = send_now_fingerprint(&req.connection, &req.frame);
+        let fp = sealer.effect_fingerprint(req.subject.as_deref(), plain_fp.clone());
+        let record = |status: pb::EffectStatus, grounding: pb::Grounding| pb::EffectRecord {
+            ordinal,
+            kind: KIND.into(),
+            target: target.clone(),
+            fingerprint: fp.clone(),
+            status: status as i32,
+            request: tagged(
+                &req.subject,
+                send_now_request(
+                    &req.connection,
+                    if status == pb::EffectStatus::Ok {
+                        req.seq
+                    } else {
+                        0
+                    },
+                    &req.frame,
+                )
+                .encode_to_vec(),
+            ),
+            delivery: "unsafe".into(),
+            grounding: grounding as i32,
+            ..Default::default()
+        };
+        let cap = kronik_effects::Capability::SEND_NOW;
+        if self.config().grant(&self.actor.kind, cap).is_none() {
+            let e = format!("CAPABILITY_NOT_GRANTED: {cap}");
+            self.push(self.denied(ordinal, KIND, target.clone(), e.clone()))?;
+            return Ok(SendNowOutcome::Denied(e));
+        }
+        // Production admits a new send-now with room for its request.
+        let need = send_now_request(&req.connection, req.seq, &req.frame).encoded_len();
+        self.admit(ordinal, KIND, kronik_sched::record_budget::fetch_need(need))?;
+        if let Some(p) = self
+            .prod_at(ordinal)
+            .filter(|p| p.kind == KIND && p.target == target)
+            .cloned()
+        {
+            let outcome = outcome_of_send_now(&p)?;
+            let status = pb::EffectStatus::try_from(p.status).unwrap_or(pb::EffectStatus::Closed);
+            let exact =
+                sealer.fingerprint_matches(req.subject.as_deref(), &p.fingerprint, &plain_fp);
+            let mut rec = record(
+                status,
+                if exact {
+                    pb::Grounding::Exact
+                } else {
+                    pb::Grounding::Approximate
+                },
+            );
+            rec.error = p.error;
+            self.push(rec)?;
+            return Ok(outcome);
+        }
+        let (status, outcome) = if !req.live || req.closing {
+            (pb::EffectStatus::Closed, SendNowOutcome::Closed)
+        } else {
+            (pb::EffectStatus::Ok, SendNowOutcome::Ok)
+        };
+        let mut rec = record(status, pb::Grounding::Synthetic);
+        rec.simulator = kronik_effects::simulator::label::CONNECTION.into();
+        self.push(rec)?;
+        Ok(outcome)
+    }
+
     fn reveal(&self, ordinal: u32, name: String) -> Result<Result<String, String>, GateError> {
         let kind = "secret.reveal";
         let cap = format!("secret-reveal:{name}");
@@ -3393,6 +3473,15 @@ impl EffectGate for GateHandle {
     ) -> BoxFuture<'static, Result<Result<String, String>, GateError>> {
         let g = self.0.clone();
         Box::pin(async move { g.reveal(ordinal, name) })
+    }
+
+    fn send_now(
+        &self,
+        ordinal: u32,
+        req: SendNowRequest,
+    ) -> BoxFuture<'static, Result<SendNowOutcome, GateError>> {
+        let g = self.0.clone();
+        Box::pin(async move { g.send_now(ordinal, req) })
     }
 }
 

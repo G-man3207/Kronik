@@ -147,6 +147,18 @@ impl Drop for FinishGuard {
     }
 }
 
+/// What became of a `send-now` frame in the hub (§4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendNowStatus {
+    /// Queued for the writer after every earlier frame of the connection.
+    Ok,
+    /// The connection is closed or closing, or not live on this node.
+    Closed,
+    /// Its queue stayed full for the effect timeout: the connection closes
+    /// as a slow consumer, and the frame is not sent.
+    Timeout,
+}
+
 /// What a connection's writer sends next.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outgoing {
@@ -192,6 +204,8 @@ struct Live {
     abandoned: bool,
     queue: VecDeque<Outgoing>,
     queued_bytes: usize,
+    /// Signals room in the queue, or the close, to a waiting `send-now`.
+    room: Arc<Notify>,
     frames_written: u64,
     frames_received: u64,
     /// The next incoming seq.
@@ -420,6 +434,7 @@ impl Hub {
                 abandoned: false,
                 queue: VecDeque::new(),
                 queued_bytes: 0,
+                room: Arc::new(Notify::new()),
                 frames_written: 0,
                 frames_received: 0,
                 next_in: 0,
@@ -440,6 +455,7 @@ impl Hub {
     /// Removes `id` and gives its cap slots back.
     fn remove(&self, inner: &mut Inner, id: &str) -> Option<Live> {
         let live = inner.live.remove(id)?;
+        live.room.notify_one();
         if live.state != State::Opening {
             inner.count_open(&live.owner.kind, live.protocol, false);
         }
@@ -840,6 +856,7 @@ impl Hub {
             live.queue.clear();
             self.queued.fetch_sub(live.queued_bytes, Ordering::Relaxed);
             live.queued_bytes = 0;
+            live.room.notify_one();
             (live.transport.clone(), live.transport.is_none())
         };
         if matches!(
@@ -866,7 +883,92 @@ impl Hub {
             live.queued_bytes -= bytes;
             self.queued.fetch_sub(bytes, Ordering::Relaxed);
         }
+        live.room.notify_one();
         Some(item)
+    }
+
+    /// A `send-now` frame (§4.4, §5.6): queued for `conn`'s writer at `seq`,
+    /// after every earlier frame of the connection, as soon as its queue has
+    /// room (its own limit and the node-wide one). It waits at most
+    /// `timeout` for room; then the connection closes as a slow consumer and
+    /// the frame is not sent.
+    pub async fn send_now(
+        &self,
+        conn: &str,
+        seq: u64,
+        frame: pb::Frame,
+        timeout: Duration,
+    ) -> SendNowStatus {
+        let bytes = conn::frame_bytes(&frame);
+        let frame = Arc::new(frame);
+        let deadline = self.env.clock.monotonic() + timeout;
+        loop {
+            let room = {
+                let mut inner = lock(&self.inner);
+                let Some(live) = inner.live.get_mut(conn) else {
+                    return SendNowStatus::Closed;
+                };
+                if live.state != State::Open {
+                    return SendNowStatus::Closed;
+                }
+                let total = self.queued.load(Ordering::Relaxed);
+                if live.queue.is_empty()
+                    || (live.queued_bytes + bytes <= self.cfg.outbound_queue_bytes
+                        && total + bytes <= self.cfg.total_queue_bytes)
+                {
+                    let (kind, protocol) = (
+                        live.owner.kind.clone(),
+                        conn::protocol_name(live.protocol as i32),
+                    );
+                    live.queue.push_back(Outgoing::Frame {
+                        seq,
+                        frame: frame.clone(),
+                    });
+                    live.queued_bytes += bytes;
+                    self.queued.fetch_add(bytes, Ordering::Relaxed);
+                    let transport = live.transport.clone();
+                    drop(inner);
+                    let labels = [
+                        ("kind", kind.as_str()),
+                        ("protocol", protocol),
+                        ("direction", "out"),
+                    ];
+                    kronik_metrics::inc("kronik_connection_frames_total", &labels);
+                    kronik_metrics::add(
+                        "kronik_connection_frame_bytes_total",
+                        &labels,
+                        bytes as u64,
+                    );
+                    if let Some(t) = transport {
+                        t.wake();
+                    }
+                    return SendNowStatus::Ok;
+                }
+                live.room.clone()
+            };
+            let left = deadline.saturating_sub(self.env.clock.monotonic());
+            if left.is_zero() {
+                self.close_host(conn, pb::CloseCause::SlowConsumer);
+                return SendNowStatus::Timeout;
+            }
+            // The writer signals each frame it takes; the loop checks again.
+            let _ = self.env.timeout(left, room.notified()).await;
+        }
+    }
+
+    /// Waits until `conn`'s writer wrote the frame `seq`, or until `conn` is
+    /// gone: the hold point of `--test-hold-after-send-now`.
+    pub(crate) async fn written_through(&self, conn: &str, seq: u64) {
+        loop {
+            {
+                let inner = lock(&self.inner);
+                match inner.live.get(conn) {
+                    Some(live) if live.frames_written <= seq => {}
+                    _ => return,
+                }
+            }
+            self.env.clock.sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// `conn`'s writer wrote and flushed the frame `seq`.

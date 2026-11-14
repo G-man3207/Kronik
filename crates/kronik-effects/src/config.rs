@@ -114,9 +114,15 @@ pub enum Capability {
     Foreign(String),
     Secret(String),
     SecretReveal(String),
+    /// `connection:send-now` (M24): sending on a connection before the turn
+    /// commits. Always delivery class unsafe, never rate-limited.
+    ConnectionSendNow,
 }
 
 impl Capability {
+    /// The capability of `connections.send-now` (M24).
+    pub const SEND_NOW: &'static str = "connection:send-now";
+
     pub fn parse(s: &str) -> Option<Capability> {
         let (kind, target) = s.split_once(':')?;
         if target.is_empty() {
@@ -141,6 +147,7 @@ impl Capability {
             }
             "secret-reveal" => kronik_privacy::valid_name(target)
                 .then(|| Capability::SecretReveal(target.to_owned())),
+            "connection" => (target == "send-now").then_some(Capability::ConnectionSendNow),
             _ => None,
         }
     }
@@ -151,6 +158,7 @@ impl Capability {
             Capability::Foreign(n) => format!("foreign:{n}"),
             Capability::Secret(n) => format!("secret:{n}"),
             Capability::SecretReveal(n) => format!("secret-reveal:{n}"),
+            Capability::ConnectionSendNow => Capability::SEND_NOW.into(),
         }
     }
 }
@@ -698,6 +706,15 @@ mod tests {
         );
         assert!(Capability::parse("http:").is_none());
         assert!(Capability::parse("ftp:x").is_none());
+        assert_eq!(
+            Capability::parse("connection:send-now"),
+            Some(Capability::ConnectionSendNow)
+        );
+        assert_eq!(
+            Capability::ConnectionSendNow.render(),
+            "connection:send-now"
+        );
+        assert!(Capability::parse("connection:send").is_none());
         assert_eq!(Delivery::default_for("get"), Delivery::ReplaySafe);
         assert_eq!(Delivery::default_for("POST"), Delivery::Unsafe);
     }

@@ -11,6 +11,7 @@
 //! `anon`, no subject):
 //! - `deny=1` refuses with 403, `fail=1` fails the open turn, `call=1` first
 //!   calls `room/callee` (`ping`), so the open turn has a `TurnBegin`;
+//!   `now=1` calls `send-now` on the connection being opened, which traps;
 //!   `headers=<n>` adds `n` headers to the accept;
 //! - a WebSocket gets a `welcome` frame; an SSE stream gets the messages
 //!   after its `Last-Event-ID` (at most 100);
@@ -26,7 +27,9 @@
 //!   handles it instead: it counts it in `unknown` and stops;
 //! - `kick <conn>`: closes that connection (4000 `kicked`), `bye`: closes
 //!   the sender's (1000 `bye`), `send-to <conn> <text>`: a frame to any id
-//!   (ownership tests);
+//!   (ownership tests), `now-to <conn> <text>`: the same with `send-now`,
+//!   answering the sender `now ok`, `now closed`, `now unknown` or
+//!   `now denied <error>`;
 //! - `burst <n> <size>`: `n` buffered frames of `size` characters to the
 //!   sender, in one turn;
 //! - `fail`: the turn fails; `trap`: the guest panics.

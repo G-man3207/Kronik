@@ -14,6 +14,10 @@
 //! seqs (§4.5): after the connection's `next_seq` as of the turn's start (0
 //! for the connection the turn opens) and after the frames the turn sent
 //! with `send-now`.
+//!
+//! `send-now` is an effect (§4.4): after `send`'s checks, the gate records
+//! it and, on a live connection, hands the frame over during the turn. Its
+//! frame takes the next seq of the connection at once.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -21,7 +25,7 @@ use kronik_proto::log::v1 as pb;
 use wasmtime::bail;
 
 use super::connection_bindings::kronik::actor::connections as wit;
-use super::{ConnectionView, TurnHost};
+use super::{ConnectionView, SendNowOutcome, SendNowRequest, TurnHost};
 
 /// `send`, `broadcast` and `close` calls per turn (§4.11).
 pub const MAX_OPERATIONS: usize = 10_000;
@@ -317,11 +321,56 @@ impl wit::Host for TurnHost {
 
     async fn send_now(
         &mut self,
-        _conn: String,
-        _frame: wit::Frame,
+        conn: String,
+        frame: wit::Frame,
     ) -> wasmtime::Result<Result<(), wit::SendError>> {
         self.deny_in_describe("connections")?;
-        bail!("NOT_IMPLEMENTED: connections.send-now is not available yet")
+        if self
+            .conns
+            .opening
+            .as_ref()
+            .is_some_and(|(id, _)| *id == conn)
+        {
+            bail!(
+                "connections: send-now on the connection this turn opens; use send: the \
+                 connection opens when this turn commits"
+            );
+        }
+        let (live, closing, protocols) = match self.target(&conn)? {
+            Target::Held(p) => {
+                let closing = self
+                    .conns
+                    .views
+                    .get(&conn)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|v| v.closing);
+                (true, closing, vec![p])
+            }
+            Target::Dropped => (false, false, Vec::new()),
+        };
+        let (frame, _) = self.frame_to_pb(frame, &protocols)?;
+        let gate = self.gate("connections.send-now")?;
+        let ordinal = self.ordinal();
+        let seq = if live { self.conns.first_seq(&conn) } else { 0 };
+        let req = SendNowRequest {
+            connection: conn.clone(),
+            live,
+            closing,
+            seq,
+            frame,
+            subject: self.subject.clone(),
+        };
+        let res = gate.send_now(ordinal, req).await;
+        Ok(match res.map_err(|e| self.gate_failure(e))? {
+            SendNowOutcome::Ok => {
+                *self.conns.sent_now.entry(conn).or_insert(0) += 1;
+                Ok(())
+            }
+            SendNowOutcome::Closed => Err(wit::SendError::Closed),
+            SendNowOutcome::OutcomeUnknown => Err(wit::SendError::OutcomeUnknown),
+            SendNowOutcome::Denied(m) => Err(wit::SendError::Denied(m)),
+        })
     }
 }
 

@@ -6,6 +6,18 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- `connections.send-now` works (M24): with a grant of `connection:send-now`
+  (always delivery class `unsafe`; `--delivery` other than `unsafe` and
+  `--rate` are refused), an actor sends a frame on its connection during
+  the turn, after a durable `TurnBegin`, ahead of the turn's buffered
+  frames. The guest gets `ok` once the frame is handed to the connection,
+  `closed` when it is closed or closing or its client did not read for the
+  effect timeout (which closes it as a slow consumer), `denied` without the
+  grant, and after a crash `outcome-unknown`: a re-run never sends it
+  again (I17). An id without a live connection answers `closed` without a
+  `TurnBegin`, and the connection a turn opens cannot take one. Forks
+  answer from the recording or from a connection model (simulator
+  `connection`). New metric `kronik_connection_send_now_total`.
 - After a restart, the views that remove secret values (`history`,
   `actors inspect`, turns, traces, dead letters, the audit log and others)
   answered 503 `SECRET_UNAVAILABLE` for good once the external backend of a
@@ -109,8 +121,7 @@ until the v1.0 compatibility promise takes effect.
   propose refuse such a kind with `BAD_REQUEST` when its component lacks the
   `connection-handler` export, and an `SSE` route conflicts with a `GET`
   route on the same pattern (`ROUTE_CONFLICT`). The SDKs build against the
-  new version; until the rest of M24 lands, the `connections` functions
-  trap with `NOT_IMPLEMENTED` and the gateway opens no connections.
+  new version.
 - A turn could commit a log record over the 128 MiB record limit (for
   example many large HTTP responses or state writes in one turn), which
   `history` then refused with `STORAGE_CORRUPT: entry length ...`, and after

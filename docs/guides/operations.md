@@ -977,6 +977,7 @@ with OIDC, Host must match the configured admin origin:
 | `kronik_connection_frames_total` | counter | `kind`, `protocol`, `direction` | Frames `in` and `out` |
 | `kronik_connection_frame_bytes_total` | counter | `kind`, `protocol`, `direction` | Frame payload bytes `in` and `out` |
 | `kronik_connection_frames_dropped_total` | counter | `kind`, `protocol` | Outgoing frames never written (closed or closing connection) |
+| `kronik_connection_send_now_total` | counter | `kind`, `result` | `connection.send-now` effects: `ok`, `closed`, `timeout`, `denied` or `outcome_unknown` |
 | `kronik_connection_queued_bytes` | gauge | | Bytes all outgoing connection queues hold |
 
 A Prometheus scrape job:

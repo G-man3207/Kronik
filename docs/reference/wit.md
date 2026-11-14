@@ -469,9 +469,6 @@ accepted it, its **owner**, sends on it and closes it
 every incoming frame and the close are inputs of the owner, delivered to
 [`connection-handler`](#connection-handler).
 
-M24 is being built: `send-now` traps with `NOT_IMPLEMENTED` until its part
-lands.
-
 - **Connection ids** are `c-` and 32 lowercase hex characters, assigned
   when the connection opens, recorded and the same in replay. An id is
   data, not a capability: storing it or sending it in a message grants
@@ -501,7 +498,9 @@ lands.
   `denied("CAPABILITY_NOT_GRANTED: connection:send-now")`). Its `TurnBegin`
   is fsynced first (I14) and its result before the guest sees it. `ok`
   means the frame was handed to the connection in order, not that the
-  client received it; `closed` means it was not sent. After a crash, a
+  client received it; `closed` means it was not sent: the connection is
+  closed or closing, or the client did not read for the kind's effect
+  timeout, which also closes the connection as a slow consumer. After a crash, a
   re-run never sends it again: the guest gets `outcome-unknown`, and a turn
   that then fails fails with `EFFECT_OUTCOME_UNKNOWN` (I17). It cannot be
   used on the connection that the current turn opens. Use it for

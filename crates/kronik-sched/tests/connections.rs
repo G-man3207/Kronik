@@ -759,3 +759,324 @@ fn nothing_attaches_during_a_graceful_stop() {
         .expect("no attach while stopping");
     assert_eq!(err.code, ErrorCode::Unavailable, "{err:?}");
 }
+
+/// Grants `connection:send-now` to the room kind.
+fn grant_send_now(p: &Proc) {
+    p.rt.block_on(p.node.grant(
+        "room",
+        "connection:send-now",
+        None,
+        None,
+        kronik_effects::InForks::default(),
+        audit(),
+        false,
+        p.node.local_operator_authority().unwrap(),
+    ))
+    .unwrap();
+}
+
+/// Every record of the log, in order, to its end: a record is durable
+/// before the node applies it.
+fn log(p: &Proc) -> Vec<(u64, Record)> {
+    let mut out = Vec::new();
+    p.rt.block_on(p.node.reader().read(1, u64::MAX, |c| {
+        out.push((c.lsn, c.record));
+        Ok(())
+    }))
+    .unwrap();
+    out
+}
+
+/// The newest turn record of room/`key`.
+fn last_turn(p: &Proc, key: &str) -> pb::TurnRecord {
+    let lsn = p.node.store().db().history("room", key, None, 1).unwrap()[0].lsn;
+    p.record(lsn)
+}
+
+fn send_now_request(e: &pb::EffectRecord) -> pb::ConnectionSendRequest {
+    use prost::Message as _;
+    let Some(pb::sealable::Value::Plain(b)) = e.request.as_ref().and_then(|r| r.value.as_ref())
+    else {
+        panic!("{e:?}")
+    };
+    pb::ConnectionSendRequest::decode(b.as_slice()).unwrap()
+}
+
+/// §4.4, §4.5, §9: `send-now` needs its grant (`denied` without, recorded
+/// without a `TurnBegin`); with it, each frame is handed to the connection
+/// during the turn, after a durable `TurnBegin` (I14), with the next seqs,
+/// before the turn's buffered frames; an id without a live connection
+/// answers `closed` from the state, and the connection being opened traps.
+/// The grant takes no rate and no delivery class other than unsafe.
+#[test]
+fn send_now_hands_frames_over_during_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy(ROOM, false).unwrap();
+    let (a, ta) = p.join("lobby", "ada");
+    p.until("the welcome", || ta.recording().frames.len() == 1);
+
+    // Without the grant: denied, and the room says so in a buffered frame.
+    let begins = |p: &Proc| {
+        log(p)
+            .iter()
+            .filter(|(_, r)| matches!(r, Record::TurnBegin(_)))
+            .count()
+    };
+    let before = begins(&p);
+    p.frame(&a, "stream 2");
+    p.until("the denial", || ta.recording().frames.len() == 2);
+    let denied = frames(&ta.recording())[1].clone();
+    assert_eq!(
+        denied,
+        (
+            1,
+            "denied CAPABILITY_NOT_GRANTED: connection:send-now".to_owned()
+        )
+    );
+    let t = last_turn(&p, "lobby");
+    assert_eq!(t.effects.len(), 1);
+    assert_eq!(t.effects[0].kind, "connection.send-now");
+    assert_eq!(t.effects[0].target, format!("connection:{a}"));
+    assert_eq!(t.effects[0].status, pb::EffectStatus::Denied as i32);
+    assert_eq!(begins(&p), before, "a denial needs no TurnBegin");
+
+    // The grant refuses a rate and a delivery class other than unsafe.
+    let grant = |delivery, rate| {
+        p.rt.block_on(p.node.grant(
+            "room",
+            "connection:send-now",
+            delivery,
+            rate,
+            kronik_effects::InForks::default(),
+            audit(),
+            true,
+            p.node.local_operator_authority().unwrap(),
+        ))
+    };
+    for (delivery, rate) in [
+        (Some(kronik_effects::Delivery::ReplaySafe), None),
+        (None, kronik_effects::Rate::parse("2/s")),
+    ] {
+        let e = grant(delivery, rate).unwrap_err();
+        assert_eq!(e.code, ErrorCode::BadRequest, "{e:?}");
+        assert!(e.message.contains("always unsafe"), "{e:?}");
+    }
+    grant(Some(kronik_effects::Delivery::Unsafe), None).unwrap();
+    grant_send_now(&p);
+
+    // With it: tok 0 and tok 1 during the turn, then the buffered done.
+    let before = begins(&p);
+    p.frame(&a, "stream 2");
+    p.until("the stream", || ta.recording().frames.len() == 5);
+    assert_eq!(
+        frames(&ta.recording())[2..],
+        [
+            (2, "tok 0".to_owned()),
+            (3, "tok 1".to_owned()),
+            (4, "done 2".to_owned())
+        ]
+    );
+    assert_eq!(begins(&p), before + 1, "one TurnBegin for the turn");
+    let t = last_turn(&p, "lobby");
+    assert!(t.outcome.as_ref().unwrap().kind == pb::OutcomeKind::Committed as i32);
+    let seqs: Vec<u64> = t.effects.iter().map(|e| send_now_request(e).seq).collect();
+    assert_eq!(seqs, [2, 3]);
+    for e in &t.effects {
+        assert_eq!(e.status, pb::EffectStatus::Ok as i32);
+        assert_eq!(e.delivery, "unsafe");
+    }
+    assert_eq!(t.connection_ops[0].seqs, [4]);
+    assert_eq!(p.row(&a).unwrap().next_seq, 5);
+    // The TurnBegin came before the results (I14).
+    let records = log(&p);
+    let begin = records
+        .iter()
+        .rposition(|(_, r)| matches!(r, Record::TurnBegin(b) if b.execution_id == t.execution_id))
+        .unwrap();
+    let first_result = records
+        .iter()
+        .position(|(_, r)| matches!(r, Record::EffectResult(e) if e.execution_id == t.execution_id))
+        .unwrap();
+    assert!(begin < first_result);
+
+    // An id without a live connection: closed, from the state.
+    let before = begins(&p);
+    p.frame(&a, "now-to c-0000000000000000000000000000000f hello");
+    p.until("the answer", || ta.recording().frames.len() == 6);
+    assert_eq!(frames(&ta.recording())[5].1, "now closed");
+    let t = last_turn(&p, "lobby");
+    assert_eq!(t.effects[0].status, pb::EffectStatus::Closed as i32);
+    assert_eq!(
+        send_now_request(&t.effects[0]).data,
+        b"hello".to_vec(),
+        "the frame is recorded"
+    );
+    assert_eq!(
+        begins(&p),
+        before,
+        "closed from the state needs no TurnBegin"
+    );
+    assert_eq!(p.row(&a).unwrap().next_seq, 6);
+
+    // The connection being opened: send-now traps.
+    let (_id, r) = p.open("lobby", "user=eve&now=1");
+    assert_eq!(r.outcome.kind, pb::OutcomeKind::Trap as i32, "{r:?}");
+    assert!(
+        r.outcome.message.contains("this turn opens"),
+        "{:?}",
+        r.outcome
+    );
+}
+
+/// §4.4, §5.6: a `send-now` waits up to the effect timeout for room in its
+/// connection's outgoing queue; then it is `TIMEOUT` (the guest sees
+/// `closed`) and the connection closes as a slow consumer (1008).
+#[test]
+fn a_full_queue_times_out_send_now_and_closes_the_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let node = rt.block_on(async {
+        let env = Env::real(tokio::runtime::Handle::current());
+        let config = NodeConfig {
+            concurrency: 8,
+            connections: kronik_sched::connections::ConnectionsConfig {
+                // The welcome (88 bytes) fits; 18 tokens fill the rest.
+                outbound_queue_bytes: 100,
+                ..Default::default()
+            },
+            ..NodeConfig::default()
+        };
+        start_local(env, dir.path(), config).await.unwrap()
+    });
+    let p = Proc { rt, node };
+    p.deploy(ROOM, false).unwrap();
+    grant_send_now(&p);
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "room".into(),
+            effect_timeout_ms: Some(300),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.node.local_operator_authority().unwrap(),
+    ))
+    .unwrap();
+    let (a, ta) = p.join("lobby", "ada");
+    p.until("the welcome", || ta.recording().frames.len() == 1);
+    // The client stops reading: `tok 0` to `tok 17` fill the queue (98 of
+    // 100 bytes), `tok 18` waits and times out.
+    ta.stall(true);
+    p.frame(&a, "stream 40");
+    p.until("the slow-consumer close", || {
+        p.row(&a).is_some_and(|r| r.closed_lsn.is_some())
+    });
+    let row = p.row(&a).unwrap();
+    assert_eq!(row.cause, Some(pb::CloseCause::SlowConsumer as i32));
+    assert_eq!(row.code, Some(1008));
+    // The store's guard must be gone before `record` reads the log.
+    let turns = p
+        .node
+        .store()
+        .db()
+        .history("room", "lobby", None, 10)
+        .unwrap();
+    let stream = turns
+        .into_iter()
+        .map(|r| p.record(r.lsn))
+        .find(|t| !t.effects.is_empty())
+        .unwrap();
+    let statuses: Vec<i32> = stream.effects.iter().map(|e| e.status).collect();
+    let mut expected = vec![pb::EffectStatus::Ok as i32; 18];
+    expected.push(pb::EffectStatus::Timeout as i32);
+    assert_eq!(statuses, expected);
+    assert!(stream.effects[18].error.contains("slow consumer"));
+    // The guest saw `closed` and stopped; the turn committed.
+    assert!(stream.outcome.unwrap().kind == pb::OutcomeKind::Committed as i32);
+}
+
+/// §19 criterion 3, in process: a crash after a `send-now` frame was
+/// written and before its result was recorded. The re-run does not send it
+/// again: the effect is `OUTCOME_UNKNOWN` with the frame in its request, a
+/// turn that does not handle it fails with `EFFECT_OUTCOME_UNKNOWN` and is
+/// a dead letter, one that handles it commits; and the connections get
+/// their restart close.
+#[test]
+fn a_crash_after_send_now_gives_outcome_unknown_and_never_resends() {
+    for (cmd, safe) in [("stream 3", false), ("stream-safe 3", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let a = {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let node = rt.block_on(async {
+                let env = Env::real(tokio::runtime::Handle::current());
+                let config = NodeConfig {
+                    concurrency: 8,
+                    test_hold_after_send_now: true,
+                    ..NodeConfig::default()
+                };
+                start_local(env, dir.path(), config).await.unwrap()
+            });
+            let p = Proc { rt, node };
+            p.deploy(ROOM, false).unwrap();
+            grant_send_now(&p);
+            let (a, ta) = p.join("lobby", "ada");
+            p.frame(&a, cmd);
+            p.until("tok 0", || {
+                frames(&ta.recording()).iter().any(|(_, f)| f == "tok 0")
+            });
+            // The frame was written after a durable TurnBegin (I14).
+            assert!(
+                log(&p)
+                    .iter()
+                    .any(|(_, r)| matches!(r, Record::TurnBegin(_)))
+            );
+            a
+            // The runtime drops here: a crash.
+        };
+        let p = start(dir.path());
+        p.until("the re-run and the restart close", || {
+            p.row(&a).is_some_and(|r| r.closed_lsn.is_some())
+        });
+        // The store's guard must be gone before `record` reads the log.
+        let turns = p
+            .node
+            .store()
+            .db()
+            .history("room", "lobby", None, 10)
+            .unwrap();
+        let rerun = turns
+            .into_iter()
+            .map(|r| p.record(r.lsn))
+            .find(|t| !t.effects.is_empty())
+            .unwrap();
+        let e = &rerun.effects[0];
+        assert_eq!(e.status, pb::EffectStatus::OutcomeUnknown as i32, "{cmd}");
+        assert_eq!(send_now_request(e).data, b"tok 0".to_vec());
+        assert_eq!(rerun.effects.len(), 1, "{cmd}: nothing after it was sent");
+        let dead = p.node.store().db().dead_letters(0, 10).unwrap();
+        if safe {
+            assert!(rerun.outcome.unwrap().kind == pb::OutcomeKind::Committed as i32);
+            assert_eq!(reply(&p.send("room/lobby", "unknown", "")), "1");
+            assert!(dead.is_empty(), "{dead:?}");
+        } else {
+            assert_eq!(
+                rerun.outcome.unwrap().error_code,
+                "EFFECT_OUTCOME_UNKNOWN",
+                "{cmd}"
+            );
+            assert_eq!(dead.len(), 1, "{dead:?}");
+            assert_eq!(dead[0].error_code, "EFFECT_OUTCOME_UNKNOWN");
+        }
+        let closes = reply(&p.send("room/lobby", "closes", ""));
+        assert!(closes.contains("host 1012 restart"), "{closes}");
+    }
+}

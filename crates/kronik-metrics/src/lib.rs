@@ -188,6 +188,11 @@ pub const METRICS: &[Def] = &[
         kind: Type::Counter,
     },
     Def {
+        name: "kronik_connection_send_now_total",
+        help: "connection.send-now effects by actor kind and result: ok, closed, timeout, denied or outcome_unknown.",
+        kind: Type::Counter,
+    },
+    Def {
         name: "kronik_connection_queued_bytes",
         help: "Bytes all outgoing connection queues hold.",
         kind: Type::Gauge,

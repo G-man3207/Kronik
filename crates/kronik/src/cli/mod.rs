@@ -386,8 +386,8 @@ impl Delivery {
 pub struct GrantArgs {
     /// The actor type, e.g. billing.
     kind: String,
-    /// The capability: http:<host>, http:*.<domain>, secret:<name> or
-    /// secret-reveal:<name>.
+    /// The capability: http:<host>, http:*.<domain>, secret:<name>,
+    /// secret-reveal:<name> or connection:send-now.
     capability: String,
     /// How the target tolerates retries, for http: capabilities [default:
     /// replay-safe for GET, HEAD and OPTIONS, unsafe otherwise].

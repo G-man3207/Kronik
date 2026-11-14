@@ -8449,7 +8449,8 @@
               "neighbor",
               "model",
               "fail-closed",
-              "placeholder"
+              "placeholder",
+              "connection"
             ]
           },
           "status": {

@@ -7,6 +7,56 @@ use crate::log::v1 as pb;
 /// The prefix of a connection id.
 pub const ID_PREFIX: &str = "c-";
 
+/// The effect kind of `connections.send-now` (§4.4).
+pub const SEND_NOW_KIND: &str = "connection.send-now";
+
+/// The domain of a `send-now` fingerprint (§6.2).
+const SEND_NOW_DOMAIN: &[u8] = b"kronik.fingerprint.connection.v1";
+
+/// A `send-now`'s plain fingerprint (§6.2): BLAKE3 over the domain string
+/// and the length-prefixed connection, frame kind, data, event and id,
+/// without the seq. The node keys it per subject like every fingerprint.
+pub fn send_now_fingerprint(connection: &str, frame: &pb::Frame) -> Vec<u8> {
+    let mut h = blake3::Hasher::new();
+    h.update(SEND_NOW_DOMAIN);
+    let data: &[u8] = match frame.data.as_ref().and_then(|d| d.value.as_ref()) {
+        Some(pb::sealable::Value::Plain(b)) => b.as_slice(),
+        _ => &[],
+    };
+    let kind = frame.kind.to_le_bytes();
+    for field in [
+        connection.as_bytes(),
+        kind.as_slice(),
+        data,
+        frame.event.as_bytes(),
+        frame.id.as_bytes(),
+    ] {
+        h.update(&(field.len() as u64).to_le_bytes());
+        h.update(field);
+    }
+    h.finalize().as_bytes().to_vec()
+}
+
+/// The plaintext of a `send-now`'s `EffectRecord.request` (§6.2): the
+/// connection, the frame and its `seq` (0 unless the status is `OK`).
+pub fn send_now_request(
+    connection: &str,
+    seq: u64,
+    frame: &pb::Frame,
+) -> pb::ConnectionSendRequest {
+    pb::ConnectionSendRequest {
+        connection: connection.to_owned(),
+        seq,
+        kind: frame.kind,
+        data: match frame.data.as_ref().and_then(|d| d.value.as_ref()) {
+            Some(pb::sealable::Value::Plain(b)) => b.clone(),
+            _ => Vec::new(),
+        },
+        event: frame.event.clone(),
+        id: frame.id.clone(),
+    }
+}
+
 /// Whether `id` is a connection id: `c-` and 32 lowercase hex characters.
 pub fn valid_id(id: &str) -> bool {
     id.strip_prefix(ID_PREFIX).is_some_and(|hex| {

@@ -881,9 +881,11 @@ Grants an actor type a capability (M2). Every external effect is denied
 until it is granted (I6). Capabilities are `http:<host>`, `http:*.<domain>`
 (the most specific match wins, and a wildcard never matches the domain
 itself), `secret:<name>` (use the secret in a header template or in
-`crypto`) and `secret-reveal:<name>` (read its value). Grants apply per
-actor type, not per code hash, and take effect at a new configuration
-epoch.
+`crypto`), `secret-reveal:<name>` (read its value) and
+`connection:send-now` (send on a WebSocket or SSE connection during the
+turn, M24; always delivery class `unsafe`, so `--delivery` other than
+`unsafe` and `--rate` are refused). Grants apply per actor type, not per
+code hash, and take effect at a new configuration epoch.
 
 `--in-forks` chooses what a fork does with an unmatched
 `crypto.hmac-sha256` or `crypto.sign-ed25519` of a `secret:` grant

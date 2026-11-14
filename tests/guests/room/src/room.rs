@@ -262,6 +262,10 @@ impl ConnectionGuest for Room {
             messaging::call(&callee, &message("ping", ""), None)
                 .map_err(|e| HandlerError::Failed(format!("call: {e:?}")))?;
         }
+        if query_value(&q, "now") == Some("1") {
+            // The connection opens when this turn commits: the host traps.
+            let _ = connections::send_now(&req.connection, &Frame::Text("early".to_string()));
+        }
         let user = query_value(&q, "user").unwrap_or("anon").to_string();
         let others = members();
         let proto = match req.protocol {
@@ -358,6 +362,16 @@ impl ConnectionGuest for Room {
             "send-to" => {
                 let (to, rest) = arg.split_once(' ').unwrap_or((arg, ""));
                 connections::send(to, &Frame::Text(rest.to_string()));
+            }
+            "now-to" => {
+                let (to, rest) = arg.split_once(' ').unwrap_or((arg, ""));
+                let answer = match connections::send_now(to, &Frame::Text(rest.to_string())) {
+                    Ok(()) => "now ok".to_string(),
+                    Err(SendError::Closed) => "now closed".to_string(),
+                    Err(SendError::OutcomeUnknown) => "now unknown".to_string(),
+                    Err(SendError::Denied(m)) => format!("now denied {m}"),
+                };
+                connections::send(&conn, &Frame::Text(answer));
             }
             "fail" => return Err(HandlerError::Failed("the frame failed on request".to_string())),
             "trap" => panic!("the frame trapped on request"),

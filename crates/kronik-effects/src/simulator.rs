@@ -21,6 +21,10 @@ pub mod label {
     /// A fork's `secret.reveal` where production revealed nothing at that
     /// point: the placeholder `[secret:<name>]`, never the value.
     pub const PLACEHOLDER: &str = "placeholder";
+    /// A fork's `connection.send-now` without a recording at its ordinal
+    /// (M24 §7.3): the connection model's answer, `ok` on a live connection
+    /// of the turn's actor that is not closing, else `closed`.
+    pub const CONNECTION: &str = "connection";
 }
 
 /// An effect as seen by a simulator.

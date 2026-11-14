@@ -78,6 +78,10 @@ pub struct ServeArgs {
     /// result is recorded, so a crash test can kill the daemon there.
     #[arg(long, hide = true)]
     test_hold_after_call: bool,
+    /// Test hook: a turn's send-now stops after its frame was written to
+    /// the connection and before its result is recorded (M24).
+    #[arg(long, hide = true)]
+    test_hold_after_send_now: bool,
     /// Test hook: each isolated root input of a proposal job's replay waits
     /// for a permit; the file holds how many have been given so far.
     #[arg(long, hide = true, value_name = "FILE")]
@@ -274,6 +278,7 @@ impl ServeArgs {
     fn test_flags(&self) -> Vec<&'static str> {
         let set = [
             (self.test_hold_after_call, "--test-hold-after-call"),
+            (self.test_hold_after_send_now, "--test-hold-after-send-now"),
             (self.test_replay_permits.is_some(), "--test-replay-permits"),
             (
                 !self.test_insecure_registry.is_empty(),
@@ -639,6 +644,7 @@ async fn serve(args: ServeArgs, config: Config, early: Early) -> anyhow::Result<
         segment_max_age: Some(Duration::from_secs(config.log.segment_max_age_s)),
         group_commit_window: Some(Duration::from_millis(config.log.group_commit_ms)),
         test_hold_after_call: args.test_hold_after_call,
+        test_hold_after_send_now: args.test_hold_after_send_now,
         keystore_backup_retention: config.privacy.keystore_backup_retention.0,
         sql_bytes_per_actor: config.sql.max_size_per_actor.0,
         disk_reserve: config.log.disk_reserve.0,
@@ -1318,6 +1324,10 @@ mod tests {
         assert_eq!(
             flags(&["--test-replay-permits", "f"]),
             ["--test-replay-permits"]
+        );
+        assert_eq!(
+            flags(&["--test-hold-after-send-now"]),
+            ["--test-hold-after-send-now"]
         );
     }
 

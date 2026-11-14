@@ -94,6 +94,10 @@ pub struct NodeConfig {
     /// before the result is recorded, so a test can crash exactly there.
     #[doc(hidden)]
     pub test_hold_after_call: bool,
+    /// Test hook: a turn's `send-now` stops after its frame was written to
+    /// the connection and before its result is recorded (M24 criterion 3).
+    #[doc(hidden)]
+    pub test_hold_after_send_now: bool,
     /// Test hook: every code switch (promote, rollback, the rebase switch)
     /// parks after its record is applied and before the code is installed,
     /// until the hold releases it (ADR 0013, 0018).
@@ -144,6 +148,7 @@ impl Default for NodeConfig {
             segment_max_age: None,
             group_commit_window: None,
             test_hold_after_call: false,
+            test_hold_after_send_now: false,
             test_hold_switch: None,
             keystore_backup_retention: Duration::from_secs(30 * 86_400),
             sql_bytes_per_actor: 1 << 30,
