@@ -828,7 +828,7 @@ against both.
       ]
     },
     "source": {
-      "description": "`pin`: `saved-response`, `open-turn` or `open-effect` (M26 adds\nothers).",
+      "description": "`pin`: the row that carries it: `message` (queued), `timer`,\n`dead-letter`, `saved-response`, `saved-call` (a call's saved\noutcome), `open-turn` or `open-effect`.",
       "type": [
         "string",
         "null"

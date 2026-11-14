@@ -1942,8 +1942,9 @@ pub struct BlobRootEntry {
     /// `log`: the floor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor: Option<u64>,
-    /// `pin`: `saved-response`, `open-turn` or `open-effect` (M26 adds
-    /// others).
+    /// `pin`: the row that carries it: `message` (queued), `timer`,
+    /// `dead-letter`, `saved-response`, `saved-call` (a call's saved
+    /// outcome), `open-turn` or `open-effect`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// `pin`: the row: `kind/key/idempotency key`, an execution id, or

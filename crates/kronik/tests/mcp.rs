@@ -156,11 +156,12 @@ async fn call(
     }
 }
 
-const TOOLS: [&str; 14] = [
+const TOOLS: [&str; 15] = [
     "create_fork",
     "explain",
     "get_diff",
     "inspect_actor",
+    "inspect_blob",
     "list_actors",
     "list_connections",
     "list_dead_letters",
@@ -282,6 +283,17 @@ async fn over_streamable_http(daemon: &Daemon) {
         .await
         .unwrap_err();
     assert_eq!(no_turn["error"]["code"], "TURN_NOT_FOUND", "{no_turn}");
+    // inspect_blob is `GET /v1/blobs/{hash}` (`verify` a query flag); this
+    // node holds no such blob.
+    let absent = format!("b3:{}", "0".repeat(64));
+    let no_blob = call(
+        &client,
+        "inspect_blob",
+        json!({"hash": absent, "verify": true}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(no_blob["error"]["code"], "BLOB_NOT_FOUND", "{no_blob}");
 
     // explain is `kronik explain`.
     let fork = call(&client, "explain", json!({"topic": "fork"}))

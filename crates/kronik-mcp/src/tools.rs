@@ -161,6 +161,43 @@ const TOOLS: &[Spec] = &[
         },
     },
     Spec {
+        name: "inspect_blob",
+        title: "Inspect a blob",
+        scope: "read",
+        description: "A blob of the blob store by its hash (`b3:` or `b3s:`, as a history \
+            shows it): its state (live, erased, missing, or loose: in the store and never \
+            referenced), size, the first and last LSN that referenced it, whether its file is \
+            sealed, and what keeps it (`roots`). Its subject is null without pii:read. With \
+            `verify`, the whole file is read and checked. Never its bytes: `kronik blobs get` \
+            downloads them.",
+        mutates: false,
+        dry_run: false,
+        destructive: false,
+        input: || {
+            object(
+                json!({
+                    "hash": {"type": "string", "pattern": "^b3s?:[0-9a-f]{64}$", "description": "The blob's identity, e.g. b3:4f1c…"},
+                    "verify": {"type": "boolean", "description": "Read the whole file and check it (frames, body digest, identity)."}
+                }),
+                &["hash"],
+            )
+        },
+        output: || {
+            result(json!({
+                "hash": {"type": "string"},
+                "state": {"type": "string", "description": "live, erased, missing or loose"},
+                "size": {"type": ["integer", "null"]},
+                "subject": {"type": ["string", "null"], "description": "Null without pii:read, and for a blob without a subject."},
+                "first_ref_lsn": {"type": ["integer", "null"]},
+                "last_ref_lsn": {"type": ["integer", "null"]},
+                "sealed": {"type": ["boolean", "null"]},
+                "roots": {"type": "array", "items": {"type": "object", "description": "What keeps the blob: {kind (log, pin, snapshot, fork or lease), lsn, floor, source (a pin's row: message, timer, dead-letter, saved-response, saved-call, open-turn or open-effect), owner, fork}; empty for a blob the collector deletes"}},
+                "verified": {"type": ["boolean", "null"], "description": "With verify: whether the whole file checked out."},
+                "verify_error": {"type": ["string", "null"]}
+            }))
+        },
+    },
+    Spec {
         name: "list_connections",
         title: "List connections",
         scope: "read",
@@ -550,6 +587,10 @@ pub(crate) async fn call(
         "list_dead_letters" => args
             .query(&["after", "limit"])
             .map(|q| Request::get("/v1/dead-letters".into(), q)),
+        "inspect_blob" => args.segment("hash").and_then(|hash| {
+            let q = args.query(&["verify"])?;
+            Ok(Request::get(format!("/v1/blobs/{hash}"), q))
+        }),
         "list_connections" => match args.0.get("id") {
             Some(_) => args
                 .segment("id")
@@ -655,9 +696,10 @@ impl Args {
                 None | Some(Value::Null) => {}
                 Some(Value::String(s)) => pairs.push(format!("{key}={}", encode(s))),
                 Some(Value::Number(n)) => pairs.push(format!("{key}={n}")),
+                Some(Value::Bool(b)) => pairs.push(format!("{key}={b}")),
                 Some(_) => {
                     return Err(bad_request(
-                        format!("`{key}` must be a string or a number"),
+                        format!("`{key}` must be a string, a number or a boolean"),
                         "See the tool's input schema.",
                     ));
                 }
