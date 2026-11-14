@@ -21,7 +21,7 @@
 //! `state.db` holds open gets a close input from the node's start, not from
 //! here (§4.8).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -208,7 +208,9 @@ struct Live {
 
 #[derive(Default)]
 struct Inner {
-    live: HashMap<String, Live>,
+    /// In id order: a graceful stop walks them, and its order must not
+    /// differ from one process to the next (ADR 0004 §4).
+    live: BTreeMap<String, Live>,
     per_actor: HashMap<ActorRef, usize>,
     per_client: HashMap<IpAddr, usize>,
     stopping: bool,
