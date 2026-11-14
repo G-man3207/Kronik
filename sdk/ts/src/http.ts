@@ -33,10 +33,11 @@ export const BLOB_FRAME_BYTES = 1 << 16;
 
 /**
  * A blob: a large body kept outside the log and named by its hash (see
- * `kronik explain blob`). A handler gets one as `req.blob` or `res.blob`, or
- * from `ctx.blobs.writer().finish()`, and may use it in the turn that got it:
- * read it (`ctx.blobs`), answer with it (`ctx.blob`), or send it
- * (`ctx.http.fetch({ body: blob })`).
+ * `kronik explain blob`). A handler gets one as `req.blob` or `res.blob`, in
+ * a message's `blobs`, from `ctx.blobs.writer().finish()` or `ctx.blobs.put`,
+ * and may use it in the turn that got it: read it (`ctx.blobs`), answer with
+ * it (`ctx.blob`), send it (`ctx.http.fetch({ body: blob })`, a message's
+ * `blobs`), or hold it for later turns (`ctx.blobs.retain`).
  */
 export class BlobRef {
   /** `b3:<hex>`, or `b3s:<hex>` for a data subject's blob. */
@@ -78,6 +79,34 @@ export function encodeBody(body: Body): { bytes: Uint8Array; contentType: string
   if (isBytes(body)) return { bytes: own(body), contentType: 'application/octet-stream' };
   if (typeof body === 'string') return { bytes: encoder.encode(body), contentType: 'text/plain; charset=utf-8' };
   return { bytes: encoder.encode(toJson(body)), contentType: 'application/json' };
+}
+
+/**
+ * A message to send, schedule or reply with: a name and a body (bytes, text,
+ * or a value as JSON), and the blobs it carries (M26).
+ */
+export interface OutgoingMessage {
+  name: string;
+  body?: Body;
+  /** Overrides the content type that follows from the body. */
+  contentType?: string;
+  /**
+   * Blobs that travel with the message, at most 256: each must be one the
+   * turn may use (`kronik explain blob`). The receiving turn may read them,
+   * and holds them only if it `retain`s them.
+   */
+  blobs?: readonly BlobRef[];
+}
+
+/** The WIT message for `msg`. */
+export function toWitMessage(msg: OutgoingMessage): WitMessage {
+  const { bytes, contentType } = msg.body === undefined ? { bytes: new Uint8Array(), contentType: '' } : encodeBody(msg.body);
+  return {
+    name: msg.name,
+    contentType: msg.contentType ?? contentType,
+    body: bytes,
+    blobs: (msg.blobs ?? []).map((blob) => blob.toWit()),
+  };
 }
 
 /** The safe integer range as bigints: such a bigint converts to a number exactly. */
@@ -190,12 +219,18 @@ export class Message {
   readonly body: Uint8Array;
   /** The sending actor, if an actor sent it. */
   readonly sender?: { kind: string; key: string };
+  /**
+   * The blobs the message carries (M26): the turn may read them, and holds
+   * one only if it `ctx.blobs.retain`s it.
+   */
+  readonly blobs: BlobRef[];
 
   constructor(msg: WitMessage, sender?: { kind: string; key: string }) {
     this.name = msg.name;
     this.contentType = msg.contentType;
     this.body = own(msg.body);
     this.sender = sender;
+    this.blobs = (msg.blobs ?? []).map((blob) => new BlobRef(blob.hash, blob.size));
   }
 
   /** The body as UTF-8 text. */

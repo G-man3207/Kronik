@@ -1,8 +1,10 @@
-// Blobs (M25): reading and writing large bodies with the turn's host calls.
-// A turn may read the blobs it got (its request's or a fetch response's body)
-// and the ones it wrote; the host checks every call (`BLOB_NOT_HELD`).
+// Blobs (M25, M26): reading and writing large bodies with the turn's host
+// calls, and holding blobs. A turn may use the blobs its actor holds, the
+// ones its input carries, and the ones it got or wrote; the host checks every
+// call (`BLOB_NOT_HELD`).
 
-import { get as blobsGet, Writer } from 'kronik:actor/blobs@0.1.1';
+import { get as blobsGet, put as blobsPut, release as blobsRelease, retain as blobsRetain, Writer } from 'kronik:actor/blobs@0.1.1';
+import { currentSubject, setSubject } from 'kronik:actor/privacy@0.1.1';
 import { hostError, KronikError } from './errors.ts';
 import { BLOB_CALL_BYTES, BLOB_FRAME_BYTES, BlobRef, own } from './http.ts';
 
@@ -47,8 +49,9 @@ export function readBlob(blob: BlobRef): Uint8Array {
 }
 
 /**
- * The turn's blobs (see `kronik explain blob`): read the ones the turn got,
- * in ranges or as a stream, and write new ones.
+ * The turn's blobs (see `kronik explain blob`): read the ones the turn may
+ * use, in ranges or as a stream, write new ones, and hold them across turns
+ * (`put`, `retain`, `release`).
  */
 export class Blobs {
   /**
@@ -93,6 +96,70 @@ export class Blobs {
    */
   writer(): BlobWriter {
     return new BlobWriter();
+  }
+
+  /**
+   * Stores `bytes` (or text as UTF-8) as a blob tagged with the turn's default
+   * subject, and holds it once the turn commits (M26). One host call takes
+   * at most 1 MiB; a larger value is written in parts and then retained,
+   * which is the same.
+   */
+  put(bytes: Uint8Array | string): BlobRef {
+    const data = typeof bytes === 'string' ? encoder.encode(bytes) : own(bytes);
+    if (data.length > BLOB_CALL_BYTES) {
+      const writer = this.writer();
+      writer.write(data);
+      const blob = writer.finish();
+      this.retain(blob);
+      return blob;
+    }
+    try {
+      const blob = blobsPut(data);
+      return new BlobRef(blob.hash, blob.size);
+    } catch (e) {
+      throw hostError('blob', e);
+    }
+  }
+
+  /**
+   * {@link Blobs.put} tagged with `subject` (`null`: none), whatever the
+   * turn's default subject is; the default is restored afterwards, also when
+   * the put fails.
+   */
+  putFor(subject: string | null, bytes: Uint8Array | string): BlobRef {
+    const before = currentSubject();
+    setSubject(subject ?? undefined);
+    try {
+      return this.put(bytes);
+    } finally {
+      setSubject(before);
+    }
+  }
+
+  /**
+   * Holds `blob` from the turn's commit on: one the turn may use, such as a
+   * request body, a fetch response or one that a message brought. A blob
+   * the actor already holds stays held.
+   */
+  retain(blob: BlobRef): void {
+    try {
+      blobsRetain(blob.toWit());
+    } catch (e) {
+      throw hostError('blob', e);
+    }
+  }
+
+  /**
+   * Ends the actor's hold on `blob` at the turn's commit; the turn can still
+   * read it. Only a hold of this actor's own ends; a blob nothing holds any
+   * more is deleted later by collection.
+   */
+  release(blob: BlobRef): void {
+    try {
+      blobsRelease(blob.toWit());
+    } catch (e) {
+      throw hostError('blob', e);
+    }
   }
 }
 

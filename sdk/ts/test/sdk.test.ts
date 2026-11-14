@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
 import { explainTopic, hostError, KronikError } from '../src/errors.ts';
-import { BlobRef, encodeBody, FetchResponse, json, own, Request, Secret, toJson, toWitRequest } from '../src/http.ts';
+import { BlobRef, encodeBody, FetchResponse, json, Message, own, Request, Secret, toJson, toWitMessage, toWitRequest } from '../src/http.ts';
 import { fromSql, hasOrderBy, SqlRows, toSql } from '../src/sql.ts';
 import { accept, closedOf, Frame, IncomingFrame, OpenRequest, OutcomeUnknown, refusal, sendNowFailure, toOpenReply, toWitFrame } from '../src/connections.ts';
 
@@ -249,4 +249,24 @@ test('blob errors name their code', () => {
   assert.equal(hostError('blob', { payload: { tag: 'quota-exceeded' } }).topic, 'blob');
   assert.equal(hostError('blob', { payload: { tag: 'erased' } }).message, 'the blob belonged to an erased subject (see `kronik explain SUBJECT_ERASED`)');
   assert.equal(hostError('blob', { payload: { tag: 'invalid', val: 'more than 1 MiB in one call' } }).kind, 'blob.invalid');
+});
+
+test('messages carry blobs both ways (M26)', () => {
+  const a = new BlobRef('b3:' + 'aa'.repeat(32), 5n);
+  const b = new BlobRef('b3s:' + 'bb'.repeat(32), 1048577n);
+  assert.deepEqual(toWitMessage({ name: 'shared', body: { id: 'img-1' }, blobs: [a, b] }), {
+    name: 'shared',
+    contentType: 'application/json',
+    body: new TextEncoder().encode('{"id":"img-1"}'),
+    blobs: [
+      { hash: a.hash, size: 5n },
+      { hash: b.hash, size: 1048577n },
+    ],
+  });
+  assert.deepEqual(toWitMessage({ name: 'tick' }).blobs, []);
+  const incoming = new Message({ name: 'shared', contentType: 'text/plain', body: new Uint8Array(), blobs: [{ hash: a.hash, size: 5n }] });
+  assert.equal(incoming.blobs.length, 1);
+  assert.ok(incoming.blobs[0] instanceof BlobRef);
+  assert.deepEqual([incoming.blobs[0].hash, incoming.blobs[0].size], [a.hash, 5n]);
+  assert.deepEqual(new Message({ name: 'tick', contentType: '', body: new Uint8Array(), blobs: [] }).blobs, []);
 });

@@ -11,11 +11,11 @@ import { reveal } from 'kronik:actor/secrets@0.1.1';
 import { emit, type Level } from 'kronik:actor/log@0.1.1';
 import { setSubject, currentSubject } from 'kronik:actor/privacy@0.1.1';
 import { broadcast as connBroadcast, close as connClose, send as connSend, sendNow as connSendNow, type OpenReply } from 'kronik:actor/connections@0.1.1';
-import type { ActorRef, Message as WitMessage, Output } from 'kronik:actor/types@0.1.1';
+import type { ActorRef, Output } from 'kronik:actor/types@0.1.1';
 import { accept, type AcceptOptions, type FrameLike, sendNowFailure, toWitFrame } from './connections.ts';
 import { Blobs, readBlob } from './blobs.ts';
 import { hostError } from './errors.ts';
-import { type Body, BlobRef, encodeBody, FetchResponse, type FetchRequest, json, Message, own, Secret, text, toJson, toWitRequest } from './http.ts';
+import { BlobRef, FetchResponse, type FetchRequest, json, Message, type OutgoingMessage, own, Secret, text, toJson, toWitMessage, toWitRequest } from './http.ts';
 import { hasOrderBy, SqlRows, toSql, type SqlParam } from './sql.ts';
 
 const encoder = new TextEncoder();
@@ -23,13 +23,6 @@ const encoder = new TextEncoder();
 /** An actor, as `"kind/key"` or `{ kind, key }`. */
 export type ActorLike = string | ActorRef;
 
-/** A message to send: a name and a body (bytes, text, or a value as JSON). */
-export interface OutgoingMessage {
-  name: string;
-  body?: Body;
-  /** Overrides the content type that follows from the body. */
-  contentType?: string;
-}
 
 function actorRef(actor: ActorLike): ActorRef {
   if (typeof actor !== 'string') return actor;
@@ -38,11 +31,6 @@ function actorRef(actor: ActorLike): ActorRef {
     throw new TypeError(`${JSON.stringify(actor)} is not an actor: expected kind/key (see \`kronik explain actor\`)`);
   }
   return { kind: actor.slice(0, slash), key: actor.slice(slash + 1) };
-}
-
-function witMessage(msg: OutgoingMessage): WitMessage {
-  const { bytes, contentType } = msg.body === undefined ? { bytes: new Uint8Array(), contentType: '' } : encodeBody(msg.body);
-  return { name: msg.name, contentType: msg.contentType ?? contentType, body: bytes, blobs: [] };
 }
 
 /** The actor's key-value state. Writes apply only if the turn commits. */
@@ -183,7 +171,7 @@ export class Secrets {
 export class Timers {
   /** Schedules `msg` to arrive as a timer input after `delayMs`; returns the timer's id. */
   schedule(delayMs: number, msg: OutgoingMessage): bigint {
-    return timersSchedule(BigInt(Math.max(0, Math.floor(delayMs))), witMessage(msg));
+    return timersSchedule(BigInt(Math.max(0, Math.floor(delayMs))), toWitMessage(msg));
   }
 
   /** Cancels the timer `id`; returns whether it was pending. */
@@ -309,7 +297,7 @@ export class Ctx {
 
   /** Sends a message to `to`: buffered, delivered exactly once, only if this turn commits. */
   send(to: ActorLike, msg: OutgoingMessage): void {
-    messagingSend(actorRef(to), witMessage(msg));
+    messagingSend(actorRef(to), toWitMessage(msg));
   }
 
   /**
@@ -319,7 +307,7 @@ export class Ctx {
   call(to: ActorLike, msg: OutgoingMessage, compensate?: OutgoingMessage): Message | undefined {
     let reply;
     try {
-      reply = messagingCall(actorRef(to), witMessage(msg), compensate && witMessage(compensate));
+      reply = messagingCall(actorRef(to), toWitMessage(msg), compensate && toWitMessage(compensate));
     } catch (e) {
       throw hostError('call', e);
     }
@@ -392,7 +380,7 @@ export class Ctx {
 
   /** A reply message (an HTTP request gets 200 with its body). */
   reply(msg: OutgoingMessage): Output {
-    return { tag: 'reply', val: witMessage(msg) };
+    return { tag: 'reply', val: toWitMessage(msg) };
   }
 
   /** No output (an HTTP request gets 204). */
