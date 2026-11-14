@@ -969,7 +969,7 @@ OpenTelemetry-backend":**
   serves its query API on 16686.
 - **Where it runs:** in docker on the test VPS, under the VPS lock
   (`flock /var/tmp/kronik-vps.lock`), as the install suites already use
-  docker there. The test entry is `suite otel 'with_garage scripts/jaeger.sh
+  docker there. The test entry is `suite otel 'scripts/s3.sh scripts/jaeger.sh
   demo/vps-otel.sh' 5` under M28.
 - **`demo/vps-otel.sh`**, in the shape of `demo/vps-restore.sh`:
   1. Start Jaeger with `--rm` on free loopback ports (`scripts/jaeger.sh`,
@@ -1001,7 +1001,7 @@ OpenTelemetry-backend":**
      - each callee has a `call` link to its caller's effect span.
   8. Print `PASS`. Stop Jaeger and the daemon.
 - **On a developer machine:** `scripts/jaeger.sh demo/vps-otel.sh`, like
-  `scripts/minio.sh`.
+  `scripts/s3.sh`.
 - **In CI, without docker:** `crates/kronik/tests/otel.rs` starts an
   in-process OTLP receiver (a small hyper server that decodes
   `ExportTraceServiceRequest` with the vendored types). It makes the same
@@ -1019,7 +1019,7 @@ OpenTelemetry-backend":**
 **"Den exporterade audit-loggen är fullständig jämfört med loggens poster,
 och ett test jämför dem":** `crates/kronik/tests/audit.rs` (§4.5), in the
 normal test suite. On the test VPS, the same `kronik audit verify` runs on
-the `with_garage` S3 sink in `demo/vps-otel.sh`'s second half
+the S3 sink of `demo/vps-otel.sh`'s second half, under `scripts/s3.sh`
 (`kronik audit verify --sink s3://…`).
 
 ## 9. Determinism and invariants

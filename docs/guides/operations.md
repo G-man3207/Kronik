@@ -476,7 +476,7 @@ new traffic, and clients reconnect: reconnect with jittered backoff.
 |---|---|---|
 | `enabled` | `false` | Ship the log, snapshots and code to object storage; see [shipping](#shipping-to-object-storage) |
 | `url` | none | `"s3://bucket/prefix"`, or `"file:///dir"` for a directory on this machine (a demo, not a backup); `enabled = true` requires it |
-| `endpoint` | none | An S3-compatible server instead of AWS, such as `"http://127.0.0.1:9000"` for MinIO |
+| `endpoint` | none | An S3-compatible server instead of AWS, such as `"http://127.0.0.1:9000"` for one on this machine |
 
 ### [keys]
 
@@ -1658,7 +1658,7 @@ code to an S3 bucket every 10 seconds:
 [ship]
 enabled = true
 url = "s3://my-bucket/kronik/prod"
-# endpoint = "http://127.0.0.1:9000"   # S3-compatible servers, such as MinIO
+# endpoint = "http://127.0.0.1:9000"   # an S3-compatible server instead of AWS
 ```
 
 `url` may also be `file:///dir`: the daemon then ships to a directory on
@@ -1712,7 +1712,8 @@ the diff it was given for (`diff_hash`). File/env sources need the
 original master key before restore; KMS sources install the shipped
 wrapped key and unwrap it using the supplied configuration. In a checkout,
 `demo/vps-restore.sh` does this with two data directories and one bucket
-(`scripts/minio.sh demo/vps-restore.sh` uses a local MinIO in Docker).
+(`scripts/s3.sh demo/vps-restore.sh` uses a local S3 server, moto's, in
+Docker).
 
 **Starts that replay a long stretch of the log, up to v0.0.8.** A start
 that replays 8,192 or more records in one

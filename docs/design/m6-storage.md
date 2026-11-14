@@ -143,10 +143,10 @@ the start, not a cursor.
 ## 4. Shipping (`kronik-ship`)
 
 Optional (`[ship] enabled`, `url = "s3://bucket/prefix"`, `endpoint` for
-S3-compatible servers such as MinIO). Credentials and region come from the
+S3-compatible servers). Credentials and region come from the
 standard environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `AWS_SESSION_TOKEN`, `AWS_REGION`, default `us-east-1`); an `http://`
-endpoint is allowed (local MinIO). Uploads use `object_store`'s S3 client,
+endpoint is allowed (a local S3 server). Uploads use `object_store`'s S3 client,
 each object compressed with zstd (level 3):
 
 ```text
@@ -381,9 +381,10 @@ overlap.
   (and the plan keeps a base for every point over weeks of hourly
   snapshots); a snapshot taken while a turn is open stays a start point
   through retention.
-- Shipping and restore against MinIO in Docker (unique container name,
-  random port, removed afterwards): restored state hash and log hash equal
-  the source's; the idle-roll bound.
+- Shipping and restore against an S3 server in Docker (`scripts/s3.sh`:
+  moto's, with a unique container name and a random port, removed
+  afterwards; MinIO until its images stopped being distributed): restored
+  state hash and log hash equal the source's; the idle-roll bound.
 - `upgrade check`: an identity replay passes; a deliberately different
   engine behaviour (a test hook) diverges with `ENGINE_UPGRADE_DIVERGED`;
   startup with a changed engine needs the report and writes

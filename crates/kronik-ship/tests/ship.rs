@@ -1,6 +1,6 @@
 //! Shipping and restore (docs/design/m6-storage.md §4, §6) against a local
 //! directory bucket, and against S3 when `KRONIK_TEST_S3_URL` is set
-//! (scripts/minio.sh runs a MinIO container for it).
+//! (scripts/s3.sh runs an S3 server in docker for it).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
@@ -325,7 +325,7 @@ fn an_interrupted_restore_leaves_a_consistent_directory() {
 #[test]
 fn ship_destroy_and_restore_from_s3() {
     let Ok(url) = std::env::var("KRONIK_TEST_S3_URL") else {
-        eprintln!("KRONIK_TEST_S3_URL is not set; run scripts/minio.sh for this test");
+        eprintln!("KRONIK_TEST_S3_URL is not set; run scripts/s3.sh for this test");
         return;
     };
     let endpoint = std::env::var("KRONIK_TEST_S3_ENDPOINT").ok();

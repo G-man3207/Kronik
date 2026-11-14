@@ -265,8 +265,8 @@ first two commands copy it from the old data directory before the restore
 (with `KRONIK_MASTER_KEY`, set it for both commands instead). The restored
 directory holds the old node's encrypted stores: without their key,
 `kronik serve` stops with `MASTER_KEY_MISSING` rather than make a new key
-that can't read them. In a checkout of the repository, `scripts/minio.sh
-demo/vps-restore.sh` runs this flow against a local MinIO. This is one
+that can't read them. In a checkout of the repository, `scripts/s3.sh
+demo/vps-restore.sh` runs this flow against a local S3 server. This is one
 machine and two directories, not a destroyed VPS.
 
 ## 10. An agent, via MCP

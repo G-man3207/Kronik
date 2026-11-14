@@ -5,7 +5,7 @@
 # removed afterwards, whatever COMMAND's result.
 #
 #   scripts/jaeger.sh demo/vps-otel.sh
-#   scripts/minio.sh scripts/jaeger.sh demo/vps-otel.sh   (with the audit half)
+#   scripts/s3.sh scripts/jaeger.sh demo/vps-otel.sh   (with the audit half)
 #
 # Exported to COMMAND:
 #   KRONIK_TEST_OTLP_ENDPOINT   http://127.0.0.1:<port>   ([otel] endpoint)

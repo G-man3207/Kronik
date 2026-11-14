@@ -364,7 +364,7 @@ either, `kronik integrity` lists the subjects and exits 1. The JSON's
 `--from` is `s3://bucket/prefix` or `file:///path`. Credentials and region
 come from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `AWS_SESSION_TOKEN` and `AWS_REGION` (default `us-east-1`). `--endpoint` is
-an S3-compatible server, such as MinIO. The data directory is `--data-dir`,
+an S3-compatible server. The data directory is `--data-dir`,
 else `server.data_dir` in the configuration file, else `/var/lib/kronik`.
 An existing `state.db` is refused unless `--force`. `--dry-run` checks the
 URL and that the bucket answers, prints the plan, and writes nothing to

@@ -4,17 +4,17 @@
 # script pointed at a bucket the first host already shipped to. It does not
 # touch any remote machine.
 #
-# Usage: scripts/minio.sh demo/vps-restore.sh
+# Usage: scripts/s3.sh demo/vps-restore.sh
 #        [KRONIK_BIN=path] [INCREMENTS=300] demo/vps-restore.sh [WORKDIR]
 # Needs KRONIK_TEST_S3_URL, KRONIK_TEST_S3_ENDPOINT and the AWS_* variables
-# that scripts/minio.sh exports. The counter is tests/guests/counter.wasm
+# that scripts/s3.sh exports. The counter is tests/guests/counter.wasm
 # (decimal n, not the examples' JSON). Needs curl and python3.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 if [ -z "${KRONIK_TEST_S3_URL:-}" ] || [ -z "${KRONIK_TEST_S3_ENDPOINT:-}" ]; then
     echo "KRONIK_TEST_S3_URL and KRONIK_TEST_S3_ENDPOINT are unset." >&2
-    echo "Run: scripts/minio.sh demo/vps-restore.sh" >&2
+    echo "Run: scripts/s3.sh demo/vps-restore.sh" >&2
     exit 2
 fi
 

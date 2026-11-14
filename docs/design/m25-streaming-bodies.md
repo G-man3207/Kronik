@@ -783,7 +783,7 @@ M24's slices.
 | **B9** `wasi:http` bodies | `kronik-runtime/src/host/wasi_http.rs` | the 100-run transcript test with 3 MiB bodies | parallel |
 | **B10** replay and forks | `kronik-fork` (gate, spaces, scratch, disclosure guards, diff, erased and `--no-pii` reads), `diff-v1.schema.json` | identity replay with blob bodies (criterion 2's replay half); `--no-pii` fork test | **coordinate**: M24 edits `replay.rs` and `diff.rs` too |
 | **B11** index, floor, leases, sweep, snapshot index | `kronik-blob` (sweep), `kronik-store` (compaction of `blobs`), `kronik-sched/src/snapshots.rs` (`blobs.idx`, manifest field, sweep after retention), fork `blobs.roots`, replay leases, API/CLI `kronik blobs status`, `inspect`, `get`, `gc` (M26 §12), error code `BLOB_NOT_FOUND` | sweep tests; snapshot fixture with `blobs.idx`; dry run | parallel |
-| **B12** shipping and restore | `kronik-ship` (order of ADR 0122, `ship-blobs.db`, multipart, restore), `kronik` (`restore --allow-missing-blobs`) | MinIO test: restore of uploaded and fetched blobs; a round stopped between steps | parallel |
+| **B12** shipping and restore | `kronik-ship` (order of ADR 0122, `ship-blobs.db`, multipart, restore), `kronik` (`restore --allow-missing-blobs`) | S3 test (`scripts/s3.sh`): restore of uploaded and fetched blobs; a round stopped between steps | parallel |
 | **B13** SDKs and acceptance | `sdk/{rust,ts,python,go}` (§16), test kits, `tests/guests` (`blobs` feature), `crates/kronik/tests/blobs_streaming.rs`, `scripts/acceptance-m25.sh`, `docs/perf.md`, `docs/guides/{actors,operations}.md` | criteria 1–5; `scripts/ci.sh ts sdks examples` | textual conflicts in SDK files |
 
 ### 18.2 Keeping `main` releasable

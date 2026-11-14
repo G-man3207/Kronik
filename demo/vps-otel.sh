@@ -5,11 +5,11 @@
 # to it is complete compared with the log (`kronik audit verify`).
 #
 # Usage: scripts/jaeger.sh demo/vps-otel.sh
-#        scripts/minio.sh scripts/jaeger.sh demo/vps-otel.sh   (with the audit half)
+#        scripts/s3.sh scripts/jaeger.sh demo/vps-otel.sh   (with the audit half)
 #        [KRONIK_BIN=path] demo/vps-otel.sh [WORKDIR]
 # Needs KRONIK_TEST_OTLP_ENDPOINT and KRONIK_TEST_JAEGER_QUERY (scripts/jaeger.sh
 # exports them); the audit half also needs KRONIK_TEST_S3_URL,
-# KRONIK_TEST_S3_ENDPOINT and the AWS_* variables (scripts/minio.sh). The
+# KRONIK_TEST_S3_ENDPOINT and the AWS_* variables (scripts/s3.sh). The
 # counter is tests/guests/counter.wasm. Needs curl and python3.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -241,7 +241,7 @@ echo "PASS: traces"
 step "audit export to S3"
 audit=skip
 if [ -z "${KRONIK_TEST_S3_URL:-}" ] || [ -z "${KRONIK_TEST_S3_ENDPOINT:-}" ]; then
-    echo "SKIP: audit: no bucket (KRONIK_TEST_S3_URL unset; run under scripts/minio.sh or with_garage)"
+    echo "SKIP: audit: no bucket (KRONIK_TEST_S3_URL unset; run under scripts/s3.sh)"
 elif ! "$bin" audit verify --help >/dev/null 2>&1; then
     echo "SKIP: audit: this kronik has no 'kronik audit verify'"
 else

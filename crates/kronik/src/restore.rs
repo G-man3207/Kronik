@@ -21,7 +21,8 @@ pub struct RestoreArgs {
     /// The bucket: `s3://bucket/prefix` or `file:///path`.
     #[arg(long, value_name = "URL")]
     from: String,
-    /// An S3-compatible endpoint, such as `http://127.0.0.1:9000` for MinIO.
+    /// An S3-compatible endpoint, such as `http://127.0.0.1:9000` for a
+    /// self-hosted server.
     #[arg(long, value_name = "URL")]
     endpoint: Option<String>,
     /// Data directory to restore into [default: server.data_dir in the
