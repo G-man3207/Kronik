@@ -7,7 +7,8 @@
 //! buffer that the client reads at its own pace, or stops reading, and
 //! another (the reader) hands the client's frames to the hub one at a time.
 //! Clients broadcast, echo, send to and kick other connections (also those
-//! of other rooms, which the host refuses), make turns fail and trap, say
+//! of other rooms, which the host drops: a turn decides only from its own
+//! actor's connections), make turns fail and trap, say
 //! bye, then close, vanish, stop reading or linger, and reconnect. A client
 //! that gives up during an open makes the server drop the open, as hyper
 //! drops the service future of a client that left. The node crashes
@@ -1285,8 +1286,10 @@ impl World {
     }
 
     /// A failed turn the workload asks for: an open with `fail=1` fails, a
-    /// frame `fail` fails, a frame `trap` traps, and `send-to` or `kick` of
-    /// a live connection of another room traps with `CONNECTION_NOT_HELD`.
+    /// frame `fail` fails, a frame `trap` traps, and a `stream` cut by an
+    /// unknown send-now ends outcome-unknown. `send-to`, `kick` and `now-to`
+    /// never fail: a target that is not a live connection of the turn's own
+    /// room is dropped (ADR 0114), so a failure of one is a violation.
     pub(super) fn expected_connection_failure(&self, t: &pb::TurnRecord) -> bool {
         use pb::connection_input::Event;
         if self.cfg.connections.is_none() {
@@ -1335,11 +1338,6 @@ impl World {
                                 e.kind == "connection.send-now"
                                     && e.status == pb::EffectStatus::OutcomeUnknown as i32
                             })
-                    }
-                    "send-to" | "kick" | "now-to" => {
-                        trapped
-                            && (o.error_code == "CONNECTION_NOT_HELD"
-                                || o.message.contains("CONNECTION_NOT_HELD"))
                     }
                     _ => false,
                 }
