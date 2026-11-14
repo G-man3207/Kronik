@@ -1933,7 +1933,8 @@ pub struct ConnectionCloseResponse {
 /// `GET /v1/blobs` (`kronik blobs status`, M25 §15).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BlobsStatusResponse {
-    /// `[blobs]` is on. When it is off every count is 0.
+    /// The node has a blob store, as every `kronik serve` does; a node
+    /// embedded without one answers false and every count 0.
     pub enabled: bool,
     /// Blobs that a record within retention or the state references (not
     /// erased), and their bytes.
@@ -2054,6 +2055,7 @@ pub struct BlobGcEntry {
 /// main's store without a root now, ignoring the two-pass grace.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BlobGcPlanResponse {
+    /// The node has a blob store (as in `GET /v1/blobs`).
     pub enabled: bool,
     pub blobs: Vec<BlobGcEntry>,
     /// How many, and their bytes.
@@ -2098,6 +2100,7 @@ pub struct BlobGcRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BlobGcResponse {
     pub dry_run: bool,
+    /// The node has a blob store (as in `GET /v1/blobs`).
     pub enabled: bool,
     /// Files deleted (a dry run: that a pass now would delete), and their
     /// bytes.

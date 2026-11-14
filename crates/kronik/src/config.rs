@@ -119,13 +119,13 @@ impl Default for Connections {
     }
 }
 
-/// `[blobs]`: the blob store of M25 and M26
-/// (docs/design/m25-streaming-bodies.md §12). Undocumented, and off by
-/// default, until M26 is complete (§18.2).
+/// `[blobs]`: the blob store of M25 and M26, always on
+/// (docs/design/m25-streaming-bodies.md §12; the `enabled` switch of the
+/// milestones' development, §18.2, is gone, so a file that still sets it
+/// fails to load as an unknown key).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Blobs {
-    pub enabled: bool,
     /// Below this much free disk no new blob is written: a multiple of
     /// `[log] disk_reserve` (`"2x"`) or a size.
     pub disk_reserve: BlobReserve,
@@ -139,7 +139,6 @@ pub struct Blobs {
 impl Default for Blobs {
     fn default() -> Self {
         Blobs {
-            enabled: false,
             disk_reserve: BlobReserve::Times(2),
             lease_ttl: Dur::secs(300),
             gc_interval: Dur::secs(3600),
@@ -1597,6 +1596,11 @@ catch_up_timeout = "5m"
 runsc_path = "/usr/local/bin/runsc"
 platform = "auto"                     # auto, systrap or kvm
 start_timeout = "30s"                 # how long a started sandbox may take to answer
+
+[blobs]
+disk_reserve = "2x"                   # a multiple of [log] disk_reserve, or a size
+lease_ttl = "5m"
+gc_interval = "1h"
 "#;
 
     #[test]
@@ -1629,23 +1633,22 @@ start_timeout = "30s"                 # how long a started sandbox may take to a
         assert_eq!(config.foreign.start_timeout.0, Duration::from_secs(30));
     }
 
-    /// `[blobs]` is off by default and undocumented until M26 is complete
-    /// (docs/design/m25-streaming-bodies.md §18.2).
+    /// `[blobs]` has no switch (M26 B20): the reserve follows the log's,
+    /// and the development's `enabled` is an unknown key.
     #[test]
-    fn blobs_are_off_by_default_and_their_reserve_follows_the_log() {
+    fn blobs_have_no_switch_and_their_reserve_follows_the_log() {
         let empty = parse("").unwrap();
-        assert!(!empty.blobs.enabled);
         assert_eq!(empty.blobs.disk_reserve_bytes(512 << 20), 1 << 30);
         assert_eq!(empty.blobs.lease_ttl, Dur::secs(300));
-        let set =
-            parse("[blobs]\nenabled = true\ndisk_reserve = \"3x\"\nlease_ttl = \"1m\"\n").unwrap();
-        assert!(set.blobs.enabled);
+        assert_eq!(empty.blobs.gc_interval, Dur::secs(3600));
+        let set = parse("[blobs]\ndisk_reserve = \"3x\"\nlease_ttl = \"1m\"\n").unwrap();
         assert_eq!(set.blobs.disk_reserve_bytes(100), 300);
         assert_eq!(set.blobs.lease_ttl, Dur::secs(60));
         let sized = parse("[blobs]\ndisk_reserve = \"2GiB\"\n").unwrap();
         assert_eq!(sized.blobs.disk_reserve_bytes(1), 2 << 30);
         assert!(parse("[blobs]\ndisk_reserve = \"zx\"\n").is_err());
         assert!(parse("[blobs]\nunknown = 1\n").is_err());
+        assert!(parse("[blobs]\nenabled = true\n").is_err());
     }
 
     #[test]
@@ -1661,6 +1664,7 @@ start_timeout = "30s"                 # how long a started sandbox may take to a
         assert_eq!(empty.fork, brief.fork);
         assert_eq!(empty.promote, brief.promote);
         assert_eq!(empty.foreign, brief.foreign);
+        assert_eq!(empty.blobs, brief.blobs);
         assert_eq!(empty.server.admin_listen, brief.server.admin_listen);
         // Values for one installation are empty, and nothing points at a
         // system port or path without TLS.

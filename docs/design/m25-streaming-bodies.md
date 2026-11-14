@@ -1,7 +1,9 @@
 # M25 streaming bodies: design
 
-Status: accepted design for M25 (v0.5), 2026-11-13. It fixes what the implementation
-slices of §18 build, so that none of them has to decide anything again. It
+Status: accepted design for M25 (v0.5), 2026-11-13; built by slices B1 to
+B13 and the M25 review's fixes (2026-11-14), and switched on for good by
+M26's B20; the as-built notes record where the build differs. It fixes what
+the implementation slices of §18 build, so that none of them has to decide anything again. It
 builds on [M1 core](m1-core.md), [M2 effects](m2-effects.md),
 [M3 fork](m3-fork.md), [M6 storage](m6-storage.md),
 [M8 privacy](m8-privacy.md) and [ADR 0070](../adr/0070-wasi-http-outgoing-handler.md).
@@ -919,7 +921,8 @@ blobs work: tests set it, and `kronik serve` sets it from an undocumented
 `[blobs] enabled = true` that defaults to false. While it is off, every
 component behaves as one that does not import `blobs` (inline bodies and
 their limits), and the functions keep trapping. M26's last slice (B20)
-removes the switch and the key.
+removes the switch and the key. (As built: B20 did; a `kronik.toml` that
+still sets `[blobs] enabled` fails to load as an unknown key.)
 
 ### 18.3 Order
 

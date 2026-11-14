@@ -6,6 +6,15 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- Blobs are on in every daemon (M25, M26): a kind whose code imports
+  `kronik:actor/blobs` gets request bodies and `fetch` responses above its
+  blob threshold as blobs, and can write, hold and send blobs. The
+  development switch `[blobs] enabled` is gone: a `kronik.toml` that still
+  sets it fails to load (remove the line). `[blobs]` keeps `disk_reserve`
+  (`"2x"`), `lease_ttl` (`"5m"`) and `gc_interval` (`"1h"`), now documented
+  with the rest of `kronik.toml`, and the operations guide has a section on
+  blobs: which bodies become blobs, holds and the quota, what keeps a blob,
+  collection, disk sizing, failures, and shipping and restoring them.
 - Erasure reaches blobs (M26, docs/design/m26-blobs.md §9). Applying a
   subject's erasure marks its blobs erased, and the node deletes their files
   at once, in main's store and in every fork's space (`blobs` in the answer

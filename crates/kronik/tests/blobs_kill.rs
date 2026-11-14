@@ -50,10 +50,7 @@ impl Daemon {
         let config = dir.join("kronik.toml");
         std::fs::write(
             &config,
-            format!(
-                "[server]\ndata_dir = {:?}\n\n[blobs]\nenabled = true\n",
-                dir.join("data")
-            ),
+            format!("[server]\ndata_dir = {:?}\n", dir.join("data")),
         )
         .unwrap();
         let log = std::fs::OpenOptions::new()

@@ -109,7 +109,7 @@ fn status(ctx: &Ctx) -> Result<ExitCode, Error> {
 fn render_status(r: &BlobsStatusResponse) -> String {
     let mut out = String::new();
     if !r.enabled {
-        out.push_str("Blobs are off in this daemon.\n");
+        out.push_str("This node has no blob store.\n");
         return out;
     }
     let _ = writeln!(
@@ -410,7 +410,7 @@ fn gc(ctx: &Ctx, a: GcArgs) -> Result<ExitCode, Error> {
     let r: BlobGcResponse = ctx.decode(&body)?;
     let mut out = String::new();
     if !r.enabled {
-        out.push_str("Blobs are off in this daemon: nothing to collect.\n");
+        out.push_str("This node has no blob store: nothing to collect.\n");
     } else if r.dry_run {
         let _ = writeln!(
             out,
@@ -463,7 +463,7 @@ fn render_drift(r: &BlobGcPlanResponse, out: &mut String) {
 fn render_plan(r: &BlobGcPlanResponse) -> String {
     let mut out = String::new();
     if !r.enabled {
-        out.push_str("Blobs are off in this daemon.\n");
+        out.push_str("This node has no blob store.\n");
         return out;
     }
     if r.blobs.is_empty() {

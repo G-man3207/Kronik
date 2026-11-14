@@ -598,11 +598,9 @@ EXAMPLES = {
 }
 
 
-# The configuration an example needs beyond the defaults (a kronik.toml).
-CONFIG = {
-    # Blob storage is off until M26 is complete.
-    "media-ts": "[blobs]\nenabled = true\n",
-}
+# The configuration an example needs beyond the defaults (a kronik.toml);
+# none needs one since blobs are always on (M26).
+CONFIG: dict[str, str] = {}
 
 
 def run(args, name):

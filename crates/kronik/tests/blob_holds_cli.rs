@@ -1,6 +1,6 @@
 //! `kronik actors inspect`, `blobs list --actor`, `blobs inspect` and
 //! `blobs gc --dry-run --verify` against a real `kronik` binary with
-//! `[blobs] enabled = true` and the test guest `media` (M26 slice B16, §12):
+//! the test guest `media` (M26 slice B16, §12):
 //! what an actor holds, page by page; a held blob's root names its holder;
 //! the plan's pins match their rows.
 
@@ -83,7 +83,7 @@ impl Serve {
             &config,
             format!(
                 "[server]\ndata_dir = {:?}\napi_socket = {:?}\nhttp_listen = {http:?}\n\n\
-                 [blobs]\nenabled = true\ngc_interval = \"0s\"\n",
+                 [blobs]\ngc_interval = \"0s\"\n",
                 dir.join("data"),
                 socket,
             ),

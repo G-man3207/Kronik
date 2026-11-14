@@ -474,6 +474,16 @@ new traffic, and clients reconnect: reconnect with jittered backoff.
 |---|---|---|
 | `max_size_per_actor` | `"1GiB"` | The SQL size limit for a kind that has no `sql_bytes_per_actor` in a `Limits` record. `kronik limits set --sql-size` still wins for that kind |
 
+### [blobs]
+
+The blob store, `<data_dir>/blobs`, is always on; see [blobs](#blobs).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `disk_reserve` | `"2x"` | Below this much free space on the data directory's file system no new blob is written: uploads that would become blobs get `503 BLOB_STORE_FULL`, and turns that write blobs wait and run again. A multiple of `[log] disk_reserve` (`"2x"`), or a size such as `"4GiB"` |
+| `lease_ttl` | `"5m"` | How long a lease (an upload, a streamed answer, a running turn, a replay) keeps its blobs without being renewed |
+| `gc_interval` | `"1h"` | How often the blob collector runs, besides after every retention pass; `"0s"` leaves only those and `kronik blobs gc` |
+
 ### [ship]
 
 | Key | Default | Meaning |

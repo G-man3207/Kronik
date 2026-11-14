@@ -1119,8 +1119,8 @@ async fn every_mutation_writes_its_audited_record() {
             json!({}),
         ),
         ("POST", "/v1/snapshots", "/v1/snapshots", json!({})),
-        // Blobs are off in this node: the pass has nothing to do, and is
-        // still audited.
+        // This test node has no blob store: the pass has nothing to do, and
+        // is still audited.
         ("POST", "/v1/blobs/gc", "/v1/blobs/gc", json!({})),
         (
             "POST",

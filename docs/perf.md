@@ -483,7 +483,7 @@ response pass through a node with constant memory
 ### Method
 
 `crates/kronik/tests/blobs_streaming.rs` runs a real `kronik serve` with
-`[blobs] enabled = true` and the test guest `media`. Memory is the daemon's
+the test guest `media`. Memory is the daemon's
 peak RSS (`VmHWM` in `/proc/<pid>/status`) after a warm-up request of 2 MiB:
 for two sizes a factor of ten apart, each must grow it by at most the blob
 threshold (1 MiB) + 48 MiB, and both by the same amount within 16 MiB. The

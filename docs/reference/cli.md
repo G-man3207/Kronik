@@ -2554,7 +2554,7 @@ their bytes, the floor (records at or after it keep their blobs: the lowest
 of the log's first LSN, each fork's point + 1 and each replay's floor), the
 leases the daemon holds (turns, uploads, streams, replays), the free disk
 and `[blobs] disk_reserve`, and the collector's last pass since the daemon
-started. With blobs off it says so.
+started. A node without a blob store (an embedded test node) says so.
 
 ```text
 $ kronik blobs status

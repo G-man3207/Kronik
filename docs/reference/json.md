@@ -633,6 +633,7 @@ against both.
       ]
     },
     "enabled": {
+      "description": "The node has a blob store (as in `GET /v1/blobs`).",
       "type": "boolean"
     },
     "floor": {
@@ -688,6 +689,7 @@ against both.
       "type": "boolean"
     },
     "enabled": {
+      "description": "The node has a blob store (as in `GET /v1/blobs`).",
       "type": "boolean"
     },
     "floor": {
@@ -999,7 +1001,7 @@ against both.
       "type": "boolean"
     },
     "enabled": {
-      "description": "`[blobs]` is on. When it is off every count is 0.",
+      "description": "The node has a blob store, as every `kronik serve` does; a node\nembedded without one answers false and every count 0.",
       "type": "boolean"
     },
     "floor": {

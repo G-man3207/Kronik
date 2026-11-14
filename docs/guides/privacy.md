@@ -303,7 +303,7 @@ complete when that time has passed and reseal and the snapshot replacement
 are done: `privacy status` counts an erasure as pending while its subject
 still has a plain value in the log, in `state.db` or in an input still queued
 from before the erasure, and while a turn that began before the erasure
-still runs. With blobs on, it is also pending while one of the subject's
+still runs. It is also pending while one of the subject's
 blobs has a file on the node or an object in the bucket, and until the blob
 collector has deleted the subject's files that no record references
 (below).

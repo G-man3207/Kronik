@@ -57,7 +57,7 @@ impl Daemon {
         std::fs::write(
             &config,
             format!(
-                "[server]\ndata_dir = {:?}\n\n[blobs]\nenabled = true\n\n{SHORT_RETENTION}",
+                "[server]\ndata_dir = {:?}\n\n{SHORT_RETENTION}",
                 dir.join("data")
             ),
         )

@@ -74,6 +74,11 @@ personal data unless your token has `pii:read`.
   route, state, close and frame counts. `query_history` with `connection`
   gives one connection's turns, with what each sent and whether the frames
   were written.
+- A body larger than its kind's blob threshold (an upload, a large `fetch`
+  response, a blob an actor wrote) shows in a turn as a blob: a `b3:` hash,
+  or `b3s:` for a subject's, and a size, never the bytes. `inspect_blob`
+  with that hash says what keeps it; the bytes are for an operator
+  (`kronik blobs get`).
 
 ### 3. Make the change
 

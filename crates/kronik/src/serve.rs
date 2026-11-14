@@ -706,7 +706,8 @@ async fn serve(args: ServeArgs, config: Config, early: Early) -> anyhow::Result<
         keystore_backup_retention: config.privacy.keystore_backup_retention.0,
         sql_bytes_per_actor: config.sql.max_size_per_actor.0,
         disk_reserve: config.log.disk_reserve.0,
-        blobs: config.blobs.enabled.then(|| kronik_sched::BlobsConfig {
+        // Blobs are always on (M26 B20).
+        blobs: Some(kronik_sched::BlobsConfig {
             disk_reserve: config.blobs.disk_reserve_bytes(config.log.disk_reserve.0),
             lease_ttl: config.blobs.lease_ttl.0,
             gc_interval: config.blobs.gc_interval.0,

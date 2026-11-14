@@ -1,6 +1,8 @@
 # M26 blob storage for apps: design
 
-Status: accepted design for M26 (v0.5), 2026-11-13. It completes
+Status: accepted design for M26 (v0.5), 2026-11-13; built by slices B14 to
+B20 (2026-11-14), after which blobs are always on; the as-built notes record
+where the build differs. It completes
 [M25 streaming bodies](m25-streaming-bodies.md), whose store, interface,
 gateway and effect paths it uses, and fixes what the slices of §18 build.
 The decisions are ADRs [0117](../adr/0117-blob-store.md) to

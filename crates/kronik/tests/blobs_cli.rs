@@ -1,5 +1,5 @@
 //! `kronik blobs status`, `inspect`, `get` and `gc` against a real `kronik`
-//! binary with `[blobs] enabled = true` and the test guest `media` (M25
+//! binary and the test guest `media` (M25
 //! slice B11): a turn's response blob is indexed, inspected, verified and
 //! downloaded with a secret value scrubbed; a blob a turn wrote and did not
 //! keep is listed as loose and collected; a blob nobody knows is
@@ -84,7 +84,7 @@ impl Serve {
             &config,
             format!(
                 "[server]\ndata_dir = {:?}\napi_socket = {:?}\nhttp_listen = {http:?}\n\n\
-                 [blobs]\nenabled = true\ngc_interval = \"0s\"\n",
+                 [blobs]\ngc_interval = \"0s\"\n",
                 dir.join("data"),
                 socket,
             ),

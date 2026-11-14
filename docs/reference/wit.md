@@ -754,8 +754,6 @@ fork matching and simulators.
 
 ## Not in v0.1
 
-- Blobs: until M25 is complete, `http-body::blob` and the `blobs` functions
-  trap, and `message.blobs` must stay empty until M26.
 - `wasi:filesystem`, `wasi:sockets` and `wasi:http/incoming-handler`: no
   files or sockets, and no inbound HTTP but the gateway's. Outgoing HTTP is
   `http-client` or, since M22, `wasi:http/outgoing-handler` (both the
