@@ -13,6 +13,12 @@
 # directory under TMPDIR: the VPS sizes need about 3 GB free there. The
 # client runs in the same scope as the daemon; memory, not throughput, is
 # what the run checks.
+#
+# On a machine without the toolchain, run the test binary itself (built
+# with `cargo zigbuild test --release --target x86_64-unknown-linux-musl
+# -p kronik --test blobs_streaming --no-run`) with KRONIK_M25_FULL=1,
+# KRONIK_M25_KRONIK (a static `kronik`) and KRONIK_M25_MEDIA
+# (tests/guests/media.wasm), and `--test-threads 1 --nocapture`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

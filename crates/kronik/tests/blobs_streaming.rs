@@ -37,6 +37,22 @@ fn full() -> bool {
     std::env::var_os("KRONIK_M25_FULL").is_some()
 }
 
+/// The daemon: this build's, or `KRONIK_M25_KRONIK` (a test machine runs
+/// the test binary and a static `kronik` away from the checkout).
+fn kronik_bin() -> PathBuf {
+    std::env::var_os("KRONIK_M25_KRONIK").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_kronik")),
+        PathBuf::from,
+    )
+}
+
+/// The test guest: the checkout's, or `KRONIK_M25_MEDIA`.
+fn media_wasm() -> Vec<u8> {
+    let path =
+        std::env::var_os("KRONIK_M25_MEDIA").map_or_else(|| PathBuf::from(MEDIA), PathBuf::from);
+    std::fs::read(path).unwrap()
+}
+
 struct Daemon {
     dir: PathBuf,
     child: Option<Child>,
@@ -59,7 +75,7 @@ impl Daemon {
             .append(true)
             .open(dir.join("serve.log"))
             .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_kronik"))
+        let child = Command::new(kronik_bin())
             .arg("serve")
             .env("KRONIK_DISK_RESERVE", "0B")
             .arg("--config")
@@ -146,7 +162,7 @@ impl Daemon {
     /// Deploys `media`, with fuel for megabytes of byte-at-a-time work, room
     /// for large responses and uploads, and `http:127.0.0.1`.
     fn media(&self) {
-        let wasm = base64::engine::general_purpose::STANDARD.encode(std::fs::read(MEDIA).unwrap());
+        let wasm = base64::engine::general_purpose::STANDARD.encode(media_wasm());
         self.api(
             "POST",
             "/v1/deployments",
