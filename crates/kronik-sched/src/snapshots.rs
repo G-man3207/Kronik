@@ -313,6 +313,17 @@ pub struct Manifest {
     pub state_hash: String,
     /// Why it was taken: `interval`, `shutdown`, `manual`.
     pub reason: String,
+    /// The blobs its state roots (`blobs.idx`, M26 §7); none in a manifest
+    /// from before blobs.
+    #[serde(default)]
+    pub blobs: BlobTotals,
+}
+
+/// How many blobs a snapshot's `blobs.idx` lists, and their bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobTotals {
+    pub count: u64,
+    pub bytes: u64,
 }
 
 impl Manifest {
@@ -736,6 +747,20 @@ impl Node {
                 .map_err(|e| io_err("snapshot of secrets", e))?;
             rel.push(PathBuf::from("secrets.db"));
         }
+        // The blobs the copied state roots (M26 §7), from the copy itself,
+        // before the manifest that lists the index.
+        let roots = kronik_store::snapshot::state_blob_roots(&tmp.join("state.db"))
+            .map_err(|e| ApiError::new(ErrorCode::Internal, format!("snapshot: {e}")))?;
+        let blobs = BlobTotals {
+            count: roots.len() as u64,
+            bytes: roots.iter().map(|(_, size)| size).sum(),
+        };
+        if !roots.is_empty() {
+            let ids: Vec<String> = roots.into_iter().map(|(hash, _)| hash).collect();
+            crate::blob_gc::write_roots_file(&tmp.join(crate::blob_gc::SNAPSHOT_INDEX), None, &ids)
+                .map_err(|e| io_err("snapshot blob index", e))?;
+            rel.push(PathBuf::from(crate::blob_gc::SNAPSHOT_INDEX));
+        }
         let mut files = Vec::with_capacity(rel.len());
         for r in &rel {
             let (size, hash) = hash_file(&tmp.join(r)).map_err(|e| io_err("snapshot file", e))?;
@@ -769,6 +794,7 @@ impl Node {
             files,
             state_hash: copy.state_hash,
             reason: reason.to_owned(),
+            blobs,
         };
         // The copy is durable before its name, and its name before its
         // manifest: every file and directory of it is fsynced, then it is
@@ -810,6 +836,8 @@ impl Node {
             tracing::warn!(error = %e.message, "compaction failed");
         }
         self.prune_snapshots(storage);
+        // The blob collector runs after every retention pass (M26 §6.4).
+        self.wake_blob_gc();
     }
 
     /// Retention between snapshot passes while the audit hold has given
@@ -835,6 +863,7 @@ impl Node {
             tracing::warn!(error = %e.message, "compaction failed");
         }
         self.prune_snapshots(storage);
+        self.wake_blob_gc();
         true
     }
 
@@ -1411,6 +1440,8 @@ impl Node {
             .db()
             .compact(first, hwm.saturating_sub(ingress_ttl))
             .map_err(store_err)?;
+        // The pins of the saved responses compaction deleted (M26 §5.4).
+        self.store().db().prune_blob_pins().map_err(store_err)?;
         Ok(first)
     }
 }

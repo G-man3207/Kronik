@@ -207,6 +207,14 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_blob_store_below_reserve` | gauge | 1 while the blob store is below [blobs] disk_reserve: no new blobs are written. |
 | `kronik_blob_turn_retries_total` | counter | Runs of turns again because their blob writes met [blobs] disk_reserve. |
 | `kronik_blob_missing_total` | counter | Reads of a committed blob whose bytes are not in the blob store (BLOB_MISSING). |
+| `kronik_blob_objects` | gauge | Blob files in main's blob store, as of the collector's last pass. |
+| `kronik_blob_bytes` | gauge | Bytes of the blob files in main's blob store, as of the collector's last pass. |
+| `kronik_blob_gc_runs_total` | counter | Passes of the blob collector. |
+| `kronik_blob_gc_deleted_total` | counter | Blob files the collector deleted because nothing kept them. |
+| `kronik_blob_gc_freed_bytes_total` | counter | Bytes of the blob files the collector deleted. |
+| `kronik_blob_gc_duration_seconds` | histogram | Time a pass of the blob collector took. |
+| `kronik_blob_gc_candidates` | gauge | Blob files without a root that the collector's next pass deletes if they still have none. |
+| `kronik_blob_leases` | gauge | Leases on blobs held in this daemon's memory (turns, uploads, streams, replays), as of the collector's last pass. |
 | `kronik_gateway_requests_total` | counter | HTTP requests answered by the gateway, by status code. |
 | `kronik_gateway_request_duration_seconds` | histogram | Time to answer an HTTP request at the gateway, by status code. |
 | `kronik_replay_runs_total` | counter | Replays run for forks and proposals, by mode. |

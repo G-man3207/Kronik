@@ -131,6 +131,9 @@ pub struct Blobs {
     pub disk_reserve: BlobReserve,
     /// How long a lease lives without renewal.
     pub lease_ttl: Dur,
+    /// The collector's pass, besides the one after every retention pass;
+    /// `"0s"` runs it only on `kronik blobs gc`.
+    pub gc_interval: Dur,
 }
 
 impl Default for Blobs {
@@ -139,6 +142,7 @@ impl Default for Blobs {
             enabled: false,
             disk_reserve: BlobReserve::Times(2),
             lease_ttl: Dur::secs(300),
+            gc_interval: Dur::secs(3600),
         }
     }
 }

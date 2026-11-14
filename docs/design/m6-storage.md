@@ -30,6 +30,7 @@ LSN `L` (I4: derived, rebuildable from the log):
 snapshots/main/<L>/state.db          VACUUM INTO copy of branches/main/state.db
 snapshots/main/<L>/sql/<file>        VACUUM INTO copy of every actor database
 snapshots/main/<L>/secrets.db        backup of keys/secrets.db (encrypted under the master key)
+snapshots/main/<L>/blobs.idx         the blobs the state roots, one per line (M26 §7; only when there are any)
 snapshots/main/<L>/manifest.json     written last: the snapshot exists iff it does
 ```
 
@@ -41,8 +42,11 @@ snapshots/main/<L>/manifest.json     written last: the snapshot exists iff it do
  "logical_time_ms": 1761399999123,
  "segments": ["00000000000000012001.seg", "…"],
  "files": [{"path": "state.db", "size": 123, "blake3": "…"}, …],
- "state_hash": "b3:…"}
+ "state_hash": "b3:…", "blobs": {"count": 0, "bytes": 0}}
 ```
+
+`blobs` (M25 slice B11, M26 §7): how many blobs `blobs.idx` lists and their
+bytes; a manifest without it (v0.4) reads as none.
 
 - `segments`: the closed and active segments a start from the snapshot
   reads, when it was taken: those holding LSNs after `L`, and from the one

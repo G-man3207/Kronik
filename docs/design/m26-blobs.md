@@ -208,6 +208,14 @@ as before and v0.4 snapshots and restores keep their hashes. `blob_pins` and
 3. `blobs` rows that nothing holds or pins and whose `last_ref_lsn` is below
    the floor (erased rows once unreferenced).
 
+As built (M25 slice B11): step 1 runs with `Db::compact`
+(`StateDb::prune_blob_pins`); step 3 runs in the collector's pass, after its
+sweep, and deletes only rows whose file is gone (`StateDb::forget_blobs`,
+which checks again that nothing roots them). So a row lives as long as its
+file, and the dry run can still say why a file has no root
+(`out-of-retention`, not `loose`), and `kronik blobs inspect` can still
+show it.
+
 The rows a rebuild produces can differ from the live ones only in rows the
 next pass deletes.
 
@@ -292,6 +300,16 @@ for shard in 00..ff:
 - Fork spaces are deleted with their fork; scratch spaces with their tree.
 - Runs after every retention pass and on `kronik blobs gc`; never during
   startup recovery (the gateway and the sweep start after it).
+- As built (M25 slice B11): the pass reads the index shard by shard rather
+  than in one read transaction. This is equivalent: what a later shard
+  reads can only root more (new records), a pin that goes is either
+  replaced by the record that ends it (an open turn's) or ends a root for
+  good (an expired saved response), and the floor, the snapshot indexes and
+  the fork roots are read once when the pass begins, which only roots more.
+  "Claimed since the pass began" is the store's touch sequence: every
+  naming and claim of an object, under its shard's claim lock, records a
+  number that a pass compares with the one it began at; the leases live
+  when the pass began are roots too.
 
 ### 6.5 Cadence and memory
 
@@ -311,7 +329,11 @@ blob of main's store without a root, now, ignoring the two-phase grace:
 
 `reason`: `loose` (no committed record ever referenced it), `released` (its
 last holder released it), `out-of-retention` (its last reference is below the
-floor), `fork-deleted` (only a deleted fork referenced it). `subject` is
+floor), `fork-deleted` (only a deleted fork referenced it). As built in M25
+(slice B11) the reasons are `loose`, `out-of-retention` and `erased` (its
+subject was erased through its key version, a file §9.3 missed); `released`
+comes with the holds (B16), and `fork-deleted` cannot occur in main's store:
+a fork writes its blobs into its own space, which is deleted with it. `subject` is
 null without `pii:read`. `--verify` also recomputes the pins by decoding the
 rows they mirror (mailbox, timers, dead letters, ingress keys, deliveries,
 open turns and effects) and reports any difference from `blob_pins` as

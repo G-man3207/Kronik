@@ -133,6 +133,46 @@ pub const METRICS: &[Def] = &[
         kind: Type::Counter,
     },
     Def {
+        name: "kronik_blob_objects",
+        help: "Blob files in main's blob store, as of the collector's last pass.",
+        kind: Type::Gauge,
+    },
+    Def {
+        name: "kronik_blob_bytes",
+        help: "Bytes of the blob files in main's blob store, as of the collector's last pass.",
+        kind: Type::Gauge,
+    },
+    Def {
+        name: "kronik_blob_gc_runs_total",
+        help: "Passes of the blob collector.",
+        kind: Type::Counter,
+    },
+    Def {
+        name: "kronik_blob_gc_deleted_total",
+        help: "Blob files the collector deleted because nothing kept them.",
+        kind: Type::Counter,
+    },
+    Def {
+        name: "kronik_blob_gc_freed_bytes_total",
+        help: "Bytes of the blob files the collector deleted.",
+        kind: Type::Counter,
+    },
+    Def {
+        name: "kronik_blob_gc_duration_seconds",
+        help: "Time a pass of the blob collector took.",
+        kind: Type::Histogram,
+    },
+    Def {
+        name: "kronik_blob_gc_candidates",
+        help: "Blob files without a root that the collector's next pass deletes if they still have none.",
+        kind: Type::Gauge,
+    },
+    Def {
+        name: "kronik_blob_leases",
+        help: "Leases on blobs held in this daemon's memory (turns, uploads, streams, replays), as of the collector's last pass.",
+        kind: Type::Gauge,
+    },
+    Def {
         name: "kronik_gateway_requests_total",
         help: "HTTP requests answered by the gateway, by status code.",
         kind: Type::Counter,

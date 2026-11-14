@@ -466,6 +466,8 @@ pub struct Node {
     next_running: AtomicU64,
     /// The blob store (M25), when the node runs with blobs.
     pub(crate) blobs: Option<Arc<kronik_blob::BlobStore>>,
+    /// The blob collector's state (M26 §6).
+    pub(crate) blob_gc: crate::blob_gc::GcState,
     /// The `TurnBegin` (and its last effect result's LSN) of each actor's
     /// turn that met a full blob store after writing it: the worker runs it
     /// again as a re-run (ADR 0117 §9).
@@ -964,6 +966,7 @@ impl Node {
             running_born: Mutex::new(HashMap::new()),
             next_running: AtomicU64::new(0),
             blobs,
+            blob_gc: Default::default(),
             blob_waits: Mutex::new(HashMap::new()),
             rates: RateLimiter::starting_full(env.clock.monotonic()),
             wheel: Mutex::new(Wheel::default()),
@@ -1172,6 +1175,13 @@ impl Node {
             env.spawn(
                 "snapshots",
                 crate::snapshots::snapshot_loop(Arc::downgrade(&node), s.snapshot_interval),
+            );
+        }
+        // The blob collector starts after recovery (M26 §6.4).
+        if let (Some(_), Some(b)) = (&node.blobs, &node.cfg.blobs) {
+            env.spawn(
+                "blob-gc",
+                crate::blob_gc::blob_gc_loop(Arc::downgrade(&node), b.gc_interval),
             );
         }
         tracing::info!(

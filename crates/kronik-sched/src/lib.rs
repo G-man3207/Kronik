@@ -17,6 +17,7 @@
 //! interval/shutdown and irreversible recovery continuations are separate host paths;
 //! audit metadata never chooses operation authority.
 
+pub mod blob_gc;
 pub mod blobs;
 pub mod connections;
 mod durable;
@@ -164,6 +165,9 @@ pub struct BlobsConfig {
     pub disk_reserve: u64,
     /// `[blobs] lease_ttl`.
     pub lease_ttl: Duration,
+    /// `[blobs] gc_interval`: the collector's pass, besides the one after
+    /// every retention pass; zero runs it only on demand.
+    pub gc_interval: Duration,
 }
 
 impl Default for BlobsConfig {
@@ -171,6 +175,7 @@ impl Default for BlobsConfig {
         BlobsConfig {
             disk_reserve: 0,
             lease_ttl: Duration::from_secs(300),
+            gc_interval: Duration::from_secs(3600),
         }
     }
 }
