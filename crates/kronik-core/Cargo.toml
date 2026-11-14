@@ -50,6 +50,7 @@ rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 ring = { workspace = true, optional = true }
 kronik-proto = { workspace = true }
+pin-project-lite = { workspace = true }
 rcgen = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 serde = { workspace = true }

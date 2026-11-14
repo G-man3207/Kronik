@@ -459,6 +459,40 @@ impl<T> Future for JoinHandle<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Elapsed;
 
+pin_project_lite::pin_project! {
+    /// A spawned task: `fut`, and then its output handed to the task's
+    /// [`JoinHandle`]. A struct and not an async block, because an async block
+    /// that awaits a future it captured keeps two copies of it
+    /// (rust-lang/rust#62958): every spawned task was boxed at twice its
+    /// size, and an actor's worker crossed the 32 KiB above which the release
+    /// build's allocator maps and unmaps every block (docs/perf.md).
+    struct Deliver<F: Future> {
+        #[pin]
+        fut: Option<F>,
+        tx: Option<tokio::sync::oneshot::Sender<F::Output>>,
+    }
+}
+
+impl<F: Future> Future for Deliver<F> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let mut this = self.project();
+        let Some(fut) = this.fut.as_mut().as_pin_mut() else {
+            return std::task::Poll::Ready(());
+        };
+        let out = std::task::ready!(fut.poll(cx));
+        // The finished future goes before its output is handed over, as it
+        // did when an async block awaited it.
+        this.fut.set(None);
+        if let Some(tx) = this.tx.take() {
+            // A dropped JoinHandle does not want the output.
+            let _ = tx.send(out);
+        }
+        std::task::Poll::Ready(())
+    }
+}
+
 impl Env {
     pub fn spawn<T, F>(&self, name: &'static str, fut: F) -> JoinHandle<T>
     where
@@ -468,8 +502,9 @@ impl Env {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.spawner.spawn(
             name,
-            Box::pin(async move {
-                let _ = tx.send(fut.await);
+            Box::pin(Deliver {
+                fut: Some(fut),
+                tx: Some(tx),
             }),
         );
         JoinHandle(rx)
@@ -508,6 +543,98 @@ impl Env {
         let mut b = [0u8; N];
         self.entropy.fill(&mut b);
         b
+    }
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// A future that holds `N` bytes across an await, so that its state is
+    /// at least that large.
+    async fn holding<const N: usize>() -> usize {
+        let buf = [7u8; N];
+        tokio::task::yield_now().await;
+        buf.iter().map(|b| usize::from(*b)).sum()
+    }
+
+    /// A spawned task is boxed at the size of its future, not twice it: the
+    /// adapter adds the output's sender and nothing else.
+    #[test]
+    fn a_spawned_task_is_boxed_at_its_own_size() {
+        let fut = holding::<16384>();
+        let own = std::mem::size_of_val(&fut);
+        assert!(own >= 16384, "{own}");
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let task: BoxFuture<'static, ()> = Box::pin(Deliver {
+            fut: Some(fut),
+            tx: Some(tx),
+        });
+        let boxed = std::mem::size_of_val(&*task);
+        assert!(
+            boxed >= own && boxed <= own + 64,
+            "boxed {boxed}, the future {own}"
+        );
+    }
+
+    /// The output reaches the handle; a dropped handle is ignored; a task
+    /// dropped before it finished leaves the handle with `None`; the finished
+    /// future is dropped before the output is handed over.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_task_hands_over_its_output_as_before() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        Deliver {
+            fut: Some(holding::<64>()),
+            tx: Some(tx),
+        }
+        .await;
+        assert_eq!(JoinHandle(rx).await, Some(7 * 64));
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<usize>();
+        drop(rx);
+        Deliver {
+            fut: Some(holding::<8>()),
+            tx: Some(tx),
+        }
+        .await;
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<usize>();
+        let task = Deliver {
+            fut: Some(std::future::pending::<usize>()),
+            tx: Some(tx),
+        };
+        drop(task);
+        assert_eq!(JoinHandle(rx).await, None);
+
+        // A future that keeps what it holds after it finished, as a
+        // hand-written one may: the task drops it as soon as it finishes, not
+        // when the task itself goes.
+        struct Witness(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Witness {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        // Held only to be dropped with the future.
+        struct Holding(#[allow(dead_code)] Witness);
+        impl Future for Holding {
+            type Output = u8;
+            fn poll(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<u8> {
+                std::task::Poll::Ready(1)
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut task = Box::pin(Deliver {
+            fut: Some(Holding(Witness(dropped.clone()))),
+            tx: Some(tx),
+        });
+        (&mut task).await;
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(JoinHandle(rx).await, Some(1));
+        drop(task);
     }
 }
 

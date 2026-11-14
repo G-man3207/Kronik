@@ -2000,6 +2000,7 @@ dependencies = [
  "hyper-util",
  "kronik-proto",
  "libc",
+ "pin-project-lite",
  "rcgen",
  "ring",
  "rustix",
