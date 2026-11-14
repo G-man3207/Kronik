@@ -1,5 +1,6 @@
 use std::fmt;
 
+use crate::bindings::kronik::actor::blobs::BlobError;
 use crate::bindings::kronik::actor::connections::SendError;
 use crate::bindings::kronik::actor::crypto::CryptoError;
 use crate::bindings::kronik::actor::http_client::FetchError;
@@ -42,6 +43,16 @@ pub enum Error {
     },
     /// A SQL value is missing or has another type than the one asked for.
     Value(String),
+    /// A blob function failed (M25).
+    Blob(BlobError),
+    /// A body is a blob, which `text()` and `json()` do not read: read it
+    /// with `read_body()` or `ctx.blobs().reader()`.
+    BlobBody {
+        /// The body, such as `the request body`.
+        what: String,
+        /// The blob's size.
+        size: u64,
+    },
 }
 
 impl fmt::Display for Error {
@@ -133,6 +144,30 @@ impl fmt::Display for Error {
                 write_error(f, &format!("{what} is not UTF-8"), "", topic)
             }
             Error::Value(m) => write_error(f, m, "", "sql-state"),
+            Error::Blob(e) => match e {
+                BlobError::NotHeld => write_error(
+                    f,
+                    "the turn does not hold this blob: it may use only the blobs it received or wrote",
+                    "",
+                    "BLOB_NOT_HELD",
+                ),
+                BlobError::QuotaExceeded => {
+                    write_error(f, "the actor's blob quota is exceeded", "", "blob")
+                }
+                BlobError::Erased => {
+                    write_error(f, "the blob's subject was erased", "", "SUBJECT_ERASED")
+                }
+                BlobError::Invalid(m) => write_error(f, "invalid blob operation", m, "blob"),
+            },
+            Error::BlobBody { what, size } => write_error(
+                f,
+                &format!(
+                    "{what} is a blob of {size} bytes; read it with read_body() or \
+                     ctx.blobs().reader()"
+                ),
+                "",
+                "blob",
+            ),
         }
     }
 }

@@ -3,12 +3,13 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::BlobRef;
 use crate::Error;
 use crate::HttpBody;
 use crate::bindings::kronik::actor::http_client::{
     self, HeaderValue, RequestHeader, SecretTemplate,
 };
-use crate::types::{find_header, from_json, inline_bytes, to_json, utf8};
+use crate::types::{blob_of, find_header, from_json, inline_bytes, inline_only, to_json, utf8};
 
 pub use crate::bindings::kronik::actor::http_client::{FetchError, Request, Response};
 
@@ -127,6 +128,13 @@ impl Request {
         self
     }
 
+    /// Sets a blob the turn holds as the body (M25): the host streams it to
+    /// the target from the blob store.
+    pub fn body_blob(mut self, blob: &BlobRef) -> Self {
+        self.body = HttpBody::Blob(blob.clone());
+        self
+    }
+
     /// Sets `value` as a JSON body and the `content-type` header.
     pub fn json<T: Serialize + ?Sized>(self, value: &T) -> Result<Self, Error> {
         let body = to_json(value, "the request body", "effect")?;
@@ -145,20 +153,39 @@ impl Response {
         find_header(self.headers.iter().map(|(n, v)| (n, v)), name)
     }
 
-    /// The body's bytes. Bodies are inline up to M25; a blob body gives an
-    /// empty slice.
+    /// The body's bytes when it is inline; a blob body (above the actor
+    /// type's blob threshold, M25) gives an empty slice: see
+    /// [`Response::blob`] and [`Response::read_body`].
     pub fn body_bytes(&self) -> &[u8] {
         inline_bytes(&self.body)
     }
 
-    /// The body as UTF-8 text.
-    pub fn text(&self) -> Result<&str, Error> {
-        utf8(self.body_bytes(), "the response body", "effect")
+    /// The body's blob, when the response is one (M25).
+    pub fn blob(&self) -> Option<&BlobRef> {
+        blob_of(&self.body)
     }
 
-    /// The body parsed as JSON.
+    /// The whole body, inline or blob; a blob is read into memory.
+    pub fn read_body(&self) -> Result<Vec<u8>, Error> {
+        crate::types::read_body(&self.body)
+    }
+
+    /// The body as UTF-8 text; `Error::BlobBody` for a blob body.
+    pub fn text(&self) -> Result<&str, Error> {
+        utf8(
+            inline_only(&self.body, "the response body")?,
+            "the response body",
+            "effect",
+        )
+    }
+
+    /// The body parsed as JSON; `Error::BlobBody` for a blob body.
     pub fn json<T: DeserializeOwned>(&self) -> Result<T, Error> {
-        from_json(self.body_bytes(), "the response body", "effect")
+        from_json(
+            inline_only(&self.body, "the response body")?,
+            "the response body",
+            "effect",
+        )
     }
 }
 
@@ -192,6 +219,43 @@ mod tests {
             ]
         );
         assert_eq!(inline_bytes(&req.body), br#"{"amount":100}"#);
+    }
+
+    /// M25: a blob body is never read as text by accident; `read_body`
+    /// and the blob API read it.
+    #[test]
+    fn blob_bodies() {
+        let blob = BlobRef {
+            hash: format!("b3:{}", "ab".repeat(32)),
+            size: 3_000_000,
+        };
+        let req = Request::post("https://api.example.com/files").body_blob(&blob);
+        assert!(
+            matches!(&req.body, HttpBody::Blob(b) if b.hash == blob.hash && b.size == blob.size)
+        );
+        let res = Response {
+            status: 200,
+            headers: Vec::new(),
+            body: HttpBody::Blob(blob.clone()),
+        };
+        assert_eq!(
+            res.blob().map(|b| (b.hash.as_str(), b.size)),
+            Some((blob.hash.as_str(), blob.size))
+        );
+        assert!(res.body_bytes().is_empty());
+        let e = res.text().err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains("is a blob of 3000000 bytes"), "{e}");
+        assert!(e.contains("kronik explain blob"), "{e}");
+        assert!(matches!(
+            res.json::<serde_json::Value>(),
+            Err(Error::BlobBody {
+                size: 3_000_000,
+                ..
+            })
+        ));
+        let out = crate::HttpResponse::blob(200, &blob, "application/pdf");
+        assert!(matches!(&out.body, HttpBody::Blob(b) if b.hash == blob.hash));
+        assert_eq!(out.headers[0].value, "application/pdf");
     }
 
     #[test]

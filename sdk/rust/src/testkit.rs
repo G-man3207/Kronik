@@ -75,6 +75,33 @@ pub struct Response {
     pub body: Vec<u8>,
     /// The id of the turn that answered, such as `main:5`.
     pub turn: Option<String>,
+    /// When the body is a blob (M25): its identity and size. `body` holds
+    /// its bytes either way.
+    pub blob: Option<Blob>,
+}
+
+/// A gateway answer of the test host: its status, headers, body and turn,
+/// and its blob's reference when the body is one (M25).
+fn response_of(answer: &Value) -> Result<Response> {
+    Ok(Response {
+        status: answer["status"].as_u64().unwrap_or(0) as u16,
+        headers: pairs(&answer["headers"]),
+        body: get_body(answer)?,
+        turn: answer["turn"].as_str().map(str::to_string),
+        blob: answer["blob"]["hash"].as_str().map(|hash| Blob {
+            hash: hash.to_string(),
+            size: answer["blob"]["size"].as_u64().unwrap_or(0),
+        }),
+    })
+}
+
+/// A blob answer's reference in a test (M25).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blob {
+    /// Its identity, `b3:` and 64 hex digits (`b3s:` for a subject's).
+    pub hash: String,
+    /// Its size in bytes.
+    pub size: u64,
 }
 
 impl Response {
@@ -461,12 +488,7 @@ impl TestHost {
             json!({ "op": "http", "method": method, "path": path, "headers": headers });
         put_body(&mut request, body.as_ref());
         let answer = self.call(request)?;
-        Ok(Response {
-            status: answer["status"].as_u64().unwrap_or(0) as u16,
-            headers: pairs(&answer["headers"]),
-            body: get_body(&answer)?,
-            turn: answer["turn"].as_str().map(str::to_string),
-        })
+        response_of(&answer)
     }
 
     /// Opens a WebSocket at `path` through the gateway, as a client would.
@@ -488,12 +510,7 @@ impl TestHost {
         let answer = self.call(json!({ "op": "open-connection", "path": path, "protocol": protocol, "headers": headers }))?;
         Ok(TestConnection {
             id: answer["connection"].as_str().map(str::to_string),
-            response: Response {
-                status: answer["status"].as_u64().unwrap_or(0) as u16,
-                headers: pairs(&answer["headers"]),
-                body: get_body(&answer)?,
-                turn: answer["turn"].as_str().map(str::to_string),
-            },
+            response: response_of(&answer)?,
         })
     }
 
@@ -786,6 +803,7 @@ mod connection_tests {
                 headers: Vec::new(),
                 body: b"no".to_vec(),
                 turn: None,
+                blob: None,
             },
         };
         assert!(!refused.accepted());

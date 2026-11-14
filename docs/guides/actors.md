@@ -222,6 +222,55 @@ increment about 0.5 million (Python) and 1 million (Go), and a notes request
 with its SQL 0.6 to 0.7 million (Python) and 0.8 to 1.3 million (Go),
 against 2.3 million for an empty JavaScript turn.
 
+## Large bodies
+
+A body larger than the actor type's blob threshold (`kronik limits set
+<type> --blob-threshold`, 1 MiB by default) reaches an actor whose code
+imports `kronik:actor/blobs` as a blob: a reference (`b3:` and the BLAKE3 of
+its bytes, `b3s:` for a subject's) and its size, never the bytes. That holds
+for a request's body up to the type's `--upload-size` and for the response
+to an outgoing request; the gateway streams it into the blob store as it
+arrives, and a blob response back to the client. A turn may read the blobs
+it received and the ones it wrote, and answer or send them; any other
+reference is `BLOB_NOT_HELD` (`kronik explain blob`). Reading a blob is
+charged by the 64 KiB frames it touches, at 64 bytes per unit of the type's
+fuel.
+
+In Rust:
+
+```rust
+use std::io::{Read as _, Write as _};
+
+fn handle(ctx: &Ctx, req: &HttpRequest) -> Result<Output, HandlerError> {
+    // The whole body, inline or blob (a blob is read into memory):
+    // let bytes = req.read_body()?;
+    let Some(upload) = req.body_blob() else {
+        return Ok(Output::text(200, format!("{} bytes inline", req.body_bytes().len())));
+    };
+    // Read it a frame at a time, and write a new blob.
+    let mut reader = ctx.blobs().reader(upload);
+    let mut writer = ctx.blobs().writer();
+    let mut buf = vec![0; 64 << 10];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| HandlerError::Failed(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        buf[..n].make_ascii_uppercase();
+        writer.write_all(&buf[..n]).map_err(|e| HandlerError::Failed(e.to_string()))?;
+    }
+    let copy = writer.finish()?;
+    Ok(Output::http(HttpResponse::blob(200, &copy, "text/plain")))
+}
+```
+
+`req.text()` and `req.json()` fail with `Error::BlobBody` for a blob, so a
+large body is never mistaken for an empty one; `ctx.blobs().get(&b,
+offset, len)` reads a range (at most 1 MiB); `Request::post(url)
+.body_blob(&b)` sends a blob, and a fetch's `res.blob()` and
+`res.read_body()` read a blob response. A turn holds at most 64 open
+writers; a writer dropped or left open when the turn ends is discarded.
+
 ## Building
 
 `kronik build` (in the project, or `--dir`) writes `dist/<name>.wasm` and
@@ -259,6 +308,9 @@ gate, where the clock moves only when the test advances it, and outgoing
 HTTP is answered by stubs and recorded. Starting a test host builds the
 project, so tests run the code they see. The `kronik` binary comes from
 `KRONIK_BIN` or `PATH`; compiled components are cached in `.kronik/code`.
+The test host stores blobs as a node does: a request body above the actor
+type's threshold reaches the actor as a blob, and an answer whose body is a
+blob carries its reference (Rust: `Response::blob`) next to its bytes.
 
 Every request waits until what it started has finished: messages are
 delivered and timers that came due have fired. A test can check the outcome

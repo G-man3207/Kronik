@@ -60,6 +60,12 @@ impl Ctx {
         messaging::call(to, message, compensate).map_err(Error::Call)
     }
 
+    /// The turn's blobs: bodies above the actor type's blob threshold (M25,
+    /// see `kronik explain blob`).
+    pub fn blobs(&self) -> crate::blobs::Blobs {
+        crate::blobs::Blobs::new()
+    }
+
     /// Outgoing HTTP requests (see `kronik explain effect`). Available from
     /// M2; in M1 every request is denied.
     pub fn http(&self) -> Http {

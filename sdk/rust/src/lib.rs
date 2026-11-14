@@ -59,6 +59,7 @@
 extern crate self as kronik_sdk;
 
 mod actor;
+pub mod blobs;
 pub mod connections;
 mod ctx;
 mod error;
@@ -96,6 +97,7 @@ pub use bindings::kronik::actor::types::{
     ActorRef, BlobRef, HandlerError, Header, HttpBody, HttpRequest, HttpResponse, Incoming, Input,
     Manifest, Message, Output, Route, TimerFired,
 };
+pub use blobs::{BlobError, BlobReader, BlobWriter, Blobs};
 pub use connections::{
     Accept, CloseInfo, CloseInitiator, Closed, Connections, Frame, IncomingFrame, OpenReply,
     OpenRequest, Protocol, SendError, SseEvent,

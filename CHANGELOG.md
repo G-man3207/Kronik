@@ -233,6 +233,14 @@ until the v1.0 compatibility promise takes effect.
   as it arrives, scrubbed of the turn's secrets and named durably before
   its result is recorded, and a blob request body is streamed from the store
   with its length. The effect's record holds only the references.
+- The Rust SDK reads and writes blobs (M25): `ctx.blobs()` (`get`,
+  `read_all`, a `reader` that is `Read + Seek` and reads whole 64 KiB
+  frames, a `writer` that is `Write`), `HttpRequest::body_blob` and
+  `read_body`, `HttpResponse::blob`, `Request::body_blob`, and a fetch's
+  `Response::blob` and `read_body`; `text()` and `json()` of a blob body
+  fail with `Error::BlobBody` instead of reading nothing. The test kit's
+  responses carry a blob answer's reference, and `kronik test-host` stores
+  blobs as a node does.
 - The gateway reads request bodies as they arrive (M25): for a kind whose
   code imports `blobs`, on a node with blobs, a body above the kind's
   threshold is written to a blob as it arrives, up to its upload size (413

@@ -7,8 +7,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::{
-    ActorRef, Error, HandlerError, Header, HttpBody, HttpRequest, HttpResponse, Manifest, Message,
-    Output, Route,
+    ActorRef, BlobRef, Error, HandlerError, Header, HttpBody, HttpRequest, HttpResponse, Manifest,
+    Message, Output, Route,
 };
 
 impl Manifest {
@@ -170,6 +170,20 @@ impl HttpResponse {
         self.body = HttpBody::Inline(body.into());
         self
     }
+
+    /// A response whose body is `blob` (M25), streamed by the gateway from
+    /// the blob store: the turn must hold it (it received or wrote it).
+    pub fn blob(status: u16, blob: &BlobRef, content_type: impl Into<String>) -> Self {
+        HttpResponse::new(status)
+            .header("content-type", content_type)
+            .body_blob(blob)
+    }
+
+    /// Sets a blob as the body (M25).
+    pub fn body_blob(mut self, blob: &BlobRef) -> Self {
+        self.body = HttpBody::Blob(blob.clone());
+        self
+    }
 }
 
 impl HttpRequest {
@@ -198,20 +212,40 @@ impl HttpRequest {
         find_header(self.headers.iter().map(|h| (&h.name, &h.value)), name)
     }
 
-    /// The body's bytes. Bodies are inline up to M25; a blob body gives an
-    /// empty slice.
+    /// The body's bytes when it is inline; a blob body (above the actor
+    /// type's blob threshold, M25) gives an empty slice: see
+    /// [`HttpRequest::body_blob`] and [`HttpRequest::read_body`].
     pub fn body_bytes(&self) -> &[u8] {
         inline_bytes(&self.body)
     }
 
-    /// The body as UTF-8 text.
-    pub fn text(&self) -> Result<&str, Error> {
-        utf8(self.body_bytes(), "the request body", "message")
+    /// The body's blob, when the body is one (M25).
+    pub fn body_blob(&self) -> Option<&BlobRef> {
+        blob_of(&self.body)
     }
 
-    /// The body parsed as JSON.
+    /// The whole body, inline or blob; a blob is read into memory, which
+    /// bounds it (use `ctx.blobs().reader()` for a large one).
+    pub fn read_body(&self) -> Result<Vec<u8>, Error> {
+        read_body(&self.body)
+    }
+
+    /// The body as UTF-8 text; `Error::BlobBody` for a blob body.
+    pub fn text(&self) -> Result<&str, Error> {
+        utf8(
+            inline_only(&self.body, "the request body")?,
+            "the request body",
+            "message",
+        )
+    }
+
+    /// The body parsed as JSON; `Error::BlobBody` for a blob body.
     pub fn json<T: DeserializeOwned>(&self) -> Result<T, Error> {
-        from_json(self.body_bytes(), "the request body", "message")
+        from_json(
+            inline_only(&self.body, "the request body")?,
+            "the request body",
+            "message",
+        )
     }
 }
 
@@ -338,6 +372,32 @@ pub(crate) fn inline_bytes(body: &HttpBody) -> &[u8] {
     match body {
         HttpBody::Inline(bytes) => bytes,
         HttpBody::Blob(_) => &[],
+    }
+}
+
+pub(crate) fn blob_of(body: &HttpBody) -> Option<&BlobRef> {
+    match body {
+        HttpBody::Inline(_) => None,
+        HttpBody::Blob(blob) => Some(blob),
+    }
+}
+
+/// An inline body's bytes; for a blob, the error that says how to read it.
+pub(crate) fn inline_only<'a>(body: &'a HttpBody, what: &str) -> Result<&'a [u8], Error> {
+    match body {
+        HttpBody::Inline(bytes) => Ok(bytes),
+        HttpBody::Blob(blob) => Err(Error::BlobBody {
+            what: what.to_string(),
+            size: blob.size,
+        }),
+    }
+}
+
+/// The whole body; a blob is read into memory.
+pub(crate) fn read_body(body: &HttpBody) -> Result<Vec<u8>, Error> {
+    match body {
+        HttpBody::Inline(bytes) => Ok(bytes.clone()),
+        HttpBody::Blob(blob) => crate::blobs::Blobs::new().read_all(blob),
     }
 }
 
