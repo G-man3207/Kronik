@@ -33,7 +33,7 @@ mod bucket_tests;
 #[cfg(test)]
 mod credential_tests;
 
-pub use blobs::{BlobRestore, shipped_blob_names};
+pub use blobs::{BlobRestore, missing_blob_names, shipped_blob_names};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShipError {
@@ -72,8 +72,8 @@ pub enum ShipError {
         dir: PathBuf,
         error: object_store::Error,
     },
-    /// A blob that a record or snapshot references is not in the local store
-    /// (shipping), or not in the bucket or damaged there (restore).
+    /// A blob that the restored records or snapshot reference is not in the
+    /// bucket, or damaged there (restore).
     #[error("BLOB_MISSING: {0}")]
     BlobMissing(String),
 }
@@ -670,22 +670,25 @@ impl BlobRound<'_> {
             return Ok(());
         };
         for id in ids {
-            let bytes = match blobs::ship_blob(remote, self.data, shipped, index, &id).await {
-                Ok(bytes) => bytes,
-                Err(e @ ShipError::BlobMissing(_)) => {
-                    tracing::error!(
-                        blob = %id,
-                        "a referenced blob is not in the blob store; what references it is not shipped"
-                    );
-                    kronik_metrics::inc("kronik_blob_missing_total", &[]);
-                    return Err(e);
+            match blobs::ship_blob(remote, self.data, shipped, index, &id).await? {
+                blobs::BlobShipped::Uploaded(bytes) => {
+                    report.objects += 1;
+                    report.bytes += bytes;
+                    fault("blob")?;
                 }
-                Err(e) => return Err(e),
-            };
-            if bytes > 0 {
-                report.objects += 1;
-                report.bytes += bytes;
-                fault("blob")?;
+                blobs::BlobShipped::Nothing => {}
+                blobs::BlobShipped::Missing { first } => {
+                    // The node reads it as missing too: the reference ships
+                    // without it rather than stopping every later segment
+                    // and snapshot (ADR 0122, amended 2026-11-14).
+                    if first {
+                        tracing::error!(
+                            blob = %id,
+                            "a referenced blob's file is missing (BLOB_MISSING); its reference ships without it"
+                        );
+                        kronik_metrics::inc("kronik_blob_missing_total", &[]);
+                    }
+                }
             }
         }
         Ok(())
@@ -709,7 +712,8 @@ pub async fn ship_once(
 }
 
 /// [`ship_once`], stopping with `fault`'s error where it names a step:
-/// `blob` after each blob upload, `segment` after each segment upload,
+/// `blob` after each blob upload, `blob-deleted` after a blob's object is
+/// deleted and before its record goes, `segment` after each segment upload,
 /// `snapshot` after each snapshot upload, `snapshot-delete` and
 /// `segment-delete` after each remote deletion, `blob-delete` before the
 /// remote blobs gone locally are deleted. Tests stop a round anywhere with
@@ -881,15 +885,24 @@ pub async fn ship_once_with_fault(
     if blobs::Shipped::path(data).exists() {
         fault("blob-delete")?;
         let mut roots = BTreeSet::new();
+        // A snapshot that retention removed during this round may still be
+        // in the bucket (the deletions above used the list read before):
+        // its blobs are not roots any more, so this step waits a round.
+        let mut pruned = false;
         for (dir, _) in &local {
+            if !dir.exists() {
+                pruned = true;
+                break;
+            }
             for id in blobs::roots_file(&dir.join("blobs.idx"))? {
                 roots.insert(id.file_name());
             }
         }
         round.index()?;
         round.shipped()?;
-        if let (Some(index), Some(shipped)) = (&round.index, &round.shipped) {
-            report.deleted += blobs::delete_gone(remote, data, shipped, index, &roots).await?;
+        if let (false, Some(index), Some(shipped)) = (pruned, &round.index, &round.shipped) {
+            report.deleted +=
+                blobs::delete_gone(remote, data, shipped, index, &roots, fault).await?;
             kronik_metrics::set(
                 "kronik_blob_ship_pending",
                 &[],

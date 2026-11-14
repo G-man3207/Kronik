@@ -9,7 +9,9 @@
 //! `ship.json`; never shipped or restored). A round uploads the blobs that
 //! the segments and snapshots it uploads reference before them, and deletes
 //! the remote objects of blobs gone locally only after the remote snapshots
-//! and segments gone locally are deleted (ADR 0122 §3). A restore downloads
+//! and segments gone locally are deleted (ADR 0122 §3). A referenced blob
+//! whose file the node has lost ships as a reference only, and is recorded
+//! (ADR 0122, amended 2026-11-14). A restore downloads
 //! the snapshot's `blobs.idx` and every blob the staged segments reference,
 //! and checks each before anything moves into place (ADR 0122 §5).
 
@@ -62,10 +64,13 @@ impl Shipped {
 
     pub(crate) fn open(data: &Path) -> Result<Shipped, ShipError> {
         let conn = rusqlite::Connection::open(Self::path(data)).map_err(sqlite)?;
+        // `missing`: referenced blobs whose file this node no longer has; their
+        // references shipped without them (ADR 0122, amended 2026-11-14).
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;
              CREATE TABLE IF NOT EXISTS shipped (
-               name TEXT PRIMARY KEY, body_digest BLOB NOT NULL) WITHOUT ROWID;",
+               name TEXT PRIMARY KEY, body_digest BLOB NOT NULL) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS missing (name TEXT PRIMARY KEY) WITHOUT ROWID;",
         )
         .map_err(sqlite)?;
         Ok(Shipped {
@@ -90,6 +95,35 @@ impl Shipped {
                 "INSERT OR REPLACE INTO shipped (name, body_digest) VALUES (?1, ?2)",
                 params![name, digest],
             )
+            .map_err(sqlite)?;
+        Ok(())
+    }
+
+    /// Marks a row whose object is being deleted: an empty digest matches
+    /// no file, so a blob referenced again before the deletion's end is
+    /// uploaded again, and the row stays until the object is gone.
+    fn mark_deleting(&self, name: &str) -> Result<(), ShipError> {
+        locked(&self.conn)
+            .execute(
+                "UPDATE shipped SET body_digest = x'' WHERE name = ?1",
+                [name],
+            )
+            .map_err(sqlite)?;
+        Ok(())
+    }
+
+    /// Records a referenced blob whose file is missing; `true` the first
+    /// time.
+    fn note_missing(&self, name: &str) -> Result<bool, ShipError> {
+        Ok(locked(&self.conn)
+            .execute("INSERT OR IGNORE INTO missing (name) VALUES (?1)", [name])
+            .map_err(sqlite)?
+            > 0)
+    }
+
+    fn found(&self, name: &str) -> Result<(), ShipError> {
+        locked(&self.conn)
+            .execute("DELETE FROM missing WHERE name = ?1", [name])
             .map_err(sqlite)?;
         Ok(())
     }
@@ -225,45 +259,81 @@ fn read_header(file: &std::fs::File) -> Result<Header, String> {
     Header::decode(&bytes)
 }
 
+/// What [`ship_blob`] did with one blob.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BlobShipped {
+    /// Uploaded, this many bytes.
+    Uploaded(u64),
+    /// In the bucket already, or of an erased subject: nothing to do.
+    Nothing,
+    /// The node has no file for it: its reference ships without it.
+    /// `first` the first time a round finds it so.
+    Missing { first: bool },
+}
+
 /// Uploads one blob that a segment or snapshot of this round references,
-/// unless it was uploaded with the same body digest. A blob whose local file
-/// is gone is skipped when the index says it was erased, and is an error
-/// otherwise: the reference must not leave without its bytes.
+/// unless it was uploaded with the same body digest. An erased subject's
+/// blob is never uploaded. A blob whose file is gone is one the node itself
+/// reads as missing (BLOB_MISSING): the reference ships without it and the
+/// blob is recorded in `missing` (ADR 0122, amended 2026-11-14), so that one
+/// lost file does not stop every later segment and snapshot. A blob whose
+/// file exists is never referenced in the bucket before it is there.
 pub(crate) async fn ship_blob(
     remote: &Remote,
     data: &Path,
     shipped: &Shipped,
     index: &Index,
     id: &BlobId,
-) -> Result<u64, ShipError> {
+) -> Result<BlobShipped, ShipError> {
+    if matches!(index.get(&id.to_string())?, Indexed::Erased) {
+        return Ok(BlobShipped::Nothing);
+    }
     let path = local_path(data, id);
     let name = id.file_name();
     let file = match std::fs::File::open(&path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return match index.get(&id.to_string())? {
-                Indexed::Erased => Ok(0),
-                _ => Err(ShipError::BlobMissing(id.to_string())),
-            };
+            return Ok(BlobShipped::Missing {
+                first: shipped.note_missing(&name)?,
+            });
         }
         Err(e) => return Err(e.into()),
     };
+    shipped.found(&name)?;
     let header =
         read_header(&file).map_err(|why| ShipError::Restore(format!("blob {id}: {why}")))?;
     let digest = header.body_digest;
     if shipped.digest(&name)?.as_deref() == Some(digest.as_slice()) {
-        return Ok(0);
+        return Ok(BlobShipped::Nothing);
     }
     let rel = remote_name(id);
     // A lost ship-blobs.db: the bucket may hold it already.
     if shipped.digest(&name)?.is_none() && remote.exists(&rel).await? {
         shipped.put(&name, &digest)?;
-        return Ok(0);
+        return Ok(BlobShipped::Nothing);
     }
     let len = file.metadata()?.len();
     remote.put_file(&rel, &file, len).await?;
     shipped.put(&name, &digest)?;
-    Ok(len)
+    Ok(BlobShipped::Uploaded(len))
+}
+
+/// The blobs whose references shipped without them: their files were
+/// missing (ADR 0122, amended 2026-11-14). File names; none without a
+/// ship-blobs.db.
+pub fn missing_blob_names(data: &Path) -> Result<BTreeSet<String>, ShipError> {
+    if !Shipped::path(data).exists() {
+        return Ok(BTreeSet::new());
+    }
+    let shipped = Shipped::open(data)?;
+    let conn = locked(&shipped.conn);
+    let mut st = conn
+        .prepare("SELECT name FROM missing ORDER BY name")
+        .map_err(sqlite)?;
+    let rows = st
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(sqlite)?;
+    rows.collect::<Result<_, _>>().map_err(sqlite)
 }
 
 /// Step 6 of a round (ADR 0122 §3): deletes the remote objects of blobs
@@ -277,6 +347,7 @@ pub(crate) async fn delete_gone(
     shipped: &Shipped,
     index: &Index,
     snapshot_roots: &BTreeSet<String>,
+    fault: &(dyn Fn(&str) -> std::io::Result<()> + Sync),
 ) -> Result<u64, ShipError> {
     let mut deleted = 0;
     for name in shipped.names()? {
@@ -295,7 +366,12 @@ pub(crate) async fn delete_gone(
                 kronik_metrics::inc("kronik_blob_missing_total", &[]);
             }
             Indexed::Absent | Indexed::Erased => {
+                // Marked first: a crash after the deletion leaves a row
+                // that matches no file, so the blob is uploaded again if a
+                // record references it before the next round's step 6.
+                shipped.mark_deleting(&name)?;
                 remote.delete_object(&remote_name(&id)).await?;
+                fault("blob-deleted")?;
                 shipped.remove(&name)?;
                 deleted += 1;
             }

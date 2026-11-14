@@ -402,6 +402,17 @@ is served unverified; a blob whose keys the backup shows erased is counted as
 erased and not installed. The reseal markers (`blobs/reupload/<name>`) and the
 erasure status of `privacy status` come with the privacy slice (B15).
 
+Amended 2026-11-14 ([ADR 0122](../adr/0122-shipping-and-restoring-blobs.md),
+"A blob the node has lost"): a referenced blob whose file is gone no longer
+stops the round. Its reference ships without it, and it is recorded:
+- `ship-blobs.db`'s `missing` table (`kronik_ship::missing_blob_names`),
+  until a round finds the file again;
+- `kronik_blob_missing_total` and an error-level log line, once per blob.
+
+An erased subject's blob is never uploaded. Step 6 marks a row (an empty
+digest) before deleting its object and waits a round when a listed snapshot
+vanished during it.
+
 ## 9. Privacy
 
 ### 9.1 Subjects

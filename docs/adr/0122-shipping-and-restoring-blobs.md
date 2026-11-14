@@ -1,6 +1,6 @@
 # 0122. Shipping and restoring blobs: uploads before references, deletions after them
 
-- **Status:** Accepted (2026-11-13)
+- **Status:** Accepted (2026-11-13), amended 2026-11-14
 - **Date:** 2026-11-13
 
 ## Context
@@ -137,3 +137,38 @@ that is missing, unless the operator chose `--allow-missing-blobs`.
   (the existing harnesses): a blob referenced only by a timer survives the
   compaction of its creating record, is restored, and the timer gets the
   right bytes; and by a fault test that stops a round between each step.
+
+## Amendment (2026-11-14): a blob the node has lost
+
+Decided by the maintainers' lead after the M25 review (finding R-3).
+
+As accepted, a round stopped with `BLOB_MISSING` when a segment or snapshot
+it was about to upload referenced a blob whose local file was gone and whose
+index row was not erased. One lost file therefore stopped the backup: that
+segment, every later segment and every later snapshot stayed out of the
+bucket, round after round, until the segment aged out of the log (`[retention]
+history`). By then the bucket's log had a hole and its newest snapshot was as
+old. A restore with `--allow-missing-blobs`, whose node keeps those references,
+stopped its own shipping the same way at its first snapshot.
+
+Now: a blob whose file exists is still never referenced in the bucket before
+it is uploaded. A blob whose file the node no longer has is one the node itself
+already reads as missing (`BLOB_MISSING`; `kronik blobs inspect` says
+`missing`). Its reference ships without it, and the shipper records it:
+- in `ship-blobs.db`'s `missing` table, until a round finds the file again
+  and uploads it;
+- in `kronik_blob_missing_total`, once per blob;
+- in an error-level log line naming the blob, once per blob.
+
+The bucket then holds what the node holds, and a restore of it fails with
+`BLOB_MISSING` for that blob unless `--allow-missing-blobs`, as the node
+would answer.
+
+The same review fixed three narrower cases:
+- An erased subject's blob is never uploaded, even when its file has not been
+  deleted yet.
+- A blob's row in `ship-blobs.db` is marked before its object is deleted and
+  removed after. A crash in between can then never make a later round skip
+  the upload of a blob that a new record references.
+- The deletions of step 6 wait a round when a snapshot that the round listed
+  was removed locally during it.

@@ -319,21 +319,38 @@ fn ship_and_restore_blobs(remote: &Remote) {
     // Nothing new, nothing shipped.
     assert_eq!(p.ship(remote, src.path()).unwrap().objects, 0);
 
-    // A referenced blob gone from the store stops a round before the
-    // segment that references it.
+    // A referenced blob whose file the node has lost does not stop the
+    // backup: its reference ships without it and the blob is recorded
+    // (ADR 0122, amended 2026-11-14); later records keep shipping. Once the
+    // file is back, the next round that ships a reference uploads it.
     let gone = p.blob(70_000, "");
+    let gone_id = BlobId::parse(&gone.hash).unwrap();
     let file = p
         .node
         .blob_store()
         .unwrap()
-        .object_path(&Space::Main, &BlobId::parse(&gone.hash).unwrap());
+        .object_path(&Space::Main, &gone_id);
     let kept_bytes = std::fs::read(&file).unwrap();
     std::fs::remove_file(&file).unwrap();
-    let err = p.ship(remote, src.path()).unwrap_err();
-    assert!(matches!(err, ShipError::BlobMissing(_)), "{err}");
-    assert_references_complete(&p.rt, remote);
-    std::fs::write(&file, kept_bytes).unwrap();
     p.ship(remote, src.path()).unwrap();
+    let later = p.blob(1_000, "");
+    p.ship(remote, src.path()).unwrap();
+    let have = bucket_blobs(&p.rt, remote);
+    assert!(!have.contains(&gone.hash) && have.contains(&later.hash));
+    assert_eq!(
+        kronik_ship::missing_blob_names(src.path()).unwrap(),
+        BTreeSet::from([gone_id.file_name()])
+    );
+    std::fs::write(&file, kept_bytes).unwrap();
+    p.ingress_with("info", "", "", pb::body::Value::Blob(gone.clone()));
+    p.ship(remote, src.path()).unwrap();
+    assert!(bucket_blobs(&p.rt, remote).contains(&gone.hash));
+    assert!(
+        kronik_ship::missing_blob_names(src.path())
+            .unwrap()
+            .is_empty()
+    );
+    assert_references_complete(&p.rt, remote);
 
     // Compaction and the collector delete the response blobs locally; the
     // next round deletes their objects after the references; the saved
@@ -421,4 +438,72 @@ fn ship_and_restore_blobs_from_s3() {
     let endpoint = std::env::var("KRONIK_TEST_S3_ENDPOINT").ok();
     let remote = Remote::open(&url, endpoint.as_deref()).unwrap();
     ship_and_restore_blobs(&remote);
+}
+
+/// An erased subject's blob is never uploaded, even while its file is
+/// still there (ADR 0122, amended 2026-11-14).
+#[test]
+fn an_erased_blob_is_not_uploaded() {
+    let src = tempdir("blob-erased-src-");
+    let bucket = tempdir("blob-erased-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let p = start(src.path());
+    p.deploy();
+    let blob = p.blob(5_000, "");
+    p.node
+        .store()
+        .db()
+        .conn()
+        .execute("UPDATE blobs SET erased = 1 WHERE hash = ?1", [&blob.hash])
+        .unwrap();
+    p.ship(&remote, src.path()).unwrap();
+    assert!(!bucket_blobs(&p.rt, &remote).contains(&blob.hash));
+}
+
+/// A crash after a blob's object was deleted and before its record went:
+/// the record is marked, so a record that references the same blob again
+/// before the next deletion step has it uploaded again.
+#[test]
+fn a_deletion_cut_short_never_skips_an_upload() {
+    let src = tempdir("blob-deleted-src-");
+    let bucket = tempdir("blob-deleted-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let p = start(src.path());
+    p.deploy();
+    let blob = p.upload(3_000);
+    p.ship(&remote, src.path()).unwrap();
+    assert!(bucket_blobs(&p.rt, &remote).contains(&blob.hash));
+    // Its records leave retention and the collector deletes it.
+    p.traffic(80);
+    p.compact();
+    for _ in 0..2 {
+        p.rt.block_on(p.node.blob_gc(SweepOptions {
+            immediate: true,
+            ..Default::default()
+        }))
+        .unwrap();
+    }
+    // The deletion step stops after deleting the object.
+    let fault = |step: &str| {
+        if step == "blob-deleted" {
+            Err(std::io::Error::other("stopped"))
+        } else {
+            Ok(())
+        }
+    };
+    let mut st = ShipState::load(src.path()).unwrap();
+    let _ = p.rt.block_on(ship_once_with_fault(
+        &remote,
+        src.path(),
+        "main",
+        &mut st,
+        &fault,
+    ));
+    assert!(!bucket_blobs(&p.rt, &remote).contains(&blob.hash));
+    // The same bytes again, and a record that references them.
+    let again = p.upload(3_000);
+    assert_eq!(again.hash, blob.hash);
+    p.ship(&remote, src.path()).unwrap();
+    assert!(bucket_blobs(&p.rt, &remote).contains(&blob.hash));
+    assert_references_complete(&p.rt, &remote);
 }
