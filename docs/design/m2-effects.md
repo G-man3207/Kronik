@@ -254,8 +254,24 @@ its ingress key belong to the re-run (an HTTP retry with the same
   taken from `deliveries`) and the compensation released; failed, nothing
   changed and the compensation is dropped. The node whose record released
   a compensation delivers it (`released_lsn`); a released one not yet
-  delivered goes out at the next start. A queued call lost to a restart
-  never runs, so its compensation stays held and nothing is orphaned.
+  delivered goes out at the next start.
+- **A call lost to a restart.** A queued call lives only in the process
+  that queued it, so a restart loses a call its callee had not run yet; a
+  call whose callee turn had begun (a `TurnBegin`) is re-run instead. At
+  start, before any turn runs, each timed-out call still waiting
+  (`released_lsn` unset) whose callee turn is not re-run is closed as a
+  failed `CALL` turn of its callee with `UNAVAILABLE` ("the daemon stopped
+  while the call waited for its callee"), built from the caller's record
+  (the call's message, sender, chain, message id and causal key). Its values
+  are read back from that record, so the closing record is sealed with that
+  record's LSN as its provenance (ADR 0123 §1): a value of a subject erased
+  since, the message of a request that can no longer be opened included,
+  becomes the erasure's tombstone, never a value under a new key version.
+  Applying that record resolves the call as a callee that did not commit:
+  the held compensation is dropped, there is no orphan, and the
+  `timed_out_calls` row goes, in a rebuild of the log too. A waiting call
+  whose caller's record the log no longer holds is left as it is, with a
+  warning.
 
 ## 6. Grants, limits and rates
 

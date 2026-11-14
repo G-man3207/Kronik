@@ -15,7 +15,7 @@ use kronik_effects::rate::RateLimiter;
 use kronik_effects::{Capability, Config, ConfigHistory, Delivery, KindLimits, Rate};
 use kronik_log::{Committed, Log, LogConfig, LogError, LogReader};
 use kronik_privacy::SecretStore;
-use kronik_privacy::sealer::Sealer;
+use kronik_privacy::sealer::{Opened, Sealer};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::{CodeError, CodeStore, LogEvent, Program, TurnLimits, TurnRequest};
@@ -966,6 +966,19 @@ impl Node {
         node.reconcile_foreign().await;
         kronik_core::authority::Authority::check(native_execution.as_ref())
             .map_err(|error| StartError::Corrupt(error.to_string()))?;
+        // Timed-out calls still waiting for a callee turn that no process
+        // will run are closed before any turn runs; a re-run callee turn
+        // resolves its call itself (#30).
+        let rerun_calls: HashSet<String> = reruns
+            .iter()
+            .filter_map(|(_, begin, _, _)| {
+                match begin.input.as_ref().and_then(|i| i.kind.as_ref()) {
+                    Some(pb::input::Kind::Message(m)) => Some(m.message_id.clone()),
+                    _ => None,
+                }
+            })
+            .collect();
+        node.close_lost_calls(&rerun_calls).await?;
         // Open turns first: each is the delivery of its input, so its mailbox
         // entry is skipped and its ingress key joins the re-run.
         let mut rerun_messages = HashSet::new();
@@ -1295,6 +1308,127 @@ impl Node {
             logical_ms: self.env.clock.wall_ms().max(self.clock.high_water()),
             monotonic: self.env.clock.monotonic(),
         }
+    }
+
+    /// Timed-out calls that wait for a callee turn no process will run: a
+    /// queued call lives only in the process that queued it (#30). At start,
+    /// before any turn runs, each is closed as a failed `CALL` turn of its
+    /// callee (`UNAVAILABLE`), so the applier resolves it as a callee that
+    /// did not commit (no orphan; the held compensation is dropped) and a
+    /// rebuild of the log does the same. `running`: the calls whose callee
+    /// turn is re-run, which resolves them. A call whose caller's record the
+    /// log no longer holds is left waiting. The closing record is built from
+    /// the caller's record, so it is sealed with that record's provenance
+    /// (ADR 0123 §1): a value of a subject erased since becomes the
+    /// erasure's tombstone, never a value under a new key version.
+    async fn close_lost_calls(&self, running: &HashSet<String>) -> Result<(), StartError> {
+        let waiting = self.store.db().waiting_timed_out_calls()?;
+        for call in waiting {
+            if running.contains(&call.call_message_id) {
+                continue;
+            }
+            let Some((callee, input, key, parent_time)) = self.lost_call(&call).await else {
+                tracing::warn!(
+                    call = %call.call_message_id,
+                    caller = %call.caller,
+                    caller_lsn = call.caller_lsn,
+                    "a timed-out call waits for a callee turn that will not run, but its \
+                     caller's record is not in the log: it is left waiting"
+                );
+                continue;
+            };
+            tracing::info!(
+                call = %call.call_message_id,
+                callee = %callee,
+                "closing a call lost with the process that queued it"
+            );
+            let kind = self.kind(&callee.kind);
+            let epoch = self.epoch.load(Ordering::Acquire);
+            self.record_unrun(
+                &callee,
+                kind.as_deref(),
+                epoch,
+                input,
+                key,
+                parent_time,
+                ErrorCode::Unavailable,
+                "the daemon stopped while the call waited for its callee: the call never ran"
+                    .into(),
+                OperationOrigin::Internal,
+                Born::Lsn(call.caller_lsn),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// A lost call's callee, its turn's input and causal key, and the
+    /// caller's logical time, from the caller's failed record: as the call
+    /// would have run (`perform_call`). `None` when the record is not there.
+    async fn lost_call(
+        &self,
+        call: &kronik_store::db::WaitingCall,
+    ) -> Option<(ActorRef, pb::Input, pb::CausalKey, u64)> {
+        let Ok(Some(committed)) = self.read_record(call.caller_lsn).await else {
+            return None;
+        };
+        let Record::TurnRecord(caller) = committed.record else {
+            return None;
+        };
+        let key = caller.causal_key.as_ref()?;
+        let effect = caller.effects.iter().find(|e| {
+            e.timed_out_call() && causal::message_id(key, e.ordinal) == call.call_message_id
+        })?;
+        let callee = effect
+            .target
+            .strip_prefix("actor:")
+            .and_then(|t| ActorRef::parse(t).ok())?;
+        // The call's message, or, when the request cannot be read (its
+        // subject was erased), an empty body tagged with the request's
+        // subject: sealing with the caller's provenance makes it that
+        // erasure's tombstone (`close_lost_calls`).
+        let msg = self
+            .recorded_call_message(effect)
+            .unwrap_or_else(|| pb::Message {
+                body: Some(pb::Sealable {
+                    subject: effect.request.as_ref().and_then(|r| r.subject.clone()),
+                    value: Some(pb::sealable::Value::Plain(Vec::new())),
+                }),
+                ..Default::default()
+            });
+        let mut chain = match caller.input.as_ref().and_then(|i| i.kind.as_ref()) {
+            Some(pb::input::Kind::Message(m)) => m.call_chain.clone(),
+            _ => Vec::new(),
+        };
+        chain.push(call.caller.to_pb());
+        let input = pb::Input {
+            kind: Some(pb::input::Kind::Message(pb::MessageInput {
+                source: pb::MessageSource::Call as i32,
+                sender: Some(call.caller.to_pb()),
+                msg: Some(msg),
+                message_id: call.call_message_id.clone(),
+                sent_logical_time_ms: caller.logical_time_ms,
+                call_chain: chain,
+                ..Default::default()
+            })),
+        };
+        let child = causal::child(key, &call.caller, effect.ordinal);
+        Some((callee, input, child, caller.logical_time_ms))
+    }
+
+    /// The message of a recorded call request, opened when sealed.
+    fn recorded_call_message(&self, effect: &pb::EffectRecord) -> Option<pb::Message> {
+        let request = effect.request.as_ref()?;
+        let bytes = match request.value.as_ref()? {
+            pb::sealable::Value::Plain(bytes) => bytes.clone(),
+            pb::sealable::Value::Sealed(_) => match self.sealer().open(request) {
+                Opened::Value(bytes) => bytes.into_owned(),
+                _ => return None,
+            },
+        };
+        <pb::CallEffectRequest as prost::Message>::decode(bytes.as_slice())
+            .ok()?
+            .msg
     }
 
     /// The compensation of the timed-out call `call_message_id` that the

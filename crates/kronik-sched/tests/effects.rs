@@ -1744,22 +1744,65 @@ fn a_call_that_times_out_is_an_orphan_once_its_callee_commits() {
         0
     );
 
-    // A restart loses the queued call: the held compensation never goes out.
+    // A restart loses the queued call. The next start closes it as a failed
+    // turn of its callee (UNAVAILABLE): no orphan, and the held compensation
+    // and the waiting row go, also from the store's tables.
     keep_busy(&p, "counter/e");
     let r = p.send(
         "counter/a",
         msg("call-fail", "counter/e increment increment"),
     );
     assert!(!r.committed());
+    assert_eq!(
+        p.node.store().db().waiting_timed_out_calls().unwrap().len(),
+        1
+    );
     drop(p);
     let p = start(dir.path());
     std::thread::sleep(Duration::from_millis(500));
+    let lost_turns = |p: &Proc| {
+        turn_records(&p.records())
+            .into_iter()
+            .filter(|t| {
+                t.actor.as_ref().is_some_and(|a| a.key == "e")
+                    && matches!(
+                        t.input.as_ref().and_then(|i| i.kind.as_ref()),
+                        Some(pb::input::Kind::Message(m))
+                            if m.source == pb::MessageSource::Call as i32
+                    )
+            })
+            .map(|t| t.outcome.unwrap_or_default())
+            .collect::<Vec<_>>()
+    };
+    let closed = lost_turns(&p);
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(closed[0].kind, pb::OutcomeKind::Failed as i32);
+    assert_eq!(closed[0].error_code, "UNAVAILABLE");
+    assert!(
+        p.node
+            .store()
+            .db()
+            .waiting_timed_out_calls()
+            .unwrap()
+            .is_empty()
+    );
+    let held: i64 = p
+        .node
+        .store()
+        .db()
+        .conn()
+        .query_row("SELECT count(*) FROM mailbox", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(held, 0, "the held compensation is dropped");
     assert!(orphan_of(&p, "e").is_none());
     assert_eq!(p.kv("counter/e", "n"), None);
-    assert!(p.node.store().db().mailbox().unwrap().is_empty());
-    // The rest stands after the restart.
+    // The rest stands after the restart, and another start closes nothing
+    // again.
     assert!(orphan_of(&p, "c").is_some_and(|o| o.resolved_lsn.is_none()));
     assert_eq!(p.kv("counter/b", "n").as_deref(), Some("2"));
+    drop(p);
+    let p = start(dir.path());
+    assert_eq!(lost_turns(&p).len(), 1);
 }
 
 /// The real clock with a wall clock the test steps, as NTP or an operator

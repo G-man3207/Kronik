@@ -271,6 +271,12 @@ M23, key and secret backends:
   matched under its own rules. Requests without rules stay version 2, byte
   for byte; a binary from before this release refuses a log with version 3
   requests.
+- A timed-out call whose callee had not run it when the daemon stopped was
+  lost with the process, and its held compensation and bookkeeping row stayed
+  in `state.db` for good. The next start now closes such a call as a failed
+  turn of its callee with `UNAVAILABLE` ("the call never ran"): its
+  compensation is dropped and nothing is orphaned, in a rebuild of the log
+  too.
 
 ## v0.4.1 — 2026-11-07
 

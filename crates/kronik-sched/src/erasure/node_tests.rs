@@ -376,3 +376,167 @@ fn an_open_turns_recorded_value_of_an_erased_subject_is_not_served_again() {
         assert!(!plain, "the closing record holds the erased plaintext");
     });
 }
+
+/// A call of user:1 that timed out: its failed caller's record holds the
+/// request (sealed under user:1's key in privacy mode `on`, plain and tagged
+/// in `off`). user:1 is erased, and the daemon stops before the busy callee
+/// runs the queued call. The next start closes the lost call (#30) with a
+/// record built from the caller's, sealed with that record's provenance
+/// (ADR 0123 §1): its input carries the erasure's tombstone, and no key
+/// version of user:1 is created after the erasure.
+#[test]
+fn a_lost_call_of_an_erased_subject_closes_with_the_tombstone() {
+    for (mode, erased_version) in [(pb::PrivacyState::On, 1), (pb::PrivacyState::Off, 0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let erased_lsn = {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let erased_lsn = rt.block_on(async {
+                let node = counter_node(dir.path()).await;
+                let authority = node.local_operator_authority().unwrap();
+                node.set_privacy_mode(mode, audit(), false, authority.clone())
+                    .await
+                    .unwrap();
+                node.set_limits(
+                    pb::Limits {
+                        kind: "counter".into(),
+                        effect_timeout_ms: Some(100),
+                        fuel: Some(100_000_000_000),
+                        ..Default::default()
+                    },
+                    audit(),
+                    false,
+                    authority.clone(),
+                )
+                .await
+                .unwrap();
+                // counter/e spins for seconds: the call waits behind it,
+                // times out, and is still queued when the daemon stops.
+                let started = node
+                    .probe
+                    .turns_run
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                let (spinner, spin_authority) = (node.clone(), authority.clone());
+                tokio::spawn(async move {
+                    let _ = spinner
+                        .send(
+                            ActorRef::parse("counter/e").unwrap(),
+                            message("spin", "1000000000", None),
+                            audit(),
+                            false,
+                            spin_authority,
+                        )
+                        .await;
+                });
+                while node
+                    .probe
+                    .turns_run
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == started
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let caller = node
+                    .send(
+                        ActorRef::parse("counter/c").unwrap(),
+                        message("call-fail", "counter/e increment increment", Some("user:1")),
+                        audit(),
+                        false,
+                        authority.clone(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!caller.committed(), "{mode:?}: {caller:?}");
+                assert_eq!(
+                    node.store().db().waiting_timed_out_calls().unwrap().len(),
+                    1,
+                    "{mode:?}: the call waits for its callee"
+                );
+                let erased = node
+                    .erase_subject("user:1", audit(), false, authority)
+                    .await
+                    .unwrap();
+                erased.lsn.unwrap()
+            });
+            // The daemon stops: the queued call goes with it.
+            drop(rt);
+            erased_lsn
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let node = crate::start_local(
+                Env::real(tokio::runtime::Handle::current()),
+                dir.path(),
+                NodeConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                node.store()
+                    .db()
+                    .waiting_timed_out_calls()
+                    .unwrap()
+                    .is_empty(),
+                "{mode:?}: the start closed the lost call"
+            );
+            let mut closing = Vec::new();
+            node.reader()
+                .read(erased_lsn + 1, node.applied_lsn(), |c| {
+                    if let Record::TurnRecord(t) = c.record
+                        && t.actor.as_ref().is_some_and(|a| a.key == "e")
+                        && matches!(
+                            t.input.as_ref().and_then(|i| i.kind.as_ref()),
+                            Some(pb::input::Kind::Message(m))
+                                if m.source == pb::MessageSource::Call as i32
+                        )
+                    {
+                        closing.push(t);
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            assert_eq!(closing.len(), 1, "{mode:?}: {closing:?}");
+            let t = closing.remove(0);
+            assert_eq!(
+                t.outcome.as_ref().map(|o| o.error_code.as_str()),
+                Some("UNAVAILABLE"),
+                "{mode:?}"
+            );
+            let Some(pb::input::Kind::Message(m)) = t.input.and_then(|i| i.kind) else {
+                panic!("{mode:?}: not a message")
+            };
+            assert_eq!(
+                m.msg.and_then(|m| m.body).and_then(|b| b.value),
+                Some(pb::sealable::Value::Sealed(
+                    kronik_privacy::sealer::erased_value(erased_version)
+                )),
+                "{mode:?}: the closing record holds the erasure's tombstone"
+            );
+            assert_eq!(
+                node.sealer()
+                    .keystore()
+                    .unwrap()
+                    .newest_version("user:1")
+                    .unwrap(),
+                None,
+                "{mode:?}: a key version of user:1 was created after its erasure"
+            );
+            assert!(
+                sealed_versions(&node, "user:1", erased_lsn)
+                    .await
+                    .iter()
+                    .all(|v| *v == erased_version),
+                "{mode:?}: a value of user:1 was sealed under a newer key"
+            );
+        });
+    }
+}

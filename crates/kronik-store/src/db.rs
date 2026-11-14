@@ -155,6 +155,16 @@ pub struct TurnRef {
     pub pos: Position,
 }
 
+/// A timed-out call of a failed caller whose callee's turn is not applied
+/// yet (#30, `timed_out_calls` with no release).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitingCall {
+    pub call_message_id: String,
+    pub caller: kronik_core::ids::ActorRef,
+    /// The caller's failed record.
+    pub caller_lsn: Lsn,
+}
+
 /// A committed message not yet consumed by its receiver.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MailboxRow {
@@ -1437,6 +1447,27 @@ impl StateDb {
             .query_row(params![call_message_id, i(lsn)], mailbox_columns)
             .optional()?;
         row.map(mailbox_row).transpose()
+    }
+
+    /// The timed-out calls of failed callers still waiting for their
+    /// callee's turn (#30), in the order of their callers' records: their
+    /// compensations, if any, are held.
+    pub fn waiting_timed_out_calls(&self) -> Result<Vec<WaitingCall>, StoreError> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT call_message_id, caller_kind, caller_key, caller_lsn FROM timed_out_calls \
+             WHERE released_lsn IS NULL ORDER BY caller_lsn, call_message_id",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(WaitingCall {
+                call_message_id: r.get(0)?,
+                caller: kronik_core::ids::ActorRef {
+                    kind: r.get(1)?,
+                    key: r.get(2)?,
+                },
+                caller_lsn: r.get::<_, i64>(3)? as Lsn,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// The turn that consumed `message_id`, if any.

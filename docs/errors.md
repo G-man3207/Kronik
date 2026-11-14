@@ -1159,6 +1159,8 @@ To fix it, retry shortly. If it persists, read the message and the daemon log. B
 
 For `serve`, `restore`, `keys wrap` or first key creation during `serve --init`, this also means another daemon or offline operation owns the data-directory lock. Stop that owning process, or use a different `--data-dir`. A missing or stale API socket is not evidence that the directory is free. Do not remove key files or bypass the ownership check.
 
+As the outcome of an actor's call turn (input source `CALL`) that a start wrote, it means the daemon stopped while the call waited for its callee, after its caller had timed out: the call never ran. Its caller had already failed or gone on without the answer. A compensation the call carried is not sent, and nothing is orphaned. If the change still matters, send it again.
+
 ## VERIFY_REQUIRED
 
 HTTP status 409, milestone M1. The actor type has history; verify the change first.
