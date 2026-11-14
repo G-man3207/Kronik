@@ -35,6 +35,7 @@ use kronik_proto::log::v1 as pb;
 use kronik_sched::connections::{FinishGuard, Hub, Outgoing, Transport};
 use tokio::sync::Notify;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
@@ -44,6 +45,10 @@ pub mod sse;
 /// How long the upgrade of an accepted connection may take before it is
 /// abandoned.
 pub const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most frames the writer sends per wakeup before it lets the reader,
+/// the timer and the closes have their turn (review M4).
+const WRITE_BATCH: usize = 64;
 
 /// The WebSocket transport the hub writes through: it wakes the
 /// connection's task, and asks it to close.
@@ -107,17 +112,17 @@ impl Limits {
     }
 }
 
-fn to_message(frame: pb::Frame) -> Message {
-    let data = match frame.data.and_then(|d| d.value) {
+fn to_message(frame: &pb::Frame) -> Message {
+    let data: &[u8] = match frame.data.as_ref().and_then(|d| d.value.as_ref()) {
         Some(pb::sealable::Value::Plain(b)) => b,
         // The hub gets the committed record's frames before they are
         // sealed; a sealed one is never expected here.
-        _ => Vec::new(),
+        _ => &[],
     };
     match pb::frame::Kind::try_from(frame.kind) {
-        Ok(pb::frame::Kind::Binary) => Message::Binary(Bytes::from(data)),
+        Ok(pb::frame::Kind::Binary) => Message::Binary(Bytes::copy_from_slice(data)),
         // An event's data is a text frame on a WebSocket.
-        _ => Message::Text(String::from_utf8_lossy(&data).into_owned().into()),
+        _ => Message::Text(String::from_utf8_lossy(data).into_owned().into()),
     }
 }
 
@@ -182,8 +187,8 @@ where
             (None, Some(sent)) => (sent + limits.ping_timeout).saturating_sub(now()),
             (None, None) => (last_heard + limits.ping_interval).saturating_sub(now()),
         };
+        // Unbiased: reading, writing and the timer take turns (review M4).
         tokio::select! {
-            biased;
             () = transport.notify.notified(), if closing.is_none() => {
                 if let Some((code, reason)) = transport.take_host_close() {
                     if send(&mut sink, close_message(code, &reason), limits.close_timeout).await.is_err() {
@@ -192,10 +197,12 @@ where
                     closing = Some(now() + limits.close_timeout);
                     continue;
                 }
+                let mut batch = 0;
                 while let Some(item) = hub.next(&conn) {
+                    batch += 1;
                     match item {
                         Outgoing::Frame { seq, frame } => {
-                            match send(&mut sink, to_message(frame), limits.ping_timeout).await {
+                            match send(&mut sink, to_message(&frame), limits.ping_timeout).await {
                                 Ok(()) => hub.written(&conn, seq),
                                 // A client that takes no frame for the ping
                                 // timeout cannot keep up: no close frame
@@ -215,8 +222,9 @@ where
                             break;
                         }
                     }
-                    // A host close decided meanwhile (it dropped the queue).
-                    if transport.host_close_pending() {
+                    // A host close decided meanwhile (it dropped the queue),
+                    // or a full batch: the rest after the other branches.
+                    if transport.host_close_pending() || batch >= WRITE_BATCH {
                         transport.notify.notify_one();
                         break;
                     }
@@ -273,7 +281,19 @@ where
                             break 'run;
                         }
                     }
-                    Some(Err(WsError::Protocol(_) | WsError::Utf8(_) | WsError::AttackAttempt)) => {
+                    // Gone without a close frame: a client close (1006).
+                    Some(Err(WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake))) => {
+                        break 'run;
+                    }
+                    // Invalid UTF-8 in a text message closes with 1007,
+                    // other protocol errors with 1002 (§5.5).
+                    Some(Err(WsError::Utf8(_))) => {
+                        hub.close_host_with(&conn, pb::CloseCause::Protocol, 1007);
+                        if !closing_after_error(&transport, &mut sink, &mut closing, now(), &limits).await {
+                            break 'run;
+                        }
+                    }
+                    Some(Err(WsError::Protocol(_) | WsError::AttackAttempt)) => {
                         hub.close_host(&conn, pb::CloseCause::Protocol);
                         if !closing_after_error(&transport, &mut sink, &mut closing, now(), &limits).await {
                             break 'run;
@@ -288,6 +308,14 @@ where
                 if closing.is_some() {
                     // The client did not answer the close in time.
                     break 'run;
+                }
+                if admitting.is_some() {
+                    // Kronik paused reading (the in-flight window, the
+                    // rate): the client's pongs wait unread, so its silence
+                    // proves nothing (review M3).
+                    last_heard = now();
+                    ping_sent = None;
+                    continue;
                 }
                 match ping_sent {
                     Some(_) => hub.close_host(&conn, pb::CloseCause::PingTimeout),

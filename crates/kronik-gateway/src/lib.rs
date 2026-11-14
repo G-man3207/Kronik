@@ -794,6 +794,42 @@ impl Gateway {
         }
     }
 
+    /// The client address that `[connections] max_per_client` counts (M24
+    /// §5.11, review M1): the peer, or, when the peer is a trusted proxy,
+    /// the address it forwards: the rightmost `X-Forwarded-For` entry that
+    /// is no trusted proxy itself. A trusted proxy that forwards none is
+    /// exempt (`true`): its clients cannot be told apart.
+    fn client_address(&self, req: &HttpRequest) -> (Option<IpAddr>, bool) {
+        let trusted = |ip: IpAddr| self.cfg.trusted_proxies.iter().any(|n| n.contains(ip));
+        let Some(peer) = req.peer else {
+            return (None, false);
+        };
+        if !trusted(peer) {
+            return (Some(peer), false);
+        }
+        let forwarded: Vec<&str> = header_values(req, "x-forwarded-for")
+            .flat_map(|v| v.split(','))
+            .map(str::trim)
+            .collect();
+        for entry in forwarded.iter().rev() {
+            // `[v6]:port`, `v4:port` and bare addresses.
+            let host = entry
+                .strip_prefix('[')
+                .and_then(|r| r.split_once(']').map(|(h, _)| h))
+                .unwrap_or_else(|| match entry.split_once(':') {
+                    Some((h, port)) if !port.contains(':') => h,
+                    _ => entry,
+                });
+            match host.parse::<IpAddr>() {
+                Ok(ip) if trusted(ip) => continue,
+                Ok(ip) => return (Some(ip), false),
+                // A value that is no address names no client.
+                Err(_) => break,
+            }
+        }
+        (Some(peer), true)
+    }
+
     /// Opens a long-lived connection (M24 §5.3 and §5.4, steps 1 to 5,
     /// without the socket): checks the handshake, matches the route, admits
     /// the open as a root input of the route's actor within the hub's caps,
@@ -886,12 +922,11 @@ impl Gateway {
             (pb::ConnectionProtocol::Sse, m, None)
         };
         let offered = offered_subprotocols(&req);
-        let peer = req.peer;
-        let exempt = peer.is_some_and(|ip| self.cfg.trusted_proxies.iter().any(|n| n.contains(ip)));
+        let (client, exempt) = self.client_address(&req);
         let (actor, http, subject) = self.input(req, m)?;
         let (conn, waiter) = self
             .node
-            .connection_open(actor, http, protocol, subject, peer, exempt)?;
+            .connection_open(actor, http, protocol, subject, client, exempt)?;
         // Every way out of here but an accept handed to the caller
         // abandons the connection, including this future being dropped
         // because the client left while the open turn ran (review S3).

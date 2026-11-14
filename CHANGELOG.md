@@ -27,6 +27,17 @@ until the v1.0 compatibility promise takes effect.
   no bytes for `ping_timeout`, HTTP responses included. An open whose
   client leaves while its turn runs, or whose transport never attaches
   (10 s), is closed as `abandoned`, so it holds no slot.
+- Connection admission and memory (M24 review): `max_per_client` counts
+  the client a trusted proxy forwards (`X-Forwarded-For`) and IPv6 clients
+  per /64; an SSE stream no longer holds a `[gateway]` HTTP connection;
+  new `[connections] total_queue_bytes` and `total_inflight_bytes` bound
+  the memory of all connections together; a broadcast shares one copy of
+  its frame; no false ping timeout while Kronik pauses reading; reading
+  and writing take turns; state.db keeps the newest 10,000 dead letters of
+  frame and close turns; a broadcast past the per-turn target limit traps
+  before it reads any connection; invalid UTF-8 closes with 1007, and a
+  client that drops the connection without a close is a client close
+  (1006).
 - The gateway serves WebSocket routes (M24): an upgrade to a `WEBSOCKET`
   route opens a connection whose owner's open turn accepts it, and the
   client gets `101 Switching Protocols` (with the selected subprotocol and

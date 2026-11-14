@@ -128,6 +128,7 @@ CREATE TABLE IF NOT EXISTS connection_history (
   restart_after_lsn INTEGER);
 CREATE INDEX IF NOT EXISTS connection_history_owner ON connection_history (kind, key, closed_lsn);
 CREATE INDEX IF NOT EXISTS connection_history_closed ON connection_history (closed_lsn);
+CREATE TABLE IF NOT EXISTS connection_dead_letters (lsn INTEGER PRIMARY KEY);
 ";
 
 /// One row of `actors`.
@@ -1119,7 +1120,13 @@ impl StateDb {
         }
         // The held compensations of timed-out calls (#30) go with the
         // mailbox they are held in.
-        for table in ["mailbox", "dead_letters", "orphans", "timed_out_calls"] {
+        for table in [
+            "mailbox",
+            "dead_letters",
+            "connection_dead_letters",
+            "orphans",
+            "timed_out_calls",
+        ] {
             tx.execute(&format!("DELETE FROM {table}"), [])?;
             copy_rows(&shadow.conn, &tx, table, "1", [])?;
         }
@@ -2688,12 +2695,36 @@ fn apply_connections(
         .execute(params![i(of.lsn), lsn])?;
     }
     // A failed frame or close turn is a dead letter; a failed open is not
-    // (its client got the error).
+    // (its client got the error). Any client can make its owner fail, so
+    // only the newest MAX_CONNECTION_DEAD_LETTERS of them are kept, node-wide
+    // (review M5); the turns themselves stay in the log and in history.
     if !committed && matches!(c.event, Some(Event::Frame(_) | Event::Close(_))) {
         dead_letter_insert(tx, lsn, kind, key, input, outcome)?;
+        tx.prepare_cached("INSERT INTO connection_dead_letters (lsn) VALUES (?1)")?
+            .execute([lsn])?;
+        let held: i64 = tx
+            .prepare_cached("SELECT count(*) FROM connection_dead_letters")?
+            .query_row([], |r| r.get(0))?;
+        let over = held - MAX_CONNECTION_DEAD_LETTERS;
+        if over > 0 {
+            tx.prepare_cached(
+                "DELETE FROM dead_letters WHERE lsn IN \
+                 (SELECT lsn FROM connection_dead_letters ORDER BY lsn LIMIT ?1)",
+            )?
+            .execute([over])?;
+            tx.prepare_cached(
+                "DELETE FROM connection_dead_letters WHERE lsn IN \
+                 (SELECT lsn FROM connection_dead_letters ORDER BY lsn LIMIT ?1)",
+            )?
+            .execute([over])?;
+        }
     }
     Ok(())
 }
+
+/// How many dead letters of connection inputs (failed frame and close
+/// turns) state.db keeps, node-wide; the oldest go first (M24, review M5).
+pub const MAX_CONNECTION_DEAD_LETTERS: i64 = 10_000;
 
 fn sealable_plain(s: Option<&pb::Sealable>) -> Vec<u8> {
     match s.and_then(|s| s.value.as_ref()) {
@@ -3033,6 +3064,10 @@ fn erase_rows(tx: &Connection, subject: &str, key_version: u32) -> Result<(), St
     ] {
         tx.prepare_cached(sql)?.execute([subject])?;
     }
+    tx.prepare_cached(
+        "DELETE FROM connection_dead_letters WHERE lsn NOT IN (SELECT lsn FROM dead_letters)",
+    )?
+    .execute([])?;
     tx.prepare_cached("UPDATE deliveries SET outcome = ?2, subject = NULL WHERE subject = ?1")?
         .execute(params![subject, erased_call_outcome()])?;
     let mut f = tombstone(subject, key_version);

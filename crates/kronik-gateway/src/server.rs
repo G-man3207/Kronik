@@ -159,6 +159,7 @@ async fn open_connection(
     req: HttpRequest,
     kind: RequestKind,
     upgrade: Option<hyper::upgrade::OnUpgrade>,
+    slot: &SlotHandle,
 ) -> hyper::Response<ResponseBody> {
     let answer = gw.open_connection(req).await;
     if kind == RequestKind::Sse {
@@ -169,11 +170,13 @@ async fn open_connection(
         // One chunk in flight: the driver learns when hyper took the last.
         let (chunks, body) = tokio::sync::mpsc::channel(1);
         tokio::spawn(crate::connections::sse::drive(hub, conn, chunks));
-        return with_body(
-            answer.response.status,
-            &answer.response.headers,
-            ResponseBody::Events(body),
-        );
+        // The stream counts in [connections] from now on, not against the
+        // [gateway] HTTP connections (review M2); the TCP connection ends
+        // with it, so no later request runs without a slot.
+        slot.release();
+        let mut headers = answer.response.headers;
+        headers.push(("connection".into(), "close".into()));
+        return with_body(answer.response.status, &headers, ResponseBody::Events(body));
     }
     let (Some(conn), Some(upgrade)) = (answer.connection.clone(), upgrade) else {
         if let Some(conn) = &answer.connection {
@@ -305,15 +308,33 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for StallGuard<I> {
     }
 }
 
-/// Serves HTTP/1.1 on one connection, with upgrades for WebSockets (M24).
-/// Its writes may stall at most `[connections] ping_timeout`.
-async fn serve_connection<I>(io: I, gw: Arc<Gateway>, peer: std::net::IpAddr)
+/// The `[gateway]` connection slot of one TCP connection, which an SSE
+/// stream gives back when it starts (M24, review M2).
+#[derive(Clone)]
+struct SlotHandle(Arc<std::sync::Mutex<Option<Slot>>>);
+
+impl SlotHandle {
+    fn new(slot: Slot) -> SlotHandle {
+        SlotHandle(Arc::new(std::sync::Mutex::new(Some(slot))))
+    }
+
+    fn release(&self) {
+        drop(self.0.lock().unwrap_or_else(|e| e.into_inner()).take());
+    }
+}
+
+/// Serves HTTP/1.1 on one connection, with upgrades for WebSockets (M24),
+/// holding its `[gateway]` slot until it ends (or an SSE stream releases
+/// it). Its writes may stall at most `[connections] ping_timeout`.
+async fn serve_connection<I>(io: I, gw: Arc<Gateway>, peer: std::net::IpAddr, slot: Slot)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let slot = SlotHandle::new(slot);
     let io = StallGuard::new(io, gw.node.hub().config().ping_timeout);
     let svc = service_fn(move |mut req: hyper::Request<Incoming>| {
         let gw = gw.clone();
+        let slot = slot.clone();
         async move {
             let started = std::time::Instant::now();
             // Taken before the request is consumed; only an upgrade uses it.
@@ -324,7 +345,7 @@ where
             let resp = match to_request(req, gw.cfg.max_body, peer).await {
                 Ok(r) => match gw.classify(&r) {
                     RequestKind::Http => to_hyper(gw.handle(r).await),
-                    kind => open_connection(&gw, r, kind, upgrade).await,
+                    kind => open_connection(&gw, r, kind, upgrade, &slot).await,
                 },
                 Err(resp) => to_hyper(resp),
             };
@@ -507,10 +528,7 @@ pub async fn serve(
         match accept(&listener, &slots, &gateway.cfg.trusted_proxies).await {
             Accepted::Served(stream, peer, slot) => {
                 let gw = gateway.clone();
-                tokio::spawn(async move {
-                    serve_connection(stream, gw, peer.ip()).await;
-                    drop(slot);
-                });
+                tokio::spawn(serve_connection(stream, gw, peer.ip(), slot));
             }
             Accepted::Refused(stream, _, permit) => {
                 tokio::spawn(async move {
@@ -568,13 +586,12 @@ pub async fn serve_tls(
             match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
                 Ok(Ok(tls)) => {
                     if tls.get_ref().1.alpn_protocol() != Some(ACME_TLS_ALPN) {
-                        serve_connection(tls, gw, peer.ip()).await;
+                        serve_connection(tls, gw, peer.ip(), slot).await;
                     }
                 }
                 Ok(Err(e)) => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
                 Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
             }
-            drop(slot);
         });
     }
 }
