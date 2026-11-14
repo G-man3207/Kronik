@@ -4,6 +4,12 @@ name: CI
 # hosted run spends minutes only when someone asks for it. Start it from the
 # Actions tab, or with `gh workflow run ci.yml`. The same steps run locally
 # with scripts/ci.sh.
+#
+# The steps of scripts/ci.sh run in parallel jobs, every step once. A job runs
+# its steps in the script's order, because a later step can use what an
+# earlier one built: identity replays the examples that the examples, ts and
+# sdks steps build, so those four share a job. scripts/check-ci-steps.py, in
+# the hygiene step, checks both.
 on:
   workflow_dispatch:
 
@@ -21,8 +27,158 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
-  ci:
-    name: fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, foreign, identity, action
+  lint:
+    name: fmt, clippy, hygiene, docs, book, deny
+    runs-on: ubuntu-24.04
+    steps:
+      # The runner's preinstalled SDKs that this job does not use, for disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            examples -> target
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-deny@0.20.2
+
+      # Each step runs the same command as scripts/ci.sh does locally.
+      - name: fmt
+        run: scripts/ci.sh fmt
+      - name: clippy
+        run: scripts/ci.sh clippy
+      - name: hygiene
+        run: scripts/ci.sh hygiene
+      - name: docs
+        run: scripts/ci.sh docs
+      - name: book
+        run: scripts/ci.sh book
+      - name: deny
+        run: scripts/ci.sh deny
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    steps:
+      # The runner's preinstalled SDKs that this job does not use, for disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            examples -> target
+
+      # The CLI audit and API mutation tests run the repository's owned
+      # TLS/code/PKCE/JWT provider through a pinned private Python runtime
+      # (CONTRIBUTING.md); the test step is its only consumer.
+      - name: Prepare the pinned OIDC test runtime
+        run: |
+          python3 -m venv target/oidc-test-python
+          target/oidc-test-python/bin/python3 -m pip install --only-binary=:all: \
+            -r scripts/requirements-oidc-tests.txt
+
+      - name: test
+        env:
+          KRONIK_TEST_PYTHON: ${{ github.workspace }}/target/oidc-test-python/bin/python3
+        run: scripts/ci.sh test
+
+  dst:
+    name: dst
+    runs-on: ubuntu-24.04
+    steps:
+      # The runner's preinstalled SDKs that this job does not use, for disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            examples -> target
+
+      - name: dst
+        run: scripts/ci.sh dst
+
+  foreign:
+    name: foreign
+    runs-on: ubuntu-24.04
+    steps:
+      # The runner's preinstalled SDKs that this job does not use, for disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            examples -> target
+
+      # Trusted checkout setup only: never manufacture an unsigned release to
+      # bypass the production installer's attestation policy.
+      - name: Install gVisor
+        run: |
+          sudo KRONIK_INSTALL_RUNSC=yes sh scripts/install-runsc.sh </dev/null
+          runsc --version
+
+      # The foreign step needs root: it runs as root with this user's
+      # toolchain, then gives the build files back for the cache.
+      # KRONIK_FOREIGN_TESTS=require makes any skip a failure.
+      - name: foreign
+        run: |
+          status=0
+          sudo -E env "PATH=$PATH" "HOME=$HOME" KRONIK_FOREIGN_TESTS=require \
+            scripts/ci.sh foreign || status=$?
+          sudo chown -R "$(id -u):$(id -g)" target examples "$HOME/.cargo" "$HOME/.rustup"
+          exit "$status"
+
+  sdk-chain:
+    name: examples, ts, sdks, identity
     runs-on: ubuntu-24.04
     steps:
       # The runner's preinstalled SDKs that this job does not use, for disk.
@@ -60,36 +216,7 @@ jobs:
             sdk/ts/package-lock.json
             examples/package-lock.json
 
-      - name: Install cargo-deny
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
-        with:
-          tool: cargo-deny@0.20.2
-
       # Each step runs the same command as scripts/ci.sh does locally.
-      - name: fmt
-        run: scripts/ci.sh fmt
-      - name: clippy
-        run: scripts/ci.sh clippy
-      - name: hygiene
-        run: scripts/ci.sh hygiene
-
-      # The CLI audit and API mutation tests run the repository's owned
-      # TLS/code/PKCE/JWT provider through a pinned private Python runtime
-      # (CONTRIBUTING.md); the test step is its only consumer.
-      - name: Prepare the pinned OIDC test runtime
-        run: |
-          python3 -m venv target/oidc-test-python
-          target/oidc-test-python/bin/python3 -m pip install --only-binary=:all: \
-            -r scripts/requirements-oidc-tests.txt
-
-      - name: test
-        env:
-          KRONIK_TEST_PYTHON: ${{ github.workspace }}/target/oidc-test-python/bin/python3
-        run: scripts/ci.sh test
-      - name: docs
-        run: scripts/ci.sh docs
-      - name: book
-        run: scripts/ci.sh book
       - name: examples
         run: scripts/ci.sh examples
       - name: ts
@@ -98,28 +225,22 @@ jobs:
       # tests the examples the identity step replays.
       - name: sdks
         run: scripts/ci.sh sdks
-      - name: dst
-        run: scripts/ci.sh dst
-      - name: deny
-        run: scripts/ci.sh deny
-      # Trusted checkout setup only: never manufacture an unsigned release to
-      # bypass the production installer's attestation policy.
-      - name: Install gVisor
-        run: |
-          target/debug/kronik --version
-          sudo KRONIK_INSTALL_RUNSC=yes sh scripts/install-runsc.sh </dev/null
-          runsc --version
-      # The foreign step needs root: it runs as root with this user's
-      # toolchain, then gives the build files back for the later steps and the
-      # cache. KRONIK_FOREIGN_TESTS=require makes any skip a failure.
-      - name: foreign
-        run: |
-          status=0
-          sudo -E env "PATH=$PATH" "HOME=$HOME" KRONIK_FOREIGN_TESTS=require \
-            scripts/ci.sh foreign || status=$?
-          sudo chown -R "$(id -u):$(id -g)" target examples "$HOME/.cargo" "$HOME/.rustup"
-          exit "$status"
       - name: identity
         run: scripts/ci.sh identity
+
+  action:
+    name: action
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The full history: two of the step's tests check it, that the
+          # action commit the reference workflow pins is an ancestor of HEAD
+          # and that every contract snapshot is its release's, and a shallow
+          # checkout would skip them.
+          fetch-depth: 0
+
+      # Python, PyYAML and curl come with the runner; the step runs no cargo.
       - name: action
         run: scripts/ci.sh action

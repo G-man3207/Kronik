@@ -741,6 +741,57 @@ class CiInventoryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no default"):
             self.check("run: scripts/ci.sh fmt", "# no defaults")
 
+    def jobs(self, first, second):
+        return ("on:\n  workflow_dispatch:\n"
+                "jobs:\n"
+                "  first:\n"
+                "    steps:\n"
+                f"      - run: {first}\n"
+                "\n"
+                "  second:  # the other job\n"
+                "    name: second\n"
+                "    steps:\n"
+                f"      - run: {second}\n")
+
+    def test_jobs_split_the_steps_in_any_job_order(self):
+        self.check(self.jobs("scripts/ci.sh action", "scripts/ci.sh fmt\n      - run: scripts/ci.sh test"))
+
+    def test_a_step_in_two_jobs_fails(self):
+        with self.assertRaisesRegex(ValueError, "more than once.*'test': \\['first', 'second'\\]"):
+            self.check(self.jobs("scripts/ci.sh fmt test", "scripts/ci.sh test action"))
+
+    def test_a_job_that_runs_its_steps_out_of_order_fails(self):
+        with self.assertRaisesRegex(ValueError, "job first runs \\['action', 'fmt'\\]"):
+            self.check(self.jobs("scripts/ci.sh action\n      - run: scripts/ci.sh fmt", "scripts/ci.sh test"))
+
+    def test_a_step_that_no_job_runs_fails(self):
+        with self.assertRaisesRegex(ValueError, "missing: \\['action'\\]"):
+            self.check(self.jobs("scripts/ci.sh fmt", "scripts/ci.sh test"))
+
+    def test_the_hosted_workflow_runs_every_step_once(self):
+        self.check((ROOT / ".github/workflows/ci.yml").read_text(), (ROOT / "scripts/ci.sh").read_text())
+
+    @unittest.skipIf(yaml is None, "PyYAML is not installed; skipping the YAML structure checks")
+    def test_the_hosted_workflow_jobs(self):
+        checker = runpy.run_path(str(ROOT / "scripts/check-ci-steps.py"))
+        workflow = load(ROOT / ".github/workflows/ci.yml")
+        on = workflow.get("on", workflow.get(True))  # YAML 1.1 reads a bare on as true
+        self.assertEqual(on, {"workflow_dispatch": None}, "manual only (ADR 0110)")
+        for name, job in workflow["jobs"].items():
+            with self.subTest(job=name):
+                steps = job["steps"]
+                runs = checker["calls"]("\n".join(step.get("run", "") for step in steps), [])
+                self.assertTrue(runs, "every job runs ci.sh steps")
+                (checkout,) = [s for s in steps if s.get("uses", "").startswith("actions/checkout@")]
+                self.assertIs(checkout["with"]["persist-credentials"], False)
+                # The ts step compares the contract snapshots with their
+                # releases, and the action step's tests check the history.
+                if {"ts", "action"} & set(runs):
+                    self.assertEqual(checkout["with"].get("fetch-depth"), 0)
+                if runs != ["action"]:
+                    self.assertIn("rustup toolchain install", [s.get("run") for s in steps])
+                    self.assertTrue(any(s.get("uses", "").startswith("Swatinem/rust-cache@") for s in steps))
+
     def test_cluster_server_is_an_exact_opt_in_boundary(self):
         script = (ROOT / "scripts/ci.sh").read_text().split("python3 -c '\n", 1)[1].split("\n'\n", 1)[0]
         server = ["dep:h2", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:rustls",
