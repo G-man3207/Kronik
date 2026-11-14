@@ -100,9 +100,11 @@ CREATE TABLE orders (
 
 - `kronik_subject()` returns the turn's default subject, so rows written
   under `ctx.subject("user:123")` carry `user:123`.
-- A row's subject can't change: `UPDATE … SET _subject` is refused (delete
-  the row and insert it again), and a turn whose writes would move a row to
-  another subject fails.
+- A row's subject can't change: `UPDATE … SET _subject` is refused, and a
+  turn whose writes would move a row to another subject fails with
+  `subjects/move-detected`, for example an `INSERT OR REPLACE` of a row of
+  another subject, or a `DELETE` and an `INSERT` of the same key in one
+  turn. Delete the row in one turn and insert it in a later one.
 - Erasure deletes the subject's rows from every table that has `_subject`.
 - A turn that has a default subject may only write tables that have a
   `_subject` column. A write to a table without that column fails the turn

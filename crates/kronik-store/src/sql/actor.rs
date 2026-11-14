@@ -385,7 +385,7 @@ fn authorize(s: &mut Shared, ctx: &AuthContext<'_>) -> Authorization {
             {
                 return deny(
                     s,
-                    "changing _subject is not allowed; delete the row and insert it again".into(),
+                    "changing _subject is not allowed; delete the row in one turn and insert it in a later one".into(),
                 );
             }
             s.stmt.dml = true;
@@ -1516,9 +1516,13 @@ impl SqlActor {
             Op::Insert => Ok(val_text(c.new.get(i).cloned().flatten())),
             Op::Delete => Ok(val_text(c.old.get(i).cloned().flatten())),
             Op::Update => {
+                // A REPLACE, or a DELETE and INSERT of the same key, is
+                // recorded as one UPDATE whose old values are one subject's
+                // and new values another's: no changeset may hold both.
                 if c.new.get(i).cloned().flatten().is_some() {
                     return Err(format!(
-                        "a change to {} moves a row to another _subject",
+                        "subjects/move-detected: a change to {} moves a row to another \
+                         _subject; delete the row in one turn and insert it in a later one",
                         c.table
                     ));
                 }

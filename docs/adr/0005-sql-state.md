@@ -265,10 +265,14 @@ Limits:
   changeset per subject with `sqlite3changegroup_add_change`, preserving
   their order. If no changed table has `_subject`, the split is skipped.
 - **Moving a row between subjects is not allowed.** An `UPDATE` of
-  `_subject` is denied. A `REPLACE` or upsert that moves a row is detected
-  at the end of the turn, and the turn fails (`subjects/move-detected`).
-  Otherwise the moved row's old values (one subject's data) would sit in
-  the other subject's changeset.
+  `_subject` is denied when the statement runs, also an upsert's
+  `DO UPDATE SET _subject`. A `REPLACE`, or a `DELETE` and an `INSERT` of
+  the same key in one turn, is recorded as one UPDATE whose old values are
+  one subject's and new values another's: it is detected at the end of the
+  turn, and the turn fails with `subjects/move-detected`. Otherwise the
+  moved row's old values (one subject's data) would sit in the other
+  subject's changeset. Deleting the row in one turn and inserting it in a
+  later one moves it.
 - **Verified** (`subjects/split`, `subjects/row-subject-wins`): one turn
   with default subject `user:1` wrote rows for `user:2` and `user:3`, each
   in its own changeset, applicable on its own. An update of `user:2`'s row

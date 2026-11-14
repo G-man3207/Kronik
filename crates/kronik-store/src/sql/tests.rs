@@ -457,6 +457,117 @@ fn a_rewritten_changeset_applies_pseudonyms_and_keeps_the_primary_key() {
     assert_eq!(rows.values[0][3], Value::Text("user:1".into()));
 }
 
+const SUBJECT_TABLE: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
+     _subject TEXT DEFAULT (kronik_subject()))";
+
+/// A turn on behalf of `subject`.
+fn as_subject(seed: u8, subject: &str) -> TurnOpts {
+    let mut o = opts(seed, i64::from(seed), false);
+    o.default_subject = Some(subject.to_owned());
+    o
+}
+
+/// An actor with [`SUBJECT_TABLE`], created at LSN 1.
+fn subject_actor(name: &str) -> SqlActor {
+    let mut a = actor(name);
+    let (_, res) = commit(&mut a, &opts(1, 1, true), &[SUBJECT_TABLE], 1);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    a
+}
+
+/// Every row of a table, with no subject in force: (id, body, _subject).
+fn subject_rows(a: &mut SqlActor) -> Vec<(i64, String, String)> {
+    a.begin_turn(&opts(0, 0, false)).unwrap();
+    let rows = a
+        .query("SELECT id, body, _subject FROM notes ORDER BY id", &[])
+        .unwrap();
+    a.end_turn(false).unwrap();
+    rows.values
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [Value::Integer(id), Value::Text(body), Value::Text(subject)] => {
+                (*id, body.clone(), subject.clone())
+            }
+            other => panic!("unexpected row {other:?}"),
+        })
+        .collect()
+}
+
+/// `subjects/move-detected` (ADR 0005 §6): a row cannot move to another
+/// subject. An UPDATE of `_subject`, an upsert's too, is denied when the
+/// statement runs. A REPLACE, or a DELETE and an INSERT of the same key in
+/// one turn, is recorded as one UPDATE whose old values are one subject's
+/// and new values another's: the turn fails when it ends, and nothing is
+/// written. Deleting the row in one turn and inserting it in a later one
+/// moves it, each change in its own subject's changeset.
+#[test]
+fn subjects_move_detected() {
+    let mut a = subject_actor("move");
+    let (_, res) = commit(
+        &mut a,
+        &as_subject(2, "user:1"),
+        &["INSERT INTO notes(body) VALUES ('one')"],
+        2,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+
+    for statements in [
+        &["INSERT OR REPLACE INTO notes(id, body, _subject) VALUES (1, 'moved', 'user:2')"][..],
+        &[
+            "DELETE FROM notes WHERE id = 1",
+            "INSERT INTO notes(id, body, _subject) VALUES (1, 'moved', 'user:2')",
+        ][..],
+    ] {
+        a.begin_turn(&as_subject(3, "user:2")).unwrap();
+        for q in statements {
+            a.query(q, &[]).unwrap();
+        }
+        let err = a.end_turn(true).unwrap_err();
+        assert!(
+            err.contains("subjects/move-detected"),
+            "{statements:?}: {err}"
+        );
+        assert!(err.contains("notes"), "{err}");
+    }
+
+    a.begin_turn(&as_subject(4, "user:2")).unwrap();
+    let err = a
+        .query(
+            "INSERT INTO notes(id, body, _subject) VALUES (1, 'moved', 'user:2') \
+             ON CONFLICT(id) DO UPDATE SET _subject = excluded._subject",
+            &[],
+        )
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("_subject"), "{err:?}");
+    let t = a.end_turn(true).unwrap();
+    assert!(t.changesets.is_empty(), "{t:?}");
+    assert_eq!(
+        subject_rows(&mut a),
+        [(1, "one".to_owned(), "user:1".to_owned())]
+    );
+
+    let (deleted, res) = commit(
+        &mut a,
+        &as_subject(5, "user:1"),
+        &["DELETE FROM notes WHERE id = 1"],
+        3,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let (inserted, res) = commit(
+        &mut a,
+        &as_subject(6, "user:2"),
+        &["INSERT INTO notes(id, body) VALUES (1, 'moved')"],
+        4,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    assert_eq!(deleted.changesets[0].0.as_deref(), Some("user:1"));
+    assert_eq!(inserted.changesets[0].0.as_deref(), Some("user:2"));
+    assert_eq!(
+        subject_rows(&mut a),
+        [(1, "moved".to_owned(), "user:2".to_owned())]
+    );
+}
+
 /// A turn with a default subject may not write a table that has no
 /// `_subject` column. A turn without a subject may. Erasure of a tagged
 /// row is unchanged.
