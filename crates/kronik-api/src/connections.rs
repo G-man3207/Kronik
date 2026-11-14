@@ -114,10 +114,12 @@ pub(crate) type FateCache = HashMap<String, Option<(ConnectionRow, Option<LiveSt
 impl Api {
     /// Adds the fates of a turn's sends to its summary (§4.7): the frame
     /// with seq `s` of a connection was written if `s` is below its count
-    /// of frames written; queued after it while the writer has it; dropped
-    /// otherwise, or when no live connection had the id. After a restart,
-    /// the frames of turns up to the restart's LSN have an unknown fate,
-    /// and later ones were dropped.
+    /// of frames written; on an open connection, any later frame is queued
+    /// (it waits in the queue, its writer has it and has not confirmed it
+    /// yet, or the hub has not received it yet); on a closing or closed
+    /// one it was dropped, as when no live connection had the id. After a
+    /// restart, the frames of turns up to the restart's LSN have an unknown
+    /// fate, and later ones were dropped.
     pub(crate) fn fill_fates(
         &self,
         summary: &mut TurnSummary,
@@ -143,9 +145,11 @@ impl Api {
                     None => &mut fates.unknown,
                     Some((row, stats)) => match (row.closed_lsn, stats, row.frames_written) {
                         (None, Some(s), _) if seq < s.frames_written => &mut fates.written,
-                        (None, Some(s), _) if seq < s.frames_written + s.queued_frames => {
-                            &mut fates.queued
-                        }
+                        // Not written yet, and the connection goes on: the
+                        // frame waits in the queue, or the writer has it
+                        // (an SSE stream confirms a frame only when the
+                        // next chunk goes out).
+                        (None, Some(s), _) if s.open => &mut fates.queued,
                         (None, Some(_), _) => &mut fates.dropped,
                         (None, None, _) => &mut fates.unknown,
                         (Some(_), _, Some(w)) if seq < w => &mut fates.written,

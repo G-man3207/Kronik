@@ -449,3 +449,92 @@ async fn the_operator_closes_a_connection() {
         "{v}"
     );
 }
+
+/// Takes frames from the hub and never confirms them written: the state of
+/// an SSE stream whose last frame hyper has not confirmed yet.
+struct Unconfirmed {
+    hub: Arc<kronik_sched::connections::Hub>,
+    conn: String,
+    taken: std::sync::Mutex<u64>,
+}
+
+impl kronik_sched::connections::Transport for Unconfirmed {
+    fn wake(&self) {
+        while let Some(item) = self.hub.next(&self.conn) {
+            if matches!(item, kronik_sched::connections::Outgoing::Frame { .. }) {
+                *self.taken.lock().unwrap() += 1;
+            }
+        }
+    }
+
+    fn close(&self, _code: u16, _reason: &str) {
+        self.hub.finished(&self.conn, None);
+    }
+}
+
+/// §4.7: on an open connection, a frame the writer has taken and not yet
+/// confirmed is `queued`, not `dropped` (an SSE stream confirms a frame
+/// only when the next chunk goes out).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frame_the_writer_has_not_confirmed_is_queued() {
+    let r = room().await;
+    let request = pb::HttpInput {
+        method: "GET".into(),
+        path: "/room/lobby/ws".into(),
+        query: "user=ada".into(),
+        params: vec![pb::Param {
+            name: "key".into(),
+            value: "lobby".into(),
+            sealed_value: None,
+        }],
+        route: "/room/{key}/ws".into(),
+        ..Default::default()
+    };
+    let (ada, waiter) = r
+        .node
+        .connection_open(
+            ActorRef::parse("room/lobby").unwrap(),
+            request,
+            pb::ConnectionProtocol::Websocket,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+    assert!(waiter.wait().await.unwrap().committed());
+    let transport = Arc::new(Unconfirmed {
+        hub: r.node.hub().clone(),
+        conn: ada.clone(),
+        taken: std::sync::Mutex::new(0),
+    });
+    r.node.hub().attach(&ada, transport.clone()).unwrap();
+    // The welcome is taken, never confirmed.
+    for _ in 0..500 {
+        if *transport.taken.lock().unwrap() == 1 {
+            break;
+        }
+        r.node.env().clock.sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(*transport.taken.lock().unwrap(), 1);
+    let h = get(
+        &r.api,
+        &format!("/v1/actors/room/lobby/history?connection={ada}"),
+    )
+    .await;
+    let open = h["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| {
+            t["input"]["summary"]
+                .as_str()
+                .is_some_and(|s| s.starts_with(&format!("open {ada}")))
+        })
+        .unwrap_or_else(|| panic!("ada's open turn in {h}"));
+    let welcome = &open["connection_ops"][0];
+    assert_eq!(
+        welcome["fates"],
+        json!({"written": 0, "queued": 1, "dropped": 0, "unknown": 0}),
+        "{open}"
+    );
+}

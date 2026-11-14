@@ -485,7 +485,7 @@ shows every outgoing frame's **fate**:
 | Fate | When |
 | --- | --- |
 | `written` | `seq < frames_written`, or the connection is live and its writer has written it. |
-| `queued` | The connection is live and the frame waits in its queue. |
+| `queued` | The connection is open and the frame is not written yet: it waits in its queue, or its writer has taken it and not confirmed it yet (an SSE stream confirms a frame when the next chunk goes out). |
 | `dropped` | `seq >= frames_written`. Or the connection was closed by a restart and the frame's record has an LSN above that close's `restart_after_lsn`. Or the target is in its operation's `dropped` list: no live connection had the id. |
 | `unknown` | The connection was closed by a restart (the count died with the process) and the frame's record has an LSN at or below `restart_after_lsn`. |
 
