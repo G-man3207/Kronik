@@ -413,6 +413,32 @@ and [0104](../adr/0104-admin-ui-as-a-public-api-client.md).
 | `trusted_proxies` | `[]` | Reverse proxies, as addresses or CIDR blocks (`["127.0.0.1", "10.0.0.0/8"]`). One client address may hold a quarter of the gateway's connections; a trusted proxy, which carries many users' traffic, may hold all of them. A connection over its client's share gets `503 UNAVAILABLE` with `connection: close`. When set, only these peers may set the request's subject (`privacy.subject_from`): a subject header or `jwt:` claim from any other peer gets `400 BAD_REQUEST`; IPv4-mapped entries (`::ffff:10.0.0.0/104`) mean their IPv4 block | |
 | `preview_domain` | none | The domain whose subdomains serve preview forks (`<id>.<domain>`), best a separate registrable domain; see [previews](#previews). With it, previews answer only there, not under `/__preview/`. With `[tls] mode = "acme"` it needs `dns01_hook` (the `*.<domain>` certificate); with `mode = "files"` the certificate must cover `*.<domain>`. It must not be, or be a parent of, a `[tls] domains` name. Lowercase, without scheme or port | |
 
+### [connections]
+
+WebSocket and SSE connections (M24). The gateway holds them, and the actor
+that accepted one sends on it; see
+[the design](../design/m24-connections.md). These are admission and
+transport settings: replay never reads them.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max_open` | `4096` | Live connections in total, besides the gateway's HTTP connections. The open-file limit lowers it: `kronik serve` keeps descriptors for the node, the gateway and the TCP API first (with the shipped unit's `LimitNOFILE=65536`, about 63,000 remain), and `kronik doctor` warns when the limit leaves fewer than `max_open` |
+| `max_per_actor` | `2048` | Live connections per owner |
+| `max_per_client` | `256` | Live connections per client address; `[gateway] trusted_proxies` are exempt. Over any of the three caps an open gets `503 CONNECTION_LIMIT` with `retry-after: 5`, before any turn |
+| `max_frame_bytes` | `65536` | The largest incoming message, never above the owner kind's message limit. A larger one closes the connection with `too-large` (1009) |
+| `inflight_frames` | `16` | Incoming frames per connection admitted and not finished. While they are in flight the gateway stops reading the socket, so a fast client cannot outrun its actor |
+| `inbound_rate` | `"50/s"` | Reads per connection are paced to this |
+| `outbound_queue_bytes` | `1048576` | Outgoing bytes a connection may queue. A client that does not read is closed as a slow consumer (1008) instead of holding memory |
+| `ping_interval` | `"30s"` | An idle WebSocket gets a ping this often |
+| `ping_timeout` | `"30s"` | A WebSocket that answers nothing within this after a ping is closed with `ping-timeout` (1001) |
+| `sse_heartbeat` | `"15s"` | An SSE stream gets a `: keep-alive` comment this often |
+| `close_timeout` | `"5s"` | How long a close waits for the client's close frame |
+| `shutdown_grace` | `"2s"` | On SIGTERM every WebSocket gets the close code 1012 `kronik: restart`; the daemon waits this long for the writers |
+
+After any restart, graceful or not, every connection the last process held
+gets a close input with the reason `restart` (1012) before the gateway takes
+new traffic, and clients reconnect: reconnect with jittered backoff.
+
 ### [log]
 
 | Key | Default | Meaning |
@@ -893,6 +919,7 @@ rather than fail, unless `kronik.toml` asks for what is missing
 | `key_source` | The configured master-key source cannot load the key (its error code, such as `KEY_SOURCE_UNAVAILABLE` or `KEY_HELPER_FAILED`, failure), or a bootstrap credential lies under the data directory (warning). With a running daemon it asks `GET /v1/keys` instead | Check the provider, the credentials, the key version and the memory-lock limit; see [the master key](#the-master-key) |
 | `secrets` | With the daemon answering on `server.api_socket`: an external secret backend's last request failed after its last answer, or a linked name has no cached value (`SECRET_UNAVAILABLE`, warning); passes without a daemon or without external backends | `kronik secret backends` shows each backend's last answer and error; the log's `secret fetch failed` lines say why. See [a turn whose effect cannot get its secret](#a-turn-whose-effect-cannot-get-its-secret) |
 | `retention` | With the daemon answering on `server.api_socket`: the last retention pass kept log segments past `[retention] history` for an open turn, which it names (warning); passes without a daemon | See [an open turn that keeps the log](#an-open-turn-that-keeps-the-log) |
+| `connections` | The hard open-file limit leaves room for fewer WebSocket and SSE connections than `[connections] max_open` (`CONNECTION_LIMIT`, warning) | Raise the daemon's open-file limit (`LimitNOFILE=65536` in the shipped unit), or lower `max_open` |
 
 ## Metrics and logs
 

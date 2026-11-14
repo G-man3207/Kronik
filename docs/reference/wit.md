@@ -470,7 +470,7 @@ every incoming frame and the close are inputs of the owner, delivered to
 [`connection-handler`](#connection-handler).
 
 M24 is being built: `send-now` traps with `NOT_IMPLEMENTED` until its part
-lands, and the gateway does not open connections yet.
+lands, and the gateway serves WebSocket routes, not yet SSE ones (`501`).
 
 - **Connection ids** are `c-` and 32 lowercase hex characters, assigned
   when the connection opens, recorded and the same in replay. An id is

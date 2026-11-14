@@ -57,7 +57,7 @@ struct Check {
     /// export, key_source, secrets; with `--rootless` also userns, uid_view,
     /// subid, pin and delegate, and service_identity when a root invocation
     /// becomes the service user; microvm where a microVM tool bundle is
-    /// installed and the root service runs.
+    /// installed and the root service runs; retention, connections.
     name: &'static str,
     status: Status,
     /// An error code from the catalog. Set on every failure, and on a
@@ -271,6 +271,11 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
     checks.push(key_before_drop.unwrap_or_else(|| key_source(&config)));
     checks.push(secrets(&config));
     checks.push(retention(&config));
+    let hard = rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum;
+    checks.push(connections(
+        &config,
+        hard.map_or(usize::MAX, |h| usize::try_from(h).unwrap_or(usize::MAX)),
+    ));
     let count = |s| checks.iter().filter(|c| c.status == s).count();
     let report = Report {
         pass: count(Status::Pass),
@@ -294,6 +299,31 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Whether the open-file limit leaves room for `[connections] max_open`
+/// (M24 §5.11): `kronik serve` raises its limit to the hard limit `hard`
+/// and caps `max_open` to what the node, the gateway and the API leave.
+fn connections(config: &Config, hard: usize) -> Check {
+    let budget = crate::serve::connection_budget(hard);
+    let max_open = config.connections.max_open;
+    if budget >= max_open {
+        return check(
+            "connections",
+            Status::Pass,
+            format!("room for [connections] max_open = {max_open} under {hard} open files"),
+        );
+    }
+    check(
+        "connections",
+        Status::Warn,
+        format!(
+            "{hard} open files leave room for {budget} WebSocket and SSE connections, \
+             fewer than [connections] max_open = {max_open}"
+        ),
+    )
+    .code(ErrorCode::ConnectionLimit.as_str())
+    .hint("raise the daemon's open-file limit (LimitNOFILE=65536 in the shipped unit)")
 }
 
 /// `major.minor` of a kernel release such as `6.12.38+deb13-amd64`.
@@ -1789,6 +1819,18 @@ fn export_streams(config: &Config, streams: &[kronik_api::types::ExportStream]) 
 
 #[cfg(test)]
 mod tests {
+    /// M24 §5.11: the open-file limit against `[connections] max_open`.
+    #[test]
+    fn connections_room() {
+        let config = Config::default();
+        let ok = super::connections(&config, 65_536);
+        assert!(matches!(ok.status, Status::Pass), "{ok:?}");
+        let low = super::connections(&config, 1024);
+        assert!(matches!(low.status, Status::Warn), "{low:?}");
+        assert_eq!(low.code, Some("CONNECTION_LIMIT"));
+        assert!(low.hint.is_some());
+    }
+
     use super::*;
 
     #[test]
