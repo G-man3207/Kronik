@@ -52,22 +52,56 @@ fn trusted(owner: u32, euid: u32) -> bool {
     owner == 0 || owner == euid
 }
 
+/// The tool directory as the nonroot daemon checked it before it entered
+/// the Kronik user namespace (see [`check_from_host`]), and the uid that an
+/// owner the namespace does not map shows as there.
+static HOST_CHECKED: std::sync::OnceLock<(PathBuf, u32)> = std::sync::OnceLock::new();
+
+/// Checks the tool directory `dir` as [`Assets::load`] does, from the host's
+/// view: the nonroot daemon calls it before it enters the Kronik user
+/// namespace. Inside, root's files show as the overflow uid, the uid of every
+/// owner the namespace does not map, so ownership cannot be judged there; a
+/// file of `dir` (and `dir` and its ancestors) that shows as that uid is then
+/// taken as the owner this check saw. Only root or the daemon's user can
+/// change what it checked: the directory and every one above it are theirs
+/// alone. A bundle installed after the daemon started is not checked, and
+/// adding a microVM then says that it is not root's.
+pub fn check_from_host(dir: &Path) -> Result<(), String> {
+    Assets::load(dir)?;
+    let overflow = fs::read_to_string("/proc/sys/kernel/overflowuid")
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(65_534);
+    let _ = HOST_CHECKED.set((dir.to_path_buf(), overflow));
+    Ok(())
+}
+
+/// The overflow uid, when `dir` is the directory [`check_from_host`] checked.
+fn host_checked_overflow(dir: &Path) -> Option<u32> {
+    HOST_CHECKED
+        .get()
+        .filter(|(checked, _)| checked == dir)
+        .map(|(_, overflow)| *overflow)
+}
+
 fn check_bundle_path(dir: &Path, euid: u32) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
     if !dir.is_absolute() {
         return Err(error("tool directory must be an absolute path"));
     }
+    let checked = host_checked_overflow(dir);
+    let trusted = |owner: u32| trusted(owner, euid) || checked == Some(owner);
     for (index, ancestor) in dir.ancestors().enumerate() {
         let md = fs::symlink_metadata(ancestor).map_err(error)?;
         let sticky = md.mode() & 0o1000 != 0 && index > 0;
-        if !md.is_dir() || !trusted(md.uid(), euid) || (md.mode() & 0o022 != 0 && !sticky) {
+        if !md.is_dir() || !trusted(md.uid()) || (md.mode() & 0o022 != 0 && !sticky) {
             return Err(error(format!(
                 "{} is {}: the tool directory and the directories above it must be real directories \
                  owned by root or by the daemon's user, with no write access for anyone else",
                 ancestor.display(),
                 if !md.is_dir() {
                     "not a real directory".to_owned()
-                } else if !trusted(md.uid(), euid) {
+                } else if !trusted(md.uid()) {
                     format!("owned by uid {}", md.uid())
                 } else {
                     format!(
@@ -91,8 +125,9 @@ fn regular(path: &Path, max: u64, private: bool) -> Result<File, String> {
         .open(path)
         .map_err(error)?;
     let md = file.metadata().map_err(error)?;
+    let checked = path.parent().and_then(host_checked_overflow);
     if !md.is_file()
-        || !trusted(md.uid(), euid())
+        || !(trusted(md.uid(), euid()) || checked == Some(md.uid()))
         || md.len() > max
         || (private && md.nlink() != 1)
         || md.mode() & (if private { 0o077 } else { 0o022 }) != 0
@@ -486,6 +521,29 @@ pub(crate) async fn data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The overflow uid is an owner like any other except for the very tool
+    /// directory that the daemon checked from the host's view.
+    #[test]
+    fn only_the_directory_checked_from_the_host_takes_an_unmapped_owner_as_seen() {
+        let (dir, _) = fixture();
+        assert!(host_checked_overflow(dir.path()).is_none());
+        check_from_host(dir.path()).unwrap();
+        let overflow = fs::read_to_string("/proc/sys/kernel/overflowuid")
+            .map(|text| text.trim().parse().unwrap())
+            .unwrap_or(65_534);
+        assert_eq!(host_checked_overflow(dir.path()), Some(overflow));
+        for other in [dir.path().join("x"), PathBuf::from("/usr")] {
+            assert!(
+                host_checked_overflow(&other).is_none(),
+                "{}",
+                other.display()
+            );
+        }
+        // A file of another directory is judged as before.
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(host_checked_overflow(elsewhere.path()).is_none());
+    }
 
     #[test]
     fn a_bundle_that_someone_else_could_replace_is_refused_up_front() {

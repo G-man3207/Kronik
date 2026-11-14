@@ -30,7 +30,7 @@ mod checkpoint;
 mod layout;
 mod logs;
 mod manager;
-mod microvm_assets;
+pub mod microvm_assets;
 mod microvm_checkpoint;
 mod microvm_sys;
 mod runtime;

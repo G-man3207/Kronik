@@ -443,6 +443,13 @@ fn nonroot_boundary(
     let leaf = (!host_view).then(sys::cgroup_leaf);
     let acceptor = sys::Acceptor::spawn(std::os::fd::OwnedFd::from(unix))
         .context("starting the API socket's acceptor")?;
+    // The microVM tool bundle, from the host's view: inside the namespace its
+    // root-owned files show as the overflow uid, whose owner cannot be told
+    // there. A bundle that fails here is refused inside, with the reason.
+    let microvm_dir = &config.foreign.microvm_dir;
+    if microvm_dir.exists() {
+        let _ = kronik_foreign::microvm_assets::check_from_host(microvm_dir);
+    }
     let pin = Path::new(USERNS_PIN);
     let privilege = if !pin.exists() {
         Unavailable(format!(
