@@ -4,6 +4,7 @@
 
 pub mod db;
 pub mod rebase;
+pub mod ship_blobs;
 pub mod snapshot;
 pub mod sql;
 

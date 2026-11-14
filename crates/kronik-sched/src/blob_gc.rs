@@ -345,11 +345,26 @@ impl Node {
                 .db()
                 .unrooted_blobs(floor)
                 .map_err(store_error)?;
+            // An erased blob's row stays while the bucket still has its
+            // object: privacy status ties the object to its subject through
+            // it until the shipper has deleted it (ADR 0122 §4).
+            let shipped = kronik_store::ship_blobs::shipped_names(&self.blob_data_dir()?)
+                .map_err(store_error)?;
             let mut gone = Vec::new();
             for hash in unrooted {
                 let Ok(id) = BlobId::parse(&hash) else {
                     continue;
                 };
+                if shipped.contains(&id.file_name())
+                    && self
+                        .store()
+                        .db()
+                        .blob(&hash)
+                        .map_err(store_error)?
+                        .is_some_and(|row| row.erased)
+                {
+                    continue;
+                }
                 if !store
                     .contains(&Space::Main, &id)
                     .await

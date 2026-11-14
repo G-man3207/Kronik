@@ -495,3 +495,46 @@ fn an_upload_waiting_past_the_lease_ttl_is_kept() {
     }
     drop(upload);
 }
+
+/// An erased blob's index row stays while the shipper's record says its
+/// object is still in the bucket (privacy status ties the object to its
+/// subject through the row), and goes once the shipper has deleted it.
+#[test]
+fn an_erased_row_stays_while_its_object_is_shipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    let blob = p.blob_turn(40_000, "");
+    // Stand-ins for an erasure (B15) and a shipped object (ADR 0122).
+    p.node
+        .store()
+        .db()
+        .conn()
+        .execute("UPDATE blobs SET erased = 1 WHERE hash = ?1", [&blob.hash])
+        .unwrap();
+    let id = kronik_blob::BlobId::parse(&blob.hash).unwrap();
+    let shipped = rusqlite::Connection::open(dir.path().join("ship-blobs.db")).unwrap();
+    shipped
+        .execute_batch(
+            "CREATE TABLE shipped (name TEXT PRIMARY KEY, body_digest BLOB NOT NULL) WITHOUT ROWID;",
+        )
+        .unwrap();
+    shipped
+        .execute(
+            "INSERT INTO shipped (name, body_digest) VALUES (?1, x'00')",
+            [id.file_name()],
+        )
+        .unwrap();
+    let gone = p.gc(SweepOptions {
+        immediate: true,
+        ..Default::default()
+    });
+    assert!(!p.exists(&blob), "{gone:?}");
+    assert_eq!(gone.forgotten, 0);
+    assert!(p.node.store().db().blob(&blob.hash).unwrap().is_some());
+    shipped
+        .execute("DELETE FROM shipped WHERE name = ?1", [id.file_name()])
+        .unwrap();
+    let after = p.gc(SweepOptions::default());
+    assert_eq!(after.forgotten, 1, "{after:?}");
+    assert!(p.node.store().db().blob(&blob.hash).unwrap().is_none());
+}

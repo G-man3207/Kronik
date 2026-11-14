@@ -59,7 +59,7 @@ fn locked(
 
 impl Shipped {
     pub(crate) fn path(data: &Path) -> PathBuf {
-        data.join("ship-blobs.db")
+        kronik_store::ship_blobs::path(data)
     }
 
     pub(crate) fn open(data: &Path) -> Result<Shipped, ShipError> {
@@ -150,10 +150,8 @@ impl Shipped {
 /// never shipped a blob. For `privacy status`: an erased subject's blob is
 /// gone remotely once its name has left this set (ADR 0122 §4).
 pub fn shipped_blob_names(data: &Path) -> Result<BTreeSet<String>, ShipError> {
-    if !Shipped::path(data).exists() {
-        return Ok(BTreeSet::new());
-    }
-    Ok(Shipped::open(data)?.names()?.into_iter().collect())
+    kronik_store::ship_blobs::shipped_names(data)
+        .map_err(|e| ShipError::Io(std::io::Error::other(format!("ship-blobs.db: {e}"))))
 }
 
 fn sqlite(e: rusqlite::Error) -> ShipError {
