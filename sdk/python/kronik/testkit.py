@@ -14,6 +14,12 @@
 # environment variable or PATH. Every request waits until what it started
 # has finished (messages delivered, timers that came due fired), so a test
 # can check the outcome right after it.
+#
+# A test plays the client of WebSocket and SSE connections too:
+#
+#     conn = host.open_connection("/chat/lobby/ws?user=ada")
+#     host.send_frame(conn, json.dumps({"type": "say", "text": "hi"}))
+#     frames = host.frames_sent(conn, clear=True).frames
 
 import base64
 import json
@@ -88,6 +94,66 @@ class ApiAnswer:
 
     status: int
     body: object
+
+
+@dataclass
+class TestConnection:
+    """A WebSocket or SSE connection a test opened with `open_connection`: the client's side.
+
+    `connection` is its id (`c-` and 32 hex digits) when the actor accepted it,
+    else None. `response` is the handshake's answer: 101 for an accepted
+    WebSocket, 200 for an accepted event stream, else the refusal or the error.
+    """
+
+    __test__ = False
+
+    connection: object
+    response: TestResponse
+
+    @property
+    def accepted(self):
+        """Whether the actor accepted the connection."""
+        return self.connection is not None
+
+
+@dataclass
+class TestFrame:
+    """A frame an actor sent on a connection, as `frames_sent` returns it.
+
+    `seq` is its outgoing seq on the connection, from 0; `kind` is `text`,
+    `binary` or `event`; `body` is the data as bytes; an event has `event` and `id`.
+    """
+
+    __test__ = False
+
+    seq: int
+    kind: str
+    body: bytes
+    event: object = None
+    id: object = None
+
+    def text(self):
+        return self.body.decode()
+
+    def json(self):
+        return json.loads(self.body)
+
+
+@dataclass
+class FramesSent:
+    """What an actor sent on a connection: the `frames` since the last `clear`,
+    and `closed`, the close it got from its actor or the host as (code, reason), or None."""
+
+    frames: list
+    closed: object
+
+
+def _connection_id(conn):
+    if isinstance(conn, str):
+        return conn
+    if conn.connection is None:
+        raise TestHostError(f"the connection was not accepted: HTTP {conn.response.status} {conn.response.text()}")
+    return conn.connection
 
 
 class TestHostError(Exception):
@@ -168,6 +234,51 @@ class TestHost:
         hdrs = _with_content_type([[n, v] for n, v in (headers or {}).items()], is_json)
         answer = self._call({"op": "http", "method": method, "path": path, "headers": hdrs, **wire})
         return TestResponse(answer["status"], answer["headers"], _bytes_of(answer), answer.get("turn"))
+
+    def open_connection(self, path, protocol="websocket", headers=None):
+        """Opens a WebSocket (the default) or an event stream (`protocol="sse"`) at `path`
+        through the gateway, as a client would; returns a TestConnection.
+
+        The open turn has run when this returns: `accepted` tells whether the
+        actor accepted, and `frames_sent` has what its open turn sent.
+        """
+        hdrs = [[n, v] for n, v in (headers or {}).items()]
+        answer = self._call({"op": "open-connection", "path": path, "protocol": protocol, "headers": hdrs})
+        response = TestResponse(answer["status"], answer["headers"], _bytes_of(answer), answer.get("turn"))
+        return TestConnection(answer.get("connection"), response)
+
+    def send_frame(self, conn, frame):
+        """A frame from the client: a text frame for a str, a binary frame for bytes.
+
+        Returns once its turn, and what that started, have finished.
+        """
+        if isinstance(frame, str):
+            wire = {"body": frame}
+        elif isinstance(frame, (bytes, bytearray, memoryview)):
+            wire = {"body_base64": base64.b64encode(frame).decode()}
+        else:
+            raise TypeError("a frame is a str (text) or bytes (binary)")
+        self._call({"op": "send-frame", "connection": _connection_id(conn), **wire})
+
+    def close_connection(self, conn, initiator="client", code=None, reason="", cause=None):
+        """Ends a connection: by default the client closes it with 1000.
+
+        A client's `code` 1006 is a client that goes away without a close
+        frame. The host closes for a `cause`: restart, ping-timeout, too-large,
+        slow-consumer, protocol, operator or unavailable. Returns once the
+        close turn, and what that started, have finished.
+        """
+        self._call({"op": "close-connection", "connection": _connection_id(conn), "initiator": initiator, "code": code, "reason": reason, "cause": cause})
+
+    def frames_sent(self, conn, clear=False):
+        """What the actor sent on a connection since the last `clear`, and the close it got (a FramesSent).
+
+        `clear` forgets the frames returned.
+        """
+        answer = self._call({"op": "frames-sent", "connection": _connection_id(conn), "clear": clear})
+        frames = [TestFrame(f["seq"], f["kind"], _bytes_of(f), f.get("event"), f.get("id")) for f in answer["frames"]]
+        closed = answer.get("closed")
+        return FramesSent(frames, None if closed is None else (closed["code"], closed["reason"]))
 
     def send(self, actor, name, body=""):
         """Sends the message `name` to `actor` ("kind/key") as the operator; returns the API's answer (`outcome`, `reply`, `turn_id`)."""

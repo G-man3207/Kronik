@@ -325,8 +325,14 @@ func TestCounts(t *testing.T) {
 | `grant`, `secret` | `grant`, `secret` | `grant`, `secret` | `Grant`, `Secret` | What an operator sets up |
 | `state(actor)`, `stateJson(actor, key)` | `state`, `state_json` | `state`, `state_json` | `State`, `StateJSON` | An actor's key-value state |
 | `api(method, path, body)` | `api` | `api` | `API` | Any request to the daemon's API (`/v1/...`), as `kronik` sends it |
+| `openConnection(path, { protocol, headers })` | `open_connection`, `open_connection_with` | `open_connection(path, protocol=, headers=)` | `OpenConnection(path, opts...)` | A WebSocket, or an event stream with the protocol `sse`, through the gateway: `accepted`, `connection` and the handshake's `response` |
+| `sendFrame(conn, frame)` | `send_frame` | `send_frame` | `SendFrame` | A frame from the client: text from a string, binary from bytes |
+| `closeConnection(conn, { initiator, code, reason, cause })` | `close_connection(Close::..)` | `close_connection(conn, initiator=, code=, reason=, cause=)` | `CloseConnection(conn, testkit.Close{...})` | The client's close (1006: gone without one), or the host's for a cause such as `restart` |
+| `framesSent(conn, { clear })` | `frames_sent` | `frames_sent(conn, clear=)` | `FramesSent(conn, clear)` | What the actor sent on the connection, with seqs, and the close it got |
 
-A request no stub matches fails as if the connection were refused. The seed
+The connection methods are for WebSocket and SSE actors
+([Connections](connections.md#testing)). A request no stub matches fails as
+if the connection were refused. The seed
 of ids and guest randomness is 0, or `KRONIK_TEST_SEED`. A TypeScript test
 can deploy several actor types or variants of one project:
 `TestHost.start({ entries: ["src/actor.ts", "src/ledger.ts"] })` builds each

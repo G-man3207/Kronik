@@ -19,6 +19,12 @@
 // environment variable or PATH. Every request waits until what it started
 // has finished (messages delivered, timers that came due fired), so a test
 // can check the outcome right after it.
+//
+// A test plays the client of WebSocket and SSE connections too:
+//
+//   const conn = await host.openConnection("/chat/lobby/ws?user=ada");
+//   await host.sendFrame(conn, JSON.stringify({ type: "say", text: "hi" }));
+//   const { frames } = await host.framesSent(conn, { clear: true });
 
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { createInterface } from 'node:readline';
@@ -71,6 +77,72 @@ export class TestResponse {
   }
 }
 
+/** A WebSocket or SSE connection a test opened with `openConnection`: the client's side. */
+export class TestConnection {
+  /** The connection's id (`c-` and 32 hex digits), when its actor accepted it. */
+  readonly connection: string | undefined;
+  /** The handshake's answer: 101 for an accepted WebSocket, 200 for an accepted event stream, else the refusal or the error. */
+  readonly response: TestResponse;
+
+  constructor(connection: string | undefined, response: TestResponse) {
+    this.connection = connection;
+    this.response = response;
+  }
+
+  /** Whether the actor accepted the connection. */
+  get accepted(): boolean {
+    return this.connection !== undefined;
+  }
+}
+
+/** A frame an actor sent on a connection, as `framesSent` returns it. */
+export class TestFrame {
+  /** Its outgoing seq on the connection, from 0. */
+  readonly seq: number;
+  readonly kind: 'text' | 'binary' | 'event';
+  /** An event's `event` and `id` fields. */
+  readonly event: string | undefined;
+  readonly id: string | undefined;
+  /** The text or binary data, or the event's data. */
+  readonly body: Uint8Array;
+
+  constructor(seq: number, kind: 'text' | 'binary' | 'event', body: Uint8Array, event?: string, id?: string) {
+    this.seq = seq;
+    this.kind = kind;
+    this.body = body;
+    this.event = event;
+    this.id = id;
+  }
+
+  text(): string {
+    return new TextDecoder().decode(this.body);
+  }
+
+  json<T = unknown>(): T {
+    return JSON.parse(this.text()) as T;
+  }
+}
+
+/** What an actor sent on a connection. */
+export interface FramesSent {
+  /** The frames since the last `clear`, oldest first. */
+  frames: TestFrame[];
+  /** The close the connection got, from its actor or from the host. */
+  closed: { code: number; reason: string } | undefined;
+}
+
+/** How `closeConnection` ends a connection. */
+export interface CloseOptions {
+  /** `client` (default) or `host`. */
+  initiator?: 'client' | 'host';
+  /** The client's close code, default 1000; 1006 is a client that goes away without a close frame. */
+  code?: number;
+  /** The client's close reason. */
+  reason?: string;
+  /** The host's cause: `restart`, `ping-timeout`, `too-large`, `slow-consumer`, `protocol`, `operator` or `unavailable`. */
+  cause?: string;
+}
+
 /** An outgoing request an actor made, as the target got it (with the secrets the host inserted). */
 export interface RecordedRequest {
   method: string;
@@ -117,6 +189,26 @@ interface RecordedAnswer extends WireBody {
   method: string;
   url: string;
   headers: Array<[string, string]>;
+}
+interface OpenAnswer extends HttpAnswer {
+  connection: string | null;
+}
+interface FrameAnswer extends WireBody {
+  seq: number;
+  kind: 'text' | 'binary' | 'event';
+  event?: string;
+  id?: string;
+}
+interface FramesAnswer {
+  frames: FrameAnswer[];
+  closed: { code: number; reason: string } | null;
+}
+
+/** The id of an accepted connection. */
+function idOf(conn: TestConnection | string): string {
+  if (typeof conn === 'string') return conn;
+  if (conn.connection === undefined) throw new Error(`the connection was not accepted: HTTP ${conn.response.status} ${conn.response.text()}`);
+  return conn.connection;
 }
 
 /** The wire fields for a body: text if it is a string, base64 for bytes, else JSON. */
@@ -217,6 +309,37 @@ export class TestHost {
     if (json && !headers.some(([n]) => n.toLowerCase() === 'content-type')) headers.push(['content-type', 'application/json']);
     const answer = await this.#call<HttpAnswer>({ op: 'http', method, path, headers, ...body });
     return new TestResponse(answer.status, answer.headers, bytesOf(answer), answer.turn ?? undefined);
+  }
+
+  /**
+   * Opens a WebSocket (the default) or an event stream (`protocol: 'sse'`) at
+   * `path` through the gateway, as a client would. The open turn has run
+   * when this returns: `accepted` tells whether the actor accepted, and
+   * `framesSent` has what its open turn sent.
+   */
+  async openConnection(path: string, init: { protocol?: 'websocket' | 'sse'; headers?: Record<string, string> } = {}): Promise<TestConnection> {
+    const answer = await this.#call<OpenAnswer>({ op: 'open-connection', path, protocol: init.protocol ?? 'websocket', headers: Object.entries(init.headers ?? {}) });
+    return new TestConnection(answer.connection ?? undefined, new TestResponse(answer.status, answer.headers, bytesOf(answer), answer.turn ?? undefined));
+  }
+
+  /** A frame from the client: a text frame for a string, a binary frame for bytes. Returns once its turn, and what that started, have finished. */
+  async sendFrame(conn: TestConnection | string, frame: string | Uint8Array): Promise<void> {
+    const body = typeof frame === 'string' ? { body: frame } : { body_base64: Buffer.from(frame).toString('base64') };
+    await this.#call({ op: 'send-frame', connection: idOf(conn), ...body });
+  }
+
+  /** Ends a connection: by default the client closes it with 1000. Returns once the close turn, and what that started, have finished. */
+  async closeConnection(conn: TestConnection | string, close: CloseOptions = {}): Promise<void> {
+    await this.#call({ op: 'close-connection', connection: idOf(conn), initiator: close.initiator ?? 'client', code: close.code, reason: close.reason ?? '', cause: close.cause });
+  }
+
+  /** What the actor sent on a connection since the last `clear`, and the close it got; `clear` forgets the frames returned. */
+  async framesSent(conn: TestConnection | string, options: { clear?: boolean } = {}): Promise<FramesSent> {
+    const answer = await this.#call<FramesAnswer>({ op: 'frames-sent', connection: idOf(conn), clear: options.clear ?? false });
+    return {
+      frames: answer.frames.map((f) => new TestFrame(f.seq, f.kind, bytesOf(f), f.event, f.id)),
+      closed: answer.closed ?? undefined,
+    };
   }
 
   /** Sends the message `name` to `actor` (`"kind/key"`) as the operator; returns the API's answer (`outcome`, `reply`, `turn_id`). */

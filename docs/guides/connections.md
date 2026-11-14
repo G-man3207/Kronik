@@ -146,3 +146,32 @@ and a reconnecting EventSource sends the last one back as `Last-Event-ID`
 - `[connections]` in the configuration caps the connections in total, per
   actor and per client address, the incoming frame size and rate, and the
   outgoing queue of a slow client.
+
+## Testing
+
+The testkits play the client
+([Writing actors](actors.md#testing) lists the methods per language). A
+test opens a connection through the test host's gateway, sends frames,
+closes it as the client or as the host, and reads what the actor sent:
+
+```ts
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { TestHost } from "@kronik/sdk/testkit";
+
+test("members chat", async (t) => {
+  const host = await TestHost.start();
+  t.after(() => host.close());
+  const ada = await host.openConnection("/chat/lobby/ws?user=ada");
+  assert.ok(ada.accepted);
+  await host.framesSent(ada, { clear: true }); // the welcome
+  await host.sendFrame(ada, JSON.stringify({ type: "say", text: "hi" }));
+  const { frames } = await host.framesSent(ada, { clear: true });
+  assert.equal(frames[0].json<{ text: string }>().text, "hi");
+  await host.closeConnection(ada, { initiator: "host", cause: "restart" });
+  assert.deepEqual((await host.framesSent(ada)).closed, { code: 1012, reason: "restart" });
+});
+```
+
+Each call returns once the turns it caused have finished, so the frames
+they sent are there. `examples/chat-ts/test/connections.test.ts` has more.

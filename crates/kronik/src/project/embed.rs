@@ -224,6 +224,7 @@ pub const GO_SDK: &[File] = sdk_files!("../../../../sdk/go/":
     "internal/wit/wasi/sockets/udp/udp.wasm.go",
     "internal/wit/wasi/sockets/udp/udp.wit.go",
     "sql.go",
+    "testkit/connections.go",
     "testkit/testkit.go",
     "wit/deps/cli/command.wit",
     "wit/deps/cli/environment.wit",

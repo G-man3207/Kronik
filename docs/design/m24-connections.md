@@ -1715,11 +1715,25 @@ implements only `open`, such as an SSE feed.
 when it defines that world, else `actor`. A project that an older `kronik
 init` vendored an SDK into therefore keeps building with the new binary.
 
-**Test kits.** Each SDK's test kit gains `openConnection(actor,
-request)`, which returns `{connection, accepted, response}`, plus
-`sendFrame(conn, frame)`, `closeConnection(conn, initiator, code, reason)`
-and `framesSent(conn)`. They run the handlers against the in-memory host,
-which records frames and closes, and `send-now` with a stubbed outcome.
+**Test kits.** Each SDK's test kit gains, in its language's spelling:
+
+- `openConnection(path, {protocol, headers})`: a WebSocket, or an event
+  stream, through the test host's gateway (`Gateway::open_connection`, the
+  real path without the socket). It returns `{connection, accepted,
+  response}`, and the open turn has run.
+- `sendFrame(conn, frame)`: a text or binary frame from the client.
+- `closeConnection(conn, {initiator, code, reason, cause})`: the client's
+  close (1006: gone without a close frame), or the host's for a cause such
+  as `restart`.
+- `framesSent(conn, {clear})`: the frames the actor sent, with their seqs,
+  and the close the connection got.
+
+The test host attaches the hub's `RecordingTransport` to every connection
+a test opens, so frames are recorded as a writer takes them, `send-now`
+frames included. Each call answers once the turns it caused have finished:
+the host settles also on the actors' in-memory queues
+(`Node::actors_idle`). It runs connections unpaced, since its clock moves
+only when the test advances it.
 
 ## 16. The example app `chat-ts`
 

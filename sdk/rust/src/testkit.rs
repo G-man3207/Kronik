@@ -18,6 +18,16 @@
 //! has finished (messages delivered, timers that came due fired), so a test
 //! can check the outcome right after it. The testkit exists only on the
 //! host, not in the Wasm build.
+//!
+//! A test plays the client of WebSocket and SSE connections too:
+//!
+//! ```no_run
+//! # use kronik_sdk::testkit::TestHost;
+//! # let mut host = TestHost::start(env!("CARGO_MANIFEST_DIR")).unwrap();
+//! let conn = host.open_connection("/chat/lobby/ws?user=ada").unwrap();
+//! host.send_frame(&conn, r#"{"type":"say","text":"hi"}"#).unwrap();
+//! let frames = host.frames_sent(&conn, true).unwrap().frames;
+//! ```
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -82,6 +92,169 @@ impl Response {
     pub fn json<T: DeserializeOwned>(&self) -> Result<T> {
         serde_json::from_slice(&self.body).map_err(|e| fail("the response body", e))
     }
+}
+
+/// A WebSocket or SSE connection a test opened with
+/// [`TestHost::open_connection`]: the client's side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestConnection {
+    /// The connection's id (`c-` and 32 hex digits) when its actor
+    /// accepted it.
+    pub id: Option<String>,
+    /// The handshake's answer: 101 for an accepted WebSocket, 200 for an
+    /// accepted event stream, else the refusal or the error.
+    pub response: Response,
+}
+
+impl TestConnection {
+    /// Whether the actor accepted the connection.
+    pub fn accepted(&self) -> bool {
+        self.id.is_some()
+    }
+
+    fn accepted_id(&self) -> Result<&str> {
+        self.id.as_deref().ok_or_else(|| {
+            TestError(format!(
+                "the connection was not accepted: HTTP {} {}",
+                self.response.status,
+                String::from_utf8_lossy(&self.response.body)
+            ))
+        })
+    }
+}
+
+/// A frame an actor sent on a connection, as [`TestHost::frames_sent`]
+/// returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentFrame {
+    /// Its outgoing seq on the connection, from 0.
+    pub seq: u64,
+    /// `text`, `binary` or `event`.
+    pub kind: String,
+    /// The text or binary data, or the event's data.
+    pub body: Vec<u8>,
+    /// An event's `event` field.
+    pub event: Option<String>,
+    /// An event's `id` field.
+    pub id: Option<String>,
+}
+
+impl SentFrame {
+    /// The data as UTF-8 text.
+    pub fn text(&self) -> Result<&str> {
+        std::str::from_utf8(&self.body).map_err(|e| fail("the frame", e))
+    }
+
+    /// The data parsed as JSON.
+    pub fn json<T: DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_slice(&self.body).map_err(|e| fail("the frame", e))
+    }
+}
+
+/// What an actor sent on a connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FramesSent {
+    /// The frames since the last clear, oldest first.
+    pub frames: Vec<SentFrame>,
+    /// The close the connection got, from its actor or from the host: its
+    /// code and reason.
+    pub closed: Option<(u16, String)>,
+}
+
+/// A frame from the client: text from a `&str`, binary from bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientFrame<'a> {
+    /// A text frame.
+    Text(&'a str),
+    /// A binary frame.
+    Binary(&'a [u8]),
+}
+
+impl<'a> From<&'a str> for ClientFrame<'a> {
+    fn from(text: &'a str) -> Self {
+        ClientFrame::Text(text)
+    }
+}
+
+impl<'a> From<&'a String> for ClientFrame<'a> {
+    fn from(text: &'a String) -> Self {
+        ClientFrame::Text(text)
+    }
+}
+
+impl<'a> From<&'a [u8]> for ClientFrame<'a> {
+    fn from(bytes: &'a [u8]) -> Self {
+        ClientFrame::Binary(bytes)
+    }
+}
+
+impl<'a> From<&'a Vec<u8>> for ClientFrame<'a> {
+    fn from(bytes: &'a Vec<u8>) -> Self {
+        ClientFrame::Binary(bytes)
+    }
+}
+
+/// How [`TestHost::close_connection`] ends a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Close {
+    /// The client's close frame, with its code and reason.
+    Client(u16, String),
+    /// The client goes away without a close frame: the actor sees 1006.
+    Gone,
+    /// The host closes it for a cause: `restart`, `ping-timeout`,
+    /// `too-large`, `slow-consumer`, `protocol`, `operator` or
+    /// `unavailable`.
+    Host(String),
+}
+
+impl Close {
+    /// The client's normal close: 1000 without a reason.
+    pub fn normal() -> Close {
+        Close::Client(1000, String::new())
+    }
+
+    fn request(&self, connection: &str) -> Value {
+        match self {
+            Close::Client(code, reason) => {
+                json!({ "op": "close-connection", "connection": connection, "initiator": "client", "code": code, "reason": reason })
+            }
+            Close::Gone => {
+                json!({ "op": "close-connection", "connection": connection, "initiator": "client", "code": 1006 })
+            }
+            Close::Host(cause) => {
+                json!({ "op": "close-connection", "connection": connection, "initiator": "host", "cause": cause })
+            }
+        }
+    }
+}
+
+/// The frames and the close of a `frames-sent` answer.
+fn frames_of(answer: &Value) -> Result<FramesSent> {
+    let none = Vec::new();
+    let frames = answer["frames"]
+        .as_array()
+        .unwrap_or(&none)
+        .iter()
+        .map(|f| {
+            Ok(SentFrame {
+                seq: f["seq"].as_u64().unwrap_or(0),
+                kind: f["kind"].as_str().unwrap_or("").to_string(),
+                body: get_body(f)?,
+                event: f["event"].as_str().map(str::to_string),
+                id: f["id"].as_str().map(str::to_string),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let closed = answer["closed"].as_object().map(|c| {
+        (
+            c.get("code").and_then(Value::as_u64).unwrap_or(0) as u16,
+            c.get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        )
+    });
+    Ok(FramesSent { frames, closed })
 }
 
 /// An outgoing request an actor made, as the target would have received it
@@ -294,6 +467,65 @@ impl TestHost {
             body: get_body(&answer)?,
             turn: answer["turn"].as_str().map(str::to_string),
         })
+    }
+
+    /// Opens a WebSocket at `path` through the gateway, as a client would.
+    /// The open turn has run when it returns: [`TestConnection::accepted`]
+    /// tells whether the actor accepted, and [`TestHost::frames_sent`] has
+    /// what its open turn sent.
+    pub fn open_connection(&mut self, path: &str) -> Result<TestConnection> {
+        self.open_connection_with(path, "websocket", &[])
+    }
+
+    /// Opens a connection with a protocol (`websocket` or `sse`) and
+    /// headers.
+    pub fn open_connection_with(
+        &mut self,
+        path: &str,
+        protocol: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<TestConnection> {
+        let answer = self.call(json!({ "op": "open-connection", "path": path, "protocol": protocol, "headers": headers }))?;
+        Ok(TestConnection {
+            id: answer["connection"].as_str().map(str::to_string),
+            response: Response {
+                status: answer["status"].as_u64().unwrap_or(0) as u16,
+                headers: pairs(&answer["headers"]),
+                body: get_body(&answer)?,
+                turn: answer["turn"].as_str().map(str::to_string),
+            },
+        })
+    }
+
+    /// A frame from the client: a text frame from a `&str`, a binary frame
+    /// from bytes. Returns once its turn, and what that started, have
+    /// finished.
+    pub fn send_frame<'a>(
+        &mut self,
+        conn: &TestConnection,
+        frame: impl Into<ClientFrame<'a>>,
+    ) -> Result<()> {
+        let mut request = json!({ "op": "send-frame", "connection": conn.accepted_id()? });
+        match frame.into() {
+            ClientFrame::Text(text) => request["body"] = json!(text),
+            ClientFrame::Binary(bytes) => request["body_base64"] = json!(base64_encode(bytes)),
+        }
+        self.call(request).map(drop)
+    }
+
+    /// Ends a connection as `close` says. Returns once the close turn, and
+    /// what that started, have finished.
+    pub fn close_connection(&mut self, conn: &TestConnection, close: Close) -> Result<()> {
+        self.call(close.request(conn.accepted_id()?)).map(drop)
+    }
+
+    /// What the actor sent on a connection since the last `clear`, and the
+    /// close it got; `clear` forgets the frames returned.
+    pub fn frames_sent(&mut self, conn: &TestConnection, clear: bool) -> Result<FramesSent> {
+        let answer = self.call(
+            json!({ "op": "frames-sent", "connection": conn.accepted_id()?, "clear": clear }),
+        )?;
+        frames_of(&answer)
     }
 
     /// Sends the message `name` to `actor` (`"kind/key"`) as the operator
@@ -510,6 +742,55 @@ fn base64_decode(text: &str) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+
+    #[test]
+    fn frames_sent_answers_parse() {
+        let answer = json!({
+            "ok": true,
+            "frames": [
+                { "seq": 0, "kind": "text", "body": "{\"type\":\"welcome\"}" },
+                { "seq": 1, "kind": "binary", "body_base64": "/wA=" },
+                { "seq": 2, "kind": "event", "body": "x", "event": "message", "id": "7" }
+            ],
+            "closed": { "code": 1000, "reason": "bye" }
+        });
+        let sent = frames_of(&answer).unwrap();
+        assert_eq!(sent.frames.len(), 3);
+        assert_eq!(sent.frames[0].json::<Value>().unwrap()["type"], "welcome");
+        assert_eq!(sent.frames[1].body, [0xff, 0]);
+        assert_eq!(sent.frames[2].event.as_deref(), Some("message"));
+        assert_eq!(sent.frames[2].id.as_deref(), Some("7"));
+        assert_eq!(sent.closed, Some((1000, "bye".to_string())));
+        let empty = frames_of(&json!({ "ok": true, "frames": [], "closed": null })).unwrap();
+        assert_eq!(empty, FramesSent::default());
+    }
+
+    #[test]
+    fn closes_become_requests() {
+        let c = "c-0123456789abcdef0123456789abcdef";
+        assert_eq!(Close::normal().request(c)["code"], 1000);
+        assert_eq!(Close::Gone.request(c)["code"], 1006);
+        let host = Close::Host("restart".into()).request(c);
+        assert_eq!(host["initiator"], "host");
+        assert_eq!(host["cause"], "restart");
+        assert!(host.get("code").is_none());
+        let refused = TestConnection {
+            id: None,
+            response: Response {
+                status: 403,
+                headers: Vec::new(),
+                body: b"no".to_vec(),
+                turn: None,
+            },
+        };
+        assert!(!refused.accepted());
+        assert!(refused.accepted_id().unwrap_err().0.contains("HTTP 403 no"));
+    }
 }
 
 #[cfg(test)]
