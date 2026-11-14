@@ -389,3 +389,112 @@ fn a_forks_read_of_an_erased_blob_is_unverifiable() {
     assert_eq!(summary["divergent_turns"], 0, "{diff:#}");
     assert!(summary["unverifiable"].as_u64().unwrap() >= 1, "{diff:#}");
 }
+
+/// M25 §6.4: a preview of code that reads blobs takes uploads into its
+/// fork's blob space and streams its blob answers from there, through the
+/// gateway's prefix path (sandboxed).
+#[test]
+fn a_preview_takes_uploads_and_streams_blob_answers_in_its_space() {
+    use kronik_gateway::{Gateway, GatewayConfig, HttpRequest, PREVIEW_PREFIX};
+    let dir = tempdir();
+    let p = blob_node(dir.path());
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "media".into(),
+            fuel: Some(2_000_000_000),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    ingress(&p, http("info", "", inline(b"x")));
+    p.settle();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    let (proposal, _) =
+        p.rt.block_on(props.propose(
+            kronik_fork::proposal::ProposeRequest {
+                // The same code with a custom section added: another
+                // component, as a proposal needs, that runs the same.
+                wasm: vec![{
+                    let mut v2 = std::fs::read(guest("media")).unwrap();
+                    v2.extend_from_slice(&[0x00, 0x07, 0x04, b't', b'e', b's', b't', b'v', b'2']);
+                    v2
+                }],
+                names: Vec::new(),
+                window_ms: None,
+                at: None,
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
+        .unwrap();
+    let (preview, _) =
+        p.rt.block_on(props.create_preview(&proposal.id, None, false, audit(), false, p.owner()))
+            .unwrap();
+    let gw = Gateway::new(p.node.clone(), GatewayConfig::default()).with_preview(props.clone());
+    let request = |op: &str, query: &str, body: Vec<u8>| HttpRequest {
+        method: "POST".into(),
+        path: format!("{PREVIEW_PREFIX}{}/media/a/{op}", preview.id),
+        query: query.into(),
+        headers: Vec::new(),
+        body,
+        peer: None,
+    };
+    let objects = |root: std::path::PathBuf| -> usize {
+        fn walk(dir: &std::path::Path) -> usize {
+            std::fs::read_dir(dir).map_or(0, |entries| {
+                entries
+                    .flatten()
+                    .map(|e| {
+                        if e.path().is_dir() {
+                            walk(&e.path())
+                        } else {
+                            1
+                        }
+                    })
+                    .sum()
+            })
+        }
+        walk(&root.join("objects"))
+    };
+    let main_before = objects(dir.path().join("blobs"));
+    let upload: Vec<u8> = (0..2_000_000u64).map(|i| (i % 249) as u8).collect();
+    let r =
+        p.rt.block_on(gw.handle(request("info", "", upload.clone())));
+    assert_eq!(
+        String::from_utf8_lossy(&r.body),
+        format!(
+            "blob b3:{} {}",
+            blake3::hash(&upload).to_hex(),
+            upload.len()
+        ),
+    );
+    let space = dir.path().join("branches").join(&preview.id).join("blobs");
+    assert_eq!(
+        objects(space.clone()),
+        1,
+        "the upload is in the preview's space"
+    );
+    assert_eq!(
+        objects(dir.path().join("blobs")),
+        main_before,
+        "not in main's"
+    );
+    let size = 1_500_000u64;
+    let r =
+        p.rt.block_on(gw.handle(request("write", &format!("size={size}"), Vec::new())));
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, (0..size).map(pattern).collect::<Vec<u8>>());
+    assert!(
+        r.headers
+            .iter()
+            .any(|(n, v)| n == "content-security-policy" && v == "sandbox"),
+        "{:?}",
+        r.headers
+    );
+}

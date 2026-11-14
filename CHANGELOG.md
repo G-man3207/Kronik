@@ -241,7 +241,9 @@ until the v1.0 compatibility promise takes effect.
   request still running or answered is only hashed. A blob response is
   streamed from the store with its length, one frame at a time; an erased
   subject's is 410 `SUBJECT_ERASED`, a missing one 500 `BLOB_MISSING`.
-  Other kinds read bodies as before.
+  Other kinds read bodies as before. A preview of code that imports `blobs`
+  writes uploads to its fork's blob space and streams its blob answers from
+  there.
 - Idempotency-Key request hashes are version 4 (M25): the body counts as
   its BLAKE3 digest, so a large body read as a stream and a small one held
   in memory hash alike. Responses saved under version 3 are still replayed

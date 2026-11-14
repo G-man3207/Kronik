@@ -56,6 +56,13 @@ pub trait PreviewRouter: Send + Sync {
         subject: Option<String>,
         authority: kronik_core::authority::AuthLease,
     ) -> BoxFuture<'static, Result<TurnResult, ApiError>>;
+    /// How the gateway reads a request body for `kind` in preview `id` (M25
+    /// §6.4), as the node does for main's code: a body above the threshold
+    /// of a kind whose preview code reads blobs is written to the preview
+    /// fork's blob space. Inline by default.
+    fn body_policy(&self, _id: &str, _kind: &str) -> BodyPolicy {
+        BodyPolicy::Inline
+    }
 }
 
 /// Gateway settings.
@@ -373,12 +380,9 @@ const PREFIX_HEADERS: &[&str] = &[
 /// keeps only [`PREFIX_HEADERS`], and its page runs sandboxed (an opaque
 /// origin), so its scripts can neither read main's cookies nor call main
 /// with them.
-fn sandboxed(mut resp: HttpResponse) -> HttpResponse {
-    resp.headers
-        .retain(|(n, _)| PREFIX_HEADERS.iter().any(|h| n.eq_ignore_ascii_case(h)));
-    resp.headers
-        .push(("content-security-policy".into(), "sandbox".into()));
-    resp
+fn sandbox(headers: &mut Vec<(String, String)>) {
+    headers.retain(|(n, _)| PREFIX_HEADERS.iter().any(|h| n.eq_ignore_ascii_case(h)));
+    headers.push(("content-security-policy".into(), "sandbox".into()));
 }
 
 /// A route match: kind, the route's method, pattern and parameters in
@@ -947,11 +951,9 @@ impl Gateway {
         if let Some(router) = &self.preview
             && let Some((id, path)) = preview_target(&req, self.cfg.preview_domain.as_deref())
         {
-            req.body = self.read_inline(body).await?;
-            return Ok(self
-                .serve_preview(router.clone(), id, path, req)
-                .await?
-                .into());
+            return self
+                .serve_preview(router.clone(), id, path, req, body)
+                .await;
         }
         if is_websocket_upgrade(&req) {
             return Err(ApiError::new(
@@ -978,8 +980,9 @@ impl Gateway {
                 upload_bytes,
             } => {
                 let who = self.identify(&req, &m)?;
+                let main = kronik_blob::Space::Main;
                 match self
-                    .read_for_blobs(&req, &who, body, threshold, upload_bytes)
+                    .read_for_blobs(&req, &who, body, threshold, upload_bytes, &main)
                     .await?
                 {
                     ReadBody::Inline(bytes) => {
@@ -1006,8 +1009,9 @@ impl Gateway {
             upload,
             body_withheld,
         };
+        let main = kronik_blob::Space::Main;
         let (waiter, joined) = match self.node.ingress_with(actor, http, subject, extras)? {
-            Ingress::Done(r) => return Ok(self.turn_answer(&r).await),
+            Ingress::Done(r) => return Ok(self.turn_answer(&r, &main).await),
             Ingress::Started(w) => (w, false),
             Ingress::Joined(w) => (w, true),
         };
@@ -1017,7 +1021,7 @@ impl Gateway {
             .timeout(self.cfg.timeout, waiter.wait())
             .await
         {
-            Ok(r) => Ok(self.turn_answer(&r?).await),
+            Ok(r) => Ok(self.turn_answer(&r?, &main).await),
             Err(_) if joined => Err(ApiError::new(
                 ErrorCode::IdempotencyInFlight,
                 "the original request with this Idempotency-Key is still running",
@@ -1089,6 +1093,7 @@ impl Gateway {
     /// as it arrives, up to `upload_bytes`, with no more than a frame of it
     /// in memory; the retry of a request running or answered is only
     /// hashed. Each chunk must arrive within `[gateway] body_idle_timeout`.
+    /// The blob goes to `space`: main's, or a preview's (§6.4).
     async fn read_for_blobs(
         &self,
         req: &HttpRequest,
@@ -1096,6 +1101,7 @@ impl Gateway {
         body: RequestBody,
         threshold: u64,
         upload_bytes: u64,
+        space: &kronik_blob::Space,
     ) -> Result<ReadBody, ApiError> {
         let kind = who.actor.kind.as_str();
         let too_large = |size: String| {
@@ -1179,7 +1185,7 @@ impl Gateway {
             ),
         };
         let mut writer = store
-            .writer(kronik_blob::Space::Main, keys, upload_bytes, lease.clone())
+            .writer(space.clone(), keys, upload_bytes, lease.clone())
             .await
             .map_err(stored)?;
         let mut digest = blake3::Hasher::new();
@@ -1193,7 +1199,7 @@ impl Gateway {
         let meta = writer.finish().await.map_err(stored)?;
         // Durable before the input that references it exists.
         store
-            .ensure_durable(&kronik_blob::Space::Main, &[meta.id])
+            .ensure_durable(space, &[meta.id])
             .await
             .map_err(stored)?;
         kronik_metrics::add(
@@ -1211,8 +1217,8 @@ impl Gateway {
     /// The answer for a finished turn: [`turn_response`], with a blob body
     /// streamed from the store (M25 §6.5). An erased blob is 410
     /// SUBJECT_ERASED, a missing one 500 BLOB_MISSING, both with the turn
-    /// id.
-    async fn turn_answer(&self, r: &TurnResult) -> Answer {
+    /// id. A preview's blobs are in its fork's space (§6.4).
+    async fn turn_answer(&self, r: &TurnResult, space: &kronik_blob::Space) -> Answer {
         let resp = turn_response(r);
         let blob = match &r.outcome.output {
             Some(pb::outcome::Output::Http(h)) if r.committed() => {
@@ -1226,7 +1232,7 @@ impl Gateway {
         let Some(blob) = blob.filter(|_| (200..=599).contains(&resp.status)) else {
             return resp.into();
         };
-        match self.open_blob(blob).await {
+        match self.open_blob(blob, space).await {
             Ok(body) => Answer {
                 status: resp.status,
                 headers: resp.headers,
@@ -1241,8 +1247,13 @@ impl Gateway {
         }
     }
 
-    /// Opens a response blob in main's space under a streaming lease.
-    async fn open_blob(&self, blob: &pb::BlobRef) -> Result<BlobBody, ApiError> {
+    /// Opens a response blob in `space` (which also finds main's blobs)
+    /// under a streaming lease.
+    async fn open_blob(
+        &self,
+        blob: &pb::BlobRef,
+        space: &kronik_blob::Space,
+    ) -> Result<BlobBody, ApiError> {
         let missing = |why: String| ApiError::new(ErrorCode::BlobMissing, why);
         let store = self.node.blob_store().ok_or_else(|| {
             missing("the response is a blob and the node has no blob store".into())
@@ -1252,7 +1263,7 @@ impl Gateway {
         lease.add(meta.id);
         let access = self.node.sealer().blob_key_access();
         let reader = store
-            .reader(&kronik_blob::Space::Main, &meta, &access)
+            .reader(space, &meta, &access)
             .await
             .map_err(|e| match e {
                 kronik_blob::BlobError::Erased => ApiError::new(
@@ -1527,7 +1538,8 @@ impl Gateway {
         id: String,
         path: String,
         mut req: HttpRequest,
-    ) -> Result<HttpResponse, ApiError> {
+        body: RequestBody,
+    ) -> Result<Answer, ApiError> {
         // New input, refused like main's on a fatal node or a full disk.
         self.node.check_running()?;
         // This public host request starts a new native operation. The factory
@@ -1549,12 +1561,50 @@ impl Gateway {
         if m.method == "SSE" {
             return Err(previews_take_none());
         }
+        // A preview's uploads and blob answers are in its fork's space.
+        let space = kronik_blob::Space::Fork(id.clone());
+        let (input_body, upload) = match router.body_policy(&id, &m.kind) {
+            BodyPolicy::Inline => {
+                req.body = self.read_inline(body).await?;
+                (InputBody::Inline, None)
+            }
+            BodyPolicy::Blobs {
+                threshold,
+                upload_bytes,
+            } => {
+                strip_admin_cookies(&mut req.headers);
+                let mut who = self.identify(&req, &m)?;
+                // Previews keep no idempotency keys: nothing to peek at, and
+                // a body is never only hashed.
+                who.idempotency_key.clear();
+                match self
+                    .read_for_blobs(&req, &who, body, threshold, upload_bytes, &space)
+                    .await?
+                {
+                    ReadBody::Spooled {
+                        blob,
+                        digest,
+                        lease,
+                    } => (InputBody::Blob { blob, digest }, Some(lease)),
+                    ReadBody::Inline(bytes) => {
+                        req.body = bytes;
+                        (InputBody::Inline, None)
+                    }
+                    ReadBody::Hashed(_) => {
+                        return Err(ApiError::new(
+                            ErrorCode::Internal,
+                            "a preview request's body was only hashed",
+                        ));
+                    }
+                }
+            }
+        };
         let Admitted {
             actor,
             mut http,
             subject,
             ..
-        } = self.input(req, m, InputBody::Inline)?;
+        } = self.input(req, m, input_body)?;
         http.idempotency_key.clear();
         http.request_hash.clear();
         // On main's origin the browser sends main's credentials (N2): the
@@ -1567,18 +1617,18 @@ impl Gateway {
             });
         }
         let turn = router.send(id, actor, http, subject, authority);
-        let resp = match self.node.env().timeout(self.cfg.timeout, turn).await {
-            Ok(r) => turn_response(&r?),
+        let mut answer = match self.node.env().timeout(self.cfg.timeout, turn).await {
+            Ok(r) => self.turn_answer(&r?, &space).await,
             Err(_) => return Err(self.timed_out()),
         };
-        Ok(match self.cfg.preview_domain {
-            None => sandboxed(resp),
-            Some(_) => resp,
-        })
+        // The upload's blob is the input's now; the turn's result is in.
+        drop(upload);
+        if self.cfg.preview_domain.is_none() {
+            sandbox(&mut answer.headers);
+        }
+        Ok(answer)
     }
 
-    /// The root input of a matched request: its actor, the HTTP input and
-    /// its subject.
     /// Who a request is for and from (M25 §6.2: known before its body is
     /// read): its actor, its idempotency key and its subject.
     fn identify(&self, req: &HttpRequest, m: &Matched) -> Result<Identity, ApiError> {
@@ -1639,6 +1689,8 @@ impl Gateway {
         })
     }
 
+    /// The root input of a matched request: its actor, the HTTP input and
+    /// its subject, with its body as the body phase read it.
     fn input(
         &self,
         mut req: HttpRequest,
@@ -1787,17 +1839,14 @@ mod tests {
     /// carries the sandbox policy.
     #[test]
     fn a_prefix_response_sets_no_cookie_and_is_sandboxed() {
-        let r = sandboxed(HttpResponse {
-            status: 200,
-            headers: vec![
-                ("Set-Cookie".into(), "s=1".into()),
-                ("set-cookie".into(), "t=2".into()),
-                ("content-type".into(), "text/html".into()),
-            ],
-            body: Vec::new(),
-        });
+        let mut headers = vec![
+            ("Set-Cookie".into(), "s=1".into()),
+            ("set-cookie".into(), "t=2".into()),
+            ("content-type".into(), "text/html".into()),
+        ];
+        sandbox(&mut headers);
         assert_eq!(
-            r.headers,
+            headers,
             [
                 ("content-type".to_owned(), "text/html".to_owned()),
                 ("content-security-policy".to_owned(), "sandbox".to_owned()),

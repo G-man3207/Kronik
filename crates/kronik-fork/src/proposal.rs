@@ -439,7 +439,7 @@ impl Proposals {
             .map(|e| {
                 (
                     e.meta.id.clone(),
-                    preview::Served::new(e.meta.clone(), None),
+                    preview::Served::new(e.meta.clone(), None, BTreeMap::new()),
                 )
             })
             .collect();

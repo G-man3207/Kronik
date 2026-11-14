@@ -15,6 +15,7 @@
 //! Creation/deletion retain the original request authority through intent
 //! admission and failure auditing; daemon-driven expiry needs no user authority.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,11 +79,18 @@ pub struct PreviewRoute {
 pub(super) struct Served {
     expires_ms: u64,
     routes: Vec<RouteEntry>,
+    /// How the gateway reads bodies for each kind of the preview's code
+    /// (M25 §6.4); a kind not here is read inline.
+    policies: BTreeMap<String, kronik_sched::BodyPolicy>,
     state: tokio::sync::Mutex<Entry>,
 }
 
 impl Served {
-    pub(super) fn new(meta: Proposal, live: Option<Live>) -> Arc<Served> {
+    pub(super) fn new(
+        meta: Proposal,
+        live: Option<Live>,
+        policies: BTreeMap<String, kronik_sched::BodyPolicy>,
+    ) -> Arc<Served> {
         let (expires_ms, routes) = meta.preview.as_ref().map_or((0, Vec::new()), |p| {
             let routes = p
                 .routes
@@ -98,6 +106,7 @@ impl Served {
         Arc::new(Served {
             expires_ms,
             routes,
+            policies,
             state: tokio::sync::Mutex::new(Entry { meta, live }),
         })
     }
@@ -222,6 +231,33 @@ impl Proposals {
     }
 
     /// A preview that has not expired.
+    /// The body policy of each kind of a preview's code (M25 §6.4): blobs
+    /// above the kind's threshold when its code reads blobs and the node has
+    /// a blob store, with the limits the preview runs with.
+    fn body_policies(&self, live: &Live) -> BTreeMap<String, kronik_sched::BodyPolicy> {
+        if self.node.blob_store().is_none() {
+            return BTreeMap::new();
+        }
+        let config = live
+            .continuous
+            .as_ref()
+            .map_or_else(|| self.node.config_now(), |c| c.setup().config.clone());
+        live.kinds
+            .iter()
+            .filter(|(_, kind)| kind.program.reads_blobs())
+            .map(|(name, _)| {
+                let limits = config.limits(name);
+                (
+                    name.clone(),
+                    kronik_sched::BodyPolicy::Blobs {
+                        threshold: limits.blob_threshold(),
+                        upload_bytes: limits.upload_bytes,
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn served(&self, id: &str) -> Result<Arc<Served>, ApiError> {
         let now = self.now();
         lock(&self.previews)
@@ -381,7 +417,8 @@ impl Proposals {
                         live: None,
                     },
                 );
-                let served = Served::new(meta, Some(live));
+                let policies = self.body_policies(&live);
+                let served = Served::new(meta, Some(live), policies);
                 lock(&self.previews).insert(id.clone(), served.clone());
                 served
             };
@@ -679,6 +716,13 @@ impl kronik_gateway::PreviewRouter for Proposals {
     fn routes(&self, id: &str) -> BoxFuture<'_, Result<Vec<RouteEntry>, ApiError>> {
         let routes = self.served(id).map(|s| s.routes.clone());
         Box::pin(std::future::ready(routes))
+    }
+
+    fn body_policy(&self, id: &str, kind: &str) -> kronik_sched::BodyPolicy {
+        self.served(id)
+            .ok()
+            .and_then(|s| s.policies.get(kind).copied())
+            .unwrap_or(kronik_sched::BodyPolicy::Inline)
     }
 
     fn send(
