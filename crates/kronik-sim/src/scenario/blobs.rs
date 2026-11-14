@@ -72,6 +72,10 @@ pub enum BlobMutation {
     SweepIgnoresTouches,
     /// An erasure deletes none of its subject's blob files (E1).
     ErasureKeepsFiles,
+    /// The collector's roots leave out what timers keep: a timer's blob is
+    /// deleted before the timer fires (the node's
+    /// `mutation_sweep_ignores_timers`; with a floor lag and edges).
+    SweepIgnoresTimers,
 }
 
 impl BlobMutation {
@@ -81,6 +85,7 @@ impl BlobMutation {
             "blob-sweep-ignores-leases" => Some(BlobMutation::SweepIgnoresLeases),
             "blob-sweep-ignores-touches" => Some(BlobMutation::SweepIgnoresTouches),
             "blob-erasure-keeps-files" => Some(BlobMutation::ErasureKeepsFiles),
+            "blob-sweep-ignores-timers" => Some(BlobMutation::SweepIgnoresTimers),
             _ => None,
         }
     }
@@ -114,6 +119,16 @@ pub struct BlobWorkload {
     pub privacy_on: bool,
     /// How many of the subjects are erased while the clients run.
     pub erasures: u32,
+    /// Actors `e<n>` that pass blobs along (M26 §3): put, send to another
+    /// that retains, release, schedule a timer that reads, call one that
+    /// replies with it; 0 runs none.
+    pub edges: u32,
+    /// The collector's floor this many records behind the applied one, as
+    /// if compaction had kept no more (the node's `gc_floor_lag`): records
+    /// below it keep nothing, and what holds, queued messages, timers and
+    /// saved answers keep is all that stays. `None`: the floor stays at the
+    /// log's first record, as nothing compacts the simulated log.
+    pub floor_lag: Option<u64>,
     pub mutation: Option<BlobMutation>,
     pub faults: ServiceFaults,
 }
@@ -186,6 +201,12 @@ impl BlobWorkload {
         } else {
             0
         };
+        let edges = if r.chance(0.6) {
+            2 + r.below(2) as u32
+        } else {
+            0
+        };
+        let floor_lag = r.chance(0.5).then(|| 10 + r.below(150));
         BlobWorkload {
             threshold,
             sizes,
@@ -198,12 +219,24 @@ impl BlobWorkload {
             subjects,
             privacy_on,
             erasures,
+            edges,
+            floor_lag,
             mutation: None,
             faults: ServiceFaults {
                 connect_fail: [0.0, 0.05][r.below(2) as usize],
                 lose_response: [0.0, 0.05][r.below(2) as usize],
                 cut_body: [0.0, 0.05][r.below(2) as usize],
             },
+        }
+    }
+
+    /// Sets the deliberate bug of the run. The timer mutation needs a floor
+    /// that moves and timers that carry blobs: it gets both.
+    pub fn set_mutation(&mut self, mutation: Option<BlobMutation>) {
+        self.mutation = mutation;
+        if mutation == Some(BlobMutation::SweepIgnoresTimers) {
+            self.edges = self.edges.max(2);
+            self.floor_lag = Some(10);
         }
     }
 
@@ -231,7 +264,8 @@ impl BlobWorkload {
             disk_reserve: RESERVE,
             lease_ttl: Duration::from_secs(30),
             gc_interval: Duration::from_secs(1),
-            ..BlobsConfig::default()
+            gc_floor_lag: self.floor_lag,
+            mutation_sweep_ignores_timers: self.mutation == Some(BlobMutation::SweepIgnoresTimers),
         }
     }
 }
@@ -261,6 +295,18 @@ enum Op {
     /// Store `text` as the reference, in a turn without a subject: a copy
     /// of a subject's reference that the subject's erasure does not delete.
     RememberText { text: String },
+    /// Release the stored reference: `released`, or why not.
+    Release,
+    /// Send `media/<to>` a message `retain` with the stored reference's
+    /// blob: the receiver holds it then. `sent`.
+    Send { to: String },
+    /// A timer in `delay` ms whose message `sum` carries the stored
+    /// reference's blob: the timer's turn reads it whole. `scheduled`.
+    Schedule { delay: u64 },
+    /// Call `media/<to>` with the stored reference's blob; it replies with
+    /// it, and the caller retains the reply's blob: `reply blob <hash>
+    /// <size> retained`.
+    Call { to: String },
 }
 
 /// Which actors a request goes to (M26 §9, the erasure part).
@@ -274,6 +320,8 @@ enum Group {
     Strict(u32),
     /// `r<i>`: subject `i`'s actor whose writes may run across its erasure.
     Racy(u32),
+    /// `e<n>`: actors that pass blobs without a subject along (M26 §3).
+    Edge,
 }
 
 fn subject_name(i: u32) -> String {
@@ -299,6 +347,10 @@ impl Op {
             Op::Put { size } => ("put", format!("size={size}"), None),
             Op::HeldSum => ("held-sum", String::new(), None),
             Op::RememberText { text } => ("remember-text", String::new(), Some(text.clone())),
+            Op::Release => ("release", String::new(), None),
+            Op::Send { to } => ("send", format!("to={to}&op=retain&with=ref"), None),
+            Op::Schedule { delay } => ("schedule", format!("delay={delay}&op=sum"), None),
+            Op::Call { to } => ("call", format!("to={to}&op=reply&keep=1"), None),
         };
         pb::HttpInput {
             method: "POST".into(),
@@ -402,6 +454,8 @@ pub(super) struct BlobState {
     sweeps: u64,
     /// Full-store windows so far.
     full: u32,
+    /// Files the workload's passes deleted.
+    deleted: u64,
     /// Subjects whose erasure has begun: their strict actors write no more.
     erasing: BTreeSet<u32>,
     /// Subjects whose erasure is done (its call returned, or a start
@@ -506,13 +560,31 @@ impl World {
     /// read of a held reference that is not there or whose subject was
     /// erased.
     pub(super) fn expected_blob_failure(&self, turn: &pb::TurnRecord) -> bool {
-        let Some(pb::input::Kind::Http(h)) = turn.input.as_ref().and_then(|i| i.kind.as_ref())
-        else {
-            return false;
-        };
         let message = turn.outcome.as_ref().map_or("", |o| o.message.as_str());
+        let code = turn.outcome.as_ref().map_or("", |o| o.error_code.as_str());
+        let h = match turn.input.as_ref().and_then(|i| i.kind.as_ref()) {
+            Some(pb::input::Kind::Http(h)) => h,
+            // The callee of an edge actor's call that carried no blob (the
+            // caller had none yet) replies with its own reference: it may
+            // have none, or not hold it any more.
+            Some(pb::input::Kind::Message(m)) => {
+                return self.blobs().is_some()
+                    && m.source == pb::MessageSource::Call as i32
+                    && m.msg.as_ref().is_some_and(|msg| msg.name == "reply")
+                    && (message == "no ref" || code == "BLOB_NOT_HELD");
+            }
+            _ => return false,
+        };
+        let edge_request = h.path.starts_with(&format!("/{KIND}/e"))
+            && ["/held-sum", "/release", "/send", "/schedule", "/call"]
+                .iter()
+                .any(|op| h.path.ends_with(op));
         self.blobs().is_some()
-            && (h.path.ends_with("/fail-after-write")
+            && ((edge_request
+                && (message == "no ref"
+                    || message == "get: not-held"
+                    || code == "BLOB_NOT_HELD"))
+                || h.path.ends_with("/fail-after-write")
                 || (h.path.ends_with("/held-sum")
                     && (message == "no ref" || message == "get: erased"))
                 // A write of a subject's blob in a turn that ran across the
@@ -553,6 +625,35 @@ impl World {
     /// strict write is counted in flight here, in the same step as the check
     /// that its subject's erasure has not begun.
     fn draw_request(&self) -> (String, Op, Group) {
+        let edges = self.blobs().map_or(0, |w| w.edges);
+        if edges > 0 && self.work.below(100) < 35 {
+            let me = self.work.below(u64::from(edges));
+            // Another edge actor.
+            let peer = (me + 1 + self.work.below(u64::from(edges) - 1)) % u64::from(edges);
+            let to = format!("e{peer}");
+            // An edge actor's blobs are its own (sizes of their own, so no
+            // other write lands on them): what keeps one is what this
+            // workload makes keep it.
+            let own = || Op::Put {
+                size: 1 + self.work.below(70_000),
+            };
+            let op = match self.work.below(100) {
+                0..35 => own(),
+                35..50 => Op::Send { to },
+                50..62 => Op::Release,
+                62..80 => Op::Schedule {
+                    delay: self.work.below(1_500),
+                },
+                // Calls go to a higher actor only: two actors calling each
+                // other would wait for each other until the call times out.
+                80..90 if me + 1 < u64::from(edges) => Op::Call {
+                    to: format!("e{}", me + 1 + self.work.below(u64::from(edges) - me - 1)),
+                },
+                80..90 => own(),
+                _ => Op::HeldSum,
+            };
+            return (format!("e{me}"), op, Group::Edge);
+        }
         let subjects = self.blobs().map_or(0, |w| w.subjects);
         if subjects == 0 || self.work.below(100) < 40 {
             let key = format!("k{}", self.work.below(self.cfg.actors as u64));
@@ -678,7 +779,7 @@ impl World {
                 Err(e) => return self.violation(format!("actor: {e}")),
             };
             let subject = match (group, &op) {
-                (Group::Plain, _) | (_, Op::HeldSum) => None,
+                (Group::Plain | Group::Edge, _) | (_, Op::HeldSum) => None,
                 (Group::Strict(i) | Group::Racy(i), _) => Some(subject_name(i)),
             };
             // A read is held to E2 when its subject's erasure was done before
@@ -714,6 +815,18 @@ impl World {
                 && let Some(n) = self.st().blobs.inflight.get_mut(&i)
             {
                 *n = n.saturating_sub(1);
+            }
+            // Half the timers' senders let their blob go at once: until the
+            // timer fires, its pin is then all that keeps the blob once its
+            // record is below the floor (B16).
+            if let (Op::Schedule { .. }, Some("scheduled")) = (&op, text.as_deref())
+                && self.work.chance(0.5)
+            {
+                let idem = format!("{idem}-release");
+                if let Some(result) = self.request(&actor, &Op::Release, &idem, None).await {
+                    self.check_answer(&idem, &Op::Release, group, false, &result)
+                        .await;
+                }
             }
         }
         self.st().clients_done += 1;
@@ -761,6 +874,13 @@ impl World {
             {
                 e
             }
+            // An edge actor without a reference yet, or whose reference it
+            // released (by another client's request: the workload does not
+            // order them), cannot pass the blob on or read it.
+            (
+                Op::HeldSum | Op::Release | Op::Send { .. } | Op::Schedule { .. } | Op::Call { .. },
+                Err(e),
+            ) if group == Group::Edge && edge_refusal(&e) => e,
             (_, Ok(text)) => text,
             (_, Err(e)) => {
                 self.violation(format!("{idem} {op:?}: {e}"));
@@ -784,7 +904,7 @@ impl World {
             }
         }
         let subject = match group {
-            Group::Plain => None,
+            Group::Plain | Group::Edge => None,
             Group::Strict(i) | Group::Racy(i) => Some(i),
         };
         // A fetch the service failed or cut answers its error: nothing to
@@ -816,6 +936,16 @@ impl World {
             Op::OpenWriter => text == "left open",
             Op::FailAfterWrite => text.starts_with("TURN_FAILED"),
             Op::RememberText { .. } => text == "remembered",
+            _ if group == Group::Edge && edge_refusal(&text) => true,
+            Op::Release => text == "released" || text == "not-held",
+            Op::Send { .. } => text == "sent",
+            Op::Schedule { .. } => text == "scheduled",
+            // The callee replies with the blob it received; the caller keeps
+            // it. A call the callee could not answer says so.
+            Op::Call { .. } => {
+                text.starts_with("call error")
+                    || (text.starts_with("reply blob b3:") && text.ends_with(" retained"))
+            }
             Op::HeldSum => match text.split_once(' ') {
                 // The bytes of a blob the actor holds: never after its
                 // subject's erasure (E2).
@@ -1039,8 +1169,9 @@ impl World {
         loop {
             match node.pending_erasures().await {
                 Ok(0) => break,
-                // Bounded: the run ends, or the node with it, before long.
-                Ok(_) if waited < Duration::from_secs(5) => {}
+                // Bounded: the run ends, or the node with it, before long;
+                // a call across the erasure may wait for its callee.
+                Ok(_) if waited < Duration::from_secs(15) => {}
                 Ok(n) => {
                     return self.violation(format!(
                         "{when}: privacy status still reports {n} pending erasure(s) after \
@@ -1280,7 +1411,9 @@ impl World {
                         gc.report.objects + gc.report.deleted,
                         gc.report.candidates
                     ));
-                    self.st().blobs.sweeps += 1;
+                    let mut st = self.st();
+                    st.blobs.sweeps += 1;
+                    st.blobs.deleted += gc.report.deleted;
                 }
                 Ok(None) => self.violation("blob_gc: no blob store"),
                 Err(e) => self.event(format!("pass {pass}: {}", e.code)),
@@ -1302,32 +1435,44 @@ impl World {
         self.event("the disk has room again");
     }
 
-    /// B1/B2: every blob a committed record references, and every blob a
-    /// pin names, has its file and reads back with its digest.
+    /// B1/B2: every blob the state keeps (a hold, or a pin: a queued
+    /// message, a pending timer, a dead letter, a saved answer, an open
+    /// turn or effect) and every blob a committed record at or above the
+    /// collector's floor references has its file and reads back with its
+    /// digest; every pin is a record's; and the index's pins are what its
+    /// rows say (B16's verify: no drift).
     pub(super) async fn check_blob_refs(&self, node: &Node, when: &str) {
-        // The pins first, then the log up to what is applied after them: a
-        // pin is written with its record, which is then in what is read.
-        let pinned: Vec<String> = match node
-            .store()
-            .db()
-            .conn()
-            .prepare("SELECT DISTINCT hash FROM blob_pins ORDER BY hash")
-            .and_then(|mut st| {
-                st.query_map([], |r| r.get::<_, String>(0))
-                    .and_then(|rows| rows.collect())
-            }) {
+        // The state's roots first, then the log up to what is applied after
+        // them: a pin or a hold is written with its record, which is then in
+        // what is read.
+        let query = |sql: &str| -> Result<Vec<String>, String> {
+            node.store()
+                .db()
+                .conn()
+                .prepare(sql)
+                .and_then(|mut st| {
+                    st.query_map([], |r| r.get::<_, String>(0))
+                        .and_then(|rows| rows.collect())
+                })
+                .map_err(|e| e.to_string())
+        };
+        let pinned = match query("SELECT DISTINCT hash FROM blob_pins ORDER BY hash") {
             Ok(pinned) => pinned,
             Err(e) => return self.violation(format!("{when}: reading the pins: {e}")),
         };
+        let held = match query("SELECT DISTINCT hash FROM blob_refs ORDER BY hash") {
+            Ok(held) => held,
+            Err(e) => return self.violation(format!("{when}: reading the holds: {e}")),
+        };
+        let floor = node.blob_floor().unwrap_or(1);
         let applied = node.applied_lsn();
+        // Every reference: its blob, and the last record that references it.
         let mut referenced: BTreeMap<String, (pb::BlobRef, u64)> = BTreeMap::new();
         if let Err(e) = node
             .reader()
             .read(1, applied, |c| {
                 for blob in kronik_proto::blobs::refs(&c.record) {
-                    referenced
-                        .entry(blob.hash.clone())
-                        .or_insert_with(|| (blob.clone(), c.lsn));
+                    referenced.insert(blob.hash.clone(), (blob.clone(), c.lsn));
                 }
                 Ok(())
             })
@@ -1336,24 +1481,56 @@ impl World {
             return self.violation(format!("{when}: reading the log: {e}"));
         }
         let erasures = erased_versions(node);
+        let kept: BTreeSet<&String> = pinned.iter().chain(held.iter()).collect();
         for (hash, (blob, lsn)) in &referenced {
             // An erased subject's blob has no file (E1 checks that), and the
             // collector may have forgotten its row.
             if is_erased(&erasures, blob) {
                 continue;
             }
+            let state = kept.contains(hash);
+            // The last reference as the collector sees it: the index's.
+            let last = node
+                .store()
+                .db()
+                .blob(hash)
+                .ok()
+                .flatten()
+                .map_or(*lsn, |row| row.last_ref_lsn);
+            // Below the floor and kept by nothing: the collector may delete
+            // it (only with a floor lag does the floor move).
+            if !state && last < floor {
+                continue;
+            }
             if let Err(e) = self.read_blob(Some(node), blob).await {
+                // A pass may have moved the floor past it since.
+                if !state && last < node.blob_floor().unwrap_or(1) {
+                    continue;
+                }
+                let why = if state {
+                    "the state keeps it"
+                } else {
+                    "it is at or above the floor"
+                };
                 self.violation(format!(
-                    "{when}: the record at lsn {lsn} references {hash}, which is not whole: {e}"
+                    "{when}: the record at lsn {lsn} references {hash}, which is not whole \
+                     although {why} (floor {floor}): {e}"
                 ));
             }
         }
-        for hash in pinned {
-            if !referenced.contains_key(&hash) {
+        for hash in pinned.iter().chain(held.iter()) {
+            if !referenced.contains_key(hash) {
                 self.violation(format!(
-                    "{when}: a pin names {hash}, which no record references"
+                    "{when}: a pin or a hold names {hash}, which no record references"
                 ));
             }
+        }
+        match node.blob_pin_drift().await {
+            Ok(drift) if drift.is_empty() => {}
+            Ok(drift) => self.violation(format!(
+                "{when}: the index's pins are not what its rows say: {drift:?}"
+            )),
+            Err(e) => self.event(format!("{when}: no pin verify: {}", e.code)),
         }
     }
 
@@ -1367,7 +1544,12 @@ impl World {
         self.check_blob_refs(node, "the end").await;
         for _ in 0..2 {
             if let Err(e) = node.blob_gc(SweepOptions::default()).await {
-                return self.violation(format!("the last passes: {}", e.code));
+                return self.violation(format!(
+                    "the last passes: {} {} (fatal: {:?})",
+                    e.code,
+                    e.message,
+                    node.fatal()
+                ));
             }
         }
         self.check_erased_files(node, "the end").await;
@@ -1463,19 +1645,58 @@ impl World {
             .iter()
             .map(|p| format!("{:?}#{}", p.op, p.nth))
             .collect();
-        let (erased, reads) = {
+        let (erased, reads, deleted) = {
             let st = self.st();
-            (st.blobs.erased.len(), st.blobs.erased_reads)
+            (
+                st.blobs.erased.len(),
+                st.blobs.erased_reads,
+                st.blobs.deleted,
+            )
         };
+        let count = |sql: &str| -> i64 {
+            node.store()
+                .db()
+                .conn()
+                .query_row(sql, [], |r| r.get(0))
+                .unwrap_or(-1)
+        };
+        let holds = count("SELECT count(*) FROM blob_refs");
+        let pins = count("SELECT count(*) FROM blob_pins");
+        // Timer turns that read the blob their message carried.
+        let mut timer_reads = 0;
+        let _ = node
+            .reader()
+            .read(1, node.applied_lsn(), |c| {
+                if let kronik_proto::Record::TurnRecord(t) = &c.record
+                    && let Some(pb::input::Kind::Timer(timer)) =
+                        t.input.as_ref().and_then(|i| i.kind.as_ref())
+                    && timer.msg.as_ref().is_some_and(|m| !m.blobs.is_empty())
+                    && t.outcome.as_ref().map(|o| o.kind) == Some(pb::OutcomeKind::Committed as i32)
+                {
+                    timer_reads += 1;
+                }
+                Ok(())
+            })
+            .await;
         self.st().notes = format!(
-            " blobs={} files={} unrooted={left} passes={sweeps} full={full} erased={erased} \
+            " blobs={} files={} unrooted={left} passes={sweeps} deleted={deleted} full={full} \
+             floor={} holds={holds} pins={pins} timer-reads={timer_reads} erased={erased} \
              erased-reads={}/{} crash-points={crashed:?}",
             referenced.len(),
             objects.len(),
+            node.blob_floor().unwrap_or(0),
             reads.1,
             reads.0,
         );
     }
+}
+
+/// The refusals of an edge actor's request that the workload does not
+/// order out: no reference stored yet, or one it no longer holds.
+fn edge_refusal(answer: &str) -> bool {
+    answer == "TURN_FAILED no ref"
+        || answer == "TURN_FAILED get: not-held"
+        || answer.starts_with("BLOB_NOT_HELD")
 }
 
 /// The erased key versions by subject: a subject's blob keyed with one of

@@ -750,20 +750,46 @@ run again after the erasure deleted its saved response: E1 is what holds
 for it. B2 skips erased blobs, whose rows the collector may forget, and B3
 compares the index without its erased rows for the same reason.
 
+Holds and edges (B14) on 60 % of the seeds: two or three actors that pass
+blobs without a subject along, each blob its own (a size of its own, so no
+other write lands on it). An actor `put`s a blob, which it then holds;
+`send`s it to another actor in a message `retain`, after which the receiver
+holds it too; `release`s it; `schedule`s a timer whose message `sum` reads
+it, and lets it go at once half of the time, so that until the timer fires
+its pin is all that keeps the blob; `call`s a higher-numbered actor, which
+replies with the blob, and retains the reply's blob; or reads its reference
+back (`held-sum`). Refusals the workload cannot order out (no reference yet,
+one released meanwhile: `BLOB_NOT_HELD`) are answers, not violations; a
+timer's or a message's turn must commit. On half the seeds the collector's
+floor moves (the node's hidden `[blobs] gc_floor_lag`, 10 to 160 records
+behind the applied one, as if compaction kept no more): records below it
+keep nothing, and what the state keeps (holds, queued messages, timers,
+dead letters, saved answers, open turns and effects) is all that stays.
+Checked (B16) after every start, every workload pass and at the end: every
+blob a hold or a pin keeps, and every blob a record at or above the floor
+references, is whole; every pin and hold is a record's; and the index's
+pins are what its rows say (`blob_pin_drift`, the dry run's verify, is
+empty). B3 then compares the index above the floor and what the state
+keeps, without first LSNs: a row a pass forgot and a later record named
+again starts at that record, where a rebuild from the uncompacted log
+starts at the first.
+
 Checked: B1 and B2 (with the index's pins) after every start, every workload
 pass and at the end; B3 (the recovered `blobs` and `blob_pins` rows against a
 rebuild); B5 (every blob a guest answered or the service received has the
 bytes written); B6; E1 and E2; and the counter workload's exactly-once and
 logical-time checks. The mutations are `blob-skip-ensure-durable`,
 `blob-sweep-ignores-leases`, `blob-sweep-ignores-touches` and
-`blob-erasure-keeps-files` (`kronik_blob::StoreConfig`). A run's storage root
+`blob-erasure-keeps-files` (`kronik_blob::StoreConfig`), and
+`blob-sweep-ignores-timers` (the node's hidden `[blobs]
+mutation_sweep_ignores_timers`: the collector's roots leave out what timers
+keep; the run gets edges and a floor 10 records behind). A run's storage root
 (snapshots, among them an erasure's, which go through `std::fs`) is a real
 directory of the run, so the node's periodic snapshots are off, the floor
-stays at the log's first LSN, and fork spaces, `privacy status`'s count of
+moves only by the lag above, and fork spaces, `privacy status`'s count of
 remaining files and the shipper's objects are not exercised (they use
 `std::fs`; their cases are covered by `kronik-sched/tests/blobs.rs` and the
-B11 and B15 tests). Timers and edges (B14, B16) and the mutation "a sweep
-that ignores timers" come with those slices.
+B11, B15 and B16 tests).
 
 ## 15. The `media-ts` example
 

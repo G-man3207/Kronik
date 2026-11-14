@@ -736,9 +736,12 @@ impl World {
             // Taken before anything awaits: no re-run and no new input has
             // been applied yet.
             let applied = node.applied_lsn();
-            match derived_state(node.store()) {
+            // The blob index above the collector's floor (B3): below it a
+            // pass forgets rows that a rebuild from the whole log brings back.
+            let floor = node.blob_floor().unwrap_or(1);
+            match derived_state(node.store(), floor) {
                 Ok(recovered) => {
-                    self.check_recovered(node_id, applied, recovered, &node)
+                    self.check_recovered(node_id, applied, floor, recovered, &node)
                         .await
                 }
                 Err(e) => return self.violation(format!("node {node_id}: recovered state: {e}")),
@@ -1607,7 +1610,14 @@ impl World {
     /// The state a start recovered, taken before anything ran, equals a
     /// plain (not bulk) rebuild of the log up to the same LSN: the
     /// recovered-versus-rebuilt check of scripts/chaos.py.
-    async fn check_recovered(&self, node_id: NodeId, applied: Lsn, recovered: String, node: &Node) {
+    async fn check_recovered(
+        &self,
+        node_id: NodeId,
+        applied: Lsn,
+        floor: Lsn,
+        recovered: String,
+        node: &Node,
+    ) {
         let mut records = Vec::new();
         if let Err(e) = node
             .reader()
@@ -1621,7 +1631,7 @@ impl World {
         }
         let rebuilt = Self::new_store().and_then(|s| {
             s.apply(&records).map_err(|e| e.to_string())?;
-            derived_state(&s)
+            derived_state(&s, floor)
         });
         match rebuilt {
             Ok(r) if r == recovered => {
@@ -1789,7 +1799,7 @@ impl World {
 /// The derived state a rebuild from the log must reproduce: the state hash
 /// (the tables a snapshot hashes) and the open turns and recorded effects
 /// of unfinished turns, which the next start re-runs.
-fn derived_state(store: &Store) -> Result<String, String> {
+fn derived_state(store: &Store, blob_floor: Lsn) -> Result<String, String> {
     use std::fmt::Write as _;
     let mut out = store.state_hash().map_err(|e| e.to_string())?;
     let db = store.db();
@@ -1812,10 +1822,32 @@ fn derived_state(store: &Store) -> Result<String, String> {
         ),
         ("blob_pins", "hash, source, owner, lsn"),
     ] {
-        let only = if table == "blobs" {
-            " WHERE erased = 0"
+        // The index's rows above the floor and those the state keeps: a
+        // live pass forgets the others once their files are gone, which a
+        // rebuild does not (the simulated log is never compacted). A row
+        // forgotten and referenced again starts at its new reference, so
+        // its first LSN is not compared then.
+        let cols = if table == "blobs" && blob_floor > 1 {
+            "hash, size, subject, key_version, last_ref_lsn, erased"
         } else {
-            ""
+            cols
+        };
+        let only = if table == "blobs" {
+            format!(
+                " WHERE erased = 0 AND (last_ref_lsn >= {blob_floor} \
+                 OR EXISTS (SELECT 1 FROM blob_pins p WHERE p.hash = blobs.hash) \
+                 OR EXISTS (SELECT 1 FROM blob_refs h WHERE h.hash = blobs.hash))"
+            )
+        } else if table == "blob_pins" && blob_floor > 1 {
+            // Without the saved call outcomes a retention pass prunes below
+            // the floor (`prune_blob_pins`), which a rebuild keeps.
+            format!(
+                " WHERE NOT (source = {} AND lsn < {blob_floor} \
+                 AND NOT EXISTS (SELECT 1 FROM open_turns o WHERE o.lsn < blob_pins.lsn))",
+                kronik_store::db::blob_source::DELIVERY
+            )
+        } else {
+            String::new()
         };
         let mut st = db
             .conn()
