@@ -1071,9 +1071,11 @@ fn view(t: &pb::TurnRecord, n: &Norm) -> TurnView {
         // M24 (ADR 0116): an open turn's accept, against a refusal's
         // `http` above.
         Some(pb::outcome::Output::Accept(a)) => {
+            // The subprotocol's position, never its value: within one root
+            // input the offered list is the same in production and fork.
             let mut v = format!(
-                "accept\0{}\0{}\0",
-                a.subprotocol,
+                "accept\0{:?}\0{}\0",
+                a.subprotocol_index,
                 a.subject.as_deref().unwrap_or("")
             )
             .into_bytes();

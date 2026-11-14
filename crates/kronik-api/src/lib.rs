@@ -722,10 +722,6 @@ fn connection_input_json(c: &pb::ConnectionInput) -> serde_json::Value {
         }),
         _ => serde_json::Value::Null,
     };
-    let subprotocols = match &c.event {
-        Some(Event::Open(o)) => o.subprotocols.clone(),
-        _ => Vec::new(),
-    };
     let (seq, frame) = match &c.event {
         Some(Event::Frame(f)) => (serde_json::json!(f.seq), frame_json(f.frame.as_ref())),
         _ => (serde_json::Value::Null, serde_json::Value::Null),
@@ -749,7 +745,6 @@ fn connection_input_json(c: &pb::ConnectionInput) -> serde_json::Value {
         "protocol": connection::protocol_name(c.protocol),
         "route": c.route,
         "request": request,
-        "subprotocols": subprotocols,
         "seq": seq,
         "frame": frame,
         "close": close,
@@ -757,6 +752,49 @@ fn connection_input_json(c: &pb::ConnectionInput) -> serde_json::Value {
         "reason": c.audit.as_ref().map(|a| a.reason.clone()),
         "token_id": c.audit.as_ref().map(|a| a.token_id.clone()),
     })
+}
+
+/// Fills in `output.accept.subprotocol` of an open turn's JSON for a caller
+/// with `pii:read` (M24 §8): the value at the recorded position among the
+/// subprotocols the open's request offered in `Sec-WebSocket-Protocol`, a
+/// credential header. Without `pii:read` it stays null.
+pub(crate) fn accept_subprotocol(v: &mut serde_json::Value, t: &pb::TurnRecord, pii: bool) {
+    let Some(pb::outcome::Output::Accept(a)) = t.outcome.as_ref().and_then(|o| o.output.as_ref())
+    else {
+        return;
+    };
+    let (Some(index), true) = (a.subprotocol_index, pii) else {
+        return;
+    };
+    let Some(pb::input::Kind::Connection(pb::ConnectionInput {
+        event: Some(pb::connection_input::Event::Open(open)),
+        ..
+    })) = t.input.as_ref().and_then(|i| i.kind.as_ref())
+    else {
+        return;
+    };
+    let Some(request) = &open.request else {
+        return;
+    };
+    let offered: Vec<String> = request
+        .headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("sec-websocket-protocol"))
+        .filter_map(|h| match h.value.as_ref().and_then(|v| v.value.as_ref()) {
+            Some(pb::sealable::Value::Plain(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+            _ => None,
+        })
+        .flat_map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if let Some(p) = usize::try_from(index).ok().and_then(|i| offered.get(i)) {
+        v["output"]["accept"]["subprotocol"] = serde_json::Value::String(p.clone());
+    }
 }
 
 /// A turn's buffered connection operations as JSON (M24).
@@ -824,8 +862,11 @@ fn turn_json(branch: &str, lsn: u64, t: &pb::TurnRecord) -> TurnJson {
                 _ => serde_json::Value::Null,
             },
         }}),
+        // The selected subprotocol's value is filled in for callers with
+        // pii:read only ([`accept_subprotocol`]).
         Some(pb::outcome::Output::Accept(a)) => serde_json::json!({"accept": {
-            "subprotocol": (!a.subprotocol.is_empty()).then(|| a.subprotocol.clone()),
+            "subprotocol_index": a.subprotocol_index,
+            "subprotocol": null,
             "headers": headers_json(&a.headers),
             "subject": a.subject,
         }}),
@@ -2404,6 +2445,7 @@ impl Api {
                 redact::redact_turn(&mut t, self.node.sealer(), pii);
                 redact_credentials(&mut t, pii);
                 let mut v = turn_json(self.node.branch(), c.lsn, &t);
+                accept_subprotocol(&mut v.0, &t, pii);
                 if hide {
                     hide_http_identity(&mut v);
                 }
@@ -2734,22 +2776,27 @@ mod connection_turn_json_tests {
                     value: "lobby".into(),
                     sealed_value: None,
                 }],
-                headers: vec![pb::Header {
-                    name: "authorization".into(),
-                    value: plain(None, b"Bearer x"),
-                }],
+                headers: vec![
+                    pb::Header {
+                        name: "authorization".into(),
+                        value: plain(None, b"Bearer x"),
+                    },
+                    pb::Header {
+                        name: "sec-websocket-protocol".into(),
+                        value: plain(None, b"room.v1, bearer.token-1"),
+                    },
+                ],
                 body: Some(pb::Body {
                     value: Some(pb::body::Value::Inline(plain(None, b"").unwrap())),
                 }),
                 route: "/room/{key}/ws".into(),
                 ..Default::default()
             }),
-            subprotocols: vec!["room.v1".into()],
         }));
         open.outcome = Some(pb::Outcome {
             kind: pb::OutcomeKind::Committed as i32,
             output: Some(pb::outcome::Output::Accept(pb::ConnectionAccept {
-                subprotocol: "room.v1".into(),
+                subprotocol_index: Some(0),
                 headers: vec![pb::Header {
                     name: "x-room".into(),
                     value: plain(None, b"lobby"),
@@ -2778,17 +2825,40 @@ mod connection_turn_json_tests {
                 })),
             },
         ];
+        let original = open.clone();
         redact_credentials(&mut open, false);
         let v = turn_json("main", 7, &open).0;
         validate(&v);
         assert_eq!(v["input"]["type"], "connection");
         assert_eq!(v["input"]["event"], "open");
         assert_eq!(v["input"]["request"]["route"], "/room/{key}/ws");
+        // Without pii:read, credential headers (Sec-WebSocket-Protocol too)
+        // are redacted, and the accept shows only the selected
+        // subprotocol's position (M24 §8).
+        for h in 0..2 {
+            assert_eq!(
+                v["input"]["request"]["headers"][h]["value"]["value"]["text"],
+                "[redacted]"
+            );
+        }
+        assert!(!v.to_string().contains("token-1"), "{v}");
+        assert_eq!(v["output"]["accept"]["subprotocol_index"], 0);
         assert_eq!(
-            v["input"]["request"]["headers"][0]["value"]["value"]["text"],
-            "[redacted]"
+            v["output"]["accept"]["subprotocol"],
+            serde_json::Value::Null
         );
-        assert_eq!(v["output"]["accept"]["subprotocol"], "room.v1");
+        let mut with_pii = v.clone();
+        accept_subprotocol(&mut with_pii, &open, false);
+        assert_eq!(
+            with_pii["output"]["accept"]["subprotocol"],
+            serde_json::Value::Null
+        );
+        let mut unredacted = original;
+        redact_credentials(&mut unredacted, true);
+        let mut with_pii = turn_json("main", 7, &unredacted).0;
+        accept_subprotocol(&mut with_pii, &unredacted, true);
+        assert_eq!(with_pii["output"]["accept"]["subprotocol"], "room.v1");
+        validate(&with_pii);
         assert_eq!(v["output"]["accept"]["subject"], "user:ada");
         assert_eq!(v["connection_ops"][0]["frame"]["kind"], "event");
         assert_eq!(v["connection_ops"][1]["op"], "close");

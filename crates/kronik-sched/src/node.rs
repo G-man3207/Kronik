@@ -3230,14 +3230,14 @@ impl Node {
     /// Admits the open of a long-lived connection (M24 §5.3, §5.4): a root
     /// input of `actor` with the upgrade request or the GET, registered
     /// with the hub within its caps (`CONNECTION_LIMIT`; `cap_exempt` for a
-    /// trusted proxy's clients). Returns the connection id (`c-` and the
-    /// root id) and the open turn's waiter.
-    #[allow(clippy::too_many_arguments)]
+    /// trusted proxy's clients). The offered subprotocols stay in the
+    /// request's `Sec-WebSocket-Protocol` header, which is sealable (§8).
+    /// Returns the connection id (`c-` and the root id) and the open turn's
+    /// waiter.
     pub fn connection_open(
         &self,
         actor: ActorRef,
         mut request: pb::HttpInput,
-        subprotocols: Vec<String>,
         protocol: pb::ConnectionProtocol,
         subject: Option<String>,
         client: Option<std::net::IpAddr>,
@@ -3275,7 +3275,6 @@ impl Node {
                 route,
                 event: Some(pb::connection_input::Event::Open(pb::ConnectionOpen {
                     request: Some(request),
-                    subprotocols,
                 })),
                 ..Default::default()
             })),

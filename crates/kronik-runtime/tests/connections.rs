@@ -141,12 +141,28 @@ fn connection(event: pb::connection_input::Event) -> pb::Input {
     }
 }
 
+/// An open whose client offers `subprotocols` in one
+/// `Sec-WebSocket-Protocol` header, as browsers send them.
 fn open(query: &str, subprotocols: &[&str]) -> pb::Input {
+    let headers = if subprotocols.is_empty() {
+        vec![]
+    } else {
+        vec![pb::Header {
+            name: "Sec-WebSocket-Protocol".into(),
+            value: Some(pb::Sealable {
+                subject: None,
+                value: Some(pb::sealable::Value::Plain(
+                    subprotocols.join(" , ").into_bytes(),
+                )),
+            }),
+        }]
+    };
     connection(pb::connection_input::Event::Open(pb::ConnectionOpen {
         request: Some(pb::HttpInput {
             method: "GET".into(),
             path: "/room/a/ws".into(),
             query: query.into(),
+            headers,
             body: Some(pb::Body {
                 value: Some(pb::body::Value::Inline(pb::Sealable {
                     subject: None,
@@ -155,7 +171,6 @@ fn open(query: &str, subprotocols: &[&str]) -> pb::Input {
             }),
             ..Default::default()
         }),
-        subprotocols: subprotocols.iter().map(|s| (*s).into()).collect(),
     }))
 }
 
@@ -207,7 +222,8 @@ async fn connection_inputs_call_the_connection_handler() {
     let Some(pb::outcome::Output::Accept(accept)) = &out.outcome.output else {
         panic!("{:?}", out.outcome)
     };
-    assert_eq!(accept.subprotocol, "room.v1");
+    // `room.v1` was offered second: the record keeps its position only.
+    assert_eq!(accept.subprotocol_index, Some(1));
     assert_eq!(accept.subject.as_deref(), Some("user:ada"));
     assert_eq!(accept.headers[0].name, "x-room");
     assert_eq!(out.connection_ops.len(), 1);

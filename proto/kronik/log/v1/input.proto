@@ -131,8 +131,10 @@ message ConnectionOpen {
   // params, headers and route, sealed fields when it has a subject; the
   // body empty; idempotency_key and request_hash empty.
   HttpInput request = 1;
-  // Sec-WebSocket-Protocol values in the order offered.
-  repeated string subprotocols = 2;
+  // Was a plain copy of the offered subprotocols. Bearer tokens travel in
+  // Sec-WebSocket-Protocol, so the list is derived from the request's
+  // sealable header instead (I9).
+  reserved 2;
 }
 
 message ConnectionFrame {

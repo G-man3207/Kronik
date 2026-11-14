@@ -367,17 +367,21 @@ fn open_outcome(
             committed(types::Output::Http(response), subject, limit)
         }
         conn_wit::OpenReply::Accept(accept) => {
+            // Recorded as its first position among the offered values, never
+            // as the value: clients put bearer tokens there (§6.1, §8).
+            let mut subprotocol_index = None;
             if let Some(p) = &accept.subprotocol {
                 if protocol == conn_wit::Protocol::Sse {
-                    return bad(format!(
-                        "the open's accept selects the subprotocol {p:?}, but SSE has none"
-                    ));
+                    return bad("the open's accept selects a subprotocol, but SSE has none".into());
                 }
-                if !offered.contains(p) {
-                    return bad(format!(
-                        "the open's accept selects the subprotocol {p:?}, which the client did \
-                         not offer"
-                    ));
+                match offered.iter().position(|o| o == p) {
+                    Some(i) => subprotocol_index = u32::try_from(i).ok(),
+                    None => {
+                        return bad(
+                            "the open's accept selects a subprotocol the client did not offer"
+                                .into(),
+                        );
+                    }
                 }
             }
             for h in &accept.headers {
@@ -403,7 +407,7 @@ fn open_outcome(
                 error_code: String::new(),
                 message: String::new(),
                 output: Some(pb::outcome::Output::Accept(pb::ConnectionAccept {
-                    subprotocol: accept.subprotocol.unwrap_or_default(),
+                    subprotocol_index,
                     headers: accept
                         .headers
                         .into_iter()
@@ -653,6 +657,21 @@ fn frame_to_wit(f: Option<&pb::Frame>) -> Result<conn_wit::Frame, RunError> {
     })
 }
 
+/// The subprotocols a WebSocket client offered: its `Sec-WebSocket-Protocol`
+/// headers in order, each split at commas and trimmed (RFC 6455 §4.1). They
+/// come from the recorded request, whose headers are sealable, because
+/// browsers put bearer tokens there (M24 §8); the log keeps no other copy.
+fn offered_subprotocols(headers: &[types::Header]) -> Vec<String> {
+    headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("sec-websocket-protocol"))
+        .flat_map(|h| h.value.split(','))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The `connection-handler` call of a connection input (M24): the open's
 /// request, an incoming frame, or the close; a host close's reason is its
 /// cause, such as `restart`.
@@ -669,13 +688,16 @@ fn connection_to_wit(c: &pb::ConnectionInput) -> Result<ConnCall, RunError> {
     };
     Ok(match &c.event {
         Some(Event::Open(o)) => {
+            let request =
+                http_to_wit(o.request.as_ref().ok_or_else(|| {
+                    RunError::Input("a connection open without its request".into())
+                })?)?;
+            let subprotocols = offered_subprotocols(&request.headers);
             ConnCall::Open(conn_wit::OpenRequest {
                 connection: c.connection.clone(),
                 protocol,
-                request: http_to_wit(o.request.as_ref().ok_or_else(|| {
-                    RunError::Input("a connection open without its request".into())
-                })?)?,
-                subprotocols: o.subprotocols.clone(),
+                request,
+                subprotocols,
             })
         }
         Some(Event::Frame(f)) => ConnCall::Frame(conn_wit::IncomingFrame {

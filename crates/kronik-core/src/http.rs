@@ -20,12 +20,15 @@ pub fn hop_by_hop(name: &str) -> bool {
 
 /// Whether a header carries a credential: `Authorization` in any spelling,
 /// `X-Auth`, a cookie, an API or access key, a session id, a JWT, a
-/// password, a token or a secret. The API shows their values only to
-/// callers with `pii:read`. It over-matches on purpose (`x-session-affinity`).
+/// password, a token or a secret, and `Sec-WebSocket-Protocol`, where
+/// browsers' WebSocket clients put bearer tokens because they cannot set
+/// `Authorization` (M24). The API shows their values only to callers with
+/// `pii:read`. It over-matches on purpose (`x-session-affinity`).
 pub fn credential_header(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     [
         "authorization",
+        "sec-websocket-protocol",
         "x-auth",
         "cookie",
         "api-key",
@@ -76,6 +79,7 @@ mod tests {
             "x-access-key",
             "x-password",
             "proxy-password",
+            "Sec-WebSocket-Protocol",
         ] {
             assert!(super::credential_header(name), "{name}");
         }

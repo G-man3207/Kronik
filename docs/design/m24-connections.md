@@ -322,6 +322,8 @@ Every input of a connection is a root input of its owner, with
 - The guest answers `ok(accept(..))` or `ok(refuse(http-response))`. The
   host checks an accept before the turn is recorded:
   - `subprotocol` must be one of those the client offered (none for SSE);
+    the record keeps only its position in the offered list (the first, if
+    the client offered it twice), never the value (§6.1);
   - header names and values must be valid;
   - `subject` must be a valid subject (m8-privacy §1).
 
@@ -612,14 +614,19 @@ simulated clients.
    - Build the `HttpInput` exactly as for HTTP (`Gateway::input`): the
      subject, admin cookies stripped, every value tagged. The body is
      empty, and the idempotency key and request hash are cleared.
-   - Add `subprotocols` from `Sec-WebSocket-Protocol`.
+   - Record no copy of the subprotocols: the runtime derives
+     `open-request.subprotocols` from the request's recorded
+     `Sec-WebSocket-Protocol` header, which is sealed like every header
+     (§8). Browsers cannot set `Authorization` on a WebSocket, so bearer
+     tokens travel in that header.
    - `node.connection_open(actor, input, subject)` returns the connection
      id and a waiter.
 4. **Wait** for the turn, at most `[gateway] timeout`. On a timeout: 504,
    and the hub closes an eventual accept as `abandoned`.
 5. **Answer:** a refusal or a failure as in §4.2. An accept: `101` with
-   `Sec-WebSocket-Accept`, the selected subprotocol, the actor's headers and
-   `kronik-turn-id`. The HTTP connection must be served `.with_upgrades()`.
+   `Sec-WebSocket-Accept`, the selected subprotocol (the value at the
+   recorded position in the request's offered list), the actor's headers
+   and `kronik-turn-id`. The HTTP connection must be served `.with_upgrades()`.
 6. **Upgrade** on a task: wait at most 10 s for `hyper::upgrade::on(req)`
    (a failure closes the connection as `abandoned`), then
    `WebSocketStream::from_raw_socket(.., Role::Server, config)` with:
@@ -798,6 +805,12 @@ close when the preview expires.
   security guide says so.
 - **Admin cookies.** `__Host-kronik-session` and `__Host-kronik-login` are
   stripped from upgrade requests as from HTTP (`strip_admin_cookies`).
+- **Tokens in subprotocols.** Browsers cannot set `Authorization` on a
+  WebSocket, so apps pass bearer tokens in `Sec-WebSocket-Protocol`. The
+  header is recorded only as a sealable header of the open request, sealed
+  like `Authorization` when the request has a subject, and the accept
+  records only the selected value's position in it. The API redacts the
+  header like `Authorization` (§8).
 - **Subjects.** Only trusted proxies may set them (§4.10).
 - **Caps.** Per client, per actor and in total (§5.11).
 - Memory per idle connection is bounded (§5.3 buffers). Incoming memory is
@@ -875,8 +888,10 @@ message ConnectionOpen {
   // params, headers and route, sealed fields when it has a subject; the
   // body empty; idempotency_key and request_hash empty.
   HttpInput request = 1;
-  // Sec-WebSocket-Protocol values in the order offered.
-  repeated string subprotocols = 2;
+  // Was a plain copy of the offered subprotocols. Bearer tokens travel in
+  // Sec-WebSocket-Protocol, so the list is derived from the request's
+  // sealable header instead (I9).
+  reserved 2;
 }
 
 message ConnectionFrame {
@@ -948,11 +963,15 @@ message ConnectionCloseRequest {
 
 // The open turn's accept (Outcome.output.accept).
 message ConnectionAccept {
-  // Empty: none selected.
-  string subprotocol = 1;
+  // Was the selected subprotocol as a string. Bearer tokens travel in
+  // Sec-WebSocket-Protocol, so only its position is recorded (field 4).
+  reserved 1;
   repeated Header headers = 2;
   // The connection's subject from now on; unset: the request's.
   optional string subject = 3;
+  // The selected subprotocol: its position, from 0, among the request's
+  // Sec-WebSocket-Protocol values in the order offered; unset: none.
+  optional uint32 subprotocol_index = 4;
 }
 ```
 
@@ -1000,6 +1019,10 @@ message ConnectionSendRequest {
   - `Frame.kind` is valid.
 - `EffectRecord` of kind `connection.send-now`: the target starts with
   `connection:`.
+- `ConnectionAccept` (an open turn's accept): an SSE open's accept has no
+  `subprotocol_index`. Whether the index lies within the offered list is
+  checked by the runtime before the turn is recorded; `validate` cannot,
+  since the request's header may be sealed.
 - A record that breaks one of these is `STORAGE_CORRUPT` when applied, as
   for every record.
 
@@ -1082,6 +1105,9 @@ Agreed with the M25/M26 design, so that the two never collide:
 
 ### 6.7 Compatibility fixtures
 
+- The connection-open golden fixture has no `subprotocols` (field 2 is
+  reserved, §6.1), and its accept records `subprotocol_index` (field 1 is
+  reserved).
 - `crates/kronik-proto` golden round-trip tests for every new message, and
   validation tests (an enum 0 or unknown value gives `STORAGE_CORRUPT`; a
   missing oneof is refused).
@@ -1151,7 +1177,8 @@ parts:
 - `connection_ops`: per operation, the targets, then the frame (kind, data
   normalized like a body with `ignore_json_paths`, event, id) or the close
   (code, reason). Never `seq`.
-- The open answer: `accept` (subprotocol, headers, subject) against
+- The open answer: `accept` (the subprotocol's position, headers,
+  subject) against
   `http` (status, headers, body), next to the existing `reply` and `http`
   outputs.
 
@@ -1259,6 +1286,7 @@ diffs with 1, 4 and 16 workers.
 | Value | Subject | Sealed in `on` mode |
 | --- | --- | --- |
 | The open's request (path, query, params, headers) | the request's subject | yes, as HTTP |
+| The offered subprotocols (`Sec-WebSocket-Protocol`) | the request's subject | yes, as a header of the request; no other copy is recorded, and the accept keeps only the selected value's position |
 | Incoming frame data, a client's close reason | the connection's subject (§4.10) | yes |
 | Outgoing frame data, an actor's close reason | the turn's default subject at the call | yes |
 | A `send-now` request | the turn's default subject | yes (`EffectRecord.request`) |
@@ -1276,7 +1304,15 @@ diffs with 1, 4 and 16 workers.
   - `GET /v1/turns/{id}` renders data with `render_sealable`: `[sealed]`
     without `pii:read`, `[erased]` after an erasure;
   - diffs redact as `DiffValue`;
-  - the `connections` API shows `subject` only with `pii:read`.
+  - the `connections` API shows `subject` only with `pii:read`;
+  - `Sec-WebSocket-Protocol` is a credential header
+    (`kronik_core::http::credential_header`), so the turn JSON, history and
+    MCP show it only with `pii:read`. The accept records the selected
+    subprotocol only as its position in that list (§6.1), so the record
+    holds no copy of the header's values outside the header itself, which
+    is sealed like every header. The turn JSON shows the position, and with
+    `pii:read` also the value, resolved from the open's request in the
+    same record.
 - The `connections` table holds no personal data beyond the subject id,
   which `kv.subject` and the SQL `_subject` column hold already.
 

@@ -697,6 +697,7 @@ impl Api {
             .find(|(i, _, _)| i == id)
             .map_or(0, |t| t.1);
         let mut v = crate::turn_json(branch, lsn, &tree.target);
+        crate::accept_subprotocol(&mut v.0, &tree.target, pii);
         if hide {
             crate::hide_http_identity(&mut v);
         }

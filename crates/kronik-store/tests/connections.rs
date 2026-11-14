@@ -68,7 +68,6 @@ fn open(id: &str) -> pb::Input {
                 }),
                 ..Default::default()
             }),
-            subprotocols: vec![],
         }),
         "",
     )

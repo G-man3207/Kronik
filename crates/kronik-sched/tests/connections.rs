@@ -179,7 +179,8 @@ fn text_frame(t: &str) -> pb::Frame {
     }
 }
 
-/// The upgrade request of `/room/<key>/ws?<query>`, as the gateway builds it.
+/// The upgrade request of `/room/<key>/ws?<query>`, as the gateway builds
+/// it, offering the subprotocol `room.v1`.
 fn open_request(key: &str, query: &str) -> pb::HttpInput {
     pb::HttpInput {
         method: "GET".into(),
@@ -189,6 +190,10 @@ fn open_request(key: &str, query: &str) -> pb::HttpInput {
             name: "key".into(),
             value: key.into(),
             sealed_value: None,
+        }],
+        headers: vec![pb::Header {
+            name: "sec-websocket-protocol".into(),
+            value: plain(None, b"room.v1"),
         }],
         route: "/room/{key}/ws".into(),
         ..Default::default()
@@ -232,7 +237,6 @@ impl Proc {
             .connection_open(
                 ActorRef::parse(&format!("room/{key}")).unwrap(),
                 open_request(key, query),
-                vec!["room.v1".into()],
                 pb::ConnectionProtocol::Websocket,
                 None,
                 None,
@@ -337,7 +341,7 @@ fn opens_frames_and_broadcasts_go_through_the_turn_and_the_hub() {
     else {
         panic!("{open:?}")
     };
-    assert_eq!(accept.subprotocol, "room.v1");
+    assert_eq!(accept.subprotocol_index, Some(0), "room.v1, offered first");
     assert_eq!(accept.subject.as_deref(), Some("user:ada"));
     assert_eq!(open.connection_ops.len(), 1);
     assert_eq!(open.connection_ops[0].seqs, [0]);

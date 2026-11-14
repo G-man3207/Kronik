@@ -861,7 +861,7 @@
       }
     },
     "TurnConnectionRequest": {
-      "description": "The upgrade request (WebSocket) or the GET (SSE) that opened the connection, with an empty body.",
+      "description": "The upgrade request (WebSocket) or the GET (SSE) that opened the connection, with an empty body. The offered subprotocols are its `Sec-WebSocket-Protocol` header, a credential header.",
       "type": "object",
       "required": [
         "method",
@@ -969,7 +969,6 @@
         "protocol",
         "route",
         "request",
-        "subprotocols",
         "seq",
         "frame",
         "close",
@@ -1013,13 +1012,6 @@
               "type": "null"
             }
           ]
-        },
-        "subprotocols": {
-          "description": "`open` only: the WebSocket subprotocols the client offered, in order.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
         },
         "seq": {
           "description": "`frame` only: 0, 1, 2, ... per connection, in the order the client sent them.",
@@ -1212,14 +1204,26 @@
       "description": "An open turn's accept (M24); a refusal is `http`.",
       "type": "object",
       "required": [
+        "subprotocol_index",
         "subprotocol",
         "headers",
         "subject"
       ],
       "additionalProperties": false,
       "properties": {
+        "subprotocol_index": {
+          "description": "The selected WebSocket subprotocol: its position, from 0, among the values the open's request offered in `Sec-WebSocket-Protocol`; null when none was selected.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnCount"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "subprotocol": {
-          "description": "The selected WebSocket subprotocol, or null.",
+          "description": "The selected subprotocol's value, resolved from the open's request, for a caller with `pii:read`; null otherwise, because clients offer subprotocols in a credential header.",
           "type": [
             "string",
             "null"

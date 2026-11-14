@@ -242,9 +242,13 @@ message ConnectionCloseRequest {
 
 // The open turn's accept (Outcome.output.accept).
 message ConnectionAccept {
-  // Empty: none selected.
-  string subprotocol = 1;
+  // Was the selected subprotocol as a string. Bearer tokens travel in
+  // Sec-WebSocket-Protocol, so only its position is recorded (field 4).
+  reserved 1;
   repeated Header headers = 2;
   // The connection's subject from now on; unset: the request's.
   optional string subject = 3;
+  // The selected subprotocol: its position, from 0, among the request's
+  // Sec-WebSocket-Protocol values in the order offered; unset: none.
+  optional uint32 subprotocol_index = 4;
 }

@@ -14,7 +14,7 @@
 //! - a WebSocket gets a `welcome` frame; an SSE stream gets the messages
 //!   after its `Last-Event-ID` (at most 100);
 //! - the other members get `joined`; the subprotocol `room.v1` is selected
-//!   when offered.
+//!   when offered (`pick=last`: the last offered one, whatever it is).
 //!
 //! Incoming frames are text commands:
 //! - `say <text>`: the next room seq, stored and broadcast to every member as
