@@ -30,6 +30,11 @@ How it uses blobs:
   is its own: the sender's delete leaves the receiver's image.
 - An expiry's timer carries the blob, which keeps the bytes until it fires,
   even if the image was deleted meanwhile.
+- An image is its uploader's data. With `[privacy] subject_from`, its row
+  and its blob get the subject of the upload request, and a share and an
+  expiry run under that subject, whoever asks: the copy in the receiving
+  album and the timer are the owner's too, and erasing the owner takes
+  them all.
 - A blob that nothing holds, carries or keeps any more is deleted by
   collection once retention passes its last record.
 
@@ -71,4 +76,7 @@ kronik blobs gc --dry-run
 `npm test` runs the tests against a test host (`KRONIK_BIN` names the
 `kronik` binary); `scripts/identity-examples.py` replays a workload of
 uploads, reads, shares, imports and expiries through the same code and
-expects an empty diff.
+expects an empty diff. Its `media-ts-private` variant does the same with
+privacy mode on and two users, then checks that erasing a user who shared
+another's image leaves that image, and that erasing its owner removes it
+from both albums.

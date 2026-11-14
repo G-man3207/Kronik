@@ -772,16 +772,21 @@ The details, which the slice settles:
   retained.
 - **A share** is a buffered `send` of a message `shared` that carries the
   content type and the reference, answered 202 with
-  `{"to": "media/<album>"}`. The receiving album's turn retains the
-  reference and adds a row with an id of its own. A share to the same album
-  is 400.
+  `{"to": "media/<album>"}`. It is sent under the image owner's subject
+  (the row's `_subject`), whoever asks, so the receiving album's turn
+  starts with it: that turn retains the reference and adds a row with an
+  id of its own, which is the owner's data, and erasing the owner removes
+  it. The receiver adds only `image/*` content types. A share to the same
+  album is 400.
 - **An import** takes `{"url": "..."}`. An answer other than 2xx or
   `image/*` is 502, naming the status or the type. Its body is kept as an
   upload's is.
 - **An expiry** takes fractional days, more than 0 and at most 3650 (the
   identity workload uses `days=0.00002`, under 2 s). The timer's message
   carries the id in its body and the reference in `blobs`, so the bytes
-  outlive a `DELETE` until it fires (the shape of criterion 6). When it
+  outlive a `DELETE` until it fires (the shape of criterion 6). It is
+  scheduled under the owner's subject, so erasing whoever set it does not
+  cancel it. When it
   fires, it deletes the row as `DELETE` does, or does nothing if the row is
   gone.
 - `GET /media/{key}/images` answers `{"images": [{id, hash, size,

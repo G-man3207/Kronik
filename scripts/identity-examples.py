@@ -577,6 +577,53 @@ def media_traffic(ex):
     ex.check("the expired image is gone", read("zoo", "img-1") == 404)
 
 
+def media_private_setup(ex):
+    ex.api("POST", "/v1/privacy/mode", {"mode": "on", "reason": REASON})
+
+
+def media_private_traffic(ex):
+    """media-ts with privacy mode on and two users (x-user-id): their
+    uploads, inline and as a blob, are sealed blobs of their subjects; ben
+    shares ana's image and his own, and sets an expiry on ana's."""
+    ana, ben = {"x-user-id": "user:ana"}, {"x-user-id": "user:ben"}
+    a1, a2, b1 = picture(20_000, 21), picture(1536 << 10, 23), picture(30_000, 25)
+
+    def read(album, image):
+        got, data, _ = ex.http("GET", f"/media/{album}/images/{image}", raw=True)
+        return data if got == 200 else got
+
+    def ids(album):
+        return [i["id"] for i in ex.expect("GET", f"/media/{album}/images", 200)["images"]]
+
+    uploads = [ex.expect("POST", "/media/trip/images", 201, data, {**who, "content-type": kind})
+               for data, who, kind in ((a1, ana, "image/png"), (a2, ana, "image/jpeg"), (b1, ben, "image/png"))]
+    ex.check("a subject's images are keyed blobs (b3s:)", all(u["hash"].startswith("b3s:") for u in uploads), uploads)
+    ex.check("the images read back", [read("trip", i) for i in ("img-1", "img-2", "img-3")] == [a1, a2, b1])
+    # ben shares ana's image and his own; the copies are their owners' data.
+    ex.expect("POST", "/media/trip/images/img-1/share/family", 202, None, ben)
+    ex.wait_for("the first share", lambda: ids("family") == ["img-1"])
+    ex.expect("POST", "/media/trip/images/img-3/share/family", 202, None, ben)
+    ex.wait_for("the second share", lambda: ids("family") == ["img-1", "img-2"])
+    ex.check("the shared copies read back", [read("family", "img-1"), read("family", "img-2")] == [a1, b1])
+    # ben's expiry of ana's blob image: the timer is ana's data.
+    ex.expect("POST", "/media/trip/images/img-2/expire?days=0.00002", 202, None, ben)
+    ex.wait_for("the expiry", lambda: ids("trip") == ["img-1", "img-3"])
+    ex.media = {"a1": a1, "read": read, "ids": ids}
+
+
+def media_private_after(ex):
+    """After the replays: erasing the sharer leaves the copy of the owner's
+    image he shared, and erasing the owner takes her images from both
+    albums, so a share tagged the receiver's row with the owner's subject."""
+    read, ids = ex.media["read"], ex.media["ids"]
+    ex.api("POST", "/v1/privacy/erase", {"subject": "user:ben", "reason": REASON})
+    ex.wait_for("after ben's erasure, only ana's image left in both albums (a share of hers is hers)",
+                lambda: ids("trip") == ["img-1"] and ids("family") == ["img-1"])
+    ex.check("ana's image that ben shared survives his erasure", read("family", "img-1") == ex.media["a1"])
+    ex.api("POST", "/v1/privacy/erase", {"subject": "user:ana", "reason": REASON})
+    ex.wait_for("after ana's erasure, no image left in either album", lambda: ids("trip") == [] and ids("family") == [])
+
+
 EXAMPLES = {
     "counter-rs": (["counter.wasm"], None, counter_traffic),
     "counter-ts": (["counter-ts.wasm"], None, counter_traffic),
@@ -594,17 +641,23 @@ EXAMPLES = {
     "todo-ts": (["todo-ts.wasm"], None, todo_traffic),
     "chat-ts": (["chat-ts.wasm"], None, chat_traffic),
     "media-ts": (["media-ts.wasm"], media_setup, media_traffic),
+    # The same component with privacy mode on: subjects' sealed blobs, and
+    # erasure after the replays.
+    "media-ts-private": (["media-ts.wasm"], media_private_setup, media_private_traffic, media_private_after),
     "billing-ts": (["billing-ts.wasm", "billing-ts-ledger.wasm"], billing_setup, billing_traffic),
 }
 
 
-# The configuration an example needs beyond the defaults (a kronik.toml);
-# none needs one since blobs are always on (M26).
-CONFIG: dict[str, str] = {}
+# The configuration an example needs beyond the defaults (a kronik.toml).
+CONFIG: dict[str, str] = {
+    # Subjects from a header, for privacy mode.
+    "media-ts-private": "[privacy]\nsubject_from = \"header:x-user-id\"\n",
+}
 
 
 def run(args, name):
-    components, setup, traffic = EXAMPLES[name]
+    # An entry may name a check that runs after the replays (`after`).
+    components, setup, traffic, *after = EXAMPLES[name]
     ex = Example(args, name)
     started = time.time()
     try:
@@ -636,6 +689,8 @@ def run(args, name):
                 failures.append(f"the {mode} identity replay is not empty: {json.dumps(s)}\n{diff}")
         if failures:
             raise Violation(f"{name}: " + "\n".join(failures))
+        for check in after:
+            check(ex)
         return {"fork_lsn": fork_lsn, "coverage": coverage, "replays": replays,
                 "seconds": round(time.time() - started, 1)}
     finally:

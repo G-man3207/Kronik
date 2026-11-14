@@ -8,6 +8,12 @@
 // blob in a message (the receiving album retains it), imports one from a
 // URL (the operator grants the host), and lets one expire with a timer
 // whose message carries the blob.
+//
+// An image is its uploader's data: its row and its blob have the subject of
+// the request that uploaded it (`[privacy] subject_from`). A share and an
+// expiry run under that subject too, whoever asks for them, so the copy in
+// the receiving album and the timer are the owner's data, and erasing the
+// owner takes them with the rest.
 
 import { actor, BlobRef, type Ctx, KronikError, type Request } from '@kronik/sdk';
 
@@ -62,6 +68,23 @@ function add(ctx: Ctx, blob: BlobRef, contentType: string): Image {
   return row;
 }
 
+/** The subject of image `id`'s row (its uploader's), or null for none. */
+function ownerOf(ctx: Ctx, id: string): string | null {
+  const row = ctx.sql.query('SELECT _subject AS subject FROM images WHERE id = ?1', [id]).first();
+  return typeof row?.subject === 'string' ? row.subject : null;
+}
+
+/** Runs `f` with `subject` as the default subject, then restores the one before. */
+function asSubject<T>(ctx: Ctx, subject: string | null, f: () => T): T {
+  const before = ctx.currentSubject() ?? null;
+  ctx.subject(subject);
+  try {
+    return f();
+  } finally {
+    ctx.subject(before);
+  }
+}
+
 /** Deletes a row, and releases its blob unless another row of the album has it. */
 function remove(ctx: Ctx, row: Image): void {
   ctx.sql.execute('DELETE FROM images WHERE id = ?1', [row.id]);
@@ -106,7 +129,11 @@ function importImage(req: Request, ctx: Ctx) {
 function share(req: Request, ctx: Ctx, row: Image) {
   const album = req.param('album') ?? '';
   if (album === req.param('key')) return ctx.json(400, { error: 'share the image with another album' });
-  ctx.send(`media/${album}`, { name: 'shared', body: { content_type: row.content_type }, blobs: [blobOf(row)] });
+  // Under the owner's subject, whoever shares: the message, and so the
+  // receiving album's row, are the owner's data.
+  asSubject(ctx, ownerOf(ctx, row.id), () =>
+    ctx.send(`media/${album}`, { name: 'shared', body: { content_type: row.content_type }, blobs: [blobOf(row)] }),
+  );
   return ctx.json(202, { to: `media/${album}` });
 }
 
@@ -115,7 +142,10 @@ function expire(req: Request, ctx: Ctx, row: Image) {
   if (!(days > 0 && days <= MAX_DAYS)) return ctx.json(400, { error: `days must be more than 0 and at most ${MAX_DAYS}` });
   const delay = Math.round(days * DAY_MS);
   // The timer's message carries the blob: it keeps the bytes until it fires.
-  ctx.timers.schedule(delay, { name: 'expire', body: { id: row.id }, blobs: [blobOf(row)] });
+  // It is the owner's data: erasing whoever asked leaves the expiry in place.
+  asSubject(ctx, ownerOf(ctx, row.id), () =>
+    ctx.timers.schedule(delay, { name: 'expire', body: { id: row.id }, blobs: [blobOf(row)] }),
+  );
   return ctx.json(202, { id: row.id, expires_ms: ctx.now() + delay });
 }
 
@@ -173,10 +203,12 @@ export default actor({
     }
   },
 
-  // A shared image: this album retains the blob and adds a row of its own.
+  // A shared image: this album retains the blob and adds a row of its own,
+  // under the subject the message came with (the owner's).
   message(msg, ctx) {
     if (msg.name !== 'shared' || msg.blobs.length !== 1) return ctx.none();
     const { content_type } = msg.json<{ content_type: string }>();
+    if (!isImage(content_type)) return ctx.none();
     ctx.blobs.retain(msg.blobs[0]);
     add(ctx, msg.blobs[0], content_type);
     return ctx.none();
