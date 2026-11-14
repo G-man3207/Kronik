@@ -108,12 +108,13 @@ class Node:
         return self.ok("GET", "/v1/dead-letters?limit=1000")["dead_letters"]
 
     def proc_status(self):
-        """VmRSS and VmHWM in KiB, and user+system CPU seconds."""
+        """VmRSS, VmHWM, RssAnon (heap) and RssFile (mapped files) in KiB,
+        and user+system CPU seconds."""
         pid = self.daemon.proc.pid
         fields = {}
         for line in Path(f"/proc/{pid}/status").read_text().splitlines():
             key, _, value = line.partition(":")
-            if key in ("VmRSS", "VmHWM"):
+            if key in ("VmRSS", "VmHWM", "RssAnon", "RssFile"):
                 fields[key] = int(value.split()[0])
         stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
         ticks = os.sysconf("SC_CLK_TCK")
@@ -201,6 +202,10 @@ def load():
         steady_samples = [s for s in samples if steady - started + 60 <= s["t"] <= stop - started]
         hwm_kib = max((s["VmHWM"] for s in samples), default=0)
         growth = (steady_samples[-1]["VmRSS"] / steady_samples[0]["VmRSS"] - 1) if len(steady_samples) >= 2 else 0.0
+        # Where the growth is: the heap (RssAnon) or mapped files (RssFile).
+        if len(steady_samples) >= 2 and "RssAnon" in steady_samples[0]:
+            first, last = steady_samples[0], steady_samples[-1]
+            report["rss_growth_mib"] = {k: round((last[k] - first[k]) / 1024, 1) for k in ("VmRSS", "RssAnon", "RssFile")}
         cpu = (samples[-1]["cpu_s"] - samples[0]["cpu_s"]) / max(samples[-1]["t"] - samples[0]["t"], 1e-9) if len(samples) >= 2 else 0.0
         report.update({"vm_hwm_mib": round(hwm_kib / 1024, 1), "rss_growth": round(growth, 4), "daemon_cpu_cores": round(cpu, 3)})
         check(report, out["ok"], "loadgen: every client connected, no gap, duplicate, loss or unexpected close")
@@ -209,17 +214,33 @@ def load():
         check(report, out["p99_ms"] <= env("P99_MS", 250.0, float), "end-to-end p99 within P99_MS")
         check(report, hwm_kib <= env("HWM_MIB", 1536.0, float) * 1024, "the daemon's VmHWM within HWM_MIB")
         check(report, growth < env("RSS_GROWTH", 0.10, float), "VmRSS growth over the steady phase below RSS_GROWTH")
-        time.sleep(3)  # the close turns of the last connections
         report["open_during_steady"] = open_mid
         check(report, open_mid == clients, "connections list shows every client open during the steady phase")
-        report["open_after"] = api_check(report, "no connection open after the clients closed",
-                                         lambda: len(daemon.connections("open")), lambda n: n == 0)
+
+        def open_after():
+            # A client's close is recorded when its close handshake ends,
+            # within [connections] close_timeout (5 s): wait at most 30 s.
+            closed_at = time.monotonic()
+            while True:
+                n = len(daemon.connections("open"))
+                if n == 0 or time.monotonic() - closed_at > 30:
+                    report["close_settle_s"] = round(time.monotonic() - closed_at, 1)
+                    return n
+                time.sleep(0.5)
+
+        report["open_after"] = api_check(report, "no connection open after the clients closed", open_after, lambda n: n == 0)
         report["dead_letters"] = api_check(report, "no dead letters", lambda: len(daemon.dead_letters()), lambda n: n == 0)
         per_room = clients // rooms
 
         def sample_room():
-            turns = daemon.ok("GET", "/v1/actors/chat/r0/history?limit=1000")["turns"]
-            inputs = [t["input"] for t in turns if t["input"]["type"] == "connection"]
+            # The whole history, page by page: a room's turns outnumber a page.
+            inputs, before = [], None
+            while True:
+                page = daemon.ok("GET", "/v1/actors/chat/r0/history?limit=1000" + (f"&before={before}" if before else ""))
+                inputs += [t["input"] for t in page["turns"] if t["input"]["type"] == "connection"]
+                before = page.get("next")
+                if not before:
+                    break
             return [sum(1 for i in inputs if i["summary"].startswith(event)) for event in ("open", "close")]
 
         report["sample_room_opens_closes"] = api_check(report, "a sample room's history has one open and one close per member",
