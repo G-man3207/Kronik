@@ -1,6 +1,6 @@
 # 0142. Encrypted scrub-only copies of recorded external secret versions
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-14)
 - **Date:** 2026-11-14
 
 ## Context

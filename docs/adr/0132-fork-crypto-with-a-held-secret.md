@@ -1,6 +1,6 @@
 # 0132. A fork's computation with a held linked secret is synthetic
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-14)
 - **Date:** 2026-11-13
 
 ## Context

@@ -1,6 +1,6 @@
 # 0133. The isolation proofs run on GitHub-hosted runners
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-14)
 - **Date:** 2026-11-13
 - **Relates to:** ADR 0064 (the conformance proof), ADR 0095 and 0096 (the
   microVM level), ADR 0110 (hosted workflows start only by hand)
