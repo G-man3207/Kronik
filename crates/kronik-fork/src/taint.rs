@@ -22,13 +22,35 @@ use kronik_proto::log::v1 as pb;
 /// Unverified from production position `from` on. `subject`: the only
 /// subject whose values are involved, when its erasure leaves both sides
 /// equal; `None` when nothing but a verified write ends it. `until`: where
-/// that erasure came (SQL: rows of a table without `_subject` survive it,
-/// so a database with such a table stays unverified).
+/// that erasure came. `untagged` (SQL): production's side was recorded by
+/// an engine that let a subject's turn write a table without `_subject`,
+/// whose rows survive the erasure, so in a database with such a table the
+/// mark does not end there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Mark {
     from: Lsn,
     subject: Option<String>,
     until: Option<Lsn>,
+    untagged: bool,
+}
+
+/// Whether a turn recorded by `engine_version` could write a subject's rows
+/// to a table without `_subject`: engines before Kronik 0.5.0, which
+/// refuses such a write (ADR 0005 §6, option B). A version that does not
+/// parse counts as one that could.
+pub(crate) fn subject_rows_may_be_untagged(engine_version: &str) -> bool {
+    let release = engine_version
+        .strip_prefix("kronik-")
+        .and_then(|v| v.split('+').next())
+        .and_then(|v| v.split('-').next());
+    let mut parts = release.into_iter().flat_map(|v| v.split('.'));
+    let (Some(Ok(major)), Some(Ok(minor))) = (
+        parts.next().map(str::parse::<u64>),
+        parts.next().map(str::parse::<u64>),
+    ) else {
+        return true;
+    };
+    (major, minor) < (0, 5)
 }
 
 /// Where a replay's store holds state it could not verify (module doc).
@@ -132,14 +154,16 @@ impl Taint {
                 from,
                 subject,
                 until: None,
+                untagged: false,
             });
     }
 
-    fn mark_sql(&mut self, actor: &str, from: Lsn, subject: Option<String>) {
+    fn mark_sql(&mut self, actor: &str, from: Lsn, subject: Option<String>, untagged: bool) {
         self.sql.entry(actor.to_owned()).or_default().push(Mark {
             from,
             subject,
             until: None,
+            untagged,
         });
     }
 
@@ -175,13 +199,14 @@ impl Taint {
 
     /// Whether the actor's SQL database may hold other rows than
     /// production's. `untagged`: it has a table without `_subject`, whose
-    /// rows a subject's erasure does not delete (written by a subject's
-    /// turn before ADR 0005 §6 option B), so the erasure ends no mark.
+    /// rows a subject's erasure does not delete; only a mark whose
+    /// production side an engine before ADR 0005 §6 option B recorded can
+    /// involve such rows, and the erasure ends no such mark.
     pub fn sql(&self, actor: &str, at: Lsn, untagged: bool) -> bool {
         self.sql.get(actor).is_some_and(|marks| {
-            marks
-                .iter()
-                .any(|m| m.from <= at && (untagged || m.until.is_none_or(|u| at < u)))
+            marks.iter().any(|m| {
+                m.from <= at && ((untagged && m.untagged) || m.until.is_none_or(|u| at < u))
+            })
         })
     }
 
@@ -232,13 +257,14 @@ impl Taint {
             );
             let subjects: std::collections::BTreeSet<Option<&str>> =
                 fs.keys().chain(ps.keys()).copied().collect();
+            let untagged = prod.is_some_and(|p| subject_rows_may_be_untagged(&p.engine_version));
             for s in subjects {
                 if fs.get(&s) != ps.get(&s) {
-                    self.mark_sql(&actor, at, s.map(str::to_owned));
+                    self.mark_sql(&actor, at, s.map(str::to_owned), untagged);
                 }
             }
             if fschema != pschema {
-                self.mark_sql(&actor, at, None);
+                self.mark_sql(&actor, at, None, untagged);
             }
             return;
         }
@@ -265,12 +291,14 @@ impl Taint {
         for id in timers(t).keys() {
             self.mark_timer(&actor, *id, at);
         }
+        // A fork turn's record carries this engine's version.
+        let untagged = subject_rows_may_be_untagged(&t.engine_version);
         let (changes, schema) = sql(t);
         for s in changes.keys() {
-            self.mark_sql(&actor, at, s.map(str::to_owned));
+            self.mark_sql(&actor, at, s.map(str::to_owned), untagged);
         }
         if !schema.is_empty() {
-            self.mark_sql(&actor, at, None);
+            self.mark_sql(&actor, at, None, untagged);
         }
     }
 
@@ -421,12 +449,15 @@ mod tests {
     }
 
     /// SQL: a differing changeset of one subject is that subject's rows; its
-    /// erasure ends the mark, an untagged one's never does.
+    /// erasure ends the mark, an untagged one's never does. Rows the erasure
+    /// does not delete (a table without `_subject`) can only come from a
+    /// production side an engine before ADR 0005 §6 option B recorded.
     #[test]
     fn sql_marks_end_with_their_subjects_erasure() {
         let mut t = Taint::default();
         let fork = turn("n/1", &[], &[(Some("u:1"), "fork rows"), (None, "same")]);
-        let prod = turn("n/1", &[], &[(Some("u:1"), "prod rows"), (None, "same")]);
+        let mut prod = turn("n/1", &[], &[(Some("u:1"), "prod rows"), (None, "same")]);
+        prod.engine_version = "kronik-0.4.1+wasmtime-50.0.1".into();
         t.unverified_turn(Some(&fork), Some(&prod), 10);
         assert!(t.sql("n/1", 11, false) && !t.sql("n/1", 9, false) && !t.sql("n/2", 11, false));
         t.erasure("u:1", 12);
@@ -434,11 +465,36 @@ mod tests {
         assert!(!t.sql("n/1", 13, false));
         // A table without `_subject` keeps rows the erasure does not delete.
         assert!(t.sql("n/1", 13, true));
+        // Recorded by an engine that refuses a subject's untagged write: the
+        // erasure ends the mark whatever tables the database has (#73).
+        let mut t = Taint::default();
+        prod.engine_version = "kronik-0.5.0-dev+wasmtime-50.0.1".into();
+        t.unverified_turn(Some(&fork), Some(&prod), 10);
+        t.erasure("u:1", 12);
+        assert!(t.sql("n/1", 11, true), "before the erasure");
+        assert!(!t.sql("n/1", 13, true));
         let fork = turn("n/1", &[], &[(None, "fork rows")]);
         let prod = turn("n/1", &[], &[(None, "prod rows")]);
         t.unverified_turn(Some(&fork), Some(&prod), 20);
         t.erasure("u:1", 22);
         assert!(t.sql("n/1", 23, false));
+    }
+
+    #[test]
+    fn engines_before_0_5_could_write_a_subjects_untagged_rows() {
+        for (version, untagged) in [
+            ("kronik-0.1.0-dev+wasmtime-50.0.0", true),
+            ("kronik-0.3.0+wasmtime-50.0.0", true),
+            ("kronik-0.4.1+wasmtime-50.0.1", true),
+            ("kronik-0.5.0-dev+wasmtime-50.0.1", false),
+            ("kronik-0.5.0+wasmtime-51.0.0", false),
+            ("kronik-1.2.3+wasmtime-60.0.0", false),
+            (kronik_runtime::ENGINE_VERSION, false),
+            ("", true),
+            ("something else", true),
+        ] {
+            assert_eq!(subject_rows_may_be_untagged(version), untagged, "{version}");
+        }
     }
 
     /// The erased value named the target: each side changed its own actor.

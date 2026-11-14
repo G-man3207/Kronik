@@ -866,6 +866,11 @@ fn forge_failed_increment(rt: &Runtime, dir: &Path) {
         config_epoch: epoch,
         ..Default::default()
     };
+    append(rt, dir, forged);
+}
+
+/// Appends `record` to the log of the stopped node in `dir`.
+fn append(rt: &Runtime, dir: &Path, record: pb::TurnRecord) {
     rt.block_on(async {
         let env = Env::real(tokio::runtime::Handle::current());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -878,10 +883,66 @@ fn forge_failed_increment(rt: &Runtime, dir: &Path) {
         )
         .await
         .unwrap();
-        log.append(Record::TurnRecord(forged)).await.unwrap();
+        log.append(Record::TurnRecord(record)).await.unwrap();
         drop(log);
         drop(rx);
     });
+}
+
+/// The first recorded turn of `actor` that ran the message `op`.
+fn recorded_turn(rt: &Runtime, dir: &Path, actor: &str, op: &str) -> pb::TurnRecord {
+    let node = start_when_released(rt, dir);
+    let head = node.applied_lsn();
+    let found = rt.block_on(async {
+        let mut found = None;
+        node.reader()
+            .read(1, head, |c| {
+                if let Record::TurnRecord(t) = &c.record
+                    && found.is_none()
+                    && t.actor
+                        .as_ref()
+                        .is_some_and(|a| format!("{}/{}", a.kind, a.key) == actor)
+                    && matches!(
+                        t.input.as_ref().and_then(|i| i.kind.as_ref()),
+                        Some(pb::input::Kind::Message(m))
+                            if m.msg.as_ref().is_some_and(|m| m.name == op)
+                    )
+                {
+                    found = Some(t.clone());
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        found
+    });
+    drop(node);
+    found.unwrap_or_else(|| panic!("no recorded {op} of {actor}"))
+}
+
+/// A crafted recording of a root turn like the recorded `op` of `actor`,
+/// under its own root, that claims to have failed: the replay of it, which
+/// commits, is a verified difference.
+fn forge_failed(rt: &Runtime, dir: &Path, actor: &str, op: &str) {
+    let mut t = recorded_turn(rt, dir, actor, op);
+    t.execution_id = String::new();
+    t.causal_key = Some(pb::CausalKey {
+        root: format!("forged-{op}"),
+        path: Vec::new(),
+    });
+    t.effects.clear();
+    t.writes.clear();
+    t.messages.clear();
+    t.timers.clear();
+    t.sql_changes.clear();
+    t.sql_schema.clear();
+    t.outcome = Some(pb::Outcome {
+        kind: pb::OutcomeKind::Failed as i32,
+        error_code: "TURN_FAILED".into(),
+        message: "forged: the recording says this failed".into(),
+        output: None,
+    });
+    append(rt, dir, t);
 }
 
 /// Issue #27 (workload d4b): an erased turn that wrote a state value sealed
@@ -1239,4 +1300,95 @@ fn a_real_divergence_still_fails_next_to_an_unverifiable_turn() {
         String::from_utf8_lossy(&checked.diff_bytes)
     );
     keep(&dir, "erased-and-real");
+}
+
+/// Issue #73 (a), ADR 0109 point 7: notes/n1's
+/// database has a table without `_subject`, and user:1's rows in its `notes`
+/// table were erased in the window. This engine refuses a subject's write
+/// to a table without `_subject`, so the erasure leaves both sides equal:
+/// the actor's later SQL turns are verified, and a real change in one fails
+/// the check. Before, every later SQL turn of the actor was unverifiable,
+/// and the check passed.
+#[test]
+fn a_real_change_in_a_later_sql_turn_of_an_actor_with_an_erased_subject_fails() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["notes-untagged"],
+        &[
+            Step::Send("notes/n1", "add", "note text", Some("user:1")),
+            Step::Erase("user:1"),
+            Step::Send("notes/n1", "count", "", None),
+        ],
+    );
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(checked.report.passed, "{text}");
+    // Only the turn whose input was erased.
+    assert_eq!(checked.report.unverifiable, 1, "{text}");
+    assert_eq!(checked.diff.summary.divergent_turns, 0, "{text}");
+
+    forge_failed(&rt, dir.path(), "notes/n1", "count");
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(!checked.report.passed, "{text}");
+    assert_eq!(checked.diff.summary.divergent_turns, 1, "{text}");
+    assert_eq!(checked.diff.summary.unverifiable, 1, "{text}");
+    keep(&dir, "erased-sql-untagged-table");
+}
+
+/// Issue #73 (b), ADR 0109 point 9: a turn
+/// whose input is intact wrote `s` sealed for user:1, erased later. Its
+/// guest read nothing erased, so it is replayed and compared like any other
+/// turn, except for user:1's values, which no one can read again: it is not
+/// unverifiable, and a real change in it (here its reply) fails the check.
+/// Before, the erased write made the whole turn unverifiable, and the check
+/// passed.
+#[test]
+fn a_turn_whose_outputs_alone_hold_an_erased_value_is_compared() {
+    let dir = tempdir();
+    let rt = rt();
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["counter"],
+        &[
+            // No subject on the input: `s` is sealed for user:1, `t` for
+            // user:2.
+            Step::Send("counter/a", "subject", "", None),
+            Step::Erase("user:1"),
+            Step::Send("counter/k9", "increment", "", None),
+        ],
+    );
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(checked.report.passed, "{text}");
+    assert_eq!(checked.report.unverifiable, 0, "{text}");
+    assert_eq!(checked.diff.summary.divergent_turns, 0, "{text}");
+
+    // The same turn, recorded with a reply the code does not give.
+    let mut t = recorded_turn(&rt, dir.path(), "counter/a", "subject");
+    t.execution_id = String::new();
+    t.causal_key = Some(pb::CausalKey {
+        root: "forged-reply".into(),
+        path: Vec::new(),
+    });
+    let Some(pb::outcome::Output::Reply(reply)) =
+        t.outcome.as_mut().and_then(|o| o.output.as_mut())
+    else {
+        panic!("no reply: {:?}", t.outcome)
+    };
+    reply.body = Some(pb::Sealable {
+        subject: None,
+        value: Some(pb::sealable::Value::Plain(b"forged".to_vec())),
+    });
+    append(&rt, dir.path(), t);
+    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(!checked.report.passed, "{text}");
+    assert_eq!(checked.diff.summary.divergent_turns, 1, "{text}");
+    assert_eq!(checked.diff.summary.unverifiable, 0, "{text}");
+    keep(&dir, "erased-output-only");
 }

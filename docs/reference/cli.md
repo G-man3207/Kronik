@@ -379,11 +379,19 @@ replay modes. The new daemon refuses the old directory until the exact
 pair has a passing report, then writes one `EngineUpgrade` before serving.
 Do not rewrite recorded engine metadata or relabel precompiled caches.
 
-Historical v0.3.0 output (the recorded versions and hashes are unchanged):
+Right under the verdict, the check counts the turns it could not verify
+because they met erased data (`unverifiable` in `--json`, always present). The
+check passes when they are the only differences
+([ADR 0109](../adr/0109-erased-input-is-unverifiable.md)): a passing check did
+not verify them, so look at the diff when the count is not 0.
+
+Historical v0.3.0 output, with the line v0.5.0 adds (the recorded versions
+and hashes are unchanged):
 
 ```text
 $ kronik upgrade check --window 6h --data-dir /var/lib/kronik
 Upgrade check passed: kronik-0.1.0-dev+wasmtime-50.0.0 -> kronik-0.3.0+wasmtime-50.0.0, window 6h, fork lsn 7 through 95
+  Unverifiable  0 turns (none met erased data)
   Root inputs   62
   Turns         63
   Diff          b3:6aff290d69f92f2a99a3236ce9d5a5285bbd527b1321dca03e212ffddc5adf6c

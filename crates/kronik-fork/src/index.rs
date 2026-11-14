@@ -141,19 +141,29 @@ pub struct ProductionIndex {
     /// Turn LSNs by root id, in LSN order.
     trees: BTreeMap<String, Vec<Lsn>>,
     pub roots: Vec<RootInput>,
-    /// Turn LSNs whose recorded values include one whose subject was erased.
-    /// Identity replay cannot verify such a turn against its input; it reports
-    /// it as unverifiable instead of divergent (S-16, ADR 0109).
+    /// Turn LSNs whose guest read a value whose subject was erased: in its
+    /// input, or in an effect's request or response. Identity replay cannot
+    /// verify such a turn against its input; it reports it as unverifiable
+    /// instead of divergent (S-16, ADR 0109).
     pub erased_turns: BTreeSet<Lsn>,
+    /// For a turn whose guest read no erased value but whose own outputs
+    /// (state writes, messages, timers, its reply, SQL changes) hold values of
+    /// subjects erased since, those subjects. The turn is replayed and
+    /// compared like any other, except for those subjects' values, which no
+    /// one can read again (ADR 0109 point 9).
+    pub erased_outputs: BTreeMap<Lsn, BTreeSet<String>>,
     /// For each turn of [`ProductionIndex::erased_turns`], the ordinals of the
     /// effects whose recorded request was erased. Such a request cannot be
     /// rebuilt from the revealed input, so replay serves the recording.
     pub erased_effects: BTreeMap<Lsn, BTreeSet<u32>>,
-    /// (lsn, actor, subject) of every SQL changeset whose subject was
-    /// erased. A store skips it when it applies the record, so the actor's
-    /// database lacks rows production had until the subject's `Erasure`
-    /// deleted them ([`ProductionIndex::sql_gap`]; ADR 0109).
-    pub erased_sql: Vec<(Lsn, String, String)>,
+    /// (lsn, actor, subject, untagged) of every SQL changeset whose subject
+    /// was erased. A store skips it when it applies the record, so the
+    /// actor's database lacks rows production had until the subject's
+    /// `Erasure` deleted them ([`ProductionIndex::sql_gap`]; ADR 0109).
+    /// `untagged`: the engine that recorded it let a subject's turn write a
+    /// table without `_subject` ([`crate::taint::subject_rows_may_be_untagged`]),
+    /// whose rows the erasure does not delete.
+    pub erased_sql: Vec<(Lsn, String, String, bool)>,
     /// (lsn, subject, key version) of the `Erasure` records, in LSN order.
     pub erasures: Vec<(Lsn, String, u32)>,
     /// Opens production's sealed SQL changesets when a cursor applies them
@@ -296,6 +306,7 @@ impl ProductionIndex {
             trees,
             roots,
             erased_turns: BTreeSet::new(),
+            erased_outputs: BTreeMap::new(),
             erased_effects: BTreeMap::new(),
             erased_sql: Vec::new(),
             erasures,
@@ -315,15 +326,33 @@ impl ProductionIndex {
         for c in std::sync::Arc::make_mut(&mut self.records) {
             match &mut c.record {
                 Record::TurnRecord(t) => {
-                    // Before it is replaced by `[erased]`: an erased value of
-                    // the turn means no replay can reproduce what the guest
-                    // read, so the turn is unverifiable (S-16, ADR 0109).
-                    let mut erased = false;
-                    kronik_proto::sealables::turn_mut(t, &mut |s| {
-                        erased |= privacy.opens_erased(s);
+                    // Before it is replaced by `[erased]`: an erased value
+                    // the guest read (its input, an effect's request or
+                    // response) means no replay can reproduce what it read,
+                    // so the turn is unverifiable (S-16, ADR 0109). Erased
+                    // values only among its outputs leave the rest of the
+                    // turn comparable (ADR 0109 point 9).
+                    let mut read = false;
+                    kronik_proto::sealables::input_mut(t.input.as_mut(), &mut |s| {
+                        read |= privacy.opens_erased(s);
                     });
-                    if erased {
+                    for e in &mut t.effects {
+                        kronik_proto::sealables::effect_mut(e, &mut |s| {
+                            read |= privacy.opens_erased(s);
+                        });
+                    }
+                    let mut outputs = BTreeSet::new();
+                    kronik_proto::sealables::turn_mut(t, &mut |s| {
+                        if let Some(subject) = &s.subject
+                            && privacy.opens_erased(s)
+                        {
+                            outputs.insert(subject.clone());
+                        }
+                    });
+                    if read {
                         self.erased_turns.insert(c.lsn);
+                    } else if !outputs.is_empty() {
+                        self.erased_outputs.insert(c.lsn, outputs);
                     }
                     let effects: BTreeSet<u32> = t
                         .effects
@@ -343,12 +372,13 @@ impl ProductionIndex {
                         .as_ref()
                         .map(|a| format!("{}/{}", a.kind, a.key))
                         .unwrap_or_default();
+                    let untagged = crate::taint::subject_rows_may_be_untagged(&t.engine_version);
                     for cs in t.sql_changes.iter().filter_map(|c| c.changeset.as_ref()) {
                         if let Some(subject) = &cs.subject
                             && privacy.opens_erased(cs)
                         {
                             self.erased_sql
-                                .push((c.lsn, actor.clone(), subject.clone()));
+                                .push((c.lsn, actor.clone(), subject.clone(), untagged));
                         }
                     }
                     privacy.reveal_turn(t);
@@ -411,6 +441,8 @@ impl ProductionIndex {
         index.no_pii = privacy.no_pii;
         index.erased_turns = self.erased_turns.clone();
         index.erased_turns.extend(tail.erased_turns);
+        index.erased_outputs = self.erased_outputs.clone();
+        index.erased_outputs.extend(tail.erased_outputs);
         index.erased_effects = self.erased_effects.clone();
         index.erased_effects.extend(tail.erased_effects);
         index.erased_sql = self.erased_sql.clone();
@@ -429,15 +461,17 @@ impl ProductionIndex {
     /// `actor` lacks rows production had: an erased subject's changeset was
     /// skipped before `at`, and that subject's `Erasure`, which deleted the
     /// rows in production too, comes after it (ADR 0109). `untagged`: the
-    /// database has a table without `_subject`, so the changeset may have
-    /// held rows the erasure left in production (a subject's turn could
-    /// write such a table before ADR 0005 §6 option B), and the gap stays.
+    /// database has a table without `_subject`. Only a changeset an engine
+    /// before ADR 0005 §6 option B recorded can hold rows of such a table
+    /// (from then on a subject's turn cannot write one), which the erasure
+    /// left in production: for it the gap stays. Every other changeset's
+    /// gap ends at the erasure, whatever tables the database has.
     pub fn sql_gap(&self, actor: &str, at: Lsn, untagged: bool) -> bool {
         self.erased_sql
             .iter()
-            .filter(|(lsn, a, _)| a == actor && *lsn < at)
-            .any(|(lsn, _, subject)| {
-                untagged
+            .filter(|(lsn, a, _, _)| a == actor && *lsn < at)
+            .any(|(lsn, _, subject, old_engine)| {
+                (untagged && *old_engine)
                     || self
                         .erasures
                         .iter()
@@ -448,7 +482,7 @@ impl ProductionIndex {
 
     /// Whether an erased subject's changeset of `actor` was skipped at all.
     pub fn has_erased_sql(&self, actor: &str) -> bool {
-        self.erased_sql.iter().any(|(_, a, _)| a == actor)
+        self.erased_sql.iter().any(|(_, a, _, _)| a == actor)
     }
 
     /// The production turns below `key` in its causal tree (messages,

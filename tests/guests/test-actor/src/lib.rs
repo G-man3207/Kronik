@@ -556,6 +556,12 @@ fn migrate(from: u32) -> Result<(), HandlerError> {
             &[],
         )
         .map_err(|e| HandlerError::Failed(format!("migrate: {e:?}")))?;
+        // untagged (with notes): also a table without `_subject`, whose rows
+        // a subject's erasure does not delete.
+        if cfg!(feature = "untagged") {
+            sql::execute("CREATE TABLE audit(line TEXT)", &[])
+                .map_err(|e| HandlerError::Failed(format!("migrate: {e:?}")))?;
+        }
     }
     Ok(())
 }

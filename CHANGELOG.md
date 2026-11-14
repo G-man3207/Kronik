@@ -76,6 +76,17 @@ until the v1.0 compatibility promise takes effect.
   inside the savepoint, the turn's end rolled them back, and a rebuild
   from the log deleted them. The deletes now run right after the turn
   ends.
+- `kronik upgrade check` (and every fork diff) no longer excuses more than
+  an erasure explains. A turn whose input and effects are intact but which
+  wrote a value of a subject erased later is compared like any other turn,
+  without that subject's values, instead of counting as unverifiable. Once a
+  subject's erasure in the window deleted its SQL rows, the actor's later
+  SQL turns are verified again even when its database has a table without
+  `_subject`: only an engine before 0.5.0 let a subject's turn write such a
+  table. Before, a real change in those turns passed the check as
+  unverifiable ([ADR 0109](docs/adr/0109-erased-input-is-unverifiable.md)
+  points 7 and 9, now accepted). The check shows the count of unverifiable
+  turns right under its verdict, also when it is 0.
 - A fork (a proposal, a preview, a rebase) never creates a key version for
   an erased subject: what it writes of one - its log, and the turns a rebase
   stages into main's log - is the erasure's tombstone. A replay that

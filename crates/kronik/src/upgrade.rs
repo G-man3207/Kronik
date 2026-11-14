@@ -65,7 +65,8 @@ struct UpgradeCheckOutput {
     /// Turns the identity replay could not verify because they met erased
     /// data: their recorded input, a state value they read, or an input or
     /// state that erased data shaped, and production turns missing below one
-    /// (S-16, ADR 0109).
+    /// (S-16, ADR 0109). Always present (0 when none): a passing check did
+    /// not verify these turns.
     #[serde(default)]
     unverifiable: u64,
     diff_hash: String,
@@ -258,18 +259,15 @@ fn state_note(plan: &kronik_sched::snapshots::StatePlan) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
-/// The report line for turns an identity replay could not verify because they
-/// met erased data (S-16, ADR 0109). None when there are none:
-/// silence is the normal case, and the line names what the passing check did
-/// not verify.
-fn unverifiable_line(turns: u64) -> Option<String> {
-    if turns == 0 {
-        return None;
+/// The report's count of turns an identity replay could not verify because
+/// they met erased data (S-16, ADR 0109), shown right under the verdict
+/// whatever it is: a passing check did not verify these turns.
+fn unverifiable_text(turns: u64) -> String {
+    match turns {
+        0 => "0 turns (none met erased data)".to_owned(),
+        1 => "1 turn met erased data and was not verified".to_owned(),
+        n => format!("{n} turns met erased data and were not verified"),
     }
-    let plural = if turns == 1 { "" } else { "s" };
-    Some(format!(
-        "  Unverifiable  {turns} turn{plural} unverifiable: erased"
-    ))
 }
 
 fn diverge_error(v: &UpgradeCheckOutput, window: &str) -> ApiError {
@@ -310,12 +308,14 @@ fn render(
         "{dry}Upgrade check {verb}: {} -> {}, window {window}, fork lsn {} through {}",
         v.from_engine, v.to_engine, v.fork_lsn, v.checked_through_lsn
     );
+    field(
+        &mut out,
+        "Unverifiable",
+        &[unverifiable_text(v.unverifiable)],
+        "",
+    );
     field(&mut out, "Root inputs", &[v.root_inputs.to_string()], "");
     field(&mut out, "Turns", &[v.turns.to_string()], "");
-    if let Some(line) = unverifiable_line(v.unverifiable) {
-        out.push_str(&line);
-        out.push('\n');
-    }
     field(&mut out, "Diff", std::slice::from_ref(&v.diff_hash), "");
     if let Some(path) = &v.report_path {
         field(&mut out, "Report", std::slice::from_ref(path), "");
@@ -398,7 +398,7 @@ fn check_error(msg: String) -> ApiError {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::{check_error, unverifiable_line};
+    use super::{check_error, unverifiable_text};
     use kronik_core::error::ErrorCode;
 
     /// A replay that meets a sealed value of an erased subject says so: the
@@ -420,14 +420,24 @@ mod tests {
         assert_eq!(missing.code, ErrorCode::KeystoreIncomplete);
     }
 
+    /// The count is always shown, also when it is 0: a passing check did not
+    /// verify the turns it counts (ADR 0109 point 5).
     #[test]
-    fn the_unverifiable_line_is_silent_at_zero_and_counts_above() {
-        assert_eq!(unverifiable_line(0), None);
+    fn the_unverifiable_count_is_always_shown() {
+        assert_eq!(unverifiable_text(0), "0 turns (none met erased data)");
         assert_eq!(
-            unverifiable_line(1).as_deref(),
-            Some("  Unverifiable  1 turn unverifiable: erased")
+            unverifiable_text(1),
+            "1 turn met erased data and was not verified"
         );
-        let many = unverifiable_line(7).unwrap();
-        assert_eq!(many, "  Unverifiable  7 turns unverifiable: erased");
+        assert_eq!(
+            unverifiable_text(7),
+            "7 turns met erased data and were not verified"
+        );
+        let mut out = String::new();
+        crate::cli::field(&mut out, "Unverifiable", &[unverifiable_text(7)], "");
+        assert_eq!(
+            out,
+            "  Unverifiable  7 turns met erased data and were not verified\n"
+        );
     }
 }

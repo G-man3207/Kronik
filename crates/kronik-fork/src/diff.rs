@@ -709,6 +709,73 @@ fn redacted(sealer: &Sealer, subject: &str, value: &[u8]) -> Value {
 /// [`SQL_CONCEALED`] (so it is redacted like a subject's), and no outcome
 /// message. The input stays: the diff never shows it, and it decides
 /// whether a difference is an origin.
+/// What a value of a subject [`ProductionIndex::erased_outputs`] names
+/// becomes on both sides of a comparison.
+const ERASED_OUTPUT: &[u8] = b"[erased]";
+
+/// Every value of `subjects` in `t` becomes [`ERASED_OUTPUT`].
+fn mask_subjects(t: &mut pb::TurnRecord, subjects: &BTreeSet<String>) {
+    kronik_proto::sealables::turn_mut(t, &mut |s| {
+        if s.subject.as_ref().is_some_and(|x| subjects.contains(x)) {
+            s.value = Some(pb::sealable::Value::Plain(ERASED_OUTPUT.to_vec()));
+        }
+    });
+}
+
+/// A production turn whose guest read no erased value but whose own outputs
+/// held values of subjects erased since ([`ProductionIndex::erased_outputs`]):
+/// production's values of those subjects are gone, so they are masked on
+/// both sides and cannot differ; everything else of the turn is compared
+/// (ADR 0109 point 9). The production side, owned.
+fn masked_production(index: &ProductionIndex) -> BTreeMap<Lsn, pb::TurnRecord> {
+    index
+        .erased_outputs
+        .iter()
+        .filter_map(|(lsn, subjects)| match &index.record(*lsn)?.record {
+            Record::TurnRecord(t) => {
+                let mut t = t.clone();
+                mask_subjects(&mut t, subjects);
+                Some((*lsn, t))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `prod` with the turns [`masked_production`] holds replaced by theirs.
+fn with_masked<'a>(
+    prod: Vec<(Lsn, &'a pb::TurnRecord)>,
+    masked: &'a BTreeMap<Lsn, pb::TurnRecord>,
+) -> Vec<(Lsn, &'a pb::TurnRecord)> {
+    if masked.is_empty() {
+        return prod;
+    }
+    prod.into_iter()
+        .map(|(lsn, t)| (lsn, masked.get(&lsn).unwrap_or(t)))
+        .collect()
+}
+
+/// The fork side of [`masked_production`]: the replayed counterpart's values
+/// of the same subjects.
+fn masked_fork<'t>(turns: &'t [ForkTurn], index: &ProductionIndex) -> Cow<'t, [ForkTurn]> {
+    let subjects = |f: &ForkTurn| f.prod_lsn.and_then(|l| index.erased_outputs.get(&l));
+    if !turns.iter().any(|f| subjects(f).is_some()) {
+        return Cow::Borrowed(turns);
+    }
+    Cow::Owned(
+        turns
+            .iter()
+            .map(|f| {
+                let mut f = f.clone();
+                if let Some(s) = subjects(&f).cloned() {
+                    mask_subjects(&mut f.record, &s);
+                }
+                f
+            })
+            .collect(),
+    )
+}
+
 fn sql_tagged(turns: &[ForkTurn]) -> Cow<'_, [ForkTurn]> {
     if !turns.iter().any(|t| t.sql) {
         return Cow::Borrowed(turns);
@@ -2666,6 +2733,7 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
             .collect();
     }
     let roots: BTreeMap<Lsn, &RootInput> = index.roots.iter().map(|r| (r.lsn, r)).collect();
+    let masked = masked_production(index);
     let mut replayed = 0u64;
     if let Some(trees) = input.isolated {
         for t in trees {
@@ -2673,21 +2741,25 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
                 continue;
             };
             replayed += 1;
-            let prod = index.tree(root);
-            acc.compare(&prod, &sql_tagged(&t.turns), Some(t.root_lsn), true);
+            let prod = with_masked(index.tree(root), &masked);
+            let fork = masked_fork(&t.turns, index);
+            acc.compare(&prod, &sql_tagged(&fork), Some(t.root_lsn), true);
         }
     }
     let mut state_continuous = Vec::new();
     if let Some(c) = &input.continuous {
-        let prod: Vec<(Lsn, &pb::TurnRecord)> = index
-            .records
-            .iter()
-            .filter(|r| r.lsn > index.fork_lsn)
-            .filter_map(|r| match &r.record {
-                Record::TurnRecord(t) => Some((r.lsn, t)),
-                _ => None,
-            })
-            .collect();
+        let prod: Vec<(Lsn, &pb::TurnRecord)> = with_masked(
+            index
+                .records
+                .iter()
+                .filter(|r| r.lsn > index.fork_lsn)
+                .filter_map(|r| match &r.record {
+                    Record::TurnRecord(t) => Some((r.lsn, t)),
+                    _ => None,
+                })
+                .collect(),
+            &masked,
+        );
         let full = input.isolated.is_none();
         if full {
             replayed = index.roots.len() as u64;
@@ -2701,7 +2773,8 @@ pub fn build(input: DiffInput<'_>) -> Result<Diff, ReplayError> {
             acc.preview(&preview);
             own = Cow::Owned(rest);
         }
-        acc.compare(&prod, &sql_tagged(&own), None, full);
+        let compared = masked_fork(&own, index);
+        acc.compare(&prod, &sql_tagged(&compared), None, full);
         // The state a turn the replay could not run on the recorded data
         // wrote is not evidence of a behavior change: every key and row such
         // turns touched on either side is skipped in the comparison below

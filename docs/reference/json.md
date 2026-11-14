@@ -7636,7 +7636,7 @@ against both.
     },
     "unverifiable": {
       "default": 0,
-      "description": "Turns the identity replay could not verify because they met erased\ndata: their recorded input, a state value they read, or an input or\nstate that erased data shaped, and production turns missing below one\n(S-16, ADR 0109).",
+      "description": "Turns the identity replay could not verify because they met erased\ndata: their recorded input, a state value they read, or an input or\nstate that erased data shaped, and production turns missing below one\n(S-16, ADR 0109). Always present (0 when none): a passing check did\nnot verify these turns.",
       "format": "uint64",
       "minimum": 0,
       "type": "integer"

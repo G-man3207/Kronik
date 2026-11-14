@@ -14,7 +14,7 @@ for v in step2 body-v2 fail-get fetch-extra schema1 calls-tally route-tally resp
   cargo build --locked --release --target wasm32-wasip2 --target-dir "target/$v" --features "$v"
   cp "target/$v/$target" "../counter-$v.wasm"
 done
-for v in tally route-tally sql-call; do
+for v in tally route-tally sql-call untagged; do
   cargo build --locked --release --target wasm32-wasip2 --target-dir "target/notes-$v" --features "notes,$v"
   cp "target/notes-$v/$target" "../notes-$v.wasm"
 done

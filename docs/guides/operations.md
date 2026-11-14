@@ -1463,11 +1463,17 @@ difference. So is every turn the erased data reached: one an unverifiable turn s
 a message, call or timer that production did not send the same way, one that read
 state such a turn left different (or that production wrote in a turn the replay
 could not run), one that used an actor's SQL database while it lacked the erased
-subject's rows production still had, and a production turn missing below an
-unverifiable one ([ADR 0109](../adr/0109-erased-input-is-unverifiable.md)). The
+subject's rows production still had (until that subject's erasure, which deletes
+them on both sides), and a production turn missing below an unverifiable one
+([ADR 0109](../adr/0109-erased-input-is-unverifiable.md)). A turn that only
+*wrote* a value of a subject erased later is not unverifiable: it is compared
+like any other, without that subject's values. A state key that turns read and
+write back stays unverified to the end of the window once an unverifiable turn
+left it different, so every later reader of it is unverifiable too. The
 check serves such a turn's effects from their recording, counts the turns, and
-passes when nothing else differs; the report line reads `N turns unverifiable:
-erased` and the same count is in `--json` as `unverifiable`. A diverging report
+passes when nothing else differs; the line under the verdict reads `Unverifiable
+N turns met erased data and were not verified` (`0 turns` when none did) and
+the same count is in `--json` as `unverifiable`. A diverging report
 from v0.5.0 therefore means a real change (or an unreadable recording), and
 `serve` starts from it as from any other passing report. The count is also how many
 turns the upgrade did not verify: look at the diff when it is non-zero, and re-run the

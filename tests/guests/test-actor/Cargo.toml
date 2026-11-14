@@ -44,6 +44,9 @@ respond = []
 # body, then calls `increment` on counter/c (an SQL turn open across a call).
 fail-line = []
 sql-call = []
+# Fork tests of erasures (ADR 0109): with `notes`, the migration also
+# creates a table without `_subject`.
+untagged = []
 # Standard fetch (M22): `wfetch*` operations through wasi:http directly.
 wasi-http = ["dep:wasip2"]
 
