@@ -30,6 +30,7 @@ use std::time::Duration;
 use kronik_core::env::BoxFuture;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, valid_key};
+use kronik_privacy::sealer::is_erased;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Ingress, Node, RouteEntry, TurnResult};
 
@@ -575,6 +576,34 @@ fn strip_admin_cookies(headers: &mut Vec<(String, String)>) {
     });
 }
 
+/// The actor's headers of an accepted open (M24), for the 101 or the
+/// event stream's 200: without what belongs to the handshake, the stream or
+/// Kronik, and without a header whose value is the tombstone of a subject
+/// erased while the open turn ran (ADR 0123). The accept itself stands.
+fn accept_headers(accept: &pb::ConnectionAccept) -> Vec<(String, String)> {
+    accept
+        .headers
+        .iter()
+        .filter(|h| {
+            let name = h.name.to_ascii_lowercase();
+            !kronik_core::http::hop_by_hop(&name)
+                && name != TURN_ID_HEADER
+                && !name.starts_with("sec-websocket-")
+                && !matches!(name.as_str(), "content-type" | "cache-control")
+                && !h.value.as_ref().is_some_and(is_erased)
+        })
+        .map(|h| {
+            (
+                h.name.clone(),
+                String::from_utf8_lossy(&sealable_bytes(h.value.as_ref())).into_owned(),
+            )
+        })
+        .filter(|(name, value)| {
+            !name.eq_ignore_ascii_case("set-cookie") || !reserved_admin_cookie(value)
+        })
+        .collect()
+}
+
 /// The HTTP response for a finished turn.
 pub fn turn_response(r: &TurnResult) -> HttpResponse {
     let id = (TURN_ID_HEADER.to_owned(), r.turn_id.to_string());
@@ -613,6 +642,27 @@ pub fn turn_response(r: &TurnResult) -> HttpResponse {
                         "turn {} answered with status {}, {why}: an actor answers with 200 \
                          to 599",
                         r.turn_id, h.status
+                    ),
+                ));
+                resp.headers.push(id);
+                return resp;
+            }
+            // A turn that ran across its subject's erasure answers with the
+            // erasure's tombstones, and a saved response of an erased
+            // subject has nothing else to give (ADR 0123): the client learns
+            // that the answer is gone, not a body with holes in it.
+            let erased = h
+                .headers
+                .iter()
+                .any(|hd| hd.value.as_ref().is_some_and(is_erased))
+                || matches!(h.body.as_ref().and_then(|b| b.value.as_ref()),
+                    Some(pb::body::Value::Inline(s)) if is_erased(s));
+            if erased {
+                let mut resp = error(&ApiError::new(
+                    ErrorCode::SubjectErased,
+                    format!(
+                        "the response of turn {} held values of a data subject who was erased while it ran",
+                        r.turn_id
                     ),
                 ));
                 resp.headers.push(id);
@@ -979,29 +1029,7 @@ impl Gateway {
                 200
             }
         };
-        // The actor's headers, without what belongs to the handshake, the
-        // stream or Kronik.
-        headers.extend(
-            accept
-                .headers
-                .iter()
-                .filter(|h| {
-                    let name = h.name.to_ascii_lowercase();
-                    !kronik_core::http::hop_by_hop(&name)
-                        && name != TURN_ID_HEADER
-                        && !name.starts_with("sec-websocket-")
-                        && !matches!(name.as_str(), "content-type" | "cache-control")
-                })
-                .map(|h| {
-                    (
-                        h.name.clone(),
-                        String::from_utf8_lossy(&sealable_bytes(h.value.as_ref())).into_owned(),
-                    )
-                })
-                .filter(|(name, value)| {
-                    !name.eq_ignore_ascii_case("set-cookie") || !reserved_admin_cookie(value)
-                }),
-        );
+        headers.extend(accept_headers(accept));
         headers.push((TURN_ID_HEADER.into(), r.turn_id.to_string()));
         // From here the caller attaches the connection's transport or
         // abandons it; the hub abandons it if neither happens in time.
@@ -1330,6 +1358,88 @@ mod tests {
                 r.headers
             );
         }
+    }
+
+    /// ADR 0123: a turn that ran across its subject's erasure answers with
+    /// the erasure's tombstones, and so does a saved response of an erased
+    /// subject. The client gets `SUBJECT_ERASED` (410) and the turn id, never
+    /// a body with holes in it; an open's tombstoned headers are left out
+    /// and the accept stands.
+    #[test]
+    fn an_answer_that_holds_an_erased_subjects_values_is_subject_erased() {
+        let tombstone = || {
+            Some(pb::Sealable {
+                subject: Some("user:1".into()),
+                value: Some(pb::sealable::Value::Sealed(
+                    kronik_privacy::sealer::erased_value(2),
+                )),
+            })
+        };
+        let plain = |b: &str| {
+            Some(pb::Sealable {
+                subject: Some("user:2".into()),
+                value: Some(pb::sealable::Value::Plain(b.as_bytes().to_vec())),
+            })
+        };
+        let answered = |headers: Vec<pb::Header>, body| {
+            turn_response(&TurnResult {
+                turn_id: kronik_core::ids::TurnId {
+                    branch: "main".into(),
+                    lsn: 9,
+                },
+                outcome: pb::Outcome {
+                    kind: pb::OutcomeKind::Committed as i32,
+                    output: Some(pb::outcome::Output::Http(pb::HttpResponse {
+                        status: 200,
+                        headers,
+                        body: Some(pb::Body {
+                            value: Some(pb::body::Value::Inline(body)),
+                        }),
+                    })),
+                    ..Default::default()
+                },
+                scrubbed_with: None,
+            })
+        };
+        let header = |value| pb::Header {
+            name: "x-name".into(),
+            value,
+        };
+        let erased_body = answered(vec![], tombstone().unwrap());
+        let erased_header = answered(vec![header(tombstone())], plain("ok").unwrap());
+        for r in [erased_body, erased_header] {
+            let body = String::from_utf8(r.body).unwrap();
+            assert_eq!(r.status, 410, "{body}");
+            assert!(
+                body.contains("\"SUBJECT_ERASED\"") && body.contains("turn main:9"),
+                "{body}"
+            );
+            assert!(
+                r.headers
+                    .iter()
+                    .any(|(n, v)| n == TURN_ID_HEADER && v == "main:9")
+            );
+        }
+        let fine = answered(vec![header(plain("ada"))], plain("ok").unwrap());
+        assert_eq!((fine.status, fine.body.as_slice()), (200, b"ok".as_slice()));
+
+        let accept = pb::ConnectionAccept {
+            headers: vec![
+                pb::Header {
+                    name: "x-room".into(),
+                    value: plain("lobby"),
+                },
+                pb::Header {
+                    name: "x-user".into(),
+                    value: tombstone(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            accept_headers(&accept),
+            [("x-room".to_owned(), "lobby".to_owned())]
+        );
     }
 
     #[test]

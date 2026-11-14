@@ -2454,7 +2454,7 @@ impl Node {
                 "the turn's record did not fit in one log record: it fails with TURN_TOO_LARGE"
             ),
         }
-        let outcome = record.outcome.clone().unwrap_or_default();
+        let mut outcome = record.outcome.clone().unwrap_or_default();
         let committed = outcome.kind == pb::OutcomeKind::Committed as i32;
         let mut messages = if committed {
             record.messages.clone()
@@ -2479,14 +2479,23 @@ impl Node {
         };
         // An erasure that began while the turn ran: its values of the subject
         // become tombstones, in the record and in what it sends (§6.8): its
-        // messages and compensations, and the frames and closes the hub
-        // writes to its connections' clients (M24).
+        // messages and compensations, the frames and closes the hub writes
+        // to its connections' clients (M24), and its answer to whoever asked
+        // (an HTTP response, a reply, an open's accept headers), who may be
+        // another party than the subject (ADR 0123). A saved response that an
+        // idempotent retry gets holds the same tombstones.
         let mut record = Record::TurnRecord(record);
         let fence = self.seal_born(&mut record, born).await?;
         self.tombstone_outbound(&mut messages, born);
         let mut compensations = fxs.compensations;
         self.tombstone_outbound(&mut compensations, born);
-        lock(&self.erasure_marks).tombstone_connection_ops(born, &mut connection_ops);
+        {
+            let marks = lock(&self.erasure_marks);
+            marks.tombstone_connection_ops(born, &mut connection_ops);
+            marks.tombstone(born, |f| {
+                kronik_proto::sealables::outcome_mut(Some(&mut outcome), f);
+            });
+        }
         let lsn = self.commit_origin(record, completion).await;
         drop(fence);
         let lsn = lsn?;
@@ -3307,7 +3316,7 @@ impl Node {
                     return Err(reused(&http.idempotency_key));
                 }
                 let mut outcome = row.outcome;
-                self.unseal_outcome(&mut outcome);
+                self.unseal_response(&mut outcome);
                 return Ok(Ingress::Done(Box::new(TurnResult {
                     turn_id: TurnId {
                         branch: self.cfg.branch.clone(),

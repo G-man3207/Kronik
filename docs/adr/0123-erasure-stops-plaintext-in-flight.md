@@ -62,7 +62,16 @@ running turns: it must not depend on how long other work takes.
    the log before the `Erasure` record, sealed under the version it erases,
    or sealed knowing of the erasure. A turn that runs across an erasure
    finishes, but nothing it records brings the subject back, and the
-   messages, calls and compensations it sends carry the tombstones too.
+   messages, calls and compensations it sends carry the tombstones too. So
+   do the frames and closes it hands to its connections (M24), and its
+   answer to whoever asked (amended 2026-11-14): the requester may be
+   another party than the subject, such as an operator listing users or
+   another service. An HTTP turn whose response holds a tombstone is
+   answered with `SUBJECT_ERASED` (410) and its turn id, and so is a reply
+   through the API. An open whose accept headers hold one is accepted
+   without those headers. A saved response that an idempotent retry gets
+   back answers the same way once its values can no longer be opened, so
+   the live answer and the saved one agree.
 4. **Scrub.** Applying the record tombstones the subject's values in the
    inputs still queued, and in `state.db` the erasure tombstones its values in
    `open_effects` as it does in timers and the mailbox; reseal rewrites
@@ -112,13 +121,16 @@ is new data: it is sealed under a new key version, as before.
   before it deletes the keys, and turns that append meanwhile wait for its
   record to be applied.
 - A turn that runs across the erasure has already seen the value: what it
-  sends out in an effect before it ends, and its reply to the request that
-  ran it, are not undone. What it records, and what it sends to other
-  actors, holds tombstones.
+  sends out in an effect before it ends (a `send-now` frame included), and
+  a reply that went out before the erasure began, are not undone. What it
+  records, what it sends to other actors and connections, and its answer
+  to the request that ran it hold tombstones.
 - What a guest copies into a value of another subject, or of none, still
   survives the erasure (m8-privacy, "What erasure does not do").
 - Verified by `crates/kronik-sched/src/erasure/node_tests.rs` (a turn running
-  across an erasure and a message queued behind it; an open turn's recorded
-  value in `off` mode across a restart), the store tests of `open_effects`
-  and of an erasure during a turn's SQL, and the sealer test of a fork's
-  record.
+  across an erasure, its reply and a message queued behind it; an open
+  turn's recorded value in `off` mode across a restart), the store tests of
+  `open_effects` and of an erasure during a turn's SQL, the sealer tests of
+  a fork's record and of a saved answer after an erasure, the gateway's and
+  the API's tests of an answer that holds a tombstone, and the erasure test
+  of a turn's connection operations.

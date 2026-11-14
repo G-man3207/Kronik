@@ -299,9 +299,17 @@ fn outcome(o: &pb::Outcome) -> Outcome {
     }
 }
 
-fn output_bytes(value: Option<&pb::Sealable>) -> Result<&[u8]> {
+fn output_bytes<'a>(value: Option<&'a pb::Sealable>, turn: &TurnId) -> Result<&'a [u8]> {
     match value.and_then(|value| value.value.as_ref()) {
         Some(pb::sealable::Value::Plain(bytes)) => Ok(bytes),
+        // The turn ran across its subject's erasure: its answer holds the
+        // erasure's tombstone (ADR 0123).
+        _ if value.is_some_and(kronik_privacy::sealer::is_erased) => Err(ApiError::new(
+            ErrorCode::SubjectErased,
+            format!(
+                "the reply of turn {turn} held values of a data subject who was erased while it ran"
+            ),
+        )),
         _ => Err(ApiError::new(
             ErrorCode::Unavailable,
             "the reply bytes are unavailable in this source projection",
@@ -332,7 +340,7 @@ fn turn_response(r: Option<TurnResult>) -> Result<TurnResponse> {
             Some(Reply::inline(
                 message.name.clone(),
                 message.content_type.clone(),
-                Payload::from_bytes(output_bytes(message.body.as_ref())?),
+                Payload::from_bytes(output_bytes(message.body.as_ref(), &r.turn_id)?),
                 Vec::new(),
             ))
         }
@@ -341,7 +349,7 @@ fn turn_response(r: Option<TurnResult>) -> Result<TurnResponse> {
                 Some(pb::body::Value::Inline(value)) => Some(Reply::inline(
                     format!("http {}", http.status),
                     String::new(),
-                    Payload::from_bytes(output_bytes(Some(value))?),
+                    Payload::from_bytes(output_bytes(Some(value), &r.turn_id)?),
                     Vec::new(),
                 )),
                 Some(pb::body::Value::Blob(_)) => return Err(missing_custody()),
@@ -2611,6 +2619,40 @@ mod tests {
     use prost::Message as _;
 
     use super::*;
+
+    /// ADR 0123: a reply that holds an erased subject's tombstone (the turn
+    /// ran across the erasure) is `SUBJECT_ERASED` with the turn id, not an
+    /// empty reply.
+    #[test]
+    fn a_reply_with_an_erased_subjects_tombstone_is_subject_erased() {
+        let reply = |value| TurnResult {
+            turn_id: TurnId {
+                branch: "main".into(),
+                lsn: 5,
+            },
+            outcome: pb::Outcome {
+                kind: pb::OutcomeKind::Committed as i32,
+                output: Some(pb::outcome::Output::Reply(pb::Message {
+                    name: "reply".into(),
+                    body: Some(pb::Sealable {
+                        subject: Some("user:1".into()),
+                        value: Some(value),
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            scrubbed_with: None,
+        };
+        let erased = pb::sealable::Value::Sealed(kronik_privacy::sealer::erased_value(3));
+        let Err(e) = turn_response(Some(reply(erased))) else {
+            panic!("an erased reply was answered");
+        };
+        assert_eq!(e.code, ErrorCode::SubjectErased);
+        assert!(e.message.contains("turn main:5"), "{}", e.message);
+        let plain = pb::sealable::Value::Plain(b"ok".to_vec());
+        assert!(turn_response(Some(reply(plain))).is_ok());
+    }
 
     /// `+` is literal in a path segment (#47) and a space in a query.
     #[test]

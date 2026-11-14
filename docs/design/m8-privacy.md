@@ -238,7 +238,15 @@ Concretely:
    - A turn that runs across the erasure finishes, but every record it
      writes (`TurnBegin`, effect results, `TurnRecord`) is sealed against its
      provenance: a value that predates the erasure becomes the tombstone, and
-     so do the values of the messages it sends. A turn takes its provenance
+     so do the values of what it sends: its messages and compensations, the
+     frames and closes it hands to its connections (M24), and its answer to
+     whoever asked (an HTTP response, a reply, an open's accept headers),
+     who may be another party than the subject. The gateway answers an HTTP
+     turn whose response holds a tombstone with `SUBJECT_ERASED` and the
+     turn id, the API does the same for a reply, and an open's tombstoned
+     accept headers are left out while the accept stands. A saved response
+     that an idempotent retry gets back answers the same way once its values
+     can no longer be opened. A turn takes its provenance
      before its input is checked; until the record is applied, what the node
      takes in counts as born before the erasure (the subject's rows are still
      there to read). Sealing and appending a turn's record take a fence

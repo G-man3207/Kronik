@@ -144,4 +144,13 @@ impl Node {
             let _ = self.sealer.unseal_value(s);
         });
     }
+
+    /// [`Node::unseal_outcome`] for a saved response that goes back to its
+    /// requester (an idempotent retry): a value of an erased subject, sealed
+    /// under a key that is gone, becomes the erasure's tombstone, as in the
+    /// live answer of a turn that ran across the erasure (ADR 0123). The
+    /// gateway answers either with `SUBJECT_ERASED`.
+    pub(crate) fn unseal_response(&self, outcome: &mut pb::Outcome) {
+        self.sealer.unseal_answer(outcome);
+    }
 }

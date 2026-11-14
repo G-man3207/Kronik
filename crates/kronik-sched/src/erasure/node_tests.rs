@@ -205,6 +205,18 @@ async fn plaintext_in_flight_at_an_erasure_reaches_no_guest_and_no_new_key() {
         ran.turn_id.lsn > erased.lsn.unwrap(),
         "the turn ran across the erasure"
     );
+    // Its answer to the sender holds the tombstone too, as its record does:
+    // the sender may be another party than the subject (ADR 0123).
+    let Some(pb::outcome::Output::Reply(reply)) = &ran.outcome.output else {
+        panic!("no reply: {ran:?}")
+    };
+    assert_eq!(
+        reply.body.as_ref().and_then(|b| b.value.clone()),
+        Some(pb::sealable::Value::Sealed(
+            kronik_privacy::sealer::erased_value(1)
+        )),
+        "the reply to the sender"
+    );
     let refused = waiting.await.unwrap().unwrap().unwrap();
     assert_eq!(refused.outcome.error_code, "SUBJECT_ERASED", "{refused:?}");
     assert!(

@@ -149,6 +149,13 @@ pub fn erased_value(version: u32) -> pb::Sealed {
     }
 }
 
+/// Whether `s` is an erased subject's tombstone ([`erased_value`], or the
+/// form a reseal of the log leaves): a sealed value without ciphertext. A
+/// value sealed under a key always has one, its AEAD tag at least.
+pub fn is_erased(s: &pb::Sealable) -> bool {
+    matches!(&s.value, Some(pb::sealable::Value::Sealed(x)) if x.ciphertext.is_empty())
+}
+
 fn tombstone(version: u32) -> pb::Sealed {
     pb::Sealed {
         key_version: version,
@@ -818,6 +825,23 @@ impl Sealer {
         err.map_or(Ok(()), Err)
     }
 
+    /// Unseals a saved answer (an ingress response that an idempotent retry
+    /// gets back) in place for its requester: a value whose subject was
+    /// erased becomes that erasure's tombstone ([`erased_value`], see
+    /// [`is_erased`]), as in the live answer of a turn that ran across the
+    /// erasure (ADR 0123); a value unreadable for another reason stays as it
+    /// is.
+    pub fn unseal_answer(&self, outcome: &mut pb::Outcome) {
+        kronik_proto::sealables::outcome_mut(Some(outcome), &mut |s| {
+            if let Err(Unreadable::Erased(_)) = self.unseal_value(s)
+                && let Some(pb::sealable::Value::Sealed(x)) = &s.value
+            {
+                let version = x.key_version;
+                s.value = Some(pb::sealable::Value::Sealed(erased_value(version)));
+            }
+        });
+    }
+
     /// Unseals every value of a record in place; unreadable values stay as
     /// they are and are counted.
     pub fn unseal_record(&self, r: &mut Record) -> usize {
@@ -1308,5 +1332,59 @@ mod tests {
                 Err(PrivacyError::InvalidSubject(_))
             ));
         }
+    }
+
+    /// ADR 0123: a saved answer that goes back to its requester after one of
+    /// its subjects was erased holds that erasure's tombstone in place of the
+    /// value, as the live answer of a turn that ran across the erasure does;
+    /// another subject's value opens as usual.
+    #[test]
+    fn a_saved_answer_holds_the_tombstone_of_an_erased_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sealer(dir.path());
+        s.set_on(true);
+        let fill = counter_fill();
+        let mut body = val(Some("user:1"), b"alice");
+        s.seal_value(&mut body, &fill, 1).unwrap();
+        let mut header = val(Some("user:2"), b"bob");
+        s.seal_value(&mut header, &fill, 2).unwrap();
+        let answer = pb::Outcome {
+            kind: pb::OutcomeKind::Committed as i32,
+            output: Some(pb::outcome::Output::Http(pb::HttpResponse {
+                status: 200,
+                headers: vec![pb::Header {
+                    name: "x-user".into(),
+                    value: Some(header),
+                }],
+                body: Some(pb::Body {
+                    value: Some(pb::body::Value::Inline(body)),
+                }),
+            })),
+            ..Default::default()
+        };
+        let parts = |o: &pb::Outcome| match &o.output {
+            Some(pb::outcome::Output::Http(h)) => (
+                match h.body.as_ref().and_then(|b| b.value.clone()) {
+                    Some(pb::body::Value::Inline(s)) => s,
+                    other => panic!("{other:?}"),
+                },
+                h.headers[0].value.clone().unwrap(),
+            ),
+            other => panic!("{other:?}"),
+        };
+        let mut open = answer.clone();
+        s.unseal_answer(&mut open);
+        assert_eq!(
+            parts(&open),
+            (val(Some("user:1"), b"alice"), val(Some("user:2"), b"bob"))
+        );
+        s.erase("user:1", 3).unwrap();
+        let mut after = answer;
+        s.unseal_answer(&mut after);
+        let (body, header) = parts(&after);
+        assert!(is_erased(&body), "{body:?}");
+        assert_eq!(body.subject.as_deref(), Some("user:1"));
+        assert_eq!(header, val(Some("user:2"), b"bob"));
+        assert!(!is_erased(&header));
     }
 }
