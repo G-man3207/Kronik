@@ -523,10 +523,10 @@ UTC:
 | Fetch | 4 MB, 40 MB | +3.9 MiB, +6.4 MiB | +0.4 MiB, +0.4 MiB |
 | Response | 100 MB, 1 GB | +1.5 MiB, +5.3 MiB | +1.4 MiB, +1.4 MiB |
 
-All four tests passed, in 34 s and 28 s. An earlier run on the test machine
-with a glibc 2.35 build of the same work grew the peak by at most 2.9 MiB. A growth of 0 means the peak of
-the warm-up request (a 2 MiB response) was not exceeded: a gigabyte
-streamed through one frame at a time.
+All four tests passed, in 34 s and 28 s. A gigabyte streamed through one
+frame at a time: the peak grew no more than for 100 MB. An earlier run on
+the test machine with a glibc 2.35 build of the same work grew the peak by
+at most 2.9 MiB.
 
 ## Nightly checks (Definition of done)
 
