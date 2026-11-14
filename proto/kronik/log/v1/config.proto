@@ -122,7 +122,9 @@ message Limits {
   optional uint64 blob_threshold_bytes = 13;
   // The largest HTTP request body the gateway accepts for such a kind.
   optional uint64 upload_bytes = 14;
-  // The bytes of the blobs an actor holds, and the bytes one turn creates.
+  // The bytes of the blobs an actor keeps alive (its holds, and the blobs of
+  // its timers, waiting messages and dead letters; ADR 0119 as amended
+  // 2026-11-14), and the bytes one turn creates.
   optional uint64 blob_bytes_per_actor = 15;
 }
 

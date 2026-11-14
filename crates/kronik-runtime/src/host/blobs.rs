@@ -108,10 +108,19 @@ pub trait BlobHost: Send + Sync {
     fn held(&self, _hash: &str) -> Result<Option<pb::BlobRef>, BlobHostError> {
         Ok(None)
     }
-    /// The bytes of the distinct blobs the actor held when the turn
-    /// started, for its quota (ADR 0117 §8).
-    fn held_bytes(&self) -> Result<u64, BlobHostError> {
+    /// The bytes charged to the actor when the turn started, for its quota
+    /// (ADR 0117 §8, ADR 0119 as amended 2026-11-14): the distinct blobs it
+    /// holds, and those its earlier turns keep in rows: its timers, the
+    /// messages and compensations it sent that wait in a mailbox, the dead
+    /// letters of its messages and timers.
+    fn charged_bytes(&self) -> Result<u64, BlobHostError> {
         Ok(0)
+    }
+    /// Whether a row of the actor's earlier turns (a timer, a queued message
+    /// or compensation, a dead letter) carried `hash` when the turn started:
+    /// it is charged to the actor without a hold.
+    fn charged_by_pin(&self, _hash: &str) -> Result<bool, BlobHostError> {
+        Ok(false)
     }
 }
 
@@ -135,8 +144,14 @@ pub(crate) struct TurnBlobs {
     /// Whether the actor held a blob when the turn started, by hash, as
     /// the blob host answered (looked up when first needed).
     held_start: BTreeMap<String, Option<pb::BlobRef>>,
-    /// The bytes the actor held when the turn started, once asked.
-    held_bytes_start: Option<u64>,
+    /// The bytes charged to the actor when the turn started, once asked.
+    charged_bytes_start: Option<u64>,
+    /// Whether a row of the actor's earlier turns carried a blob when the
+    /// turn started, by hash, as the blob host answered.
+    pinned_start: BTreeMap<String, bool>,
+    /// The blobs this turn's timers, sent messages and compensations carry:
+    /// charged to the actor once the turn commits.
+    sent: BTreeMap<String, pb::BlobRef>,
     /// The blobs whose hold this turn changed: their reference, and
     /// whether the actor holds them now.
     holds: BTreeMap<String, (pb::BlobRef, bool)>,
@@ -312,38 +327,100 @@ impl TurnHost {
         Ok(self.held_at_start(hash)?.is_some())
     }
 
-    /// The bytes the actor would hold with `extra` more, after the turn's
-    /// changes so far: its holds at the turn's start, plus what it retained
-    /// and minus what it released since.
-    fn would_hold(&mut self, extra: u64) -> wasmtime::Result<u64> {
-        let start = match self.blob_state.held_bytes_start {
+    /// Whether a row of the actor's earlier turns carried `hash` when the
+    /// turn started; asked of the blob host once per blob.
+    fn pinned_at_start(&mut self, hash: &str) -> wasmtime::Result<bool> {
+        if let Some(known) = self.blob_state.pinned_start.get(hash) {
+            return Ok(*known);
+        }
+        let answer = match &self.blobs {
+            Some(host) => host.charged_by_pin(hash),
+            None => Ok(false),
+        };
+        let pinned = answer.map_err(|error| self.blob_failure(error))?;
+        self.blob_state.pinned_start.insert(hash.to_owned(), pinned);
+        Ok(pinned)
+    }
+
+    /// Whether `hash` was charged to the actor when the turn started.
+    fn charged_at_start(&mut self, hash: &str) -> wasmtime::Result<bool> {
+        Ok(self.held_at_start(hash)?.is_some() || self.pinned_at_start(hash)?)
+    }
+
+    /// The bytes charged to the actor after the turn's changes so far and
+    /// `extra`: what was charged at the turn's start, plus each blob the
+    /// turn retained, put, or put into a timer, message or compensation that
+    /// was not charged then, minus each hold it released that nothing else
+    /// of the actor keeps. Each blob counts once.
+    fn would_charge(&mut self, extra: &[pb::BlobRef]) -> wasmtime::Result<u64> {
+        let start = match self.blob_state.charged_bytes_start {
             Some(bytes) => bytes,
             None => {
                 let answer = match &self.blobs {
-                    Some(host) => host.held_bytes(),
+                    Some(host) => host.charged_bytes(),
                     None => Ok(0),
                 };
                 let bytes = answer.map_err(|error| self.blob_failure(error))?;
-                self.blob_state.held_bytes_start = Some(bytes);
+                self.blob_state.charged_bytes_start = Some(bytes);
                 bytes
             }
         };
-        let mut total = start;
-        let changed: Vec<(String, u64, bool)> = self
-            .blob_state
-            .holds
-            .iter()
-            .map(|(hash, (blob, now))| (hash.clone(), blob.size, *now))
-            .collect();
-        for (hash, size, now) in changed {
-            let was = self.held_at_start(&hash)?.is_some();
-            match (was, now) {
-                (false, true) => total = total.saturating_add(size),
-                (true, false) => total = total.saturating_sub(size),
-                _ => {}
+        // What the turn charges now: held now, or carried by its edges.
+        let mut now: BTreeMap<String, u64> = BTreeMap::new();
+        let mut released: Vec<(String, u64)> = Vec::new();
+        for (hash, (blob, held)) in &self.blob_state.holds {
+            if *held {
+                now.insert(hash.clone(), blob.size);
+            } else {
+                released.push((hash.clone(), blob.size));
             }
         }
-        Ok(total.saturating_add(extra))
+        for (hash, blob) in &self.blob_state.sent {
+            now.insert(hash.clone(), blob.size);
+        }
+        for blob in extra {
+            now.insert(blob.hash.clone(), blob.size);
+        }
+        let mut total = start;
+        for (hash, size) in now.clone() {
+            if !self.charged_at_start(&hash)? {
+                total = total.saturating_add(size);
+            }
+        }
+        for (hash, size) in released {
+            if now.contains_key(&hash) {
+                continue;
+            }
+            if self.held_at_start(&hash)?.is_some() && !self.pinned_at_start(&hash)? {
+                total = total.saturating_sub(size);
+            }
+        }
+        Ok(total)
+    }
+
+    /// Charges the blobs a timer, sent message or compensation of the turn
+    /// carries to the actor (ADR 0119 as amended 2026-11-14): past
+    /// `blob_bytes_per_actor` the turn traps with `BLOB_QUOTA_EXCEEDED`, as
+    /// these calls have no error to answer with.
+    pub(crate) fn charge_edge(&mut self, blobs: &[pb::BlobRef]) -> wasmtime::Result<()> {
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        let total = self.would_charge(blobs)?;
+        if total > self.limits.blob_bytes {
+            bail!(
+                "BLOB_QUOTA_EXCEEDED: the actor would keep {total} blob bytes in its holds, \
+                 timers and messages, more than its quota of {} (blob_bytes_per_actor)",
+                self.limits.blob_bytes
+            );
+        }
+        for blob in blobs {
+            self.blob_state
+                .sent
+                .entry(blob.hash.clone())
+                .or_insert_with(|| blob.clone());
+        }
+        Ok(())
     }
 
     /// Holds `blob`, which is in `T`: `quota-exceeded` past
@@ -353,7 +430,7 @@ impl TurnHost {
             return Ok(Ok(()));
         }
         let was = self.held_at_start(&blob.hash)?.is_some();
-        if !was && self.would_hold(blob.size)? > self.limits.blob_bytes {
+        if !was && self.would_charge(std::slice::from_ref(&blob))? > self.limits.blob_bytes {
             return Ok(Err(wit::BlobError::QuotaExceeded));
         }
         if !was && self.blob_state.changes() >= MAX_HOLD_CHANGES {

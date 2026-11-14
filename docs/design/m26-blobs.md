@@ -140,6 +140,15 @@ As built (M26 slice B14):
 - A turn that would change more than 1 024 holds gets `invalid` from the
   call that would; a message with more than 256 references traps the turn
   (`TURN_FAILED`), as an oversized body does.
+- The quota counts everything the actor keeps alive, not only its holds
+  ([ADR 0119](../adr/0119-blob-reference-graph.md), amended 2026-11-14). That
+  covers the blobs of its timers, of the messages and compensations it sent
+  while they wait, and of the dead letters of its messages and timers, each
+  blob once. `blob_pins.charged` names the actor a pin of sources 1, 2 and 3
+  counts against: the sender, or the timer's actor (`StateDb::charged_bytes`,
+  `charged_by_pin`, `BlobHost::charged_bytes`, `charged_by_pin`). A `send`,
+  `schedule` or `call` whose blobs would pass it traps the turn with
+  `BLOB_QUOTA_EXCEEDED`.
 - A call's `EffectRecord.blobs` lists its message's, its compensation's and
   its reply's references, sorted by identity, each once. The record budget
   counts them when it admits the call and in the reply's room, in
@@ -181,8 +190,14 @@ CREATE INDEX IF NOT EXISTS blob_refs_hash ON blob_refs (hash);
 -- rows of other tables that reference a blob (ADR 0120 §2)
 CREATE TABLE IF NOT EXISTS blob_pins (
   hash TEXT NOT NULL, source INTEGER NOT NULL, owner TEXT NOT NULL, lsn INTEGER NOT NULL,
+  charged TEXT,  -- the actor (kind/key) whose quota it counts against, ADR 0119 (2026-11-14)
   PRIMARY KEY (hash, source, owner)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS blob_pins_owner ON blob_pins (source, owner);
+CREATE INDEX IF NOT EXISTS blob_pins_charged ON blob_pins (charged) WHERE charged IS NOT NULL;
+-- a charged pin that went, until its actor's next turn (ADR 0119, 2026-11-14)
+CREATE TABLE IF NOT EXISTS blob_charge_releases (
+  actor TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, lsn INTEGER NOT NULL,
+  PRIMARY KEY (actor, hash)) WITHOUT ROWID;
 -- every blob a committed record references (ADR 0118 §3, ADR 0120 §1)
 CREATE TABLE IF NOT EXISTS blobs (
   hash TEXT PRIMARY KEY, size INTEGER NOT NULL, subject TEXT, key_version INTEGER NOT NULL,
@@ -194,7 +209,15 @@ CREATE INDEX IF NOT EXISTS blobs_subject ON blobs (subject) WHERE subject IS NOT
 `source`: 1 mailbox (owner `message_id`), 2 timer (`kind/key/timer_id`),
 3 dead letter (its LSN), 4 ingress key (`kind/key/idempotency key`),
 5 delivery (`message_id`), 6 open turn (execution id), 7 open effect
-(execution id/ordinal). M25 uses 4, 6 and 7.
+(execution id/ordinal). M25 uses 4, 6 and 7. `charged` is set on sources
+1, 2 and 3: the sender of a message or compensation, the actor of a timer,
+and for a dead letter the sender of its message or the actor of its timer
+(none for other inputs). A database of an earlier development build gains
+the column on open. When a record deletes a charged pin, its blob goes to
+`blob_charge_releases` with the record's LSN. It counts while that LSN is
+after the actor's `last_lsn`, so a turn's charge depends only on the log
+up to the actor's last turn. The actor's next turn record deletes the
+release.
 
 ### 5.2 Applying records
 

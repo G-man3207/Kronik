@@ -1082,7 +1082,7 @@ configuration epoch. The output shows every limit in force afterwards.
 | `--fingerprint-exclude-query` | Query-parameter names left out of HTTP fingerprints | none |
 | `--blob-threshold` | Bodies above it become blobs, for code that imports `blobs` (M25); at most the message size, and a smaller message size lowers it too | 1 MiB |
 | `--upload-size` | Largest HTTP request body, for code that imports `blobs` (M25) | 64 MiB |
-| `--blob-size-per-actor` | Blob bytes one actor may hold (M26), and one turn may create | 1 GiB |
+| `--blob-size-per-actor` | Blob bytes one actor may keep alive (M26): its holds, and the blobs of its timers, of the messages and compensations it sent while they wait, and of the dead letters of its messages and timers, each blob once; and the bytes one turn may create | 1 GiB |
 
 `--fingerprint-exclude-header` and `--fingerprint-exclude-query` take
 comma-separated names (ADR 0134). They leave a header or query parameter

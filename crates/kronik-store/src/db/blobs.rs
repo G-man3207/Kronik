@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS blobs (
 CREATE INDEX IF NOT EXISTS blobs_subject ON blobs (subject) WHERE subject IS NOT NULL;
 CREATE TABLE IF NOT EXISTS blob_pins (
   hash TEXT NOT NULL, source INTEGER NOT NULL, owner TEXT NOT NULL, lsn INTEGER NOT NULL,
+  charged TEXT,
   PRIMARY KEY (hash, source, owner)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS blob_pins_owner ON blob_pins (source, owner);
 CREATE TABLE IF NOT EXISTS blob_refs (
@@ -46,7 +47,43 @@ CREATE INDEX IF NOT EXISTS blob_refs_hash ON blob_refs (hash);
 CREATE TABLE IF NOT EXISTS blob_releases (
   hash TEXT PRIMARY KEY, kind TEXT NOT NULL, key TEXT NOT NULL, lsn INTEGER NOT NULL)
   WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS blob_charge_releases (
+  actor TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, lsn INTEGER NOT NULL,
+  PRIMARY KEY (actor, hash)) WITHOUT ROWID;
 ";
+
+/// Brings the blob tables of an earlier development build up to date:
+/// `blob_pins.charged` (the actor a pin counts against, ADR 0119 as amended
+/// 2026-11-14) and its index.
+pub(super) fn migrate(conn: &Connection) -> Result<(), StoreError> {
+    let has: bool = conn.query_row(
+        "SELECT count(*) > 0 FROM pragma_table_info('blob_pins') WHERE name = 'charged'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has {
+        conn.execute_batch("ALTER TABLE blob_pins ADD COLUMN charged TEXT;")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS blob_pins_charged ON blob_pins (charged) \
+         WHERE charged IS NOT NULL;",
+    )?;
+    Ok(())
+}
+
+/// The value of `blob_pins.charged` for actor `kind`/`key`.
+fn charged_to(kind: &str, key: &str) -> String {
+    format!("{kind}/{key}")
+}
+
+/// The actor a message input counts against: its sender (an actor's
+/// message or a caller's compensation); none for an operator's.
+fn sender(input: &pb::Input) -> Option<String> {
+    match input.kind.as_ref()? {
+        pb::input::Kind::Message(m) => m.sender.as_ref().map(|a| charged_to(&a.kind, &a.key)),
+        _ => None,
+    }
+}
 
 /// The pin sources of M26 §5.1. M25 writes 4, 6 and 7.
 pub mod source {
@@ -105,8 +142,16 @@ pub(super) fn pin_message(
 ) -> Result<(), StoreError> {
     let mut refs = Vec::new();
     kronik_proto::blobs::input(Some(input), &mut refs);
+    let charged = sender(input);
     for r in refs {
-        pin(tx, &r.hash, source::MAILBOX, message_id, lsn as Lsn)?;
+        pin(
+            tx,
+            &r.hash,
+            source::MAILBOX,
+            message_id,
+            lsn as Lsn,
+            charged.as_deref(),
+        )?;
     }
     Ok(())
 }
@@ -122,34 +167,63 @@ pub(super) fn pin_timer(
     lsn: i64,
 ) -> Result<(), StoreError> {
     let owner = timer_owner(kind, key, timer_id);
-    unpin(tx, source::TIMER, &owner)?;
+    unpin(tx, source::TIMER, &owner, lsn as Lsn)?;
+    let charged = charged_to(kind, key);
     for r in &msg.blobs {
-        pin(tx, &r.hash, source::TIMER, &owner, lsn as Lsn)?;
+        pin(
+            tx,
+            &r.hash,
+            source::TIMER,
+            &owner,
+            lsn as Lsn,
+            Some(&charged),
+        )?;
     }
     Ok(())
 }
 
-/// Unpins a timer that fired or was cancelled.
+/// Unpins a timer that fired or was cancelled, at the record of `lsn`.
 pub(super) fn unpin_timer(
     tx: &Connection,
     kind: &str,
     key: &str,
     timer_id: i64,
+    lsn: i64,
 ) -> Result<(), StoreError> {
-    unpin(tx, source::TIMER, &timer_owner(kind, key, timer_id))
+    unpin(
+        tx,
+        source::TIMER,
+        &timer_owner(kind, key, timer_id),
+        lsn as Lsn,
+    )
 }
 
-/// Pins the blobs of a dead letter's input (source 3), owner its LSN.
+/// Pins the blobs of a dead letter's input (source 3), owner its LSN. It
+/// counts against the actor that sent the message, or whose timer it was
+/// (`kind`/`key`, the actor whose turn failed).
 pub(super) fn pin_dead_letter(
     tx: &Connection,
     lsn: i64,
+    kind: &str,
+    key: &str,
     input: &pb::Input,
 ) -> Result<(), StoreError> {
     let mut refs = Vec::new();
     kronik_proto::blobs::input(Some(input), &mut refs);
     let owner = lsn.to_string();
+    let charged = match input.kind.as_ref() {
+        Some(pb::input::Kind::Timer(_)) => Some(charged_to(kind, key)),
+        _ => sender(input),
+    };
     for r in refs {
-        pin(tx, &r.hash, source::DEAD_LETTER, &owner, lsn as Lsn)?;
+        pin(
+            tx,
+            &r.hash,
+            source::DEAD_LETTER,
+            &owner,
+            lsn as Lsn,
+            charged.as_deref(),
+        )?;
     }
     Ok(())
 }
@@ -165,22 +239,61 @@ pub(super) fn pin_delivery(
     let mut refs = Vec::new();
     kronik_proto::blobs::outcome(Some(outcome), &mut refs);
     for r in refs {
-        pin(tx, &r.hash, source::DELIVERY, message_id, lsn as Lsn)?;
+        pin(tx, &r.hash, source::DELIVERY, message_id, lsn as Lsn, None)?;
     }
     Ok(())
 }
 
-/// Deletes the pins of one row.
-pub(super) fn unpin(tx: &Connection, source: i64, owner: &str) -> Result<(), StoreError> {
+/// Whether pins of `source` count against an actor's quota.
+fn charges(source: i64) -> bool {
+    matches!(
+        source,
+        source::MAILBOX | source::TIMER | source::DEAD_LETTER
+    )
+}
+
+/// Deletes the pins of one row, at the record of `lsn`. A pin that counted
+/// against an actor's quota keeps counting until that actor's next turn
+/// ([`StateDb::charged_bytes`]).
+pub(super) fn unpin(tx: &Connection, source: i64, owner: &str, lsn: Lsn) -> Result<(), StoreError> {
+    if charges(source) {
+        tx.prepare_cached(
+            "INSERT INTO blob_charge_releases (actor, hash, size, lsn) \
+             SELECT p.charged, p.hash, b.size, ?3 FROM blob_pins p JOIN blobs b ON b.hash = p.hash \
+             WHERE p.source = ?1 AND p.owner = ?2 AND p.charged IS NOT NULL \
+             ON CONFLICT (actor, hash) DO UPDATE SET lsn = max(lsn, excluded.lsn)",
+        )?
+        .execute(params![source, owner, i(lsn)])?;
+    }
     tx.prepare_cached("DELETE FROM blob_pins WHERE source = ?1 AND owner = ?2")?
         .execute(params![source, owner])?;
     Ok(())
 }
 
+/// After a turn of `kind`/`key` at `lsn`: the releases of its charges
+/// up to it no longer count (its turns from now on see them gone), so they
+/// go.
+pub(super) fn settle_charges(
+    tx: &Connection,
+    kind: &str,
+    key: &str,
+    lsn: i64,
+) -> Result<(), StoreError> {
+    tx.prepare_cached("DELETE FROM blob_charge_releases WHERE actor = ?1 AND lsn <= ?2")?
+        .execute(params![charged_to(kind, key), lsn])?;
+    Ok(())
+}
+
 /// Deletes the pins of rows of `source` that are gone: rows other than the
 /// usual paths delete (an erasure, the cap on connection dead letters, a
-/// rebase switch). Each source's rows by their owner.
-pub(super) fn prune_orphan_pins(tx: &Connection, source: i64) -> Result<u64, StoreError> {
+/// rebase switch). Each source's rows by their owner. In a record's
+/// application (`lsn`), a pin that counted against an actor's quota keeps
+/// counting until that actor's next turn, as [`unpin`] does.
+pub(super) fn prune_orphan_pins(
+    tx: &Connection,
+    source: i64,
+    lsn: Option<Lsn>,
+) -> Result<u64, StoreError> {
     let exists = match source {
         source::MAILBOX => "EXISTS (SELECT 1 FROM mailbox m WHERE m.message_id = blob_pins.owner)",
         source::TIMER => {
@@ -200,6 +313,18 @@ pub(super) fn prune_orphan_pins(tx: &Connection, source: i64) -> Result<u64, Sto
         }
         _ => return Ok(0),
     };
+    if let Some(lsn) = lsn.filter(|_| charges(source)) {
+        tx.execute(
+            &format!(
+                "INSERT INTO blob_charge_releases (actor, hash, size, lsn) \
+                 SELECT blob_pins.charged, blob_pins.hash, b.size, ?2 FROM blob_pins \
+                 JOIN blobs b ON b.hash = blob_pins.hash \
+                 WHERE blob_pins.source = ?1 AND blob_pins.charged IS NOT NULL AND NOT {exists} \
+                 ON CONFLICT (actor, hash) DO UPDATE SET lsn = max(lsn, excluded.lsn)"
+            ),
+            params![source, i(lsn)],
+        )?;
+    }
     let deleted = tx.execute(
         &format!("DELETE FROM blob_pins WHERE source = ?1 AND NOT {exists}"),
         [source],
@@ -333,11 +458,21 @@ fn index_ref(tx: &Connection, lsn: Lsn, r: &pb::BlobRef) -> Result<(), StoreErro
     Ok(())
 }
 
-fn pin(tx: &Connection, hash: &str, source: i64, owner: &str, lsn: Lsn) -> Result<(), StoreError> {
+/// One pin; `charged` is the actor its blob counts against (sources 1, 2
+/// and 3), none for the others.
+fn pin(
+    tx: &Connection,
+    hash: &str,
+    source: i64,
+    owner: &str,
+    lsn: Lsn,
+    charged: Option<&str>,
+) -> Result<(), StoreError> {
     tx.prepare_cached(
-        "INSERT OR IGNORE INTO blob_pins (hash, source, owner, lsn) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR IGNORE INTO blob_pins (hash, source, owner, lsn, charged) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
     )?
-    .execute(params![hash, source, owner, i(lsn)])?;
+    .execute(params![hash, source, owner, i(lsn), charged])?;
     Ok(())
 }
 
@@ -359,14 +494,14 @@ pub(super) fn apply(
     match record {
         Record::TurnBegin(b) if !closed => {
             for r in &refs {
-                pin(tx, &r.hash, source::OPEN_TURN, &b.execution_id, lsn)?;
+                pin(tx, &r.hash, source::OPEN_TURN, &b.execution_id, lsn, None)?;
             }
         }
         Record::EffectResult(e) if !closed => {
             if let Some(effect) = &e.effect {
                 let owner = effect_owner(&e.execution_id, effect.ordinal);
                 for r in &refs {
-                    pin(tx, &r.hash, source::OPEN_EFFECT, &owner, lsn)?;
+                    pin(tx, &r.hash, source::OPEN_EFFECT, &owner, lsn, None)?;
                 }
             }
         }
@@ -384,7 +519,7 @@ pub(super) fn apply(
                 let mut saved = Vec::new();
                 kronik_proto::blobs::outcome(t.outcome.as_ref(), &mut saved);
                 for r in saved {
-                    pin(tx, &r.hash, source::INGRESS_KEY, &owner, lsn)?;
+                    pin(tx, &r.hash, source::INGRESS_KEY, &owner, lsn, None)?;
                 }
             }
         }
@@ -425,13 +560,15 @@ pub(super) fn apply_switch(
         let mut rows = st.query(params)?;
         while let Some(r) = rows.next()? {
             tx.prepare_cached(
-                "INSERT OR REPLACE INTO blob_pins (hash, source, owner, lsn) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR REPLACE INTO blob_pins (hash, source, owner, lsn, charged) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?
             .execute(params![
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<String>>(4)?
             ])?;
         }
         Ok(())
@@ -440,14 +577,14 @@ pub(super) fn apply_switch(
     for s in [source::MAILBOX, source::DEAD_LETTER] {
         copy(
             "DELETE FROM blob_pins WHERE source = ?1",
-            "SELECT hash, source, owner, lsn FROM blob_pins WHERE source = ?1",
+            "SELECT hash, source, owner, lsn, charged FROM blob_pins WHERE source = ?1",
             &[&s],
         )?;
     }
     // Deliveries after the base.
     copy(
         "DELETE FROM blob_pins WHERE source = ?1 AND lsn > ?2",
-        "SELECT hash, source, owner, lsn FROM blob_pins WHERE source = ?1 AND lsn > ?2",
+        "SELECT hash, source, owner, lsn, charged FROM blob_pins WHERE source = ?1 AND lsn > ?2",
         &[&source::DELIVERY, &base],
     )?;
     for (kind, key) in actors {
@@ -455,8 +592,8 @@ pub(super) fn apply_switch(
         let prefix = format!("{kind}\u{1f}{key}\u{1f}");
         copy(
             "DELETE FROM blob_pins WHERE source = ?1 AND owner >= ?2 AND owner < ?2 || char(127)",
-            "SELECT hash, source, owner, lsn FROM blob_pins WHERE source = ?1 AND owner >= ?2 \
-             AND owner < ?2 || char(127)",
+            "SELECT hash, source, owner, lsn, charged FROM blob_pins WHERE source = ?1 \
+             AND owner >= ?2 AND owner < ?2 || char(127)",
             &[&source::TIMER, &prefix],
         )?;
         tx.execute(
@@ -474,6 +611,24 @@ pub(super) fn apply_switch(
                 "INSERT INTO blob_refs (kind, key, hash, lsn) VALUES (?1, ?2, ?3, ?4)",
             )?
             .execute(params![kind, key, hash, lsn])?;
+        }
+    }
+    // The pending releases of quota charges follow the mailbox and the
+    // dead letters: replaced whole.
+    tx.execute("DELETE FROM blob_charge_releases", [])?;
+    {
+        let mut st = shadow.prepare("SELECT actor, hash, size, lsn FROM blob_charge_releases")?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            tx.prepare_cached(
+                "INSERT INTO blob_charge_releases (actor, hash, size, lsn) VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?
+            ])?;
         }
     }
     // The shadow's releases (bookkeeping, as the index).
@@ -545,7 +700,7 @@ impl StateDb {
             source::INGRESS_KEY,
             source::DELIVERY,
         ] {
-            deleted += prune_orphan_pins(&tx, s)?;
+            deleted += prune_orphan_pins(&tx, s, None)?;
         }
         deleted += tx.execute(
             "DELETE FROM blob_pins WHERE source = ?1 AND lsn < ?2 \
@@ -735,6 +890,49 @@ impl StateDb {
                  WHERE h.kind = ?1 AND h.key = ?2",
             )?
             .query_row(params![kind, key], |r| r.get::<_, i64>(0))? as u64)
+    }
+
+    /// The bytes charged to the actor `kind`/`key` for its quota (ADR 0119,
+    /// amended 2026-11-14), each blob once: the blobs it holds, and those its
+    /// turns keep in rows: its timers, the messages and compensations it sent
+    /// that wait in a mailbox, and the dead letters of its messages and
+    /// timers. A row that went after the actor's last turn still counts:
+    /// other actors' records end its messages at times its own turns do not
+    /// order, so its turns see them gone from its next turn on, the same in
+    /// production and in a replay at the turn's place.
+    pub fn charged_bytes(&self, kind: &str, key: &str) -> Result<u64, StoreError> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT coalesce(sum(size), 0) FROM ( \
+                   SELECT b.hash, b.size FROM blobs b WHERE b.hash IN ( \
+                     SELECT hash FROM blob_refs WHERE kind = ?1 AND key = ?2 \
+                     UNION SELECT hash FROM blob_pins WHERE charged = ?3 AND source IN (1, 2, 3)) \
+                   UNION \
+                   SELECT hash, size FROM blob_charge_releases WHERE actor = ?3 AND lsn > \
+                     coalesce((SELECT last_lsn FROM actors WHERE kind = ?1 AND key = ?2), 0))",
+            )?
+            .query_row(params![kind, key, charged_to(kind, key)], |r| {
+                r.get::<_, i64>(0)
+            })? as u64)
+    }
+
+    /// Whether a row the actor `kind`/`key`'s turns left (a timer, a queued
+    /// message or compensation, a dead letter) carries `hash`, or carried it
+    /// after the actor's last turn: it counts against its quota without a
+    /// hold ([`StateDb::charged_bytes`]).
+    pub fn charged_by_pin(&self, kind: &str, key: &str, hash: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM blob_pins WHERE hash = ?1 AND charged = ?2 \
+                   AND source IN (1, 2, 3)) \
+                 OR EXISTS(SELECT 1 FROM blob_charge_releases WHERE actor = ?2 AND hash = ?1 \
+                   AND lsn > coalesce((SELECT last_lsn FROM actors WHERE kind = ?3 AND key = ?4), 0))",
+            )?
+            .query_row(params![hash, charged_to(kind, key), kind, key], |r| {
+                r.get(0)
+            })?)
     }
 
     /// The holds of the actor `kind`/`key`, by hash, from `after` on, at

@@ -564,7 +564,8 @@ pub struct LimitsSetArgs {
     /// Largest HTTP request body for code that reads blobs, e.g. 512Mi.
     #[arg(long, value_name = "SIZE", value_parser = units::parse_size)]
     upload_size: Option<u64>,
-    /// Blob bytes one actor may hold and one turn may create, e.g. 2Gi.
+    /// Blob bytes one actor may keep alive (holds, timers, waiting messages,
+    /// dead letters) and one turn may create, e.g. 2Gi.
     #[arg(long, value_name = "SIZE", value_parser = units::parse_size)]
     blob_size_per_actor: Option<u64>,
     #[command(flatten)]

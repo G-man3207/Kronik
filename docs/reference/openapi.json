@@ -5608,7 +5608,7 @@
       "LimitsRequest": {
         "properties": {
           "blob_bytes_per_actor": {
-            "description": "The blob bytes one actor may hold and one turn may create.",
+            "description": "The blob bytes one actor may keep alive (its holds, and the blobs of\nits timers, its waiting messages and its dead letters) and one turn\nmay create.",
             "format": "uint64",
             "minimum": 0,
             "type": [

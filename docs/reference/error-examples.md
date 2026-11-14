@@ -87,8 +87,9 @@ kronik history media/fixture --limit 5
 ## BLOB_QUOTA_EXCEEDED
 
 A fixture `media` actor retains every upload it receives and reaches its
-kind's `blob_bytes_per_actor`. Look at what it holds, then release what it
-no longer needs in its code, or raise the quota for the kind.
+kind's `blob_bytes_per_actor`. Look at what it holds and what its timers and
+waiting messages carry, then release or cancel what it no longer needs in
+its code, or raise the quota for the kind.
 
 ```sh
 kronik limits set media --blob-size-per-actor 4GiB --reason "media keeps originals"

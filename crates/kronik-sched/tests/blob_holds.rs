@@ -120,6 +120,47 @@ impl Proc {
         })
     }
 
+    /// Runs `op` on `media/<key>` over HTTP with `body`.
+    fn run_with(&self, key: &str, op: &str, query: &str, body: pb::body::Value) -> TurnResult {
+        let input = pb::HttpInput {
+            method: "POST".into(),
+            path: format!("/media/{key}/{op}"),
+            query: query.into(),
+            body: Some(pb::Body { value: Some(body) }),
+            ..Default::default()
+        };
+        self.rt.block_on(async {
+            let actor = ActorRef::parse(&format!("media/{key}")).unwrap();
+            match self.node.ingress(actor, input, None).unwrap() {
+                Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
+                Ingress::Done(r) => *r,
+            }
+        })
+    }
+
+    /// A blob of `size` bytes written as the gateway writes an upload.
+    fn upload(&self, size: usize) -> pb::BlobRef {
+        let store = self.node.blob_store().unwrap().clone();
+        self.rt.block_on(async move {
+            let mut w = store
+                .writer(
+                    kronik_blob::Space::Main,
+                    None,
+                    u64::MAX,
+                    store.leases().take("upload"),
+                )
+                .await
+                .unwrap();
+            w.write(&vec![9u8; size]).await.unwrap();
+            let meta = w.finish().await.unwrap();
+            store
+                .ensure_durable(&kronik_blob::Space::Main, &[meta.id])
+                .await
+                .unwrap();
+            meta.to_pb()
+        })
+    }
+
     /// [`Proc::run`] of a turn that commits; its text answer.
     fn ok(&self, key: &str, op: &str, query: &str) -> String {
         let r = self.run(key, op, query, b"");
@@ -455,4 +496,41 @@ fn holds_and_pins_rebuild_from_the_log() {
     assert!(q.held("a", &blob) && q.held("b", &blob));
     assert_eq!(pins(&q), live_pins);
     assert_eq!(q.ok("b", "held-sum", ""), pattern_sum(3000));
+}
+
+/// The quota bounds what an actor keeps alive, not only what it holds
+/// (ADR 0119 as amended 2026-11-14): a blob it put into a timer still
+/// counts after it released its hold, until the timer fires; a message
+/// that would take it past the quota traps its turn with
+/// BLOB_QUOTA_EXCEEDED, and nothing is sent.
+#[allow(clippy::disallowed_methods)]
+#[test]
+fn the_quota_counts_timers_and_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path(), true);
+    p.set_quota(10_000);
+    let six = blob_of(&p.ok("a", "put", "size=6000"));
+    // A timer with the held blob adds nothing; released, it still counts.
+    p.ok("a", "schedule", "delay=1500&op=info");
+    assert_eq!(p.ok("a", "release", ""), "released");
+    assert!(!p.held("a", &six));
+    assert_eq!(p.ok("a", "put", "size=5000"), "quota-exceeded");
+    // Once the timer has fired, the room is back.
+    let mut waited = 0;
+    loop {
+        let charged = p.node.store().db().charged_bytes("media", "a").unwrap();
+        if charged == 0 {
+            break;
+        }
+        waited += 1;
+        assert!(waited < 1000, "the timer never fired");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let five = blob_of(&p.ok("a", "put", "size=5000"));
+    // A message that would keep 5000 + 6000 bytes: the turn traps.
+    let upload = p.upload(6000);
+    let sent = p.run_with("a", "send", "to=c&op=info", pb::body::Value::Blob(upload));
+    assert!(!sent.committed());
+    assert_eq!(sent.outcome.error_code, "BLOB_QUOTA_EXCEEDED", "{sent:?}");
+    assert!(p.held("a", &five));
 }

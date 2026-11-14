@@ -722,6 +722,8 @@ fn classify_error(e: &wasmtime::Error, memory_limit_hit: bool) -> pb::Outcome {
         "NOT_IMPLEMENTED"
     } else if msg.starts_with("BLOB_NOT_HELD") {
         ErrorCode::BlobNotHeld.as_str()
+    } else if msg.starts_with("BLOB_QUOTA_EXCEEDED") {
+        ErrorCode::BlobQuotaExceeded.as_str()
     } else if msg.starts_with("REPLAY_DIVERGED") {
         "REPLAY_DIVERGED"
     } else {

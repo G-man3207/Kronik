@@ -654,3 +654,141 @@ fn an_erased_row_stays_while_a_pin_or_a_hold_keeps_it() {
     assert_eq!(forget(&mut db), 1);
     assert!(db.blob(&theirs.hash).unwrap().is_none());
 }
+
+/// What counts against an actor's quota (ADR 0119 as amended 2026-11-14):
+/// its holds, its timers, the messages it sent while they wait, and the
+/// dead letters of its messages; each blob once. A row that goes takes
+/// its charge with it.
+#[test]
+fn an_actors_charge_is_its_holds_timers_messages_and_dead_letters() {
+    use pb::blob_ref_op::Kind;
+    let mut db = db();
+    let (held, timed, sent) = (blob(0x41, 100), blob(0x42, 20), blob(0x43, 3));
+    let out = pb::OutboundMessage {
+        to: Some(pb::ActorRef {
+            kind: "media".into(),
+            key: "b".into(),
+        }),
+        // The held blob again: it counts once.
+        msg: Some(msg_with(vec![sent.clone(), held.clone()])),
+        ordinal: 1,
+        message_id: "m1".into(),
+    };
+    let schedule = pb::TimerOp {
+        kind: pb::TimerOpKind::Schedule as i32,
+        timer_id: 9,
+        due_ms: 99,
+        msg: Some(msg_with(vec![timed.clone()])),
+        ordinal: 2,
+    };
+    db.apply(&[at(
+        1,
+        turn(
+            "e1",
+            operator(),
+            true,
+            vec![op(Kind::Retain, &held)],
+            vec![out],
+            vec![schedule],
+        ),
+    )])
+    .unwrap();
+    assert_eq!(db.charged_bytes("media", "a").unwrap(), 123);
+    assert!(db.charged_by_pin("media", "a", &timed.hash).unwrap());
+    assert!(db.charged_by_pin("media", "a", &sent.hash).unwrap());
+    // The receiver is not charged for what it was sent.
+    assert_eq!(db.charged_bytes("media", "b").unwrap(), 0);
+    // The message fails at its receiver: a dead letter, still the sender's.
+    let delivered = pb::input::Kind::Message(pb::MessageInput {
+        source: pb::MessageSource::Actor as i32,
+        sender: Some(pb::ActorRef {
+            kind: "media".into(),
+            key: "a".into(),
+        }),
+        msg: Some(msg_with(vec![sent.clone(), held.clone()])),
+        message_id: "m1".into(),
+        ..Default::default()
+    });
+    let mut failed = turn("e2", delivered, false, vec![], vec![], vec![]);
+    if let Record::TurnRecord(rec) = &mut failed {
+        rec.actor = Some(pb::ActorRef {
+            kind: "media".into(),
+            key: "b".into(),
+        });
+    }
+    db.apply(&[at(2, failed)]).unwrap();
+    assert_eq!(db.charged_bytes("media", "a").unwrap(), 123);
+    assert_eq!(db.charged_bytes("media", "b").unwrap(), 0);
+    // The timer fires; the hold is released: only the dead letter's blobs.
+    let fired = pb::input::Kind::Timer(pb::TimerInput {
+        timer_id: 9,
+        msg: Some(msg_with(vec![timed.clone()])),
+        due_ms: 99,
+        ..Default::default()
+    });
+    db.apply(&[at(
+        3,
+        turn(
+            "e3",
+            fired,
+            true,
+            vec![op(Kind::Release, &held)],
+            vec![],
+            vec![],
+        ),
+    )])
+    .unwrap();
+    assert_eq!(db.charged_bytes("media", "a").unwrap(), 103);
+    assert!(!db.charged_by_pin("media", "a", &timed.hash).unwrap());
+    // Another message, which its receiver takes: another actor's record
+    // ends it, at a time media/a's turns do not order, so media/a sees it
+    // gone only from its next turn on, as a replay at that turn's place
+    // would.
+    let other = blob(0x44, 7);
+    let out = pb::OutboundMessage {
+        to: Some(pb::ActorRef {
+            kind: "media".into(),
+            key: "b".into(),
+        }),
+        msg: Some(msg_with(vec![other.clone()])),
+        ordinal: 1,
+        message_id: "m2".into(),
+    };
+    db.apply(&[at(
+        4,
+        turn("e4", operator(), true, vec![], vec![out], vec![]),
+    )])
+    .unwrap();
+    assert_eq!(db.charged_bytes("media", "a").unwrap(), 110);
+    let taken = pb::input::Kind::Message(pb::MessageInput {
+        source: pb::MessageSource::Actor as i32,
+        sender: Some(pb::ActorRef {
+            kind: "media".into(),
+            key: "a".into(),
+        }),
+        msg: Some(msg_with(vec![other.clone()])),
+        message_id: "m2".into(),
+        ..Default::default()
+    });
+    let mut consumed = turn("e5", taken, true, vec![], vec![], vec![]);
+    if let Record::TurnRecord(rec) = &mut consumed {
+        rec.actor = Some(pb::ActorRef {
+            kind: "media".into(),
+            key: "b".into(),
+        });
+    }
+    db.apply(&[at(5, consumed)]).unwrap();
+    assert_eq!(db.charged_bytes("media", "a").unwrap(), 110);
+    assert!(db.charged_by_pin("media", "a", &other.hash).unwrap());
+    db.apply(&[at(6, turn("e6", operator(), true, vec![], vec![], vec![]))])
+        .unwrap();
+    assert_eq!(db.charged_bytes("media", "a").unwrap(), 103);
+    assert!(!db.charged_by_pin("media", "a", &other.hash).unwrap());
+    let pending: i64 = db
+        .conn
+        .query_row("SELECT count(*) FROM blob_charge_releases", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(pending, 0, "settled at media/a's turn");
+}

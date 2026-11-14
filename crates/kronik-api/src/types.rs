@@ -589,7 +589,9 @@ pub struct LimitsRequest {
     /// The largest HTTP request body of a kind whose code reads blobs (M25).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_bytes: Option<u64>,
-    /// The blob bytes one actor may hold and one turn may create.
+    /// The blob bytes one actor may keep alive (its holds, and the blobs of
+    /// its timers, its waiting messages and its dead letters) and one turn
+    /// may create.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_bytes_per_actor: Option<u64>,
     /// Required: missing or blank answers REASON_REQUIRED.

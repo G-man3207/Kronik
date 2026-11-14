@@ -835,6 +835,7 @@ impl messaging::Host for TurnHost {
         };
         self.check_message(&msg)?;
         let blobs = self.complete_message_blobs(&msg)?;
+        self.charge_edge(&blobs)?;
         let ordinal = self.ordinal();
         self.messages.push(pb::OutboundMessage {
             to: Some(to.to_pb()),
@@ -865,6 +866,8 @@ impl messaging::Host for TurnHost {
             Some(c) => self.complete_message_blobs(c)?,
             None => Vec::new(),
         };
+        // A compensation waits in the callee's mailbox if this turn fails.
+        self.charge_edge(&compensate_blobs)?;
         let gate = self.gate("messaging.call")?;
         let ordinal = self.ordinal();
         let subject = self.subject.clone();
@@ -901,6 +904,7 @@ impl timers::Host for TurnHost {
         self.deny_in_describe("timers")?;
         self.check_message(&msg)?;
         let blobs = self.complete_message_blobs(&msg)?;
+        self.charge_edge(&blobs)?;
         let ordinal = self.ordinal();
         let id = timer_id(&self.causal_key, ordinal);
         self.timers.push(pb::TimerOp {

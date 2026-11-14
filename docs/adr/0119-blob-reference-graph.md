@@ -1,6 +1,6 @@
 # 0119. Blob references: borrowed and held, and the reference graph as the authorization graph
 
-- **Status:** Accepted (2026-11-13)
+- **Status:** Accepted (2026-11-13), amended 2026-11-14
 - **Date:** 2026-11-13
 
 ## Context
@@ -148,3 +148,38 @@ At most 256 references per message and 1 024 blob operations per turn;
   the reference) follows from §2 and §3.
 - Revisit if references must ever cross a branch (a fork never sends to
   main), or if operator messages need blobs.
+
+## Amendment (2026-11-14): the quota bounds what an actor keeps alive
+
+Decided by the maintainers' lead after the M26 review (finding M-2).
+
+As accepted, `blob_bytes_per_actor` bounded the blobs an actor holds. A turn
+could still write blobs, put them into timers with any delay, messages or
+compensations, release them, and do it again in the next turn. Those rows
+keep their blobs (ADR 0120) without any bound. Client-driven code, such as an
+"expire in N days" route with a client-chosen N, could park unbounded bytes.
+
+Now the quota counts every blob an actor's turns keep alive, each blob once:
+- its holds;
+- the blobs of its timers;
+- the blobs of the messages and compensations it sent, while they wait in a
+  mailbox;
+- the blobs of the dead letters of its messages and timers.
+
+A blob counts against the sending actor, never the receiver. It stops
+counting when its row goes (the message consumed, the timer fired or
+cancelled, the dead letter resent or erased), as the actor's turns see it
+from the actor's next turn on. Another actor's record that ends a message
+is not ordered with the sender's turns: production may run the sender's
+turn before or after it, while a replay at the turn's place always has
+it. So what a turn is charged depends only on the log up to the actor's
+last turn. `state.db`'s pins record the actor they charge, and
+`blob_charge_releases` keeps a released charge until that actor's next
+turn, so production and a replay decide the same.
+
+In a turn, a hold that would pass the quota answers `quota-exceeded`, as
+before. A message, timer or compensation that would pass it traps the turn
+with `BLOB_QUOTA_EXCEEDED`, since `send`, `schedule` and `call` have no error
+to answer with. A hold released, or an edge cancelled, in the same turn
+makes room from the next turn on, except a released hold, which makes room
+at once.

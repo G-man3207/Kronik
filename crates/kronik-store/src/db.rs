@@ -391,6 +391,7 @@ impl StateDb {
         )?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(blobs::SCHEMA)?;
+        blobs::migrate(&conn)?;
         // M8: `kv.sealed` says whether `value` is an encoded `Sealed`
         // (privacy mode) or the plain bytes; older databases gain it.
         let has_sealed: bool = conn.query_row(
@@ -947,7 +948,7 @@ impl StateDb {
                     // subject's state values and saved responses and dead
                     // letters go with its keys; its queued bodies become
                     // tombstones.
-                    erase_rows(&tx, &e.subject, e.key_version)?;
+                    erase_rows(&tx, &e.subject, e.key_version, Some(c.lsn))?;
                     tx.prepare_cached(
                         "INSERT OR REPLACE INTO erasures (subject, key_version, lsn) VALUES (?1, ?2, ?3)",
                     )?
@@ -1020,7 +1021,7 @@ impl StateDb {
     /// outside a record: a rebase shadow after its staged turns (M13), and
     /// a fork's continuous replay at the erasure's place.
     pub fn erase_subject_rows(&self, subject: &str, key_version: u32) -> Result<(), StoreError> {
-        erase_rows(&self.conn, subject, key_version)
+        erase_rows(&self.conn, subject, key_version, None)
     }
 
     /// The LSN of the newest `Erasure` applied.
@@ -2306,6 +2307,7 @@ fn apply_turn(
         committed && has_sql,
         committed
     ])?;
+    blobs::settle_charges(tx, kind, key, lsn)?;
     tx.prepare_cached(
         "INSERT INTO turn_index (lsn, kind, key, segment, offset, outcome) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?
@@ -2386,7 +2388,7 @@ fn apply_turn(
                 blobs::pin_timer(tx, kind, key, op.timer_id as i64, msg, lsn)?;
             } else {
                 cancel.execute(params![kind, key, op.timer_id as i64])?;
-                blobs::unpin_timer(tx, kind, key, op.timer_id as i64)?;
+                blobs::unpin_timer(tx, kind, key, op.timer_id as i64, lsn)?;
             }
         }
     } else {
@@ -2516,7 +2518,7 @@ fn apply_turn(
             ) {
                 tx.prepare_cached("DELETE FROM mailbox WHERE message_id = ?1")?
                     .execute([&m.message_id])?;
-                blobs::unpin(tx, blob_source::MAILBOX, &m.message_id)?;
+                blobs::unpin(tx, blob_source::MAILBOX, &m.message_id, lsn as Lsn)?;
             }
             if matches!(
                 source,
@@ -2553,7 +2555,12 @@ fn apply_turn(
                 )?
                 .execute(params![i(of.lsn), lsn])?;
                 // The resend's record references the same blobs.
-                blobs::unpin(tx, blob_source::DEAD_LETTER, &i(of.lsn).to_string())?;
+                blobs::unpin(
+                    tx,
+                    blob_source::DEAD_LETTER,
+                    &i(of.lsn).to_string(),
+                    lsn as Lsn,
+                )?;
             }
             if committed && !m.compensates.is_empty() {
                 tx.prepare_cached(
@@ -2569,7 +2576,7 @@ fn apply_turn(
         Some(pb::input::Kind::Timer(tm)) => {
             tx.prepare_cached("DELETE FROM timers WHERE kind = ?1 AND key = ?2 AND timer_id = ?3")?
                 .execute(params![kind, key, tm.timer_id as i64])?;
-            blobs::unpin_timer(tx, kind, key, tm.timer_id as i64)?;
+            blobs::unpin_timer(tx, kind, key, tm.timer_id as i64, lsn)?;
             if !committed {
                 dead_letter_insert(tx, lsn, kind, key, input, outcome)?;
             }
@@ -2751,7 +2758,12 @@ fn apply_connections(
             "UPDATE dead_letters SET resent_as = ?2 WHERE lsn = ?1 AND resent_as IS NULL",
         )?
         .execute(params![i(of.lsn), lsn])?;
-        blobs::unpin(tx, blob_source::DEAD_LETTER, &i(of.lsn).to_string())?;
+        blobs::unpin(
+            tx,
+            blob_source::DEAD_LETTER,
+            &i(of.lsn).to_string(),
+            lsn as Lsn,
+        )?;
     }
     // A failed frame or close turn is a dead letter; a failed open is not
     // (its client got the error). Any client can make its owner fail, so
@@ -2776,7 +2788,7 @@ fn apply_connections(
                  (SELECT lsn FROM connection_dead_letters ORDER BY lsn LIMIT ?1)",
             )?
             .execute([over])?;
-            blobs::prune_orphan_pins(tx, blob_source::DEAD_LETTER)?;
+            blobs::prune_orphan_pins(tx, blob_source::DEAD_LETTER, Some(lsn as Lsn))?;
         }
     }
     Ok(())
@@ -2988,7 +3000,7 @@ fn resolve_timed_out_call(
     } else if let Some(compensation) = &compensation {
         tx.prepare_cached("DELETE FROM mailbox WHERE message_id = ?1")?
             .execute([compensation])?;
-        blobs::unpin(tx, blob_source::MAILBOX, compensation)?;
+        blobs::unpin(tx, blob_source::MAILBOX, compensation, lsn as Lsn)?;
     }
     tx.prepare_cached("DELETE FROM timed_out_calls WHERE call_message_id = ?1")?
         .execute([call_message_id])?;
@@ -3016,7 +3028,7 @@ fn dead_letter_insert(
         outcome.message,
         input_subject(input)
     ])?;
-    blobs::pin_dead_letter(tx, lsn, input)?;
+    blobs::pin_dead_letter(tx, lsn, kind, key, input)?;
     Ok(())
 }
 
@@ -3119,7 +3131,15 @@ fn tombstone(subject: &str, key_version: u32) -> impl FnMut(&mut pb::Sealable) -
 /// and sealing it again under a new key version (issue #31). So do the
 /// subject's values in the recorded effects of turns still open, which a
 /// re-run would hand to its guest.
-fn erase_rows(tx: &Connection, subject: &str, key_version: u32) -> Result<(), StoreError> {
+/// `lsn`: the erasure record's, when it is applied as one: the subject's
+/// rows that counted against an actor's quota count until that actor's next
+/// turn ([`blobs::unpin`]).
+fn erase_rows(
+    tx: &Connection,
+    subject: &str,
+    key_version: u32,
+    lsn: Option<Lsn>,
+) -> Result<(), StoreError> {
     for sql in [
         "DELETE FROM kv WHERE subject = ?1",
         "DELETE FROM ingress_keys WHERE subject = ?1",
@@ -3128,7 +3148,7 @@ fn erase_rows(tx: &Connection, subject: &str, key_version: u32) -> Result<(), St
         tx.prepare_cached(sql)?.execute([subject])?;
     }
     for source in [blob_source::INGRESS_KEY, blob_source::DEAD_LETTER] {
-        blobs::prune_orphan_pins(tx, source)?;
+        blobs::prune_orphan_pins(tx, source, lsn)?;
     }
     tx.prepare_cached(
         "DELETE FROM connection_dead_letters WHERE lsn NOT IN (SELECT lsn FROM dead_letters)",
@@ -3234,7 +3254,7 @@ fn add_subject_columns(conn: &Connection) -> Result<(), StoreError> {
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     for (s, v) in &erased {
-        erase_rows(&tx, s, *v)?;
+        erase_rows(&tx, s, *v, None)?;
     }
     tx.commit()?;
     Ok(())

@@ -652,15 +652,26 @@ impl BlobHost for TurnBlobs {
             .map_err(|e| BlobHostError::Host(format!("reading the actor's holds: {e}")))
     }
 
-    fn held_bytes(&self) -> Result<u64, BlobHostError> {
+    fn charged_bytes(&self) -> Result<u64, BlobHostError> {
         let Some(holds) = &self.0.holds else {
             return Ok(0);
         };
         holds
             .store
             .db()
-            .held_bytes(&holds.actor.kind, &holds.actor.key)
-            .map_err(|e| BlobHostError::Host(format!("reading the actor's holds: {e}")))
+            .charged_bytes(&holds.actor.kind, &holds.actor.key)
+            .map_err(|e| BlobHostError::Host(format!("reading the actor's blob charges: {e}")))
+    }
+
+    fn charged_by_pin(&self, hash: &str) -> Result<bool, BlobHostError> {
+        let Some(holds) = &self.0.holds else {
+            return Ok(false);
+        };
+        holds
+            .store
+            .db()
+            .charged_by_pin(&holds.actor.kind, &holds.actor.key, hash)
+            .map_err(|e| BlobHostError::Host(format!("reading the actor's blob charges: {e}")))
     }
 
     fn replaced(&self, writer: u64) -> u64 {
