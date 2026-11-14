@@ -50,6 +50,11 @@ pub struct RestoreArgs {
     /// are listed; everyone else's stay readable.
     #[arg(long)]
     allow_missing_keys: bool,
+    /// Install even when blobs that the restored data references are
+    /// missing from the bucket or fail their check. They are listed, and
+    /// the node reads them as BLOB_MISSING.
+    #[arg(long)]
+    allow_missing_blobs: bool,
     /// The branch to restore.
     #[arg(long, default_value = "main")]
     branch: String,
@@ -93,6 +98,23 @@ struct RestoreOutput {
     /// and stay unreadable. Absent when there are none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     keys_missing: Vec<String>,
+    /// The blobs the restored state and log reference. Absent for a dry
+    /// run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blobs: Option<RestoredBlobs>,
+}
+
+/// The blobs a restore installed.
+#[derive(Debug, Serialize, JsonSchema)]
+struct RestoredBlobs {
+    /// Downloaded and checked, and their bytes.
+    restored: u64,
+    bytes: u64,
+    /// Of erased subjects: not downloaded.
+    erased: u64,
+    /// With `--allow-missing-blobs`: missing from the bucket or failing
+    /// their check; the node reads them as BLOB_MISSING.
+    missing: Vec<String>,
 }
 
 #[cfg(test)]
@@ -187,6 +209,7 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
             force,
             mode,
             keys: &keys,
+            allow_missing_blobs: args.allow_missing_blobs,
         };
         let mut hooks = Hooks {
             drop_to: &crate::cli::userns::become_owner,
@@ -205,9 +228,14 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
                 return Ok(None);
             }
             let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
-            let report = kronik_ship::restore(&remote, &data, &branch, force, &env, &keys, mode)
-                .await
-                .map_err(ship_error)?;
+            let options = kronik_ship::RestoreOptions {
+                allow_missing_blobs: args.allow_missing_blobs,
+            };
+            let report = kronik_ship::restore_with_options(
+                &remote, &data, &branch, force, &env, &keys, mode, options,
+            )
+            .await
+            .map_err(ship_error)?;
             Ok::<_, ApiError>(Some(report))
         })?
     };
@@ -228,6 +256,12 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
             .as_ref()
             .map(|r| r.keys_missing.clone())
             .unwrap_or_default(),
+        blobs: report.as_ref().map(|r| RestoredBlobs {
+            restored: r.blobs.restored,
+            bytes: r.blobs.bytes,
+            erased: r.blobs.erased,
+            missing: r.blobs.missing.clone(),
+        }),
     };
     Ok((
         render(&output, &args, &data, selected_config.as_deref()),
@@ -244,6 +278,7 @@ struct Job<'a> {
     force: bool,
     mode: kronik_ship::KeystoreMode,
     keys: &'a kronik_privacy::key_source::Keys,
+    allow_missing_blobs: bool,
 }
 
 /// The steps of [`restore_dropping`], in the order they happen. The tests pin
@@ -403,6 +438,7 @@ fn restore_dropping(
         };
         kronik_ship::root_phase_from(&bucket, job.data, &env, job.keys, job.mode)
             .await
+            .map(|phase| phase.allow_missing_blobs(job.allow_missing_blobs))
             .map_err(ship_error)
     })?;
     (hooks.seen)(Step::RootPhase);
@@ -567,6 +603,22 @@ fn render(
         _ => "none in the bucket, and none needed".to_owned(),
     };
     field(&mut out, "Keystore", &[keystore], "");
+    if let Some(b) = &o.blobs
+        && (b.restored > 0 || b.erased > 0 || !b.missing.is_empty())
+    {
+        let mut line = format!(
+            "{} restored ({} bytes), {} of erased subjects",
+            b.restored, b.bytes, b.erased
+        );
+        if !b.missing.is_empty() {
+            let _ = write!(
+                line,
+                "; missing (--allow-missing-blobs, read as BLOB_MISSING): {}",
+                b.missing.join(", ")
+            );
+        }
+        field(&mut out, "Blobs", &[line], "");
+    }
     if !o.keys_missing.is_empty() {
         field(
             &mut out,
@@ -674,6 +726,11 @@ pub(crate) fn key_config(
 fn ship_error(e: ShipError) -> ApiError {
     match e {
         ShipError::KeySource(e) => e.api_error(),
+        ShipError::BlobMissing(m) => ApiError::new(ErrorCode::BlobMissing, format!("restore: {m}"))
+            .with_hint(
+                "Nothing was installed. Put the blobs back in the bucket's blobs/ from a backup, \
+                 or run again with --allow-missing-blobs: the node then reads them as BLOB_MISSING.",
+            ),
         ShipError::Config(m) => ApiError::new(ErrorCode::BadRequest, format!("ship: {m}")),
         ShipError::Restore(m) if m.contains("already holds state") => {
             ApiError::new(ErrorCode::BadRequest, format!("restore: {m}"))

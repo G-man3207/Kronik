@@ -168,6 +168,11 @@ pub const METRICS: &[Def] = &[
         kind: Type::Gauge,
     },
     Def {
+        name: "kronik_blob_ship_pending",
+        help: "Blobs the index keeps that the shipper has not uploaded, as of its last round.",
+        kind: Type::Gauge,
+    },
+    Def {
         name: "kronik_blob_leases",
         help: "Leases on blobs held in this daemon's memory (turns, uploads, streams, replays), as of the collector's last pass.",
         kind: Type::Gauge,

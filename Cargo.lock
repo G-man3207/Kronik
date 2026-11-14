@@ -2355,14 +2355,17 @@ name = "kronik-ship"
 version = "0.5.0-dev"
 dependencies = [
  "blake3",
+ "kronik-blob",
  "kronik-core",
  "kronik-log",
+ "kronik-metrics",
  "kronik-privacy",
  "kronik-proto",
  "kronik-sched",
  "kronik-store",
  "object_store",
  "reqwest",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",

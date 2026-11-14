@@ -7365,6 +7365,17 @@ against both.
 {
   "description": "What `kronik restore --json` prints.",
   "properties": {
+    "blobs": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/RestoredBlobs"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The blobs the restored state and log reference. Absent for a dry\nrun."
+    },
     "branch": {
       "type": "string"
     },
@@ -7450,6 +7461,47 @@ against both.
     "data_dir",
     "branch",
     "keys_missing"
+  ],
+  "type": "object"
+}
+```
+
+### RestoredBlobs
+
+```json
+{
+  "description": "The blobs a restore installed.",
+  "properties": {
+    "bytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "erased": {
+      "description": "Of erased subjects: not downloaded.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "missing": {
+      "description": "With `--allow-missing-blobs`: missing from the bucket or failing\ntheir check; the node reads them as BLOB_MISSING.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "restored": {
+      "description": "Downloaded and checked, and their bytes.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "restored",
+    "bytes",
+    "erased",
+    "missing"
   ],
   "type": "object"
 }

@@ -9,7 +9,7 @@
 //! <prefix>/code/<blake3>.wasm.zst
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,10 +27,13 @@ use zeroize::Zeroizing;
 
 mod names;
 
+mod blobs;
 #[cfg(test)]
 mod bucket_tests;
 #[cfg(test)]
 mod credential_tests;
+
+pub use blobs::{BlobRestore, shipped_blob_names};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShipError {
@@ -69,6 +72,10 @@ pub enum ShipError {
         dir: PathBuf,
         error: object_store::Error,
     },
+    /// A blob that a record or snapshot references is not in the local store
+    /// (shipping), or not in the bucket or damaged there (restore).
+    #[error("BLOB_MISSING: {0}")]
+    BlobMissing(String),
 }
 
 impl ShipError {
@@ -92,6 +99,7 @@ impl ShipError {
                     "file"
                 }
             }
+            ShipError::BlobMissing(_) => "blob_missing",
             ShipError::Store(e) | ShipError::CredentialsExpired(e) => match e {
                 E::NotFound { .. } => "s3_not_found",
                 E::PermissionDenied { .. } => "s3_forbidden",
@@ -612,19 +620,114 @@ pub struct ShipReport {
     pub deleted: u64,
 }
 
-/// Uploads what is missing remotely: closed segments (once), the active
-/// segment when it grew (so an idle node's last records leave within one
-/// round), snapshots (files, then the manifest), components; deletes
-/// remote segments and snapshots that retention removed locally, among them
-/// the partial upload of an active segment that retention removed before a
-/// round uploaded it as a closed one.
+/// The blob side of a round (ADR 0122): what was uploaded, opened when a
+/// round first needs it, and the local index.
+struct BlobRound<'a> {
+    data: &'a Path,
+    shipped: Option<blobs::Shipped>,
+    index: Option<blobs::Index>,
+    branch: &'a str,
+}
+
+impl BlobRound<'_> {
+    fn index(&mut self) -> Result<&blobs::Index, ShipError> {
+        if self.index.is_none() {
+            let state = self
+                .data
+                .join("branches")
+                .join(self.branch)
+                .join("state.db");
+            self.index = Some(blobs::Index::open(&state)?);
+        }
+        self.index
+            .as_ref()
+            .ok_or_else(|| ShipError::Config("the blob index is not open".into()))
+    }
+
+    fn shipped(&mut self) -> Result<&blobs::Shipped, ShipError> {
+        if self.shipped.is_none() {
+            self.shipped = Some(blobs::Shipped::open(self.data)?);
+        }
+        self.shipped
+            .as_ref()
+            .ok_or_else(|| ShipError::Config("ship-blobs.db is not open".into()))
+    }
+
+    /// Step 1: the blobs `ids` reference, before what references them.
+    async fn ship(
+        &mut self,
+        remote: &Remote,
+        ids: Vec<kronik_blob::BlobId>,
+        report: &mut ShipReport,
+        fault: &(dyn Fn(&str) -> std::io::Result<()> + Sync),
+    ) -> Result<(), ShipError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.index()?;
+        self.shipped()?;
+        let (Some(index), Some(shipped)) = (&self.index, &self.shipped) else {
+            return Ok(());
+        };
+        for id in ids {
+            let bytes = match blobs::ship_blob(remote, self.data, shipped, index, &id).await {
+                Ok(bytes) => bytes,
+                Err(e @ ShipError::BlobMissing(_)) => {
+                    tracing::error!(
+                        blob = %id,
+                        "a referenced blob is not in the blob store; what references it is not shipped"
+                    );
+                    kronik_metrics::inc("kronik_blob_missing_total", &[]);
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
+            if bytes > 0 {
+                report.objects += 1;
+                report.bytes += bytes;
+                fault("blob")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Uploads what is missing remotely: the blobs that what follows references
+/// (ADR 0122), closed segments (once), the active segment when it grew (so
+/// an idle node's last records leave within one round), snapshots (files,
+/// then the manifest), components; deletes remote segments and snapshots
+/// that retention removed locally, among them the partial upload of an
+/// active segment that retention removed before a round uploaded it as a
+/// closed one, and last the remote blobs gone locally.
 pub async fn ship_once(
     remote: &Remote,
     data: &Path,
     branch: &str,
     state: &mut ShipState,
 ) -> Result<ShipReport, ShipError> {
+    ship_once_with_fault(remote, data, branch, state, &|_| Ok(())).await
+}
+
+/// [`ship_once`], stopping with `fault`'s error where it names a step:
+/// `blob` after each blob upload, `segment` after each segment upload,
+/// `snapshot` after each snapshot upload, `snapshot-delete` and
+/// `segment-delete` after each remote deletion, `blob-delete` before the
+/// remote blobs gone locally are deleted. Tests stop a round anywhere with
+/// it (M26 §8).
+pub async fn ship_once_with_fault(
+    remote: &Remote,
+    data: &Path,
+    branch: &str,
+    state: &mut ShipState,
+    fault: &(dyn Fn(&str) -> std::io::Result<()> + Sync),
+) -> Result<ShipReport, ShipError> {
     let mut report = ShipReport::default();
+    let mut round = BlobRound {
+        data,
+        shipped: None,
+        index: None,
+        branch,
+    };
     let log_dir = data.join("branches").join(branch).join("log");
     let starts = kronik_log::segment_starts(&log_dir)?;
     let seg_rel = |s: Lsn| format!("{branch}/segments/{}.zst", kronik_log::segment_name(s));
@@ -663,10 +766,19 @@ pub async fn ship_once(
             }
         }
         let size = bytes.len() as u64;
+        // The blobs its records reference go first (ADR 0122 §3, step 1).
+        let mut refs = BTreeMap::new();
+        blobs::segment_refs(&bytes, branch, start, &mut refs)?;
+        let ids: Vec<kronik_blob::BlobId> = refs
+            .keys()
+            .filter_map(|h| kronik_blob::BlobId::parse(h).ok())
+            .collect();
+        round.ship(remote, ids, &mut report, fault).await?;
         let z = compress(&bytes)?;
         report.bytes += z.len() as u64;
         report.objects += 1;
         remote.put(&seg_rel(start), z).await?;
+        fault("segment")?;
         if dirty {
             kronik_sched::clear_reupload(data, start)?;
         }
@@ -692,6 +804,7 @@ pub async fn ship_once(
         state.segments.remove(&s);
         report.deleted += 1;
         state.save(data)?;
+        fault("segment-delete")?;
     }
     // Snapshots: files first, the manifest last.
     let local = snapshots::list(data, branch);
@@ -706,6 +819,15 @@ pub async fn ship_once(
             );
             continue;
         };
+        // The blobs its state roots go first (step 1).
+        round
+            .ship(
+                remote,
+                blobs::roots_file(&dir.join("blobs.idx"))?,
+                &mut report,
+                fault,
+            )
+            .await?;
         let base = format!("{branch}/snapshots/{:020}", m.lsn);
         for (f, path) in m.files.iter().zip(&paths) {
             let bytes = std::fs::read(path)?;
@@ -722,6 +844,7 @@ pub async fn ship_once(
             .await?;
         state.snapshots.insert(m.lsn);
         state.save(data)?;
+        fault("snapshot")?;
     }
     let kept: BTreeSet<Lsn> = local.iter().map(|(_, m)| m.lsn).collect();
     let pruned: Vec<Lsn> = state.snapshots.difference(&kept).copied().collect();
@@ -736,6 +859,7 @@ pub async fn ship_once(
         state.snapshots.remove(&lsn);
         report.deleted += 1;
         state.save(data)?;
+        fault("snapshot-delete")?;
     }
     // Components.
     if let Ok(entries) = std::fs::read_dir(data.join("code")) {
@@ -750,6 +874,27 @@ pub async fn ship_once(
             remote.put(&format!("code/{name}.zst"), z).await?;
             state.code.insert(name);
             state.save(data)?;
+        }
+    }
+    // Step 6: remote blobs gone locally, now that the remote segments and
+    // snapshots are a subset of the local ones, whose references are roots.
+    if blobs::Shipped::path(data).exists() {
+        fault("blob-delete")?;
+        let mut roots = BTreeSet::new();
+        for (dir, _) in &local {
+            for id in blobs::roots_file(&dir.join("blobs.idx"))? {
+                roots.insert(id.file_name());
+            }
+        }
+        round.index()?;
+        round.shipped()?;
+        if let (Some(index), Some(shipped)) = (&round.index, &round.shipped) {
+            report.deleted += blobs::delete_gone(remote, data, shipped, index, &roots).await?;
+            kronik_metrics::set(
+                "kronik_blob_ship_pending",
+                &[],
+                index.pending(shipped)? as f64,
+            );
         }
     }
     Ok(report)
@@ -956,6 +1101,8 @@ pub struct RestoreReport {
     /// With `--allow-missing-keys`: the subjects whose sealed values have
     /// no key in the installed keystore and stay unreadable.
     pub keys_missing: Vec<String>,
+    /// The blobs the restored state and log reference (ADR 0122 §5).
+    pub blobs: BlobRestore,
 }
 
 /// `kronik restore` (m6-storage §6): the newest remote snapshot, every
@@ -1027,6 +1174,65 @@ pub async fn restore_with_fault(
     mode: KeystoreMode,
     fault: &dyn Fn(&str) -> std::io::Result<()>,
 ) -> Result<RestoreReport, ShipError> {
+    restore_inner(
+        remote,
+        data,
+        branch,
+        force,
+        env,
+        keys,
+        mode,
+        RestoreOptions::default(),
+        fault,
+    )
+    .await
+}
+
+/// What a restore may accept besides its keystore mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RestoreOptions {
+    /// `--allow-missing-blobs` ([`RootPhase::allow_missing_blobs`]).
+    pub allow_missing_blobs: bool,
+}
+
+/// [`restore`] with `options`.
+#[allow(clippy::too_many_arguments)]
+pub async fn restore_with_options(
+    remote: &Remote,
+    data: &Path,
+    branch: &str,
+    force: bool,
+    env: &Env,
+    keys: &Keys,
+    mode: KeystoreMode,
+    options: RestoreOptions,
+) -> Result<RestoreReport, ShipError> {
+    restore_inner(
+        remote,
+        data,
+        branch,
+        force,
+        env,
+        keys,
+        mode,
+        options,
+        &|_| Ok(()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restore_inner(
+    remote: &Remote,
+    data: &Path,
+    branch: &str,
+    force: bool,
+    env: &Env,
+    keys: &Keys,
+    mode: KeystoreMode,
+    options: RestoreOptions,
+    fault: &dyn Fn(&str) -> std::io::Result<()>,
+) -> Result<RestoreReport, ShipError> {
     // The directories this restore may create, innermost first: a refusal
     // removes them again, so "nothing was written" holds for a destination
     // that did not exist.
@@ -1042,7 +1248,7 @@ pub async fn restore_with_fault(
     // One process, one authority: the root phase and the owner's phase run
     // here in the order they would run across a privilege drop.
     let phase = match root_phase(remote, data, env, keys, mode).await {
-        Ok(phase) => phase,
+        Ok(phase) => phase.allow_missing_blobs(options.allow_missing_blobs),
         Err(e) => {
             // Empty only: never anything else that appeared meanwhile.
             for d in &created {
@@ -1087,6 +1293,18 @@ pub struct RootPhase {
     /// anything is downloaded (a KMS source, or a backup to install), not once
     /// the snapshot is known to hold a secret store.
     check_stores_first: bool,
+    /// `--allow-missing-blobs`.
+    allow_missing_blobs: bool,
+}
+
+impl RootPhase {
+    /// `--allow-missing-blobs` (ADR 0122 §5): install even when blobs are
+    /// missing from the bucket or fail their check. They are listed in the
+    /// report, and the node reads them as `BLOB_MISSING`.
+    pub fn allow_missing_blobs(mut self, allow: bool) -> RootPhase {
+        self.allow_missing_blobs = allow;
+        self
+    }
 }
 
 /// Where the root phase of a restore reads the bucket (see [`root_phase_from`]).
@@ -1293,6 +1511,7 @@ pub async fn root_phase_from(
         keystore,
         mode,
         check_stores_first,
+        allow_missing_blobs: false,
     })
 }
 
@@ -1395,6 +1614,7 @@ struct Staged {
     /// The last LSN of the staged log (the snapshot's without a segment).
     through_lsn: Lsn,
     wrapped_path: Option<PathBuf>,
+    blobs: BlobRestore,
 }
 
 /// What the keystore step needs from the staged log and snapshot.
@@ -1403,6 +1623,9 @@ struct KeystoreStep {
     needed: kronik_store::db::SubjectKeys,
     erasures: Vec<(String, u32, u64)>,
     allow: bool,
+    /// Subjects' blobs staged, to check with their keys (identity, sealed
+    /// frames) once the backup is imported.
+    blobs: Vec<(kronik_blob::BlobMeta, PathBuf)>,
 }
 
 /// What the keystore step decided.
@@ -1411,6 +1634,10 @@ struct KeystoreStaged {
     backup_ms: Option<u64>,
     missing: Vec<String>,
     master: Option<kronik_privacy::MasterKey>,
+    /// Subjects' blobs that the keys show erased, and those that failed
+    /// their check (hash, why).
+    blobs_erased: Vec<kronik_blob::BlobMeta>,
+    blobs_failed: Vec<(String, String)>,
 }
 
 /// Everything after the key phase: the downloads into `stage`, the checks of
@@ -1431,6 +1658,7 @@ async fn stage_after_keys(
         keystore,
         mode,
         check_stores_first,
+        allow_missing_blobs,
     } = phase;
     let (master, deferred) = match master {
         Some(Ok(master)) => (Some(master), None),
@@ -1501,6 +1729,8 @@ async fn stage_after_keys(
     let (names, _) = remote.list(&format!("{branch}/segments")).await?;
     let mut segments = Vec::new();
     let mut through_lsn = m.lsn;
+    // Every blob the staged log references (ADR 0122 §5).
+    let mut blob_refs: BTreeMap<String, kronik_proto::log::v1::BlobRef> = BTreeMap::new();
     for n in &names {
         let Some(seg) = n.strip_suffix(".zst") else {
             continue;
@@ -1527,6 +1757,9 @@ async fn stage_after_keys(
             {
                 note_deployment_hashes(d, &mut deployed)?;
             }
+            for r in kronik_proto::blobs::refs(&c.record) {
+                blob_refs.entry(r.hash.clone()).or_insert_with(|| r.clone());
+            }
             kronik_proto::sealables::record_mut(
                 &mut c.record,
                 &mut kronik_store::db::note_sealed(&mut needed),
@@ -1551,6 +1784,10 @@ async fn stage_after_keys(
     {
         kronik_store::db::note_key(&mut needed, &subject, &sample);
     }
+    // The blobs: downloaded into the stage and checked without keys; a
+    //    subject's blob also with its keys in the keystore step.
+    let (mut blob_report, keyed) =
+        blobs::stage(remote, stage, &snap, &blob_refs, &erasures).await?;
     // 3. The keystore: the backup, with the log's erasures applied again,
     //    must hold every key a sealed value needs.
     let step = KeystoreStep {
@@ -1558,13 +1795,25 @@ async fn stage_after_keys(
         needed,
         erasures,
         allow: mode == KeystoreMode::AllowMissingKeys,
+        blobs: keyed,
     };
     let KeystoreStaged {
         status: keystore,
         backup_ms: keystore_backup_ms,
         master: keystore_master,
         missing: keys_missing,
+        blobs_erased,
+        blobs_failed,
     } = stage_keystore(keystore_restore, step)?;
+    for meta in blobs_erased {
+        blob_report.restored = blob_report.restored.saturating_sub(1);
+        blob_report.bytes = blob_report.bytes.saturating_sub(meta.size);
+        blob_report.erased += 1;
+    }
+    for (hash, why) in blobs_failed {
+        blob_report.failed.push((hash, why));
+    }
+    let blob_report = blobs::finish(blob_report, allow_missing_blobs)?;
     // A rebase switch after the snapshot whose base is before it: the first
     // start rebuilds the shadow from a snapshot at or before that base
     // (docs/design/m13-rebase.md section 6).
@@ -1629,6 +1878,7 @@ async fn stage_after_keys(
         older,
         through_lsn,
         wrapped_path,
+        blobs: blob_report,
     })
 }
 
@@ -1644,7 +1894,10 @@ fn stage_keystore(
         needed,
         erasures,
         allow,
+        blobs: keyed,
     } = step;
+    let mut blobs_erased = Vec::new();
+    let mut blobs_failed = Vec::new();
     let subjects_of = |pairs: &[(String, u32)]| {
         let mut s: Vec<String> = pairs.iter().map(|(s, _)| s.clone()).collect();
         s.dedup();
@@ -1663,6 +1916,25 @@ fn stage_keystore(
             for (subject, version, wall) in &erasures {
                 ks.erase_through(subject, *version, *wall)
                     .map_err(ShipError::Key)?;
+            }
+            // Subjects' blobs against their keys: the keyed identity, and
+            // the frames of a sealed file (ADR 0122 §5).
+            {
+                let sealer = kronik_privacy::sealer::Sealer::new(ks.clone());
+                let access = sealer.blob_key_access();
+                for (meta, path) in &keyed {
+                    match blobs::check_file(path, meta, &access) {
+                        Ok(()) => {}
+                        Err(None) => {
+                            std::fs::remove_file(path)?;
+                            blobs_erased.push(meta.clone());
+                        }
+                        Err(Some(why)) => {
+                            let _ = std::fs::remove_file(path);
+                            blobs_failed.push((meta.id.to_string(), why));
+                        }
+                    }
+                }
             }
             let mut missing = Vec::new();
             for ((subject, version), sample) in &needed {
@@ -1710,6 +1982,8 @@ fn stage_keystore(
         backup_ms,
         missing,
         master,
+        blobs_erased,
+        blobs_failed,
     })
 }
 
@@ -1846,6 +2120,10 @@ fn install_staged(
     for c in &s.components {
         std::fs::rename(stage.join("code").join(c), code.join(c))?;
     }
+    fault("blobs")?;
+    if stage.join("blobs").exists() {
+        replace_dir(&stage.join("blobs"), &data.join("blobs"))?;
+    }
     fault("keys")?;
     let keys = data.join("keys");
     if stage.join("secrets.db").exists() {
@@ -1877,6 +2155,11 @@ fn install_staged(
     }
     // Nothing was shipped from here yet.
     let _ = std::fs::remove_file(ShipState::path(data));
+    for suffix in ["", "-wal", "-shm"] {
+        let mut path = blobs::Shipped::path(data).into_os_string();
+        path.push(suffix);
+        let _ = std::fs::remove_file(path);
+    }
     // The marker is durable before the new state is in place (perf review
     // R4): restored state without it would let an audit cursor past the
     // restored log skip the new history.
@@ -1914,6 +2197,7 @@ fn install_staged(
         keystore_backup_ms: s.keystore_backup_ms,
         keystore: s.keystore,
         keys_missing: s.keys_missing,
+        blobs: s.blobs,
     })
 }
 /// Downloads and checks one remote snapshot into `snap_dir`.

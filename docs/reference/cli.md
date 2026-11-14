@@ -215,6 +215,7 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_blob_gc_freed_bytes_total` | counter | Bytes of the blob files the collector deleted. |
 | `kronik_blob_gc_duration_seconds` | histogram | Time a pass of the blob collector took. |
 | `kronik_blob_gc_candidates` | gauge | Blob files without a root that the collector's next pass deletes if they still have none. |
+| `kronik_blob_ship_pending` | gauge | Blobs the index keeps that the shipper has not uploaded, as of its last round. |
 | `kronik_blob_leases` | gauge | Leases on blobs held in this daemon's memory (turns, uploads, streams, replays), as of the collector's last pass. |
 | `kronik_gateway_requests_total` | counter | HTTP requests answered by the gateway, by status code. |
 | `kronik_gateway_request_duration_seconds` | histogram | Time to answer an HTTP request at the gateway, by status code. |
@@ -315,7 +316,7 @@ $ kronik doctor
 
 ## kronik restore
 
-`kronik restore --from <URL> [--endpoint <URL>] [--data-dir <DIR>] [--config <PATH>] [--master-key-file <PATH>] [--allow-missing-keys | --without-keystore] [--branch main] [--force] [--dry-run]`
+`kronik restore --from <URL> [--endpoint <URL>] [--data-dir <DIR>] [--config <PATH>] [--master-key-file <PATH>] [--allow-missing-keys | --without-keystore] [--allow-missing-blobs] [--branch main] [--force] [--dry-run]`
 
 Restores a data directory from object storage (M6). Offline: the daemon
 must not be running on the directory, and the command does not talk to
@@ -336,7 +337,14 @@ that fails leaves the directory as it was:
 - a backup in the bucket and the key missing or another one:
   `MASTER_KEY_MISSING` or `MASTER_KEY_MISMATCH`;
 - a sealed value whose key no backup provides (or sealed values and no
-  backup at all): `KEYSTORE_INCOMPLETE`.
+  backup at all): `KEYSTORE_INCOMPLETE`;
+- a blob that the snapshot's state or a restored record references and the
+  bucket's `blobs/` lacks, or that fails its check (its header, size, body
+  digest, frames and identity; a subject's blob with its key from the
+  installed keystore): `BLOB_MISSING`, naming it. `--allow-missing-blobs`
+  installs anyway and lists them (`blobs.missing` in the JSON); the node
+  then reads them as `BLOB_MISSING`. A blob of an erased subject is not
+  downloaded.
 
 Run as root against a nonroot installation (a data directory owned by the
 `kronik` user, M21), restore first does what only root can do, since only

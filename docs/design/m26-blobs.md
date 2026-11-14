@@ -389,6 +389,19 @@ implementation specifics:
 - A fault test stops a round after each of the six steps and checks that the
   bucket never has a segment or manifest whose blobs are missing.
 
+As built (M25 slice B12): a round reads the references of every segment it
+uploads from the bytes it uploads, the active segment's whole image each time
+it grew (no `active_scanned` offset: the segment is bounded by
+`[log] segment_max_mb`); a lost `ship-blobs.db` costs a `HEAD` per blob.
+`ship_once_with_fault` stops a round after any upload or deletion for the
+fault test. A restore checks every blob without keys (header, size, length,
+body digest, each plain frame's CRC, and the identity of a `b3:` blob), then,
+once the keystore backup is imported, a subject's blob with its keys: its
+keyed identity (`K_id`) and a sealed file's frames, so that no restored file
+is served unverified; a blob whose keys the backup shows erased is counted as
+erased and not installed. The reseal markers (`blobs/reupload/<name>`) and the
+erasure status of `privacy status` come with the privacy slice (B15).
+
 ## 9. Privacy
 
 ### 9.1 Subjects

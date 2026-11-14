@@ -174,6 +174,7 @@ fn file_job<'a>(
         force: false,
         mode: kronik_ship::KeystoreMode::Require,
         keys,
+        allow_missing_blobs: false,
     }
 }
 
@@ -415,6 +416,7 @@ fn s3_job<'a>(
         force: false,
         mode: kronik_ship::KeystoreMode::Require,
         keys,
+        allow_missing_blobs: false,
     }
 }
 

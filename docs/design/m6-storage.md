@@ -158,7 +158,15 @@ each object compressed with zstd (level 3):
 <prefix>/main/snapshots/<L>/manifest.json            (uncompressed, uploaded last)
 <prefix>/main/snapshots/<L>/<file>.zst
 <prefix>/code/<blake3>.wasm.zst                      components (restore needs them)
+<prefix>/blobs/<2 hex>/<name>                        blobs, the files as stored (M25, ADR 0122)
 ```
+
+Blobs (M25 slice B12, ADR 0122): a round uploads the blobs a segment or
+snapshot references before it (multipart above 8 MiB), records them in
+`<data>/ship-blobs.db`, and deletes the objects of blobs gone locally last,
+after the remote segments and snapshots gone locally; a restore downloads
+and checks the snapshot's `blobs.idx` and the restored records' blobs
+before anything moves into place.
 
 - **The shipper** (a task of `kronik serve`, real environment only): every
   10 s it uploads closed segments, snapshots (files first, manifest last)
