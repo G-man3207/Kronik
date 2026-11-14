@@ -809,9 +809,31 @@ def vm_stop_proof(root, cfg, name, offset):
     return evidence
 
 
-def vm_config(directory):
+# The run directory as the service sees it (its kronik.toml).
+SERVICE_RUN = Path("/run/kronik")
+
+
+def jail_api(cfg, directory, timeout=5):
+    """A connection, made, to the API socket of the VMM whose runtime is `directory`.
+
+    The jail root is a small tmpfs that the nonroot daemon mounts in its own mount namespace
+    (ADR 0095), where Firecracker makes the socket: the host sees only the empty directory
+    beneath. So the socket is reached in the daemon's view, through its root, by a descriptor
+    of the jail directory (the whole path would not fit in a socket address)."""
+    main, _ = service(cfg)
+    inside = SERVICE_RUN / Path(directory).relative_to(cfg["run"]) / "jail"
+    fd = os.open(f"/proc/{main}/root{inside}", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        conn = UnixConnection(f"/proc/self/fd/{fd}/api.sock", timeout)
+        conn.connect()
+        return conn
+    finally:
+        os.close(fd)
+
+
+def vm_config(cfg, directory):
     """Firecracker's whole configuration of a running VM (`GET /vm/config`)."""
-    conn = UnixConnection(str(directory/"jail/api.sock"),5)
+    conn = jail_api(cfg, directory)
     try:
         conn.request("GET","/vm/config")
         response = conn.getresponse()
@@ -868,7 +890,7 @@ def vm_calibration(root, cfg, name, cpu, memory, candidates):
     with open(f"/proc/{pid}/exe","rb") as executable:
         require(hashlib.file_digest(executable,"sha256").hexdigest() == manifest["firecracker_sha256"],
                 "running VMM is not the exact pinned Firecracker")
-    conn = UnixConnection(str(directory/"jail/api.sock"),5)
+    conn = jail_api(cfg, directory)
     try:
         conn.request("GET","/machine-config")
         response = conn.getresponse()
@@ -893,7 +915,7 @@ def vm_calibration(root, cfg, name, cpu, memory, candidates):
     if name.startswith("probe-") or name.startswith("pg-"):
         require(data.stat().st_size == 1<<30 and data.stat().st_blocks*512 >= 1<<30,
                 "actual persistent drive is not fixed/reserved 1GiB")
-    whole = vm_config(directory)
+    whole = vm_config(cfg, directory)
     no_network_device(whole)
     evidence = {"actor":name,"pid":pid,"launcher_pid":launcher,"runtime":str(directory),"cgroup":str(cg),
                 "machine_config":machine,"vm_config":whole,"declared_cpu_millis":cpu,
