@@ -459,9 +459,9 @@ drive that grew past its size is refused at the next start or checkpoint.
 `/dev/kvm` is bound read-only: the VMM opens and uses the device, but on a root
 installation, where the VMM is uid 0 and owns the device node, it cannot
 change the node's mode, owner or ACLs. Its jail directory is under
-`[foreign] run_dir`, by default on the `/run` tmpfs, where what it writes
-counts against the VM's memory limit: keep `run_dir` there, as on a disk it
-would not be bounded. Its disk I/O bandwidth is not limited
+`[foreign] run_dir`, but it is a small file system of its own (1 MiB, 64
+inodes), so what the VMM writes there never fills the host's `/run` or a disk.
+Its disk I/O bandwidth is not limited
 ([ADR 0095](../adr/0095-pinned-firecracker-guest.md)).
 
 A command that root runs against a nonroot installation (`sudo kronik ...`,

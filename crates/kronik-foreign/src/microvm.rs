@@ -96,6 +96,7 @@ struct Unspawned(PathBuf);
 impl Drop for Unspawned {
     fn drop(&mut self) {
         if !self.0.as_os_str().is_empty() {
+            crate::sys::detach_jail_root(&self.0.join("jail"));
             let _ = fs::remove_dir_all(&self.0);
         }
     }
@@ -544,6 +545,10 @@ impl Vm {
             return Err("stale microVM jail must be cleaned after its process exits".into());
         }
         private_dir(start.root).map_err(|e| e.to_string())?;
+        if start.root.file_name() != Some(std::ffi::OsStr::new("jail")) {
+            return Err("a microVM jail root is named `jail`".into());
+        }
+        crate::sys::mount_jail_root(start.root).map_err(|e| e.to_string())?;
         private_dir(&start.root.join("dev")).map_err(|e| e.to_string())?;
         private_dir(&start.root.join("out")).map_err(|e| e.to_string())?;
         private_dir(start.output).map_err(|e| e.to_string())?;
@@ -879,6 +884,7 @@ impl Vm {
         if let Some(parent) = self.root.parent()
             && parent.exists()
         {
+            crate::sys::detach_jail_root(&self.root);
             fs::remove_dir_all(parent)?;
         }
         if self.output.exists() {
@@ -966,6 +972,7 @@ pub(crate) async fn cleanup_stale(
                         "VMM runtime has no durable ownership state; retained for diagnosis".into(),
                     );
                 }
+                crate::sys::detach_jail_root(&directory.join("jail"));
                 fs::remove_dir_all(directory).map_err(|e| e.to_string())?;
                 continue;
             }
@@ -1008,6 +1015,7 @@ pub(crate) async fn cleanup_stale(
             }
             fs::remove_dir(group).map_err(|e| e.to_string())?;
         }
+        crate::sys::detach_jail_root(&directory.join("jail"));
         fs::remove_dir_all(directory).map_err(|e| e.to_string())?;
         removed += 1;
     }

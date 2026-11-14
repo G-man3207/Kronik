@@ -1802,6 +1802,52 @@ pub(crate) fn isolate(jail: &MicrovmJail<'_>, kvm: &Path) -> io::Result<()> {
     seal_capabilities()
 }
 
+/// The size of a jail root's own file system (see [`mount_jail_root`]).
+pub(crate) const JAIL_ROOT_BYTES: u64 = 1 << 20;
+/// Its inodes: the placeholders, `dev`, `out`, the sockets and the pivot's
+/// `.old` take fewer than twenty.
+const JAIL_ROOT_INODES: u64 = 64;
+
+/// Mounts a small tmpfs of its own on the jail root `root`, in the caller's
+/// mount namespace, before the placeholders are made in it and the launcher
+/// starts. The VMM can write its jail root (Firecracker makes its sockets
+/// there) and Firecracker's filter lets it create files: on the run
+/// directory's own tmpfs (`/run`, often sized below a VM's memory) a VMM that
+/// escaped its guest could otherwise fill it for the whole host, and on a disk
+/// without bound. This one holds 1 MiB and 64 inodes; it is nosuid, nodev and
+/// noexec (the inputs are mounts of their own, with their own flags). The
+/// launcher inherits it, and the daemon, which mounted it, sees the sockets.
+pub(crate) fn mount_jail_root(root: &Path) -> io::Result<()> {
+    let target = cstr(root)?;
+    let options = CString::new(format!(
+        "size={JAIL_ROOT_BYTES},nr_inodes={JAIL_ROOT_INODES},mode=0700"
+    ))
+    .map_err(|_| io::Error::other("jail root options"))?;
+    // SAFETY: a mount with NUL-terminated strings that live through the call.
+    check(
+        unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                target.as_ptr(),
+                c"tmpfs".as_ptr(),
+                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                options.as_ptr().cast(),
+            )
+        },
+        "mounting the microVM jail root",
+    )
+}
+
+/// Detaches the jail root's own file system before the jail is removed. A
+/// jail root without one (not mounted, or gone) is not an error.
+pub(crate) fn detach_jail_root(root: &Path) {
+    if let Ok(target) = cstr(root) {
+        // SAFETY: umount2 reads a NUL-terminated path; EINVAL (no mount
+        // there) and ENOENT are the expected outcomes for a plain directory.
+        unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+    }
+}
+
 /// The largest file the VMM may make or extend: its data disk is `DATA_BYTES`
 /// long and a full snapshot's memory file is as large as the guest's memory,
 /// which is below the VM's `memory_bytes`; the snapshot's state is small.
@@ -3829,6 +3875,8 @@ int main(void) {
         }
         fs::create_dir(&root)?;
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        // As `Vm::spawn` does: the jail root's own small file system.
+        mount_jail_root(&root)?;
         fs::create_dir(root.join("dev"))?;
         fs::create_dir(root.join("out"))?;
         for name in [
@@ -4032,6 +4080,32 @@ int main(void) {
         match fs::set_permissions("/dev/kvm", mode) {
             Err(e) if e.raw_os_error() == Some(libc::EROFS) => {}
             other => return fail(format!("the mode of /dev/kvm could be set: {other:?}")),
+        }
+        // The jail root, which the VMM can write, is a file system of its own,
+        // bounded in bytes and in inodes, not the host's /run.
+        let bytes = usize::try_from(2 * JAIL_ROOT_BYTES).unwrap_or(usize::MAX);
+        match fs::write("/fill", vec![0u8; bytes]) {
+            Err(e) if e.raw_os_error() == Some(libc::ENOSPC) => {}
+            other => return fail(format!("the jail root took 2 MiB: {other:?}")),
+        }
+        fs::remove_file("/fill")?;
+        let mut made = 0;
+        let full = loop {
+            if let Err(e) = fs::write(format!("/f{made}"), b"") {
+                break e;
+            }
+            made += 1;
+            if made > 1000 {
+                return fail("the jail root has no inode bound".into());
+            }
+        };
+        if full.raw_os_error() != Some(libc::ENOSPC) || made == 0 || made >= JAIL_ROOT_INODES {
+            return fail(format!(
+                "the jail root's inodes ran out after {made}: {full}"
+            ));
+        }
+        for at in 0..made {
+            fs::remove_file(format!("/f{at}"))?;
         }
         // The old root is gone and `..` does not lead out of the jail.
         for gone in ["/.old", "/proc", "/etc/passwd"] {
