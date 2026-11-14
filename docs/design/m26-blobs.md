@@ -706,6 +706,40 @@ CREATE TABLE images (id TEXT PRIMARY KEY, hash TEXT NOT NULL, size INTEGER NOT N
 | `POST /media/{key}/import` | `fetch`es an image URL (needs a grant) and retains the response blob |
 | `POST /media/{key}/images/{id}/expire?days=N` | a timer carrying the reference; when it fires, the image is released |
 
+The details, which the slice settles:
+
+- **Ids** are `img-<n>` from a counter in the album's state. They are never
+  reused, so a pending expiry cannot reach a later image.
+- **One hold per blob, not per row.** An album holds a blob once, however
+  many rows name it: the same bytes uploaded twice are one blob. `DELETE`
+  and an expiry release the hold only when no other row of the album has
+  the hash, and otherwise delete the row only.
+- **A row rebuilds its reference.** A `blob-ref` is only `{hash, size}`, so
+  the row's two columns give the reference that the album holds; the host
+  checks the hold, not the record. The rule above keeps every row's blob
+  held.
+- **Uploads** need a `content-type` of `image/*` (415 otherwise) and a
+  non-empty body (400). A blob body is retained. An inline body of at most
+  1 MiB, the default threshold, is stored with one `put`; a larger one,
+  under a threshold raised above 1 MiB, goes through a writer and is
+  retained.
+- **A share** is a buffered `send` of a message `shared` that carries the
+  content type and the reference, answered 202 with
+  `{"to": "media/<album>"}`. The receiving album's turn retains the
+  reference and adds a row with an id of its own. A share to the same album
+  is 400.
+- **An import** takes `{"url": "..."}`. An answer other than 2xx or
+  `image/*` is 502, naming the status or the type. Its body is kept as an
+  upload's is.
+- **An expiry** takes fractional days, more than 0 and at most 3650 (the
+  identity workload uses `days=0.00002`, under 2 s). The timer's message
+  carries the id in its body and the reference in `blobs`, so the bytes
+  outlive a `DELETE` until it fires (the shape of criterion 6). When it
+  fires, it deletes the row as `DELETE` does, or does nothing if the row is
+  gone.
+- `GET /media/{key}/images` answers `{"images": [{id, hash, size,
+  content_type, created_ms}]}` in upload order; an unknown id is 404.
+
 The stored hash is a string in SQL: it keeps nothing alive (criterion 10),
 the hold does. Unit tests run against the SDK's test kit;
 `scripts/identity-examples.sh` runs a workload of uploads, reads, shares,
