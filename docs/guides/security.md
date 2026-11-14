@@ -478,6 +478,17 @@ still answer root's requests, as the daemon does; it cannot redirect them. A
 socket in a directory that only root controls (the root service's) is used as
 before.
 
+`sudo kronik restore` into a nonroot installation works in two phases: as root
+it reads the key source and checks the newest keystore backup, then it gives up
+root and reads the rest of the bucket as the data directory's owner. A
+`file://` bucket may belong to the service user (the daemon ships to
+`/var/lib/kronik-ship`), so in the root phase it is read by descriptor: reached
+from `/` without following a link and through directories that only root
+controls, never created, and below it only real directories on its file system
+and regular files with one link. A link to a file that only root may read, a
+FIFO that would hang the restore, or a linked directory in the bucket fails
+the restore instead.
+
 `/run/kronik` is mode 0750 with group `kronik`: whoever may use the API socket
 can list it. The runtime state of the sandboxes beneath it (`runsc/`, `runc/`)
 is mode 0700, because a runtime's state file holds the container's

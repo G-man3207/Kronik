@@ -28,6 +28,8 @@ use zeroize::Zeroizing;
 mod names;
 
 #[cfg(test)]
+mod bucket_tests;
+#[cfg(test)]
 mod credential_tests;
 
 #[derive(Debug, thiserror::Error)]
@@ -1009,9 +1011,119 @@ pub struct RootPhase {
     check_stores_first: bool,
 }
 
+/// Where the root phase of a restore reads the bucket (see [`root_phase_from`]).
+pub enum Bucket<'a> {
+    /// Any remote, through its object store.
+    Remote(&'a Remote),
+    /// A `file://` bucket, by descriptor (see [`Bucket::local`]).
+    Local(kronik_privacy::owned_tree::Dir),
+}
+
+/// The largest object the root phase reads from a local bucket (a keystore
+/// backup; the wrapped key is a small JSON document).
+const ROOT_PHASE_MAX_BYTES: u64 = 4 << 30;
+
+impl Bucket<'static> {
+    /// The `file://` bucket at `path`, as a process with root's authority
+    /// reads a bucket that another user may own (a nonroot installation's
+    /// `/var/lib/kronik-ship` is the service user's): reached from `/` without
+    /// following a symbolic link, through directories that only root or
+    /// `trusted` can change, and never created. Below it, a directory is never
+    /// a link nor on another file system, and an object is read only as a
+    /// regular file with one link, never a FIFO, a socket or a device: by path,
+    /// object_store's local store follows links, which could stand for a file
+    /// that only root may read, and opens a FIFO, which hangs the restore.
+    pub fn local(path: &Path, trusted: u32) -> Result<Bucket<'static>, ShipError> {
+        kronik_privacy::owned_tree::Dir::open_controlled(path, trusted, None)
+            .map(Bucket::Local)
+            .map_err(|e| ShipError::Restore(format!("the bucket {}: {e}", path.display())))
+    }
+}
+
+impl Bucket<'_> {
+    /// The directory of the object `rel` and its name, or `None` when a
+    /// directory on the way is missing.
+    fn local_parent<'r>(
+        root: &kronik_privacy::owned_tree::Dir,
+        rel: &'r str,
+    ) -> Result<Option<(kronik_privacy::owned_tree::Dir, &'r str)>, ShipError> {
+        let mut parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+        let name = parts
+            .pop()
+            .ok_or_else(|| ShipError::Restore(format!("{rel:?} names no object")))?;
+        let mut dir = root.try_clone()?;
+        for part in parts {
+            dir = match dir.open_dir(std::ffi::OsStr::new(part)) {
+                Ok(next) => next,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(ShipError::Restore(format!("the bucket's {rel}: {e}"))),
+            };
+        }
+        Ok(Some((dir, name)))
+    }
+
+    /// The object `rel`, or `None` when there is none.
+    async fn get(&self, rel: &str) -> Result<Option<Vec<u8>>, ShipError> {
+        match self {
+            Bucket::Remote(remote) => match remote.get(rel).await {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(ShipError::Store(object_store::Error::NotFound { .. })) => Ok(None),
+                Err(e) => Err(e),
+            },
+            Bucket::Local(root) => {
+                let Some((dir, name)) = Self::local_parent(root, rel)? else {
+                    return Ok(None);
+                };
+                match dir.read_regular(std::ffi::OsStr::new(name), ROOT_PHASE_MAX_BYTES) {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(ShipError::Restore(format!("the bucket's {rel}: {e}"))),
+                }
+            }
+        }
+    }
+
+    /// The names of the objects directly under `rel/` (none when it is missing).
+    async fn list(&self, rel: &str) -> Result<Vec<String>, ShipError> {
+        match self {
+            Bucket::Remote(remote) => Ok(remote.list(rel).await?.0),
+            Bucket::Local(root) => {
+                let Some((parent, name)) = Self::local_parent(root, rel)? else {
+                    return Ok(Vec::new());
+                };
+                let dir = match parent.open_dir(std::ffi::OsStr::new(name)) {
+                    Ok(dir) => dir,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                    Err(e) => return Err(ShipError::Restore(format!("the bucket's {rel}: {e}"))),
+                };
+                Ok(dir
+                    .entries()
+                    .map_err(|e| ShipError::Restore(format!("the bucket's {rel}: {e}")))?
+                    .into_iter()
+                    .filter(|(_, kind)| *kind == kronik_privacy::owned_tree::Kind::File)
+                    .filter_map(|(name, _)| name.into_string().ok())
+                    .collect())
+            }
+        }
+    }
+}
+
 /// The part of a restore that needs the caller's authority (see [`RootPhase`]).
 pub async fn root_phase(
     remote: &Remote,
+    data: &Path,
+    env: &Env,
+    keys: &Keys,
+    mode: KeystoreMode,
+) -> Result<RootPhase, ShipError> {
+    root_phase_from(&Bucket::Remote(remote), data, env, keys, mode).await
+}
+
+/// [`root_phase`], reading the bucket through `bucket`: a restore that runs
+/// as root into another user's installation reads a `file://` bucket with
+/// [`Bucket::local`].
+pub async fn root_phase_from(
+    bucket: &Bucket<'_>,
     data: &Path,
     env: &Env,
     keys: &Keys,
@@ -1022,10 +1134,10 @@ pub async fn root_phase(
     let mut wrapped = None;
     let mut check_stores_first = false;
     let master = if keys.source.is_kms() {
-        let bytes = match remote.get("wrapped/current.wrapped").await {
-            Ok(bytes) => bytes,
-            Err(ShipError::Store(object_store::Error::NotFound { .. })) => {
-                let (backups, _) = remote.list("keystore").await?;
+        let bytes = match bucket.get("wrapped/current.wrapped").await? {
+            Some(bytes) => bytes,
+            None => {
+                let backups = bucket.list("keystore").await?;
                 let wall = backups
                     .iter()
                     .filter_map(|n| n.strip_suffix(".bin")?.parse::<u64>().ok())
@@ -1033,9 +1145,15 @@ pub async fn root_phase(
                     .ok_or_else(|| {
                         ShipError::Restore("no wrapped master key in the bucket".into())
                     })?;
-                remote.get(&format!("keystore/{wall}.wrapped")).await?
+                bucket
+                    .get(&format!("keystore/{wall}.wrapped"))
+                    .await?
+                    .ok_or_else(|| {
+                        ShipError::Restore(format!(
+                            "the bucket has no wrapped master key for keystore backup {wall}"
+                        ))
+                    })?
             }
-            Err(e) => return Err(e),
         };
         Wrapped::parse(&bytes, keys)?;
         let master = kronik_privacy::key_source::unwrap_envelope(env, keys, &bytes).await?;
@@ -1055,7 +1173,7 @@ pub async fn root_phase(
         check_stores_first = true;
         Some(Ok(master))
     } else if mode != KeystoreMode::Without {
-        let (backups, _) = remote.list("keystore").await?;
+        let backups = bucket.list("keystore").await?;
         let has_backup = backups.iter().any(|n| {
             n.strip_suffix(".bin")
                 .is_some_and(|n| n.parse::<u64>().is_ok())
@@ -1074,7 +1192,7 @@ pub async fn root_phase(
         None
     };
     let keystore = check_keystore_backup(
-        remote,
+        bucket,
         master.as_ref().and_then(|m| m.as_ref().ok()),
         mode == KeystoreMode::Without,
     )
@@ -1780,11 +1898,11 @@ struct KeystoreBackup {
 /// restored node starts without the subjects' keys, and sealed values stay
 /// unreadable). Otherwise the status: `none_in_bucket` or `skipped`.
 async fn check_keystore_backup(
-    remote: &Remote,
+    bucket: &Bucket<'_>,
     master: Option<&kronik_privacy::MasterKey>,
     without: bool,
 ) -> Result<Result<KeystoreBackup, &'static str>, ShipError> {
-    let (names, _) = match remote.list("keystore").await {
+    let names = match bucket.list("keystore").await {
         Ok(v) => v,
         Err(e) => {
             tracing::info!(code = e.code(), "restore: no keystore backups");
@@ -1814,7 +1932,10 @@ async fn check_keystore_backup(
             "the keystore backup needs a configured master key".into(),
         ))
     })?;
-    let blob = remote.get(&format!("keystore/{wall}.bin")).await?;
+    let blob = bucket
+        .get(&format!("keystore/{wall}.bin"))
+        .await?
+        .ok_or_else(|| ShipError::Restore(format!("keystore backup {wall} vanished")))?;
     match kronik_privacy::keystore::Keystore::read_backup(master, &blob) {
         Ok(_) => Ok(Ok(KeystoreBackup {
             wall,

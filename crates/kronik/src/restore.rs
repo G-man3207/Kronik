@@ -386,9 +386,24 @@ fn restore_dropping(
     let credentials = (hooks.credentials)(&root_runtime, job)?;
     (hooks.seen)(Step::CredentialsResolved);
     let phase = root_runtime.block_on(async {
-        let remote = Remote::open_with(job.from, job.endpoint, &credentials).map_err(ship_error)?;
         let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
-        kronik_ship::root_phase(&remote, job.data, &env, job.keys, job.mode)
+        // A `file://` bucket, which the service user may own, is read by
+        // descriptor: no link followed, no FIFO opened, nothing created (the
+        // owner's phase below reads the rest of it as the owner).
+        let remote;
+        let bucket = match job.from.strip_prefix("file://") {
+            Some(directory) => kronik_ship::Bucket::local(
+                Path::new(directory),
+                rustix::process::geteuid().as_raw(),
+            )
+            .map_err(ship_error)?,
+            None => {
+                remote =
+                    Remote::open_with(job.from, job.endpoint, &credentials).map_err(ship_error)?;
+                kronik_ship::Bucket::Remote(&remote)
+            }
+        };
+        kronik_ship::root_phase_from(&bucket, job.data, &env, job.keys, job.mode)
             .await
             .map_err(ship_error)
     })?;
