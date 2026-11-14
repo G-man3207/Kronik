@@ -18,7 +18,10 @@ until the v1.0 compatibility promise takes effect.
   every fork of a microVM actor resumes the same snapshot. Its proofs passed
   on 2026-11-14 on GitHub-hosted Ubuntu 24.04 runners, virtual machines with
   nested KVM on an AMD host and on an Intel host, through the manual
-  `isolation` workflow (ADR 0133).
+  `isolation` workflow (ADR 0133). On the root service it needs a delegated cgroup (a
+  drop-in, in the operations guide). `[foreign] start_timeout` (30 s) sets how
+  long a started sandbox or microVM may take to answer before its start is
+  retried.
 - `kronik serve --init --rootless` installs a nonroot service (M21; ADRs
   0060-0065): the daemon runs as the `kronik` user, foreign sandboxes run as
   root of a user namespace that `kronik userns pin` makes, and an API
@@ -26,7 +29,10 @@ until the v1.0 compatibility promise takes effect.
   actor, the v0.1 demos, the Postgres fork, ship and restore) passed on the
   same runners, once with Ubuntu's AppArmor restriction on unprivileged user
   namespaces active and once with it lifted. `serve --init` without the flag
-  keeps the root service.
+  keeps the root service. `kronik doctor --rootless` checks its prerequisites
+  (`ROOTLESS_UNAVAILABLE` names a missing one), and `kronik restore` and
+  `kronik upgrade check` do the part that needs root as root and the rest as
+  the data directory's owner.
 - `kronik promote` warns when the new code of a kind that holds open
   WebSocket or SSE connections does not handle connections: their frames
   and closes would fail (M24). The API's promote response carries it in
@@ -200,28 +206,6 @@ until the v1.0 compatibility promise takes effect.
   foreign actor with production's text and fits the answers it makes up
   (stub rules, contract fakes, neighbors, the model) to the record as it
   fits live ones.
-- The nonroot daemon (M21, opt-in; ADRs 0060–0065):
-  `kronik serve --init --rootless` installs a service that runs as its own
-  `kronik` user, with `runsc` as root of a pinned user namespace for foreign
-  actors, and `kronik doctor --rootless` checks its prerequisites
-  (`ROOTLESS_UNAVAILABLE` names a missing one). `kronik serve --init` still
-  installs the root service, the default until the nonroot service's
-  installed proofs pass: the manual `isolation` workflow runs them on
-  disposable GitHub-hosted runners (ADR 0133), and they do not pass yet.
-  `kronik restore` and `kronik upgrade check` do the part that needs root as
-  root and the rest as the data directory's owner.
-- MicroVM isolation (M20, experimental; ADRs 0095 and 0096 proposed): a
-  foreign actor added with `isolation = "microvm"` runs in a Firecracker VM,
-  on a host with a usable `/dev/kvm` and the pinned tool bundle in
-  `[foreign] microvm_dir` (`scripts/build-microvm-tools.sh` builds it);
-  without KVM the add answers `KVM_UNAVAILABLE` and suggests `gvisor`. Every
-  add warns that the level is experimental: it has not booted a VM on a KVM
-  host yet, its VMM runs as the daemon's user under Kronik's own launcher
-  instead of Firecracker's jailer, and every sandbox fork of a microVM actor
-  resumes the same snapshot. On the root service it needs a delegated cgroup
-  (a drop-in, in the operations guide). `[foreign] start_timeout` (30 s)
-  sets how long a started sandbox or microVM may take to answer before its
-  start is retried.
 - Forks, replays and proposals now work at every point of the
   `[retention] history` window, as the brief requires (#66). Retention kept
   the log for the window but only the newest `snapshots_kept` snapshots and
