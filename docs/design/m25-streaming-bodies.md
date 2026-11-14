@@ -468,26 +468,33 @@ under the simulated disk.
 implementation that buffers (so test nets keep working):
 
 ```rust
-pub enum HttpBody { Bytes(Bytes), Stream { len: u64, source: Box<dyn BodySource> } }
 pub trait BodySource: Send + 'static {
     /// The next chunk, None at the end.
     fn next(&mut self) -> BoxFuture<'_, io::Result<Option<Bytes>>>;
 }
-pub struct HttpStreamRequest { pub method: String, pub url: String, pub headers: Vec<(String, String)>, pub body: HttpBody }
+pub enum HttpBody { Bytes(Bytes), Stream { len: u64, source: Box<dyn BodySource> } }
+pub struct HttpStreamRequest { pub method: String, pub url: String, pub headers: Vec<(String, String)>,
+                               pub body: HttpBody, pub max_response_bytes: u64 }
 pub struct HttpStreamResponse { pub status: u16, pub headers: Vec<(String, String)>, pub body: Box<dyn BodySource> }
 pub trait Net {
     // existing methods ...
     fn http_stream_authorized(&self, req: HttpStreamRequest, original: AuthLease)
-        -> BoxFuture<'static, Result<HttpStreamResponse, NetError>>;   // default: buffers through http_authorized
+        -> BoxFuture<'static, Result<HttpStreamResponse, NetError>>;
 }
 ```
 
-The real implementation (`env/real/authorized.rs`) sends a `StreamBody` and
-returns hyper's `Incoming` as a `BodySource` without collecting it. The
-simulated network yields the simulated service's response in seeded chunk
-sizes, so chunk boundaries vary across seeds. `ForeignHost` gains the same
-method with a buffering default; the gVisor bridge implements it through its
-hyper client.
+The default sends a whole body through `http_authorized` and gives the
+response as one chunk; it refuses a streamed request body as not sent
+(`NetError::Connect`), since it could only collect it after the call. A body
+read past `max_response_bytes` fails with `response_too_large()`
+(`is_response_too_large` tells it from other I/O errors). The real
+implementation (`env/real/authorized.rs`) shares its admission and dispatch
+with `http_authorized`, sends a streamed body chunk by chunk with its
+`content-length`, and returns hyper's `Incoming` as a `BodySource` that owns
+the request's original authority until the body ends. The simulated network
+and `ForeignHost` keep the buffering default for now; seeded chunk sizes in
+the simulator come with the M26 simulation slice, and foreign responses stay
+inline.
 
 ### 7.2 A blob request body
 

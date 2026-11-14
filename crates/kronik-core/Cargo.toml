@@ -61,6 +61,8 @@ tokio-tungstenite = { workspace = true, optional = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+# The env tests run on a current-thread runtime without the `real` feature.
+tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = { workspace = true }
 
 [[test]]

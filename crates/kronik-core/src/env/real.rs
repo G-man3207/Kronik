@@ -473,6 +473,14 @@ impl Net for RealNet {
         authorized::send(self.connector.clone(), req, original)
     }
 
+    fn http_stream_authorized(
+        &self,
+        req: crate::env::HttpStreamRequest,
+        original: crate::authority::AuthLease,
+    ) -> BoxFuture<'static, Result<crate::env::HttpStreamResponse, NetError>> {
+        authorized::send_stream(self.connector.clone(), req, original)
+    }
+
     fn http(&self, req: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
         let client = self.client.clone();
         Box::pin(async move {

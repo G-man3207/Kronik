@@ -163,6 +163,84 @@ pub struct HttpResponse {
     pub body: Bytes,
 }
 
+/// A body read in chunks (M25, docs/design/m25-streaming-bodies.md §7.1):
+/// a request body streamed to the peer, or a response body read as it
+/// arrives, without holding it whole.
+pub trait BodySource: Send + 'static {
+    /// The next chunk; `None` at the end.
+    fn next(&mut self) -> BoxFuture<'_, std::io::Result<Option<Bytes>>>;
+}
+
+/// A body held whole, as one chunk.
+pub struct BytesSource(Option<Bytes>);
+
+impl BytesSource {
+    pub fn new(bytes: Bytes) -> BytesSource {
+        BytesSource(Some(bytes).filter(|b| !b.is_empty()))
+    }
+}
+
+impl BodySource for BytesSource {
+    fn next(&mut self) -> BoxFuture<'_, std::io::Result<Option<Bytes>>> {
+        let chunk = self.0.take();
+        Box::pin(async move { Ok(chunk) })
+    }
+}
+
+/// The body of a streaming request.
+pub enum HttpBody {
+    Bytes(Bytes),
+    /// `len` bytes from `source`, sent with that `content-length`.
+    Stream {
+        len: u64,
+        source: Box<dyn BodySource>,
+    },
+}
+
+/// An outbound HTTP request whose body may be streamed and whose response
+/// is read in chunks ([`Net::http_stream_authorized`]).
+pub struct HttpStreamRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: HttpBody,
+    /// Reading more response bytes than this fails with
+    /// [`response_too_large`].
+    pub max_response_bytes: u64,
+}
+
+/// A response whose body is read as it arrives.
+pub struct HttpStreamResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Box<dyn BodySource>,
+}
+
+/// The error a streamed response body gives past its request's
+/// `max_response_bytes` ([`is_response_too_large`]).
+#[derive(Debug)]
+pub struct ResponseTooLarge;
+
+impl std::fmt::Display for ResponseTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the response body exceeds its limit")
+    }
+}
+
+impl std::error::Error for ResponseTooLarge {}
+
+/// The I/O error of a response body read past its limit.
+pub fn response_too_large() -> std::io::Error {
+    std::io::Error::other(ResponseTooLarge)
+}
+
+/// Whether `error` is [`response_too_large`].
+pub fn is_response_too_large(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<ResponseTooLarge>())
+}
+
 /// An outbound bounded WebSocket handshake; redirects are never followed.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WebSocketRequest {
@@ -227,6 +305,42 @@ pub trait Net: Send + Sync + 'static {
         req: HttpRequest,
         original: crate::authority::AuthLease,
     ) -> BoxFuture<'static, Result<HttpResponse, NetError>>;
+    /// [`Net::http_authorized`] with a body that may be streamed and a
+    /// response read as it arrives (M25). The default buffers: it sends a
+    /// whole body through `http_authorized` and gives the response as one
+    /// chunk; a streamed request body is refused before anything is sent.
+    fn http_stream_authorized(
+        &self,
+        req: HttpStreamRequest,
+        original: crate::authority::AuthLease,
+    ) -> BoxFuture<'static, Result<HttpStreamResponse, NetError>> {
+        let body = match req.body {
+            HttpBody::Bytes(bytes) => bytes,
+            HttpBody::Stream { .. } => {
+                return Box::pin(std::future::ready(Err(NetError::Connect(
+                    "this network does not stream request bodies".into(),
+                ))));
+            }
+        };
+        let sent = self.http_authorized(
+            HttpRequest {
+                method: req.method,
+                url: req.url,
+                headers: req.headers,
+                body,
+                max_response_bytes: req.max_response_bytes,
+            },
+            original,
+        );
+        Box::pin(async move {
+            let response = sent.await?;
+            Ok(HttpStreamResponse {
+                status: response.status,
+                headers: response.headers,
+                body: Box::new(BytesSource::new(response.body)),
+            })
+        })
+    }
     /// Builds a separate provider client; simulated networks may implement
     /// this without changing their deterministic request boundary.
     /// Supplied roots augment the system roots; this never changes guest trust.
@@ -394,5 +508,93 @@ impl Env {
         let mut b = [0u8; N];
         self.entropy.fill(&mut b);
         b
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// A network that only buffers, as test and simulated networks do.
+    struct Buffered;
+
+    impl Net for Buffered {
+        fn http(&self, _req: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
+            Box::pin(async { Err(NetError::Connect("unused".into())) })
+        }
+        fn http_authorized(
+            &self,
+            req: HttpRequest,
+            _original: crate::authority::AuthLease,
+        ) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
+            Box::pin(async move {
+                Ok(HttpResponse {
+                    status: 201,
+                    headers: vec![("x".into(), "y".into())],
+                    body: Bytes::from(format!("{} {} bytes", req.method, req.body.len())),
+                })
+            })
+        }
+    }
+
+    struct Open;
+
+    impl crate::authority::Authority for Open {
+        fn check(&self) -> Result<(), crate::error::ApiError> {
+            Ok(())
+        }
+        fn cancelled(&self) -> BoxFuture<'static, ()> {
+            Box::pin(std::future::pending())
+        }
+        fn admit(
+            &self,
+            effect: &mut dyn FnMut() -> Result<(), crate::error::ApiError>,
+        ) -> Result<(), crate::error::ApiError> {
+            effect()
+        }
+    }
+
+    fn request(body: HttpBody) -> HttpStreamRequest {
+        HttpStreamRequest {
+            method: "PUT".into(),
+            url: "http://example.test/".into(),
+            headers: Vec::new(),
+            body,
+            max_response_bytes: 1 << 20,
+        }
+    }
+
+    /// The default `http_stream_authorized` buffers: a whole body goes
+    /// through `http_authorized` and the response comes as one chunk; a
+    /// streamed body is refused as not sent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_default_buffers_and_refuses_streamed_bodies() {
+        let mut response = Buffered
+            .http_stream_authorized(
+                request(HttpBody::Bytes(Bytes::from_static(b"abc"))),
+                Arc::new(Open),
+            )
+            .await
+            .unwrap();
+        assert_eq!((response.status, response.headers.len()), (201, 1));
+        assert_eq!(
+            response.body.next().await.unwrap(),
+            Some(Bytes::from_static(b"PUT 3 bytes"))
+        );
+        assert_eq!(response.body.next().await.unwrap(), None);
+        let streamed = Buffered
+            .http_stream_authorized(
+                request(HttpBody::Stream {
+                    len: 1,
+                    source: Box::new(BytesSource::new(Bytes::from_static(b"a"))),
+                }),
+                Arc::new(Open),
+            )
+            .await;
+        assert!(matches!(streamed, Err(NetError::Connect(_))));
+        assert!(is_response_too_large(&response_too_large()));
+        assert!(!is_response_too_large(&std::io::Error::other("other")));
     }
 }
