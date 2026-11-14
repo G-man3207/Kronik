@@ -964,7 +964,8 @@ fn connection_turn(event: pb::connection_input::Event) -> pb::TurnRecord {
 }
 
 /// M24: an open turn's `ConnectionInput` (Input case 5) with its request
-/// and subprotocols, its accept (`Outcome.output` case 6) and its buffered
+/// (the offered subprotocols are its `sec-websocket-protocol` header;
+/// `ConnectionOpen` field 2 is reserved), its accept (`Outcome.output` case 6) and its buffered
 /// operations (`TurnRecord.connection_ops`, field 30): a welcome event and
 /// a close.
 #[test]
@@ -979,10 +980,16 @@ fn connection_open_v1() {
                 value: "lobby".into(),
                 sealed_value: None,
             }],
-            headers: vec![pb::Header {
-                name: "origin".into(),
-                value: sealed_plain(None, b"https://example.com"),
-            }],
+            headers: vec![
+                pb::Header {
+                    name: "origin".into(),
+                    value: sealed_plain(None, b"https://example.com"),
+                },
+                pb::Header {
+                    name: "sec-websocket-protocol".into(),
+                    value: sealed_plain(None, b"room.v1, room.v0"),
+                },
+            ],
             body: Some(pb::Body {
                 value: Some(pb::body::Value::Inline(
                     sealed_plain(None, b"").unwrap_or_default(),
@@ -991,11 +998,10 @@ fn connection_open_v1() {
             route: "/room/{key}/ws".into(),
             ..Default::default()
         }),
-        subprotocols: vec!["room.v1".into(), "room.v0".into()],
     }));
     if let Some(o) = t.outcome.as_mut() {
         o.output = Some(pb::outcome::Output::Accept(pb::ConnectionAccept {
-            subprotocol: "room.v1".into(),
+            subprotocol_index: Some(0),
             headers: vec![pb::Header {
                 name: "x-room".into(),
                 value: sealed_plain(Some("user:ada"), b"lobby"),

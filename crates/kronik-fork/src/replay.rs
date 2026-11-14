@@ -1684,7 +1684,6 @@ pub(crate) fn prepared_outcome_safe(
             }
         }
         Some(pb::outcome::Output::Accept(accept)) => {
-            fields.push(accept.subprotocol.as_bytes());
             for header in &accept.headers {
                 fields.push(header.name.as_bytes());
                 if let Some(value) = &header.value {

@@ -318,7 +318,6 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
-                subprotocols: vec!["chat".into()],
             })),
             outcome: Some(pb::Outcome {
                 output: Some(pb::outcome::Output::Accept(pb::ConnectionAccept {

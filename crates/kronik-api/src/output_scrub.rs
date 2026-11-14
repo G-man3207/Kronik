@@ -161,7 +161,7 @@ impl<'a> Context<'a> {
                     current,
                     original,
                     matcher,
-                    free.chain([accept.subprotocol.as_bytes()]).chain(headers),
+                    free.chain(headers),
                 )
             }
             None => kronik_sched::scrub::prepared_fields_safe(current, original, matcher, free),

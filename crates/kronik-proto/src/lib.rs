@@ -976,7 +976,20 @@ fn turn_record(m: &pb::TurnRecord) -> Result<(), DecodeError> {
             headers(&h.headers)?;
             body(h.body.as_ref(), "Outcome.http.body")?;
         }
-        Some(pb::outcome::Output::Accept(a)) => headers(&a.headers)?,
+        Some(pb::outcome::Output::Accept(a)) => {
+            headers(&a.headers)?;
+            // SSE has no subprotocols. Whether the index is within the
+            // offered list only the runtime can check: the header may be
+            // sealed.
+            let sse = connection::input(m.input.as_ref())
+                .is_some_and(|c| c.protocol == pb::ConnectionProtocol::Sse as i32);
+            if sse && a.subprotocol_index.is_some() {
+                return Err(invalid(
+                    "ConnectionAccept.subprotocol_index",
+                    "an SSE connection has no subprotocol",
+                ));
+            }
+        }
         None => {}
     }
     for op in &m.connection_ops {
@@ -1566,7 +1579,6 @@ mod connection_tests {
                     }),
                     ..Default::default()
                 }),
-                subprotocols: vec![],
             })),
             ..ok.clone()
         };
@@ -1649,7 +1661,7 @@ mod connection_tests {
         t.outcome = Some(pb::Outcome {
             kind: pb::OutcomeKind::Committed as i32,
             output: Some(pb::outcome::Output::Accept(pb::ConnectionAccept {
-                subprotocol: "room.v1".into(),
+                subprotocol_index: Some(0),
                 headers: vec![pb::Header {
                     name: "x".into(),
                     value: plain(b"1"),
@@ -1666,6 +1678,25 @@ mod connection_tests {
             a.headers[0].value = None;
         }
         assert!(check(bad).is_err());
+        // An SSE open's accept selects no subprotocol.
+        let mut sse = t.clone();
+        if let Some(pb::Input {
+            kind: Some(pb::input::Kind::Connection(c)),
+        }) = sse.input.as_mut()
+        {
+            c.protocol = pb::ConnectionProtocol::Sse as i32;
+            c.event = Some(pb::connection_input::Event::Close(pb::ConnectionClose {
+                cause: pb::CloseCause::Client as i32,
+                ..Default::default()
+            }));
+        }
+        assert!(check(sse.clone()).is_err());
+        if let Some(pb::outcome::Output::Accept(a)) =
+            sse.outcome.as_mut().and_then(|o| o.output.as_mut())
+        {
+            a.subprotocol_index = None;
+        }
+        assert!(check(sse).is_ok());
         let effect = |target: &str| pb::EffectRecord {
             ordinal: 0,
             kind: "connection.send-now".into(),

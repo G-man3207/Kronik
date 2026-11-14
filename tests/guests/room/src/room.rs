@@ -293,7 +293,13 @@ impl ConnectionGuest for Room {
             let joined = format!("{{\"type\":\"joined\",\"user\":{}}}", json_str(&user));
             connections::broadcast(&others, &Frame::Text(joined));
         }
-        let subprotocol = req.subprotocols.iter().find(|p| *p == "room.v1").cloned();
+        // `pick=last` selects the last offered subprotocol, whatever it is
+        // (the token tests: browsers put bearer tokens there).
+        let subprotocol = if query_value(&q, "pick") == Some("last") {
+            req.subprotocols.last().cloned()
+        } else {
+            req.subprotocols.iter().find(|p| *p == "room.v1").cloned()
+        };
         Ok(OpenReply::Accept(Accept {
             subprotocol,
             headers: vec![Header {

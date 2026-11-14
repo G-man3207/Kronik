@@ -2969,6 +2969,8 @@ against both.
             "BAD_REQUEST",
             "CAPABILITY_NOT_GRANTED",
             "CERTIFICATE_INVALID",
+            "CONNECTION_LIMIT",
+            "CONNECTION_NOT_HELD",
             "DEAD_LETTER_ALREADY_RESENT",
             "DEAD_LETTER_NOT_FOUND",
             "DEPLOYMENT_NOT_FOUND",

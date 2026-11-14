@@ -286,8 +286,9 @@ fn outcome_budget(
                 plain(s, matcher, remaining)?;
             }
         }
-        // M24: an open turn's accept; its subprotocol is one the client
-        // offered and its subject is checked before the turn is recorded.
+        // M24: an open turn's accept; its subprotocol is a position in the
+        // request's offered list and its subject is checked before the
+        // turn is recorded.
         Some(pb::outcome::Output::Accept(a)) => {
             for hd in &mut a.headers {
                 text_budget(&mut hd.name, matcher, remaining)?;
