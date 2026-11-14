@@ -841,9 +841,8 @@ Committed turns/s (p50 / p99 in ms); no row had an error:
 - The open-loop p99 at 200 req/s, 28.8 to 31.5 ms, is above the brief's
   25 ms at every concurrency, and one actor's turn takes about 7 ms (p50)
   against about 5 ms on the earlier machines (the M1 results above), though
-  this machine's fsync costs the same. The cause is not investigated: the
-  machine, the build (static musl here, glibc in the earlier measurements)
-  or both.
+  this machine's fsync costs the same. That is the machine:
+  [a glibc build and `v0.4.1` give the same](#the-release-build-against-glibc-and-v041).
 
 M24 at the new default (16 on the confined two CPUs), with the same build:
 criterion 1 passed every condition (1,199,600 of 1,199,600 deliveries,
@@ -859,6 +858,57 @@ hour. The heap (`RssAnon`, MiB) every 10 minutes: 261, 307, 314, 331, 336,
 31 MiB above where the warm-up left it, which fits the room actors' SQLite
 page caches (50 rooms of at most 512 KiB, 25 MiB) and the allocator's own
 share.
+
+## The release build against glibc and v0.4.1
+
+Whether M1's latency on the test machine above comes from the release's
+static musl build, the machine or a change since `v0.4.1`: three builds ran
+`scripts/perf-m1.sh` on the test machine, confined as above, in three
+interleaved rounds at `--concurrency 64` (2026-11-14, 19:02 to 19:20 UTC):
+
+- `main` at `7e87e5ce` built as the release builds it, static musl (SHA-256
+  `26fc7274158d52e385544c78723bee27d7c75db0d7e8f8b862dafa019c323eba`);
+- the same commit for glibc 2.35 (`cargo zigbuild --locked --release -p
+  kronik --target x86_64-unknown-linux-gnu.2.35`;
+  `cb252344df1a7891ae183a4a2c51f3d68c69f0052d299222b840563af07f6866`);
+- the published `v0.4.1` release binary
+  (`fdeb2a6c198d78417bf3dbdeb9193e33bca0d54d8e7d45d2d186058de6ef61a9`), which
+  the same pinned zig, cargo-zigbuild and Rust built.
+
+Medians of the three rounds, committed turns/s (p50 / p99 in ms); no errors:
+
+| Workload | `main`, musl | `main`, glibc | `v0.4.1`, musl |
+| --- | ---: | ---: | ---: |
+| 1 actor, 1 client | 138 (7.0 / 14.2) | 144 (6.7 / 12.3) | 144 (6.8 / 13.6) |
+| 1 actor, 16 clients | 158 (101 / 132) | 154 (101 / 143) | 160 (99 / 134) |
+| 64 actors, 64 clients | 2 501 (23.6 / 56.6) | 2 846 (19.9 / 52.4) | 2 691 (21.5 / 52.4) |
+| 256 actors, 256 clients | 2 565 (96.5 / 230.7) | 2 778 (90.2 / 192.9) | 2 654 (94.4 / 201.3) |
+| 256 actors, open loop 200 req/s | 200 (7.9 / 27.3) | 200 (7.9 / 27.3) | 200 (7.7 / 29.4) |
+
+- **The latency is the machine's.** The three builds give the same
+  open-loop p99 and the same single-actor turn of about 7 ms; the first
+  round's open-loop p99 was 41 to 53 ms in every build. The brief's 25 ms
+  was met on the 2-vCPU test VPS (above), not on this machine with any
+  build.
+- **The release build costs throughput.** Against glibc, the static musl
+  build commits 12 % fewer turns/s at 64 actors and 8 % fewer at 256.
+- **A modest change since `v0.4.1`.** With the same toolchain, `main`
+  commits 7 % fewer turns/s than `v0.4.1` at 64 actors (2 473 to 2 514
+  against 2 680 to 2 771 over the three rounds) and 3 % fewer at 256: within
+  the 10 % gate below, and not investigated.
+
+Where the release build's time goes, from a flat `perf` profile of a copy
+with symbols at the 64-actor row: its C library is zig's, whose `malloc` is
+zig's own allocator and whose `memset` and `memcpy` come from zig's
+compiler runtime. `memset` took 12 % of the daemon's CPU time, `memcpy` 8 %,
+`malloc` and `free` 6 %, and the kernel's page faults, page clearing and TLB
+shootdowns about 10 %. Over 10 s under the same load (`strace -c`) the musl
+build made 4 866 `mmap` and 4 875 `munmap` calls and the glibc build none:
+the allocator maps and unmaps large blocks each time instead of reusing
+them. Part of the `memset` is likely the Wasm pool zeroing the 2 MiB it
+keeps resident per reused slot ([Memory cost of the resident Wasm
+memories](#memory-cost-of-the-resident-wasm-memories)), a trade-off measured
+with glibc's faster `memset`.
 
 ## M32 benchmark and regression contract
 
