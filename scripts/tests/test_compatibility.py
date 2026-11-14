@@ -67,6 +67,70 @@ class CompatibilityIndexTest(unittest.TestCase):
         with self.assertRaisesRegex(VERIFY["Violation"], "SQL component"):
             self.load()
 
+    def add_component(self, case, role):
+        """`role`'s maintained guest, stored as a released payload of `case`."""
+        source = SCRIPTS.parent / f"tests/guests/{role}.wasm"
+        payload, sha256 = source.read_bytes(), VERIFY["corpus"].digest(source)
+        relative = f"components/{sha256}.wasm"
+        (self.root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (self.root / relative).write_bytes(payload)
+        case["components"].append({"role": role, "path": relative, "sha256": sha256, "bytes": len(payload),
+                                   "git_blob": "0" * 40, "source_path": f"tests/guests/{role}.wasm"})
+
+    def add_v0_5_0(self, roles=("media", "room"), manifest_change=None):
+        """A synthetic v0.5.0 case: the v0.4.1 case's contracts and data under
+        a manifest that says it recorded blobs and connections, and the media
+        and room components."""
+        case = copy.deepcopy(self.index["releases"][-1])
+        case["release"] = "v0.5.0"
+        for contract in case["contracts"].values():
+            relative = contract["path"].replace(f"{self.index['releases'][-1]['release']}/", "v0.5.0/", 1)
+            (self.root / relative).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.root / contract["path"], self.root / relative)
+            contract["path"] = relative
+        manifest = json.loads((self.root / case["manifest"]).read_text())
+        manifest["release"] = "v0.5.0"
+        manifest["scenarios"] = VERIFY["corpus"].SCENARIOS
+        manifest["observations"].update(roots={}, blobs={}, connections={})
+        if manifest_change:
+            manifest_change(manifest)
+        case["manifest"] = "v0.5.0/manifest.json"
+        (self.root / case["manifest"]).write_text(json.dumps(manifest))
+        case["manifest_sha256"] = VERIFY["corpus"].digest(self.root / case["manifest"])
+        for role in roles:
+            self.add_component(case, role)
+        self.index["releases"].append(case)
+        self.index["published_releases"].append("v0.5.0")
+        return case
+
+    def test_from_v0_5_0_a_release_has_its_media_and_room_components(self):
+        self.add_v0_5_0()
+        loaded = self.load()
+        self.assertEqual({"counter", "notes", "media", "room"}, {item["role"] for item in loaded[-1]["components"]})
+        self.assertEqual("v0.5.0", loaded[-1]["release"])
+
+    def test_the_blob_and_connection_guests_come_together(self):
+        self.add_v0_5_0(roles=("media",))
+        with self.assertRaisesRegex(VERIFY["Violation"], "media and room components"):
+            self.load()
+
+    def test_a_role_is_not_listed_twice(self):
+        case = self.add_v0_5_0()
+        case["components"][3] = copy.deepcopy(case["components"][2])
+        with self.assertRaisesRegex(VERIFY["Violation"], "media and room components"):
+            self.load()
+
+    def test_a_release_before_v0_5_0_has_no_media_or_room_component(self):
+        for role in ("media", "room"):
+            self.add_component(self.index["releases"][-1], role)
+        with self.assertRaisesRegex(VERIFY["Violation"], "media and room components"):
+            self.load()
+
+    def test_a_v0_5_0_manifest_says_what_its_blobs_and_connections_were(self):
+        self.add_v0_5_0(manifest_change=lambda manifest: manifest["observations"].pop("blobs"))
+        with self.assertRaisesRegex(VERIFY["Violation"], "records blobs and connections"):
+            self.load()
+
     def test_future_index_format_needs_a_deliberate_reader(self):
         self.index["format"] = "kronik.compatibility-index/v99"
         with self.assertRaisesRegex(VERIFY["Violation"], "unsupported"):

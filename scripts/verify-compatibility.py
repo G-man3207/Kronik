@@ -21,6 +21,14 @@ contracts = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(contracts)
 
 
+def component_roles(release):
+    """The released components of a case: the counter and SQL components, and
+    from v0.5.0 the blob (`media`) and connection (`room`) guests too."""
+    if corpus.records_blobs_and_connections(release):
+        return {"counter", "notes", "media", "room"}
+    return {"counter", "notes"}
+
+
 def fixture_file(root, relative):
     if not isinstance(relative, str) or "\\" in relative or "\0" in relative:
         raise Violation("invalid compatibility fixture path")
@@ -97,11 +105,14 @@ def load_index(path):
         for field in ("release", "producer_revision", "producer_binary_sha256"):
             if manifest.get(field) != case[field]:
                 raise Violation(f"producer provenance disagrees with index: {field}")
+        corpus.check_observations(manifest)
         components = case.get("components")
-        if (not isinstance(components, list) or len(components) != 2 or
-                not all(isinstance(item, dict) for item in components) or
-                {item.get("role") for item in components} != {"counter", "notes"}):
-            raise Violation("each actual release needs its counter and SQL component")
+        roles = [item.get("role") for item in components] if isinstance(components, list) else None
+        if (roles is None or not all(isinstance(item, dict) for item in components)
+                or not all(isinstance(role, str) for role in roles)
+                or len(set(roles)) != len(roles) or set(roles) != component_roles(release)):
+            raise Violation("each actual release needs its counter and SQL component, "
+                            "and from v0.5.0 its media and room components")
         for component in components:
             if not re.fullmatch(r"[0-9a-f]{40}", component.get("git_blob", "")) or not re.fullmatch(r"[0-9a-f]{64}", component.get("sha256", "")):
                 raise Violation("released component source and payload must be pinned")
@@ -172,6 +183,81 @@ def check_policy(daemon, root):
     return results
 
 
+def exercise_media(daemon, port):
+    """The released `media` component through the candidate's host (M25, M26),
+    at the corpus's blob threshold: an upload that it reads back in 4 KiB
+    chunks, a blob it writes in 4 KiB chunks and answers with, and one it
+    puts, then holds and reads back. Returns its answers and the root inputs
+    it sent."""
+    upload = corpus.fixture_bytes("released media", 100_000)
+    pattern = corpus.media_pattern(70_000)
+    info = corpus.blob_answer(corpus.gateway_text(port, "POST", "/media/released/info", upload))
+    summed = corpus.gateway_text(port, "POST", "/media/released/sum?chunk=4096", upload)
+    status, written = corpus.gateway(port, "POST", f"/media/released/write?size={len(pattern)}&chunk=4096")
+    put = corpus.blob_answer(corpus.gateway_text(port, "POST", f"/media/held/put?size={len(pattern)}"))
+    held = [entry.get("hash") for entry in corpus.actor_blobs(daemon, "media/held")]
+    held_sum = corpus.gateway_text(port, "POST", "/media/held/held-sum")
+    if (info["size"] != len(upload) or summed != f"{len(upload)} {corpus.fnv1a64(upload)}"
+            or status != 200 or written != pattern or put["size"] != len(pattern) or held != [put["hash"]]
+            or held_sum != f"{len(pattern)} {corpus.fnv1a64(pattern)}"):
+        raise Violation(f"the released media component's blobs changed: info {info}, sum {summed!r}, write HTTP "
+                        f"{status} ({len(written)} bytes), put {put}, holds {held}, held-sum {held_sum!r}")
+    return {"upload": info, "sum": summed, "written_bytes": len(written), "put": put, "held_sum": held_sum}, 5
+
+
+def exercise_room(daemon, port):
+    """The released `room` component through the candidate's gateway (M24): a
+    WebSocket member with the subject user:7 says something, streams two
+    frames with `send-now` and says `bye`, so the actor closes it. Returns its
+    transcript and the room's messages, and the root inputs it sent."""
+    member = corpus.Member(port, "/room/released/ws?user=7")
+    member.expect_welcome(members=1)
+    member.send("say released component hello")
+    member.expect("the message", corpus.room_message(1, "7", "released component hello"))
+    member.send("stream 2")
+    for i in range(2):
+        member.expect("a send-now frame", f"tok {i}")
+    member.expect("the stream's end", "done 2")
+    member.send("bye")
+    member.expect_close("the actor's close", 1000, "bye")
+    corpus.until("the close input", lambda: corpus.closed_by_their_turns(daemon, [member.id]))
+    transcript = {"connection": member.id, "path": member.path, "sent": member.sent, "received": member.received,
+                  "close": {"initiator": "actor", "cause": "actor", "code": 1000}}
+    corpus.check_transcript(corpus.connection_view(daemon, member.id), transcript)
+    messages = corpus.gateway_text(port, "GET", "/room/released/messages")
+    if messages != "1 7 released component hello\n":
+        raise Violation(f"the released room component's messages changed: {messages!r}")
+    # Its open, its three frames, its close, and the query.
+    return {"transcript": transcript, "messages": messages}, 6
+
+
+def check_blob_and_connection_components(daemon, port, command, work):
+    """The released media and room components (from v0.5.0), configured as
+    the corpus is, from a stable point of their own: their blob and
+    connection inputs, then both replays of exactly those inputs, unchanged,
+    each kind's roots, frames and `send-now` included."""
+    corpus.configure_blobs_and_connections(daemon)
+    stable_lsn = corpus.checked_api(daemon, "GET", "/v1/health")["applied_lsn"]
+    roots, proof = {}, {}
+    proof["media"], roots["media"] = exercise_media(daemon, port)
+    proof["room"], roots["room"] = exercise_room(daemon, port)
+    expected = sum(roots.values())
+    corpus.checked_api(daemon, "POST", "/v1/forks",
+                       {"at": stable_lsn, "name": "released-blobs-and-connections", "reason": corpus.REASON})
+    proof["replays"] = {}
+    for mode in ("isolated", "continuous"):
+        result = corpus.run_json(command + ["replay", "released-blobs-and-connections", "--mode", mode,
+                                            "--reason", corpus.REASON],
+                                 work, f"blobs-and-connections-replay-{mode}", timeout=120)
+        summary = result["summary"]
+        corpus.check_identity_summary(summary, expected)
+        diff = corpus.checked_api(daemon, "GET", "/v1/forks/released-blobs-and-connections/diff")
+        corpus.check_kinds_replayed(diff, roots)
+        corpus.check_frames_replayed(diff, [proof["room"]["transcript"]], 2)
+        proof["replays"][mode] = summary
+    return proof
+
+
 def check_components(args, case, root, work):
     work.mkdir(mode=0o700)
     data, sock = work / "data", work / "api.sock"
@@ -229,10 +315,16 @@ def check_components(args, case, root, work):
             if diff.get("summary", {}).get(field) != replays["continuous"][field]:
                 raise Violation(f"public API diff disagrees with the actual CLI replay: {field}")
         policy = check_policy(daemon, root)
-        return {"release": case["release"], "counter": counter, "sql_rows": sql_rows,
-                "components": case["components"], "replays": replays, "diff_schema": diff["schema"],
-                "wit": {"original_package": old_package, "supported_package": supported_package, "components": component_modes},
-                "policy": policy, "passed": True}
+        proof = {"release": case["release"], "counter": counter, "sql_rows": sql_rows,
+                 "components": case["components"], "replays": replays, "diff_schema": diff["schema"],
+                 "wit": {"original_package": old_package, "supported_package": supported_package, "components": component_modes},
+                 "policy": policy, "passed": True}
+        # From v0.5.0 the released media and room components run too, after
+        # the replays above and the policy cases on their diff, from a stable
+        # point of their own.
+        if corpus.records_blobs_and_connections(case["release"]):
+            proof["blobs_and_connections"] = check_blob_and_connection_components(daemon, args.port, command, work)
+        return proof
     finally:
         corpus.close(daemon)
 

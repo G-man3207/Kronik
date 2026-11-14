@@ -202,6 +202,13 @@ verifier checks them as well:
 - It must show the room's messages, closes and closed connections as the
   producer saw them, and each connection's frame counts and close must agree
   with its client's transcript in the manifest.
+- The released media and room components are deployed with the counter and
+  SQL components. After the policy cases, from a stable point of their own,
+  media reads an upload above the blob threshold in 4 KiB chunks, writes a
+  blob and answers with it, and puts a blob that it then holds and reads, and
+  room has a WebSocket member with a subject that streams two `send-now`
+  frames and says `bye`; both replays of those inputs must be exact, per kind
+  and per frame.
 
 An older WIT component may instead receive a real nonzero
 `IMPORT_NOT_ALLOWED` response identifying its old package/interface version and
@@ -379,8 +386,9 @@ candidate:
    - A call answered with a blob that the callee wrote is in the script but
      off (`CALLEE_WRITTEN_REPLY`) until the release the corpus is produced
      from answers one; earlier builds fail the caller.
-5. Store the tag's four contract sources under `vX.Y.Z/contracts/` and its two
-   guest components under `components/` (`git show vX.Y.Z:<path>`), and add the
+5. Store the tag's four contract sources under `vX.Y.Z/contracts/` and its
+   guest components under `components/` (`git show vX.Y.Z:<path>`: counter and
+   notes, and from v0.5.0 also media and room), and add the
    case to `releases.json` and the tag to `published_releases`. Take the root
    count from the release binary's own `kronik upgrade check`.
 6. Run `scripts/verify-compatibility.py` as above, and scan every new file for
