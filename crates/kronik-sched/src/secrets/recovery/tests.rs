@@ -444,9 +444,18 @@ async fn link_token(node: &Arc<Node>, bao: &Arc<Bao>, recovery_status: usize) ->
     // Settle the startup inventory before the fixture takes over the name: the
     // background refresh must not race this link's single observation. The
     // condition ends the wait; the bound is far above a loaded machine's need.
+    // The wait wakes the rebuild as a reader's demand does: a first pass that
+    // failed while a loaded machine's applier lagged would otherwise wait out
+    // its backoff, the fetch timeout (30 s here) and then twice that, and pass
+    // the bound (seen once in a full run on a loaded machine).
     node.env
         .timeout(Duration::from_secs(60), async {
+            let mut polls = 0u32;
             while !runtime.cache.complete(node.epoch()) {
+                if polls.is_multiple_of(100) {
+                    node.wake_rebuild();
+                }
+                polls = polls.wrapping_add(1);
                 node.env.clock.sleep(Duration::from_millis(1)).await;
             }
         })
