@@ -520,6 +520,12 @@ check the engine name against `kronik --version` of the release build):
   after the rename, before its manifest. Before, the snapshots directory was
   never fsynced: a power loss could keep a compaction's deletions and lose
   the snapshot that replaced them. v0.4.1 has the same gap.
+- `kronik privacy reseal` marks a segment for the shipper's re-upload
+  durably (the mark and its directory fsynced) before the resealed image
+  replaces the segment. Before, the mark was written after the rename and
+  never fsynced: a crash or a power loss in between left the segment
+  resealed and unmarked, which no later reseal finds again, and the bucket
+  kept the plain copy shipped before. v0.4.1 has the same gap.
 - A reseal fails when the fsync of the log directory after it renames a
   resealed segment into place fails; before, it went on as if the rename
   were durable. v0.4.1 has the same gap.

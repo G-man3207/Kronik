@@ -313,7 +313,10 @@ starts a background compaction that requires the mode to be `on`:
 - The shipper treats closed segments as immutable and uploads each once,
   so reseal marks every rewritten segment for re-upload, and the shipped
   copy is replaced. Until it is, the shipped copy still holds the plain
-  values, and `privacy status` counts such segments as pending.
+  values, and `privacy status` counts such segments as pending. The mark
+  is durable before the rewritten segment replaces the old one: once a
+  segment is resealed no reseal finds it again, so a mark lost after the
+  rename would leave the plain copy in the bucket.
 - It does the same for the `state.db` rows the rewritten records still own
   (state values, the bodies of pending timers and undelivered messages,
   saved responses, dead-letter inputs) and takes a snapshot afterwards.
@@ -566,7 +569,10 @@ Where the code differs from the sections above:
   only: same LSNs and order, tagged plain values sealed with the current
   key, erased subjects replaced by a tombstone `Sealed` (erased version,
   zero nonce, empty ciphertext), checksums recomputed, written beside the
-  old file, fsynced and renamed. `turn_index` and `open_turns` offsets,
+  old file and fsynced; its re-upload mark (below) is written and fsynced
+  with its directory; then the segment is renamed over the old file and
+  the log directory fsynced, whose failure fails the reseal. `turn_index`
+  and `open_turns` offsets,
   and the rows the rewritten turns (a rebased turn of a `StateRebase`
   record too) still own (`kv` values, the bodies of their pending timers
   and undelivered messages, saved ingress and call responses, dead-letter

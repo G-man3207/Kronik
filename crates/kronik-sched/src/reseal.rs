@@ -107,16 +107,15 @@ pub fn keystore_retention_ms(data: &Path) -> u64 {
 /// Marks a rewritten segment so the shipper uploads it again. The file
 /// holds the BLAKE3 of the bytes that must be shipped; a shipper that sees
 /// a different file leaves the mark (the rename has not happened yet).
+///
+/// Durably, before the rewritten image replaces the segment
+/// ([`kronik_log::rewrite_segment_marked`]): once the segment is resealed
+/// no reseal finds it again, so a mark lost to a crash or a power loss
+/// after the rename would leave the shipped plain copy in the bucket.
 pub fn mark_reupload(data: &Path, start: Lsn, bytes: &[u8]) -> std::io::Result<()> {
-    let path = reupload_path(data, start);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    crate::durable::create_dir_all(data, &reupload_dir(data))?;
     let hash = blake3::hash(bytes).to_hex().to_string();
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, hash)?;
-    std::fs::rename(tmp, path)?;
-    Ok(())
+    crate::durable::write_synced(&reupload_path(data, start), hash.as_bytes())
 }
 
 /// Whether `bytes` are the rewritten segment the mark is waiting to ship.
@@ -422,43 +421,38 @@ impl Node {
             // The changed effect results: an open turn's copies of them in
             // open_effects are what its re-run hands to the guest.
             let mut effects: Vec<(String, pb::EffectRecord)> = Vec::new();
-            let rewritten = kronik_log::rewrite_segment(&path, |lsn, record| {
-                reseal_record(self.sealer(), record, &erased, &fill, wall).map(|(s, t)| {
-                    counts.0 += s;
-                    counts.1 += t;
-                    // A rebased turn owns the state rows it wrote, as a turn
-                    // record does (M13).
-                    if s + t > 0
-                        && let Some(turn) = record.turn()
-                    {
-                        turns.push((lsn, turn.clone()));
-                    }
-                    if s + t > 0
-                        && let Record::EffectResult(r) = &*record
-                        && let Some(effect) = &r.effect
-                    {
-                        effects.push((r.execution_id.clone(), effect.clone()));
-                    }
-                    s + t > 0
-                })
-            })
+            // The shipper's mark is durable before the segment changes.
+            let mark = |image: &[u8]| match &data {
+                Some(data) => mark_reupload(data, start, image),
+                None => Ok(()),
+            };
+            let rewritten = kronik_log::rewrite_segment_marked(
+                &path,
+                |lsn, record| {
+                    reseal_record(self.sealer(), record, &erased, &fill, wall).map(|(s, t)| {
+                        counts.0 += s;
+                        counts.1 += t;
+                        // A rebased turn owns the state rows it wrote, as a turn
+                        // record does (M13).
+                        if s + t > 0
+                            && let Some(turn) = record.turn()
+                        {
+                            turns.push((lsn, turn.clone()));
+                        }
+                        if s + t > 0
+                            && let Record::EffectResult(r) = &*record
+                            && let Some(effect) = &r.effect
+                        {
+                            effects.push((r.execution_id.clone(), effect.clone()));
+                        }
+                        s + t > 0
+                    })
+                },
+                mark,
+            )
             .map_err(|e| ApiError::new(ErrorCode::Internal, format!("reseal: {e}")))?;
             if !rewritten.changed {
                 continue;
-            }
-            let bytes = std::fs::read(&path).map_err(|e| {
-                ApiError::new(
-                    ErrorCode::Internal,
-                    format!("reading the rewritten segment: {e}"),
-                )
-            })?;
-            if let Some(data) = &data {
-                mark_reupload(data, start, &bytes).map_err(|e| {
-                    ApiError::new(
-                        ErrorCode::Internal,
-                        format!("marking the segment for re-upload: {e}"),
-                    )
-                })?;
             }
             self.store()
                 .db()

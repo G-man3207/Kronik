@@ -597,3 +597,94 @@ fn a_plain_request_of_an_erased_subject_still_has_to_be_covered() {
         assert_eq!(stats(&node).1, 0);
     });
 }
+
+/// The bytes of each segment of `log`, by start.
+fn segments(log: &Path) -> std::collections::BTreeMap<kronik_core::ids::Lsn, Vec<u8>> {
+    kronik_log::segment_starts(log)
+        .unwrap()
+        .into_iter()
+        .map(|start| {
+            let bytes = std::fs::read(log.join(kronik_log::segment_name(start))).unwrap();
+            (start, bytes)
+        })
+        .collect()
+}
+
+/// A reseal marks a segment for the shipper durably before the resealed
+/// image replaces it: once a segment is resealed no reseal finds it again,
+/// so a mark lost after the rename would leave the plain copy in the bucket.
+/// When the mark cannot be made durable, the segment keeps its image and
+/// the reseal fails; one that goes through leaves a synced mark per segment
+/// naming its new bytes. (v0.4.1 wrote the mark after the rename, and never
+/// fsynced it.)
+#[test]
+fn a_reseal_marks_a_segment_durably_before_it_replaces_it() {
+    use crate::durable::test_ops::{Op, watch};
+    run(async {
+        let data = tempfile::tempdir().unwrap();
+        let node = crate::start_local(
+            env(),
+            data.path(),
+            crate::NodeConfig {
+                segment_max_bytes: Some(2_048),
+                storage: Some(crate::snapshots::StorageConfig::new(
+                    data.path().to_path_buf(),
+                )),
+                ..config()
+            },
+        )
+        .await
+        .unwrap();
+        settle(&node).await;
+        privacy(&node, pb::PrivacyState::On).await;
+        quiesce(&node).await;
+        finished(&node, 1, fetch(Some("user:1"), None)).await;
+        finished(&node, 2, fetch(Some("user:2"), None)).await;
+        append_noise(&node, 80).await;
+        erase(&node, "user:1").await;
+        let log = node.reader().dir().to_path_buf();
+        let marks = data.path().join("privacy").join("reupload");
+
+        let before = segments(&log);
+        let failing = watch(
+            &marks,
+            |op| matches!(op, Op::Sync(path) if path.extension().is_some_and(|e| e == "tmp")),
+        );
+        let refused = node.reseal(audit(), false, authority(&node)).await;
+        drop(failing);
+        assert!(refused.is_err(), "{refused:?}");
+        let after = segments(&log);
+        let active = before.keys().next_back().copied();
+        for (start, bytes) in before.iter().filter(|(s, _)| Some(**s) != active) {
+            assert_eq!(
+                after.get(start),
+                Some(bytes),
+                "segment {start} was rewritten although its mark failed"
+            );
+        }
+
+        let watching = watch(&marks, |_| false);
+        let done = node.reseal(audit(), false, authority(&node)).await.unwrap();
+        let ops = watching.ops();
+        drop(watching);
+        assert!(done.segments >= 1, "{done:?}");
+        assert_eq!(ops.len(), 3 * done.segments as usize, "{ops:#?}");
+        for step in ops.chunks(3) {
+            assert!(
+                matches!(step, [Op::Sync(tmp), Op::Rename(from, to), Op::Sync(dir)]
+                    if tmp == from && to.parent() == Some(marks.as_path()) && *dir == marks),
+                "{ops:#?}"
+            );
+        }
+        for (start, bytes) in segments(&log) {
+            if marks.join(format!("{start:020}")).exists() {
+                assert!(crate::reseal::reupload_ready(data.path(), start, &bytes));
+            }
+        }
+        assert_eq!(
+            crate::reseal::pending_reuploads(data.path()),
+            done.segments,
+            "a mark per resealed segment"
+        );
+    });
+}
