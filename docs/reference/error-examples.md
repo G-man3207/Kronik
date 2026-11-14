@@ -501,9 +501,9 @@ printf '%s' 'fixture-only-value' | kronik secret set fixture-key --reason "provi
 An operation cannot obtain the complete required retained-value inventory.
 Restore that actual prerequisite; do not interpret an unavailable catalogue as
 empty or substitute current values for historical references. After a
-restart this includes a recorded version that the provider no longer serves,
-until it serves the version again; that is a known defect (see the operations
-guide). After an upgrade of data written by v0.3.0 or older it includes a
+restart this includes a recorded version that the provider no longer serves
+and that the node holds no scrub-only copy of (ADR 0142), until the provider
+serves the version again (see the operations guide). After an upgrade of data written by v0.3.0 or older it includes a
 snapshot from those versions that is still retained, until retention has
 deleted it; that is a known defect too (see the operations guide). An effect
 that cannot get its secret fails with this code inside its turn, and the guest

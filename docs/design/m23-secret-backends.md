@@ -13,7 +13,7 @@ the code; a plan is not a pass.
 | --- | --- | --- | --- |
 | B1 master key in a KMS | OpenBao, AWS, GCP and Azure wrapping; `file` and `env` seeds; `keys wrap`, `rewrap`, `status` | `scripts/e2e-keys.sh` on pinned service images (the status page has the runs) | |
 | B2 trait, links, versions | `SecretBackend`; `SecretVersion` (kind 45) and `SecretLink` (kind 46); `secret link`, `unlink`, `refresh`, `history`, `backends`; effects resolve through links; re-runs fetch by `source_version`; `secrets` in the effects of `history` | `crates/kronik/tests/secret_backends.rs` (§9, criteria 2 and 3, steps 1 to 7, against a stand-in for OpenBao's KV v2); the DST scenario `allocator` ("one allocator", step 8): `scripts/dst.sh 0..10000 6 --scenario allocator` passes (release), and seeds 0..300 give the same trace twice | |
-| B3 cache and outages | the cache and the refresher; `fetch_timeout`; `max_stale`; the failure cache of 5 s; an error result for an effect that cannot get its secret; scrubbing that fails closed; foreign actors through the cache; forks that use only a held value and never fetch; the four metrics and `kronik doctor`'s `secrets` check (§6) | the same file (outage, refusal, restart and crash re-run cases, a fork and `foreign add` with a linked name); the DST scenario `secret-outage`: `scripts/dst.sh 0..2000 6 --scenario secret-outage` passes (release), seeds 0..100 give the same trace twice, and 4 of seeds 0..16 fail without the stale fallback of this release; `scripts/e2e-secrets.sh` with each real service paused, and OpenBao also stopped | a foreign actor's start with a linked name has run only in unit tests and through `foreign add` (a start needs a sandbox) |
+| B3 cache and outages | the cache and the refresher; `fetch_timeout`; `max_stale`; the failure cache of 5 s; an error result for an effect that cannot get its secret; scrubbing that fails closed; foreign actors through the cache; forks that use only a held value and never fetch; the four metrics and `kronik doctor`'s `secrets` check (§6); encrypted scrub-only copies of recorded versions (ADR 0142) | the same file (outage, refusal, restart and crash re-run cases, a fork and `foreign add` with a linked name, a version the backend destroyed scrubbed from its copy after a restart); the DST scenario `secret-outage`: `scripts/dst.sh 0..2000 6 --scenario secret-outage` passes (release), seeds 0..100 give the same trace twice, and 4 of seeds 0..16 fail without the stale fallback of this release; `scripts/e2e-secrets.sh` with each real service paused, and OpenBao also stopped | a foreign actor's start with a linked name has run only in unit tests and through `foreign add` (a start needs a sandbox) |
 | B4 providers | clients for `env`, `openbao` (KV v2, token, AppRole, certificate), `aws` (Secrets Manager), `gcp` and `azure` | unit tests for each; `scripts/e2e-secrets.sh` against the real services below, all passing on one run | OpenBao's certificate login and token renewal, and the cloud metadata/IMDS logins, against a real service; any real cloud |
 | B5 proof and docs | `secret_backends.rs`; `scripts/e2e-secrets.sh`; `scripts/e2e-cloud-secrets.sh`; the `[secrets]` table and the troubleshooting sections of the operations guide; the CLI, JSON, OpenAPI and error references | `scripts/e2e-secrets.sh`, see below | `scripts/e2e-cloud-secrets.sh` has **not been run**: the project has no AWS, GCP or Azure account for it |
 | B6 PKCS#11 | the `kronik-keyhelper` crate and its default-off release asset (ADR 0093); `[keys] source = "pkcs11"`; `keys enroll` | `scripts/e2e-pkcs11.sh` against SoftHSM2 2.6.1 with a **development build** of `kronik` and `kronik-keyhelper --features pkcs11`, see below | the release artifacts (musl daemon, glibc helper asset); a physical HSM; the rest of ADR 0093's acceptance list (staged restore, migration with `keys wrap`, helper crash/timeout/overflow drills) |
@@ -47,7 +47,8 @@ with `SECRET_UNAVAILABLE` recorded; with OpenBao stopped or sealed, in under
 as an operator's mutation waits for the inventory before its reason is
 scrubbed (`[secrets] fetch_timeout`); and after a destroyed version and a
 restart, the reads that scrub answered 503 `SECRET_UNAVAILABLE` on all five
-(the known defect of the operations guide). The run found and this release
+(the defect that the scrub-only copies of ADR 0142 have since removed; this
+run predates them). The run found and this release
 fixes three defects: a re-run's older version became the current value after
 a restart, moto's empty `NextToken` was refused, and a Key Vault answer
 without `attributes.enabled` was refused.
@@ -627,8 +628,29 @@ secrets, and only once Kronik has no usable value.
   - A refetch that finds a new `source_version` records it (§5.1). Later
     effects use it; earlier turns keep theirs.
 - **The cache** is in memory only: `name → {version, source_version, value,
-  fetched_at}`, values in `Zeroizing`. It is never written to disk, which
-  would put external secrets at rest in a second place.
+  fetched_at}`, values in `Zeroizing`. It is never written to disk.
+- **Scrub-only copies** (ADR 0142, amending this section's "never on
+  disk"): the views that scrub need the value of every recorded version
+  after a restart too, also when the backend no longer serves it. So the
+  node keeps, for each external version it records (each `SecretVersion`
+  that becomes active), one encrypted copy in the table
+  `external_scrub_copies` of `<data>/keys/secrets.db`: XChaCha20-Poly1305
+  under a key derived from the store's storage key (from the master seed,
+  context `kronik external scrub copies v1`), with the version's identity
+  (name, version, backend, canonical reference, version id, version hash)
+  as associated data. It is written while the node holds the value, before
+  the version's `ACTIVE` record (or later, when the node next holds a value
+  that has none). It is read only by the scrub inventory, which prefers it
+  to a fetch and holds the value as scrub-only: never for an effect, a
+  re-run, a fork computation, a reveal or a foreign actor. It travels inside
+  snapshots with `secrets.db`, encrypted; `keys rewrap` keeps the seed and
+  leaves it valid. It is deleted at the next start when its version did not
+  become active, and otherwise lives as long as its `SecretVersion` record,
+  like the built-in store's own scrub needles: a value can sit in state or
+  a snapshot (a `call` input, an echoed response) for as long as they do,
+  so a copy is not deleted with the log that references it, nor on
+  `unlink`. This puts encrypted external values at rest in a second place;
+  ADR 0142 records why.
 - **An effect that needs a secret:**
   - **fresh cache:** uses it, with no I/O;
   - **stale cache** (refresh failed): uses it until `[secrets] max_stale`

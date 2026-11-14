@@ -462,6 +462,19 @@ struct CacheState {
     bound_cache: std::sync::Weak<SecretCache>,
     native_owner: Option<std::sync::Weak<crate::native_execution::NativeExecution>>,
 }
+/// What a scrub-only copy of `row` is kept under (ADR 0142); `None` for
+/// the built-in store, which keeps its own versions.
+fn scrub_copy_identity(row: &pb::SecretVersion) -> Option<kronik_privacy::ScrubCopy> {
+    (row.backend != "file" && !row.backend.is_empty()).then(|| kronik_privacy::ScrubCopy {
+        name: row.name.clone(),
+        version: row.version,
+        backend: row.backend.clone(),
+        canonical_ref: row.canonical_ref.clone(),
+        source_version: row.source_version.clone(),
+        version_hash: row.version_hash.clone(),
+    })
+}
+
 fn pattern_reference(row: &pb::SecretVersion) -> Option<pb::SecretRef> {
     if !active(row)
         || row.deleted
@@ -1111,6 +1124,9 @@ pub struct SecretRuntime {
     cycle: CycleState,
     /// Each backend's last answer, for `kronik secret backends` and doctor.
     health: Mutex<BTreeMap<String, BackendHealth>>,
+    /// The external versions that have a scrub-only copy in
+    /// `keys/secrets.db` (ADR 0142), so a copy is written once.
+    copies: Mutex<BTreeSet<(String, u64)>>,
     initialized: AtomicBool,
     background: AtomicBool,
     // The ADR-0004-compliant replacement ripples through the wait/notify
@@ -1264,6 +1280,7 @@ impl SecretRuntime {
             stats: CertificationStats::default(),
             cycle: CycleState::default(),
             health: Mutex::new(BTreeMap::new()),
+            copies: Mutex::new(BTreeSet::new()),
             failed_row: Mutex::new(None),
             initialized: AtomicBool::new(false),
             background: AtomicBool::new(false),
@@ -1449,6 +1466,110 @@ impl SecretRuntime {
             Ok(())
         }
     }
+    /// The scrub-only copy kept for the recorded external version `row`
+    /// (ADR 0142), when there is one that opens: for the scrub inventory
+    /// only, never an operational value. A copy that does not open is
+    /// treated as missing and logged; the version is then fetched.
+    async fn scrub_copy(&self, row: &pb::SecretVersion) -> Option<Zeroizing<Vec<u8>>> {
+        let copy = scrub_copy_identity(row)?;
+        let file = self.file.clone();
+        let read = self
+            .env
+            .blocking("secret-scrub-copy", move || file.scrub_copy(&copy))
+            .await?;
+        match read {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    target: "kronik::secrets",
+                    name = %row.name,
+                    version = row.version,
+                    backend = %row.backend,
+                    error = %error,
+                    "the scrub-only copy of a secret version does not open; the version is \
+                     fetched instead"
+                );
+                None
+            }
+        }
+    }
+
+    /// Keeps `value` as the scrub-only copy of the recorded external version
+    /// `row` (ADR 0142), unless it has one. Failing to keep it fails nothing:
+    /// it is logged, and the next inventory rebuild that fetches the version
+    /// keeps it then.
+    async fn keep_scrub_copy(&self, row: &pb::SecretVersion, value: &[u8]) {
+        let Some(copy) = scrub_copy_identity(row) else {
+            return;
+        };
+        let key = (row.name.clone(), row.version);
+        if lock(&self.copies).contains(&key) {
+            return;
+        }
+        let file = self.file.clone();
+        let value = Zeroizing::new(value.to_vec());
+        let nonce = self.env.random_bytes::<24>();
+        let wall_ms = self.env.clock.wall_ms();
+        let written = self
+            .env
+            .blocking("secret-scrub-copy-write", move || {
+                file.put_scrub_copy(&copy, &value, nonce, wall_ms)
+            })
+            .await;
+        match written {
+            Some(Ok(_)) => {
+                lock(&self.copies).insert(key);
+            }
+            Some(Err(error)) => tracing::warn!(
+                target: "kronik::secrets",
+                name = %row.name,
+                version = row.version,
+                backend = %row.backend,
+                error = %error,
+                "could not keep the scrub-only copy of a secret version; the next inventory \
+                 rebuild that fetches it retries"
+            ),
+            None => {}
+        }
+    }
+
+    /// Deletes the copies that are not of an active external version of
+    /// `rows` as it is recorded (one written for a version whose record never
+    /// became active, before a crash), and remembers the rest. A sweep that
+    /// fails is logged and stops nothing: a stray copy is never read for a
+    /// version it does not match, and the next start sweeps again.
+    async fn sweep_scrub_copies(&self, rows: &[pb::SecretVersion]) {
+        let wanted: Vec<kronik_privacy::ScrubCopy> = rows
+            .iter()
+            .filter(|row| active(row))
+            .filter_map(scrub_copy_identity)
+            .collect();
+        let file = self.file.clone();
+        let kept = self
+            .env
+            .blocking("secret-scrub-copy-sweep", move || {
+                let mut kept = BTreeSet::new();
+                for copy in file.scrub_copy_identities()? {
+                    if wanted.contains(&copy) {
+                        kept.insert((copy.name, copy.version));
+                    } else {
+                        file.delete_scrub_copy(&copy.name, copy.version)?;
+                    }
+                }
+                Ok::<_, kronik_privacy::PrivacyError>(kept)
+            })
+            .await;
+        match kept {
+            Some(Ok(kept)) => *lock(&self.copies) = kept,
+            Some(Err(error)) => tracing::warn!(
+                target: "kronik::secrets",
+                error = %error,
+                "could not sweep the scrub-only copies of secret versions"
+            ),
+            None => {}
+        }
+    }
+
     async fn retained_file_bytes(
         &self,
         name: &str,
@@ -2066,6 +2187,11 @@ impl Node {
             };
             self.secret_publish(pending).await?;
         }
+        // A copy whose version never became active (written before a crash
+        // that stopped its record at RESERVED) goes; the rest are known.
+        runtime
+            .sweep_scrub_copies(&self.secret_rows(None).await?)
+            .await;
         runtime.initialized.store(true, Ordering::Release);
         // A file-only inventory can be made complete without startup network I/O.
         if runtime.backends.ids().next().is_none() {
@@ -2786,6 +2912,9 @@ impl Node {
     ) -> Result<pb::SecretVersion, ApiError> {
         let runtime = self.runtime()?;
         if let Some(row) = self.known_secret_observation(scope, &fetched).await? {
+            // A version recorded before it had a copy (an earlier release, or
+            // a write that failed) gets one now (ADR 0142).
+            runtime.keep_scrub_copy(&row, &fetched.value).await;
             let mut bytes = Some(Arc::new(fetched.value));
             original.admit(&mut || {
                 self.hold_secret_observation(
@@ -2815,6 +2944,10 @@ impl Node {
             audit,
         );
         let admitted = self.admit_secret(row, original).await?;
+        // The value is held: keep its scrub-only copy before the version
+        // becomes active, so that a restart can scrub it even when the
+        // backend no longer serves it (ADR 0142).
+        runtime.keep_scrub_copy(&admitted.0, &fetched.value).await;
         let row = self.finish_secret(admitted, true).await?;
         self.hold_secret_observation(
             scope,
@@ -2833,6 +2966,7 @@ impl Node {
         auth: AuthLease,
     ) -> Result<pb::SecretVersion, ApiError> {
         if let Some(row) = self.known_secret_observation(scope, &fetched).await? {
+            self.runtime()?.keep_scrub_copy(&row, &fetched.value).await;
             let node = self.me().ok_or_else(unavailable)?;
             let scope = scope.clone();
             return self
@@ -2863,6 +2997,7 @@ impl Node {
             system_audit(&self.env, "explicit secret refresh observation"),
         );
         let admitted = self.admit_secret(row, auth).await?;
+        runtime.keep_scrub_copy(&admitted.0, &fetched.value).await;
         let row = self.finish_secret(admitted, true).await?;
         self.hold_secret_observation(scope, &row, Arc::new(fetched.value), true, &fetched.stamp)?;
         Ok(row)
@@ -3620,6 +3755,7 @@ impl Node {
             if !runtime.cache.trusted(&scope) {
                 return Err(unavailable());
             }
+            let mut from_backend = false;
             let bytes = if row.backend == "file" {
                 let physical = row
                     .source_version
@@ -3635,7 +3771,13 @@ impl Node {
                         return Err(error);
                     }
                 }
+            } else if let Some(copy) = runtime.scrub_copy(row).await {
+                // The version's scrub-only copy (ADR 0142): the backend is not
+                // asked, and need not serve the version any more. It is held
+                // for scrubbing only, never as an operational value.
+                copy
             } else {
+                from_backend = true;
                 let fetched = runtime
                     .fetched(&scope, Some(&row.source_version), original.clone())
                     .await
@@ -3662,6 +3804,9 @@ impl Node {
             {
                 runtime.note_failed_row(row, "the value does not match the recorded version hash");
                 return Err(unavailable());
+            }
+            if from_backend {
+                runtime.keep_scrub_copy(row, &bytes).await;
             }
             runtime.cache.insert(row, Arc::new(bytes), false, None)?;
         }

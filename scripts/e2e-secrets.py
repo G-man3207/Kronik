@@ -1429,14 +1429,25 @@ def run_service(service, binary, root, target, evidence):
     assert len(target.requests()) == before + 1, "the failed re-run sent something"
     assert not any(values[3] in json.dumps(r) for r in target.requests())
     assert open_turns(d.records()) == []
-    # The known defect of the operations guide ("Secrets that an external
-    # backend no longer serves"): a recorded version the service no longer
-    # serves keeps the reads that scrub at 503 after a restart. Observed, not
-    # asserted either way.
-    reads = {}
-    for path in ("/v1/actors/counter/h/history", "/v1/secrets/stripe/history"):
-        code, answer = d.api("GET", path, status=None)
-        reads[path] = code if code == 200 else f"{code} {answer.get('error', {}).get('code')}"
+    # The reads that scrub still need the destroyed version's value after the
+    # restart; the node takes it from its encrypted scrub-only copy (ADR 0142),
+    # so they answer 200 once the first certification after the start is done,
+    # where they answered 503 for good before the copies. The name also has a
+    # `secret-reveal` grant, whose certification lists the versions the
+    # service holds: a service whose "destroy" deletes the whole secret (moto)
+    # makes that listing fail, and the reads stay at 503. Recorded, not
+    # asserted.
+    reads, deadline = {}, time.monotonic() + 30
+    paths = ("/v1/actors/counter/h/history", "/v1/actors/leaky/b/history", "/v1/secrets/stripe/history")
+    while True:
+        got = {path: d.api("GET", path, status=None) for path in paths}
+        reads = {path: code if code == 200 else f"{code} {answer.get('error', {}).get('code')}"
+                 for path, (code, answer) in got.items()}
+        if all(code == 200 for code, _ in got.values()) or time.monotonic() > deadline:
+            break
+        time.sleep(0.5)
+    for _, answer in got.values():
+        assert values[3] not in json.dumps(answer), "a destroyed version's value in a read"
     evidence["criterion_3_gone"] = {"destroyed": how, "source_version": third, "turn": gone["lsn"],
                                     "current_after": fourth, "scrubbed_reads_after_restart": reads}
     checks.append("criterion 3: once the service destroyed a recorded version, the crash re-run fails the turn with "

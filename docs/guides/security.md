@@ -68,6 +68,21 @@ Secrets arrive with M2.
   in `<data>/keys/secrets.db`, sealed with XChaCha20-Poly1305 under a derived
   key, one row per version. These key sources change custody of the master
   seed, not the built-in secret store into an external secret backend.
+- **Copies of external values.** A value fetched from an external secret
+  backend is held in memory for effects, never on disk. For each version of
+  it that the node records, `secrets.db` also keeps one scrub-only copy
+  (table `external_scrub_copies`), sealed with XChaCha20-Poly1305 under its
+  own key derived from the master seed and bound to that version's identity
+  ([ADR 0142](../adr/0142-scrub-only-copies-of-external-secret-versions.md)).
+  It exists so that the views can still remove the value from what they show
+  after a restart when the backend no longer serves the version. It never
+  answers an effect, a re-run, a fork, a reveal or a foreign actor, and no
+  API shows it. It travels inside snapshots and the bucket with
+  `secrets.db`, stays valid across `keys rewrap`, and is kept as long as the
+  version's record, like the built-in store's deleted versions; a copy of a
+  version that never became active is deleted at the next start. So a
+  backend's revocation ends every use of a value at once, but not every
+  encrypted trace of it in the data directory and its backups.
 - **Handles.** Guest code names a secret in an HTTP header template such as
   `Bearer {}` (with standard `fetch`, M22, the header value `Bearer
   {{secret:NAME}}`) or in a `crypto` call, and the host inserts the value at
@@ -140,18 +155,17 @@ compensations are scrubbed in the sender's turn before delivery, so their
 receivers get the placeholder). Grant `secret-reveal` as rarely as
 possible.
 
-**Secrets linked to an external backend (known defect).** The views that
-remove secret values (`history`, `actors inspect`, turns, traces, dead letters
-and the audit log, among others) need the value of every secret version that
-the node recorded. For a name linked with `kronik secret link`, a node fetches
-each recorded version again from the provider after a restart. If the
-provider no longer serves one of them, the views answer 503
-`SECRET_UNAVAILABLE` instead of showing data they cannot scrub, until the
-provider serves it again; for a changed `env` variable no repair is known. The
-log and the state are intact and turns keep running. See [Secrets that an
-external backend no longer
-serves](operations.md#secrets-that-an-external-backend-no-longer-serves) for
-what happens, what was checked and how to avoid it.
+**Secrets linked to an external backend.** The views that remove secret
+values (`history`, `actors inspect`, turns, traces, dead letters and the
+audit log, among others) need the value of every secret version that the node
+recorded. After a restart a node takes them from its scrub-only copies (see
+above), so a version that the provider no longer serves is still removed. A
+recorded version without a copy (one an earlier release recorded, or one
+recorded after the newest snapshot of a restored node) that the provider no
+longer serves makes the views answer 503 `SECRET_UNAVAILABLE` instead of
+showing data they cannot scrub; the log and the state are intact and turns
+keep running. See [Secrets that an external backend no longer
+serves](operations.md#secrets-that-an-external-backend-no-longer-serves).
 
 ### Master-key custody
 

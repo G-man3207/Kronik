@@ -134,5 +134,7 @@
 - [ADR 0123: An erasure stops the plaintext already in flight](adr/0123-erasure-stops-plaintext-in-flight.md)
 - [ADR 0130: A turn's record fits in one log record](adr/0130-one-log-record-per-turn.md)
 - [ADR 0131: Retention keeps a base for the whole history window](adr/0131-retention-keeps-a-base-for-the-window.md)
+- [ADR 0132: A fork's computation with a held linked secret is synthetic](adr/0132-fork-crypto-with-a-held-secret.md)
 - [ADR 0133: The isolation proofs run on GitHub-hosted runners](adr/0133-isolation-proofs-on-hosted-runners.md)
 - [ADR 0134: Per-kind HTTP fingerprint rules](adr/0134-per-kind-http-fingerprint-rules.md)
+- [ADR 0142: Encrypted scrub-only copies of recorded external secret versions](adr/0142-scrub-only-copies-of-external-secret-versions.md)

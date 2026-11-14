@@ -998,7 +998,7 @@ Check `kronik doctor`, the configured backend and access to the required retaine
 
 This is not `KEY_SOURCE_UNAVAILABLE`: that code concerns loading the master seed. Do not switch master-key sources or create a fallback key to work around missing secret coverage.
 
-After a restart, a recorded version of a linked secret that its provider no longer serves keeps every read that needs scrubbing at this code, until the provider serves the version again; reads then succeed without a restart. An `env` variable that was changed cannot serve its old value again. This is a known defect and no other repair is known; see Troubleshooting in the operations guide.
+After a restart, the node scrubs with the encrypted scrub-only copy it keeps of each version of a linked secret it recorded (ADR 0142), so a version that its provider no longer serves does not stop the reads. A recorded version without a copy (recorded by an earlier release, or after the newest snapshot of a restored node) that the provider no longer serves keeps every read that needs scrubbing at this code, until the provider serves the version again; reads then succeed without a restart. A name with a `secret-reveal` grant also needs its provider to list its versions after a restart. See Troubleshooting in the operations guide.
 
 Data written by v0.3.0 or older answers the same reads with this code after an upgrade for as long as a snapshot taken by those versions is retained; that is a known defect too, and "Upgrading from v0.3.0 or older" in the operations guide describes what was observed and what ends it.
 
@@ -1030,7 +1030,7 @@ Kronik cannot recover the exact immutable secret identity recorded for this oper
 
 Restore access to the matching backend configuration and exact retained version where possible. Never substitute the current value, another reference or a plaintext fallback: that would change an already recorded outcome. A recorded successful reveal or resend stops before exposing a different guest result. Missing values also keep scrub-dependent publication incomplete rather than allowing unsanitized output.
 
-The same loss leaves the reads that need scrubbing at 503 `SECRET_UNAVAILABLE` after the next restart, until the provider serves the version again; that is a known defect. To rotate an `env` secret, link the name to a new variable and keep every variable it has used at its recorded value.
+The node's encrypted scrub-only copy of the version (ADR 0142) does not help here: it is for scrubbing only and never answers an effect. It does keep the reads that need scrubbing working after a restart; only a version without a copy (recorded by an earlier release) leaves them at 503 `SECRET_UNAVAILABLE` until the provider serves it again.
 
 ## STORAGE_CORRUPT
 

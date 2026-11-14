@@ -169,8 +169,9 @@ each object compressed with zstd (level 3):
   (§5; a snapshot's manifest goes first, so a half-deleted snapshot is
   never complete).
 - The master key is never shipped. `secrets.db` travels inside snapshots,
-  encrypted under it; the operator restores the key from their own backup
-  (`keys.master_key_file`). The privacy keystore backup joins in M8.
+  encrypted under it, with the scrub-only copies of recorded external
+  secret versions (ADR 0142); the operator restores the key from their own
+  backup (`keys.master_key_file`). The privacy keystore backup joins in M8.
 
 ## 5. Retention and compaction
 

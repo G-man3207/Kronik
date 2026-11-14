@@ -1522,6 +1522,11 @@ async fn a_failed_certification_names_the_version_it_could_not_get() {
     let (_data, node, _bao, _metadata) = provider(404).await;
     let runtime = node.runtime().unwrap();
     let original = node.local_operator_authority().unwrap();
+    // A version without a scrub-only copy, as one that an earlier release
+    // recorded: with its copy the rebuild would hold version 1 without the
+    // provider (ADR 0142).
+    assert!(runtime.file.delete_scrub_copy("token", 1).unwrap());
+    runtime.copies.lock().unwrap().clear();
     // The node's own cycle retries the same rebuild and takes what it noted
     // for its warning, so try until this call's note is the one read.
     let mut named = String::new();
@@ -1542,6 +1547,71 @@ async fn a_failed_certification_names_the_version_it_could_not_get() {
     );
     // A value is never in it.
     assert!(!named.contains("immutable-provider-value"));
+}
+
+/// A recorded version that the provider no longer serves comes from its
+/// scrub-only copy (ADR 0142): the certification succeeds without asking the
+/// provider for it, the value is among the values the views scrub, and it is
+/// not an operational value. An effect's read of the name does not get it,
+/// and the provider's 404 is what the effect sees.
+#[tokio::test]
+async fn a_certification_takes_a_lost_version_from_its_copy_and_never_uses_it() {
+    let _serial = TESTS.lock().await;
+    let (_data, node, bao, _metadata) = provider(404).await;
+    let runtime = node.runtime().unwrap();
+    let original = node.local_operator_authority().unwrap();
+    assert!(
+        runtime
+            .copies
+            .lock()
+            .unwrap()
+            .contains(&("token".to_owned(), 1))
+    );
+    let versions_before = bao
+        .urls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|url| url.ends_with("?version=1"))
+        .count();
+    node.env
+        .timeout(Duration::from_secs(60), async {
+            while node
+                .refresh_secret_inventory(original.clone())
+                .await
+                .is_err()
+            {
+                node.env.clock.sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        bao.urls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|url| url.ends_with("?version=1"))
+            .count(),
+        versions_before,
+        "the provider was asked for the version its copy holds"
+    );
+    let values = node.secret_values().unwrap();
+    assert!(
+        values
+            .iter()
+            .any(|(name, value)| name == "token" && value.as_slice() == b"immutable-provider-value")
+    );
+    let config = node.config_now();
+    // No operational value: the read answers nothing or an error.
+    assert!(matches!(
+        runtime.cache.cached("token", None, &config),
+        Ok(None) | Err(_)
+    ));
+    // An effect's resolution gets no value: the provider's answer (no such
+    // secret) is what it sees, never the copy.
+    let resolved = node.resolve_secret("token", None, &config, original).await;
+    assert!(!matches!(resolved, Ok(Some(_))), "{resolved:?}");
 }
 
 // ------------------------------------- the resolver a foreign host is given

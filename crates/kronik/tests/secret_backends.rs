@@ -1428,10 +1428,10 @@ fn a_crash_re_run_of_a_reveal_gets_the_recorded_version_and_waits_while_the_back
 /// `SECRET_VERSION_GONE`: it never starts the guest, sends nothing, and does
 /// not fall back to the value of the current version.
 ///
-/// This reads the log, not the API: while a recorded version is one that the
-/// backend no longer serves, the node cannot certify the inventory that
-/// scrubs its answers after a restart, and every scrubbed read answers 503
-/// `SECRET_UNAVAILABLE`.
+/// The node's scrub-only copy of version 1 (ADR 0142) does not change this:
+/// a copy never answers an effect. (The reads that scrub after such a
+/// restart are the subject of
+/// `a_destroyed_version_is_scrubbed_from_its_copy_after_a_restart`.)
 #[test]
 fn a_crash_re_run_of_a_reveal_fails_with_secret_version_gone_when_the_backend_destroyed_it() {
     let (Linked { mut d, bao, dir }, target) = linked_with_leaky();
@@ -1503,12 +1503,133 @@ fn a_crash_re_run_of_a_reveal_fails_with_secret_version_gone_when_the_backend_de
     assert_closed_when_quiet(&d, "after the failed re-run of a reveal");
 }
 
+/// A version that the backend destroyed after the node recorded it is still
+/// scrubbed after a restart, from the node's encrypted scrub-only copy (ADR
+/// 0142). A client sends version 1's value to an actor that keeps it in its
+/// state: no turn used or revealed the secret there, so only the views'
+/// scrubbing hides it. The secret rotates, a snapshot is taken, the backend
+/// destroys version 1 for good and the daemon restarts. Before the copies,
+/// every read that scrubs answered 503 `SECRET_UNAVAILABLE` from then on; now
+/// `actors inspect` and `history` answer 200 with the placeholder, the backend
+/// is not asked for version 1, and the reads stay so across a restart with
+/// the backend down (the name has no `secret-reveal` grant, whose catalogue
+/// would need the backend). Neither value is in plaintext in `keys/` or in the
+/// snapshot's secret store, and version 2's value is in no file at all. An
+/// effect still needs the backend: a copy is never an operational value.
+#[test]
+fn a_destroyed_version_is_scrubbed_from_its_copy_after_a_restart() {
+    let Linked { mut d, bao, dir } = linked();
+    let used = d.send("counter/a", "hmac", "stripe\npayload");
+    assert_eq!(
+        used["reply"]["text"],
+        hmac_hex(VALUE_1.as_bytes(), b"payload"),
+        "{used}"
+    );
+    let stored = d.send("counter/s", "store", VALUE_1);
+    assert_eq!(stored["outcome"]["kind"], "committed", "{stored}");
+    let shown = |v: &Value| {
+        v["state"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["key"] == "stored")
+            .unwrap_or_else(|| panic!("no state `stored`: {v}"))["text"]
+            .clone()
+    };
+    let before = d.get("/v1/actors/counter/s");
+    assert_eq!(shown(&before), "[secret:stripe]", "{before}");
+
+    assert_eq!(bao.put("payments", "stripe", VALUE_2), 2);
+    assert_eq!(d.refresh("stripe"), 2);
+    d.mutate(
+        "POST",
+        "/v1/snapshots",
+        json!({"reason": "the copies travel inside snapshots"}),
+    );
+    bao.destroy("payments", 1);
+    d.kill9();
+    let asked_for_v1 = bao.count("version=1");
+
+    // The first certification after the start takes version 1 from its copy:
+    // the reads answer 200 within a few cycles, scrubbed.
+    let scrubbed_after_restart = |d: &Daemon| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (status, v) = d.api("GET", "/v1/actors/counter/s", Value::Null);
+            if status == 200 {
+                return v;
+            }
+            assert!(
+                status == 503 && v["error"]["code"] == "SECRET_UNAVAILABLE",
+                "{status} {v}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the reads that scrub stayed unavailable after the restart: {}",
+                d.serve_log()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    d = Daemon::start(dir.path(), Some(&bao), "2s");
+    let after = scrubbed_after_restart(&d);
+    assert_eq!(shown(&after), "[secret:stripe]", "{after}");
+    // `history` answers too (it shows the turn's writes, not their values).
+    assert_eq!(d.history("counter/s").len(), 1);
+    let answers = d.answers(&["counter/s"], &[]);
+    for answer in answers.iter().chain([&after.to_string()]) {
+        for value in [VALUE_1, VALUE_2] {
+            assert!(!answer.contains(value), "{value} in {answer}");
+        }
+    }
+    assert_eq!(
+        bao.count("version=1"),
+        asked_for_v1,
+        "the destroyed version was asked for"
+    );
+
+    // With the backend down the copies still scrub; an effect cannot get the
+    // secret (no copy answers an effect).
+    d.kill9();
+    bao.set_mode(Mode::Unavailable);
+    d = Daemon::start(dir.path(), Some(&bao), "1s");
+    let down = scrubbed_after_restart(&d);
+    assert_eq!(shown(&down), "[secret:stripe]", "{down}");
+    let (_, failed) = d.api(
+        "POST",
+        "/v1/actors/counter/a/messages",
+        json!({"name": "hmac", "text": "stripe\npayload", "reason": "no operational value"}),
+    );
+    assert!(
+        failed.to_string().contains("SECRET_UNAVAILABLE"),
+        "{failed}"
+    );
+    assert!(!failed.to_string().contains(VALUE_1) && !failed.to_string().contains(VALUE_2));
+
+    // Ciphertext only, in the store and in the snapshot's store; version 2's
+    // value is in no file at all (no data holds it).
+    for value in [VALUE_1, VALUE_2] {
+        let files = files_with(&dir.path().join("data/keys"), value);
+        assert!(files.is_empty(), "{value} is in {files:?}");
+        let stores: Vec<_> = files_with(&dir.path().join("data/snapshots"), value)
+            .into_iter()
+            .filter(|f| f.to_string_lossy().contains("secrets.db"))
+            .collect();
+        assert!(stores.is_empty(), "{value} is in {stores:?}");
+    }
+    assert_eq!(files_with(dir.path(), VALUE_2), Vec::<PathBuf>::new());
+    bao.set_mode(Mode::Up);
+}
+
 /// Criterion 3, step 7: the scrubbing of a revealed value survives a restart.
 /// A guest reveals version 1 and moves it into its state, a log event, a
 /// message and its reply; the secret rotates; the daemon restarts with the
-/// backend down. A node that holds no value of version 1 cannot scrub what it
-/// shows, so it shows nothing: every read answers 503 `SECRET_UNAVAILABLE`.
-/// Once the backend is back, the reads show the placeholder and never a value.
+/// backend down. The name has a `secret-reveal` grant, so the inventory also
+/// lists the versions the backend holds for it, which it cannot while the
+/// backend is down: the node cannot show what it might not scrub, so every
+/// read answers 503 `SECRET_UNAVAILABLE` (it holds the scrub-only copies of
+/// both versions, ADR 0142, but not that list). Once the backend is back,
+/// the reads show the placeholder and never a value.
 #[test]
 fn the_scrubbing_of_a_revealed_value_survives_a_restart() {
     let Linked { mut d, bao, dir } = linked();
@@ -1564,8 +1685,15 @@ fn the_scrubbing_of_a_revealed_value_survives_a_restart() {
 fn a_backend_that_hangs_stops_only_the_turns_that_need_its_secrets() {
     let Linked { mut d, bao, dir } = linked();
     d.send("counter/h", "hmac", "stripe\npayload");
-    // A restarted node knows the link and holds no value.
+    // A restarted node knows the link and holds no value. Its scrub-only
+    // copy of version 1 (ADR 0142) is dropped too, to stand for a version
+    // that an earlier release recorded: with it, the rebuild below would
+    // hold version 1 without the backend and say nothing.
     d.kill9();
+    rusqlite::Connection::open(dir.path().join("data/keys/secrets.db"))
+        .unwrap()
+        .execute("DELETE FROM external_scrub_copies", [])
+        .unwrap();
     bao.set_mode(Mode::Hang);
     d = Daemon::start(dir.path(), Some(&bao), "1s");
 

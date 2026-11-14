@@ -1525,7 +1525,9 @@ outside the disposable tests.
 
 A snapshot is a consistent copy of the materialized state as of one log
 position: `state.db`, every actor's SQL database, and the secret store
-(`keys/secrets.db`, still encrypted under the master key). It lives in
+(`keys/secrets.db`, still encrypted under the master key, with the scrub-only
+copies of the external secret versions the node recorded, [ADR
+0142](../adr/0142-scrub-only-copies-of-external-secret-versions.md)). It lives in
 `<data_dir>/snapshots/main/<lsn>/`, with a `manifest.json` listing every
 file's size and BLAKE3 hash. The daemon takes one:
 
@@ -2203,8 +2205,8 @@ operator meets:
 | `ENGINE_VERSION_MISMATCH` | A new binary started against data written by another engine, without a passing check | Run `kronik upgrade check --window 6h`, or start the recorded engine version. For data from v0.3.0 or older read [Upgrading from v0.3.0 or older](#upgrading-from-v030-or-older) first |
 | `UNAUTHENTICATED`, `SCOPE_MISSING`, `TOKEN_NOT_FOUND` | A bearer token is missing, lacks the scope, or was revoked | `kronik token list`, `kronik token create --name <name> --scopes <scope>,... --reason ...`, on the socket as root or a member of `kronik` |
 | `SECRET_NOT_FOUND` | An effect uses a secret that isn't set, or was deleted | `kronik secret set <name> --reason ...` |
-| `SECRET_UNAVAILABLE` | A read answered 503 while the secret inventory was needed, or an effect failed inside a turn because its secret could not be fetched | For a read after a restart: the provider no longer serves a version that Kronik recorded, [a known defect](#secrets-that-an-external-backend-no-longer-serves). For a read after an upgrade of data written by v0.3.0 or older: a snapshot from those versions is still retained, [a known defect](#upgrading-from-v030-or-older). Or the rebuild of the inventory takes longer than `[secrets] refresh` and the daemon logs that it did not install its certificate: raise `refresh` above the `elapsed_ms` of the `secret inventory certified` line ([`[secrets]`](#secrets)). For an effect: the backend did not answer in time or refused, see [A turn whose effect cannot get its secret](#a-turn-whose-effect-cannot-get-its-secret) |
-| `SECRET_VERSION_GONE` | A turn needed a secret version that its provider no longer serves, for example the re-run of a `secret.reveal` after the version was destroyed | The turn is recorded as failed before the guest runs, and no other version's value is used. See [the same section](#secrets-that-an-external-backend-no-longer-serves) for what else the lost version does |
+| `SECRET_UNAVAILABLE` | A read answered 503 while the secret inventory was needed, or an effect failed inside a turn because its secret could not be fetched | For a read after a restart: the provider no longer serves a version that Kronik recorded and holds no copy of, or a name with a `secret-reveal` grant whose provider does not answer, see [Secrets that an external backend no longer serves](#secrets-that-an-external-backend-no-longer-serves). For a read after an upgrade of data written by v0.3.0 or older: a snapshot from those versions is still retained, [a known defect](#upgrading-from-v030-or-older). Or the rebuild of the inventory takes longer than `[secrets] refresh` and the daemon logs that it did not install its certificate: raise `refresh` above the `elapsed_ms` of the `secret inventory certified` line ([`[secrets]`](#secrets)). For an effect: the backend did not answer in time or refused, see [A turn whose effect cannot get its secret](#a-turn-whose-effect-cannot-get-its-secret) |
+| `SECRET_VERSION_GONE` | A turn needed a secret version that its provider no longer serves, for example the re-run of a `secret.reveal` after the version was destroyed | The turn is recorded as failed before the guest runs, and no other version's value is used, nor the version's scrub-only copy, which is for scrubbing only. See [the same section](#secrets-that-an-external-backend-no-longer-serves) |
 | `RUNSC_MISSING`, `KVM_UNAVAILABLE`, `RUNC_MISSING`, `FOREIGN_UNAVAILABLE` | Foreign actors can't run | `kronik doctor` names the cause; see [Foreign actors](#foreign-actors) |
 | `IMAGE_INVALID` | `kronik foreign add` got an image it can't verify or unpack | Check the reference; private images need a local layout |
 
@@ -2282,82 +2284,45 @@ not delete segments or edit `state.db` by hand: a start needs the begin.
 
 ### Secrets that an external backend no longer serves
 
-This is a known defect, not intended behavior. It concerns names linked to an
-external backend with `kronik secret link`; secrets set with `kronik secret
-set` were not part of these checks.
-
 Kronik records each version of a linked secret that it observes, with the
 provider's own id for it (`kronik secret history NAME`, column SOURCE
-VERSION). The views remove secret values from what they show, so after a
-restart the node fetches every recorded version again by that id. If the
-provider no longer serves one of them, the node cannot complete that inventory
-and fails closed: it answers 503 instead of showing data it cannot scrub.
+VERSION). The views that remove secret values from what they show
+(`history`, `actors inspect`, turns, traces, dead letters, the audit log and
+others) need the value of every recorded version, also after a restart. The
+node keeps an encrypted, scrub-only copy of each version it records in
+`keys/secrets.db` ([ADR 0142](../adr/0142-scrub-only-copies-of-external-secret-versions.md)),
+and a restart takes the values from these copies. So a version that the
+provider has since destroyed, removed by a version limit, or no longer
+serves because an `env` variable was changed is still scrubbed, and the reads
+answer as usual. A copy never answers an effect: the crash re-run of a turn
+that needs such a version still fails with `SECRET_VERSION_GONE`.
 
-**What happens.** From the first start after the version was lost, and for as
-long as it was watched (minutes):
+**When the reads still fail closed.** A recorded version that has no copy
+and that the provider no longer serves:
 
-- `kronik history`, `actors inspect`, `trace`, `dead-letters list`,
-  `grants list`, `audit show`, `proposals list`, `foreign list` and
-  `secret history` answer 503 `SECRET_UNAVAILABLE`, and so does reading a turn
-  by id;
-- sending messages and running turns still work, and so do `actors list`,
-  `secret list`, `secret backends`, `limits show`, `keys status`,
-  `policy show` and the health check;
-- `kronik secret refresh` and `kronik secret unlink` commit and then answer
-  503 "already committed": do not repeat them;
-- `kronik secret backends` shows `false` in the INVENTORY COMPLETE column;
-- the daemon log repeats `secret rebuild failed code=SECRET_UNAVAILABLE`; its
-  `failed_version` names the first retained version that the rebuild could not
-  get, as `NAME@vN on BACKEND: reason` (others may follow once it is served
-  again). The error that clients get does not name it.
+- a version recorded by an earlier release that the provider stopped serving
+  before this release first started (that start copies every version the
+  provider still serves, so start it before you destroy old versions);
+- on a node restored from a bucket, a version recorded after the newest
+  shipped snapshot: its copy was on the source machine only;
+- a copy that does not open (a damaged store): the log says `the scrub-only
+  copy of a secret version does not open`.
 
-A running node is not affected until it restarts: it still holds the value in
-memory, so the loss can go unnoticed until the next start.
+Then, from the first start on, every read that scrubs (`kronik history`,
+`actors inspect`, `trace`, `dead-letters list`, `grants list`, `audit show`,
+`proposals list`, `foreign list`, `secret history`, a turn by id) answers 503
+`SECRET_UNAVAILABLE`; sending messages and running turns still work; `kronik
+secret refresh` and `kronik secret unlink` commit and then answer 503
+"already committed" (do not repeat them); `kronik secret backends` shows
+`false` in INVENTORY COMPLETE; and the daemon log repeats `secret rebuild
+failed code=SECRET_UNAVAILABLE` with `failed_version` naming the first such
+version, as `NAME@vN on BACKEND: reason`. If the provider serves the version
+again, the reads come back without a restart, and the node keeps its copy
+then. No other repair is known.
 
-**How it arises.**
-
-- An `env` secret whose variable was changed. The `env` backend reads its
-  variables when the daemon starts, so a change is seen at the next start. The
-  node then records the new value as the next version, and the old value,
-  which the provider cannot serve any more, keeps the inventory incomplete.
-- A version that the provider removed: destroyed by hand, or removed by the
-  mount's version limit when newer versions were written. This was checked
-  against a local test server and, with `scripts/e2e-secrets.sh`, against a
-  real OpenBao (`kv destroy`), moto's Secrets Manager (the secret deleted
-  without recovery), the GCP Secret Manager emulator (`DestroySecretVersion`)
-  and the Azure Key Vault emulator (the version disabled): after a restart
-  the reads that scrub answered 503 on each. OpenBao's version limit, soft
-  deletion and undelete, and the real clouds were not tried.
-
-**What ends it.** If the provider serves the version again, the reads come
-back without a restart. This was checked four times with the test server,
-from 15 seconds to two minutes after the start: the first read after the
-version was served again still answered 503, and a read about a second later
-was served. With no read in between, nothing changed in the 12 seconds
-watched. An `env` variable holds one value, so it cannot serve an old value
-together with the new one. These do not help (tried with the `env` backend and
-with the test server):
-
-- unlinking the name before changing the variable;
-- putting the variable back after the node has started once with the new
-  value, because that start recorded the new value as a version too;
-- removing the backend from `kronik.toml`;
-- `kronik secret refresh` and `kronik secret unlink` on the affected node.
-
-No other repair is known.
-
-**Preventing it.**
-
-- Keep every version with PHASE `active` in `kronik secret history NAME`
-  readable at the provider. Do not destroy such a version, and check how many
-  versions the mount keeps against how often the secret changes.
-- Never change the value of an `env` variable that a linked name has used. To
-  rotate such a secret, add a variable next to the old one: define the new
-  variable in the daemon's environment (its name must start with one of the
-  backend's `allowed_refs`), keep the old variable unchanged, restart the
-  daemon, then link the name to the new variable with `kronik secret link NAME
-  --backend ID --ref NEW_VARIABLE --reason "..."`. The old variable has to stay
-  defined with its old value: unsetting it brings the 503 back (checked).
+A name with a `secret-reveal` grant needs its provider at a restart in any
+case: the inventory also lists the versions the provider holds for it, so its
+reads answer 503 while the provider does not answer.
 
 ### A turn whose effect cannot get its secret
 

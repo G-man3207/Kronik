@@ -6,6 +6,20 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- After a restart, the views that remove secret values (`history`,
+  `actors inspect`, turns, traces, dead letters, the audit log and others)
+  answered 503 `SECRET_UNAVAILABLE` for good once the external backend of a
+  linked secret no longer served a version the node had recorded (destroyed,
+  removed by a version limit, a changed `env` variable): a known defect of
+  0.5.0-dev. The node now keeps an encrypted, scrub-only copy of each external
+  version it records in `keys/secrets.db` (XChaCha20-Poly1305 under a key
+  derived from the master seed, bound to the version's identity; ADR 0142),
+  and a restart scrubs with it. The copies never answer an effect, a re-run,
+  a fork, a reveal or a foreign actor; they travel inside snapshots with
+  `secrets.db` and stay valid across `keys rewrap`. Versions recorded by an
+  earlier release get their copy at the first start while the backend still
+  serves them. **External secret values are now at rest, encrypted, in the
+  data directory, its snapshots and the bucket.**
 - A turn could commit a log record over the 128 MiB record limit (for
   example many large HTTP responses or state writes in one turn), which
   `history` then refused with `STORAGE_CORRUPT: entry length ...`, and after
