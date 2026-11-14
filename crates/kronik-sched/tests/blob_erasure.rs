@@ -33,6 +33,10 @@ fn audit() -> pb::Audit {
 }
 
 fn start(dir: &Path) -> Proc {
+    start_in(dir, pb::PrivacyState::On)
+}
+
+fn start_in(dir: &Path, mode: pb::PrivacyState) -> Proc {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -56,12 +60,19 @@ fn start(dir: &Path) -> Proc {
         owner.clone(),
     ))
     .unwrap();
-    p.rt.block_on(
-        p.node
-            .set_privacy_mode(pb::PrivacyState::On, audit(), false, owner),
-    )
-    .unwrap();
+    if mode == pb::PrivacyState::On {
+        p.rt.block_on(p.node.set_privacy_mode(mode, audit(), false, owner))
+            .unwrap();
+    }
     p
+}
+
+/// The header of a blob file: whether it is sealed.
+fn sealed(path: &Path) -> bool {
+    let bytes = std::fs::read(path).unwrap();
+    kronik_blob::format::Header::decode(&bytes[..kronik_blob::format::HEADER_LEN])
+        .unwrap()
+        .sealed
 }
 
 impl Proc {
@@ -179,4 +190,48 @@ fn erasing_a_subject_deletes_its_blobs_files_everywhere() {
         .execute("DELETE FROM shipped WHERE name = ?1", [name(&one)])
         .unwrap();
     assert_eq!(pending(), 0);
+}
+
+/// M26 §9.4: a subject's blob written while the mode was `off` is a plain
+/// file (keyed, `b3s:`). `privacy reseal` with the mode on seals it in place:
+/// the same name, readable with the subject's key, and marked for the
+/// shipper to replace its object in the bucket. A second reseal finds
+/// nothing to do.
+#[test]
+fn reseal_seals_a_subjects_plain_blob_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start_in(dir.path(), pb::PrivacyState::Off);
+    let blob = p.write("user:1");
+    assert!(blob.hash.starts_with("b3s:"), "{blob:?}");
+    let file = p.path(dir.path(), &Space::Main, &blob);
+    assert!(!sealed(&file), "written in mode off");
+    let owner = p.node.local_operator_authority().unwrap();
+    p.rt.block_on(
+        p.node
+            .set_privacy_mode(pb::PrivacyState::On, audit(), false, owner.clone()),
+    )
+    .unwrap();
+    let dry =
+        p.rt.block_on(p.node.reseal(audit(), true, owner.clone()))
+            .unwrap();
+    assert_eq!(dry.blobs_sealed, 1);
+    assert!(!sealed(&file), "a dry run writes nothing");
+    let done =
+        p.rt.block_on(p.node.reseal(audit(), false, owner.clone()))
+            .unwrap();
+    assert_eq!(done.blobs_sealed, 1, "{done:?}");
+    assert!(sealed(&file), "sealed in place");
+    let inspected =
+        p.rt.block_on(p.node.blob_inspect(&blob.hash, true))
+            .unwrap();
+    assert_eq!(inspected.verified, Some(Ok(())), "{inspected:?}");
+    let mark = dir
+        .path()
+        .join("blobs/reupload")
+        .join(BlobId::parse(&blob.hash).unwrap().file_name());
+    assert!(mark.exists(), "marked for the shipper");
+    let progress = p.node.reseal_progress();
+    assert_eq!((progress.blobs_sealed, progress.pending_blobs), (1, 1));
+    let again = p.rt.block_on(p.node.reseal(audit(), false, owner)).unwrap();
+    assert_eq!(again.blobs_sealed, 0);
 }

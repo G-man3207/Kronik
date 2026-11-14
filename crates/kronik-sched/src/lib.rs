@@ -19,6 +19,7 @@
 
 mod blob_erasure;
 pub mod blob_gc;
+mod blob_reseal;
 pub mod blobs;
 pub mod connections;
 mod durable;

@@ -28,6 +28,9 @@ pub struct ResealDone {
     pub segments: u64,
     pub values_sealed: u64,
     pub tombstones: u64,
+    /// Subjects' blob files sealed in place (M26 §9.4), or that a dry run
+    /// would seal.
+    pub blobs_sealed: u64,
 }
 
 /// Last reseal's progress, plus segments whose shipped copy is still the
@@ -41,6 +44,10 @@ pub struct ResealProgress {
     /// Rewritten segments whose reseal is not finished: not yet replaced in
     /// object storage, or their rows in state.db not fixed yet.
     pub pending_segments: u64,
+    /// Subjects' blob files the last reseal sealed (M26 §9.4).
+    pub blobs_sealed: u64,
+    /// Sealed blobs whose shipped object is still the plain file.
+    pub pending_blobs: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +56,8 @@ struct ProgressFile {
     segments_total: u64,
     values_sealed: u64,
     tombstones: u64,
+    #[serde(default)]
+    blobs_sealed: u64,
 }
 
 fn privacy_dir(data: &Path) -> PathBuf {
@@ -256,6 +265,8 @@ pub fn reseal_progress(data: &Path) -> ResealProgress {
         values_sealed: p.values_sealed,
         tombstones: p.tombstones,
         pending_segments: pending.len() as u64,
+        blobs_sealed: p.blobs_sealed,
+        pending_blobs: crate::blob_reseal::pending_blob_reuploads(data),
     }
 }
 
@@ -327,7 +338,7 @@ impl Node {
             .map_err(|e| ApiError::new(ErrorCode::Internal, format!("keystore: {e}")))
     }
 
-    fn data_dir(&self) -> Option<&Path> {
+    pub(crate) fn data_dir(&self) -> Option<&Path> {
         self.cfg.storage.as_ref().map(|s| s.data_dir.as_path())
     }
 
@@ -570,6 +581,7 @@ impl Node {
                 segments: n,
                 values_sealed: 0,
                 tombstones: 0,
+                blobs_sealed: self.plain_subject_blobs().await?,
             });
         }
         let held = self.lock_deploy_authorized(&authority).await?;
@@ -602,15 +614,28 @@ impl Node {
             // What an earlier pass renamed into place without fixing
             // state.db for it (it stopped, or failed, in between).
             node.finish_reseal_fixes().await?;
-            if todo.is_empty() {
-                return Ok(ResealDone {
+            let mut done = if todo.is_empty() {
+                ResealDone {
                     started: false,
                     segments: 0,
                     values_sealed: 0,
                     tombstones: 0,
-                });
+                    blobs_sealed: 0,
+                }
+            } else {
+                node.reseal_closed(todo).await?
+            };
+            // Then the blobs (M26 §9.4).
+            done.blobs_sealed = node.reseal_blobs().await?;
+            if done.blobs_sealed > 0 {
+                done.started = true;
+                if let Some(data) = node.data_dir() {
+                    let mut p = load_progress(data);
+                    p.blobs_sealed = done.blobs_sealed;
+                    save_progress(data, &p)?;
+                }
             }
-            node.reseal_closed(todo).await
+            Ok(done)
         })
         .await
     }
@@ -626,6 +651,7 @@ impl Node {
                     segments_total: total,
                     values_sealed: 0,
                     tombstones: 0,
+                    blobs_sealed: 0,
                 },
             )?;
         }
@@ -716,6 +742,7 @@ impl Node {
                         segments_total: total,
                         values_sealed,
                         tombstones,
+                        blobs_sealed: 0,
                     },
                 )?;
             }
@@ -736,6 +763,7 @@ impl Node {
             segments: done,
             values_sealed,
             tombstones,
+            blobs_sealed: 0,
         })
     }
 }

@@ -1267,6 +1267,16 @@ impl StateDb {
         let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+
+    /// The rows of subjects' blobs that are not erased, sorted by hash: what
+    /// a reseal looks at (M26 §9.4).
+    pub fn subject_blobs(&self) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT hash FROM blobs WHERE erased = 0 AND subject IS NOT NULL ORDER BY hash",
+        )?;
+        let rows = statement.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
 }
 
 #[cfg(test)]

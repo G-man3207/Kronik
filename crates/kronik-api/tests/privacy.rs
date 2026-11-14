@@ -75,7 +75,9 @@ fn the_privacy_mode_is_recorded_and_survives_restart_and_rebuild() {
                     "segments_total": 0,
                     "values_sealed": 0,
                     "tombstones": 0,
-                    "pending_segments": 0
+                    "pending_segments": 0,
+                    "blobs_sealed": 0,
+                    "pending_blobs": 0
                 }
             })
         );

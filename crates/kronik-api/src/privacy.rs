@@ -100,6 +100,13 @@ pub struct ResealStatus {
     /// Rewritten segments whose reseal is not finished: not yet replaced in
     /// object storage, or their rows in state.db not fixed yet.
     pub pending_segments: u64,
+    /// Subjects' blob files the last reseal sealed (M26 §9.4).
+    #[serde(default)]
+    pub blobs_sealed: u64,
+    /// Sealed blobs whose object in the bucket is still the plain file,
+    /// until the shipper's next round replaces it.
+    #[serde(default)]
+    pub pending_blobs: u64,
 }
 
 /// `POST /v1/privacy/erase` (§6).
@@ -158,6 +165,10 @@ pub struct ResealResponse {
     pub started: bool,
     /// Closed segments rewritten, or that a dry run would rewrite.
     pub segments: u64,
+    /// Subjects' plain blob files sealed in place, or that a dry run would
+    /// seal (M26 §9.4).
+    #[serde(default)]
+    pub blobs: u64,
 }
 
 impl Api {
@@ -194,6 +205,8 @@ impl Api {
                 values_sealed: progress.values_sealed,
                 tombstones: progress.tombstones,
                 pending_segments: progress.pending_segments,
+                blobs_sealed: progress.blobs_sealed,
+                pending_blobs: progress.pending_blobs,
             },
         })
     }
@@ -250,6 +263,7 @@ impl Api {
             dry_run: r.dry_run,
             started: done.started,
             segments: done.segments,
+            blobs: done.blobs_sealed,
         })
     }
 

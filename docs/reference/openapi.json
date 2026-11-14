@@ -6786,6 +6786,8 @@
           "reseal": {
             "$ref": "#/components/schemas/ResealStatus",
             "default": {
+              "blobs_sealed": 0,
+              "pending_blobs": 0,
               "pending_segments": 0,
               "segments_done": 0,
               "segments_total": 0,
@@ -7491,6 +7493,13 @@
       "ResealResponse": {
         "description": "The answer to `POST /v1/privacy/reseal`.",
         "properties": {
+          "blobs": {
+            "default": 0,
+            "description": "Subjects' plain blob files sealed in place, or that a dry run would\nseal (M26 §9.4).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "dry_run": {
             "type": "boolean"
           },
@@ -7515,6 +7524,20 @@
       "ResealStatus": {
         "description": "Progress of the latest reseal, and segments whose shipped copy is still\nthe pre-reseal bytes.",
         "properties": {
+          "blobs_sealed": {
+            "default": 0,
+            "description": "Subjects' blob files the last reseal sealed (M26 §9.4).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pending_blobs": {
+            "default": 0,
+            "description": "Sealed blobs whose object in the bucket is still the plain file,\nuntil the shipper's next round replaces it.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "pending_segments": {
             "description": "Rewritten segments whose reseal is not finished: not yet replaced in\nobject storage, or their rows in state.db not fixed yet.",
             "format": "uint64",

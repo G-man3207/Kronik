@@ -28,12 +28,14 @@ mod erase;
 pub mod format;
 mod id;
 mod lease;
+mod reseal;
 mod store;
 mod sweep;
 
 pub use budget::SpaceBudget;
 pub use id::{BlobId, BlobMeta};
 pub use lease::{Lease, Leases};
+pub use reseal::Resealed;
 pub use store::{
     BlobKeys, BlobReader, BlobStore, BlobWriter, KeyAccess, KeyAnswer, NoKeys, Space, StoreConfig,
 };

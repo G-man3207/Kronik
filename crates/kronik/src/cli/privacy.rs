@@ -171,12 +171,12 @@ fn status(ctx: &Ctx) -> Result<ExitCode, Error> {
         &mut out,
         "Reseal",
         &[format!(
-            "{} of {} segments, {} values sealed, {} tombstones",
-            r.segments_done, r.segments_total, r.values_sealed, r.tombstones
+            "{} of {} segments, {} values sealed, {} tombstones, {} blob files sealed",
+            r.segments_done, r.segments_total, r.values_sealed, r.tombstones, r.blobs_sealed
         )],
         "",
     );
-    if r.pending_segments > 0 {
+    if r.pending_segments + r.pending_blobs > 0 {
         let _ = writeln!(
             out,
             "The shipped copy still holds the old bytes until the shipper replaces them."
@@ -296,8 +296,9 @@ fn render_reseal(r: &ResealResponse, rerun: &str) -> String {
     if r.dry_run {
         let _ = writeln!(
             out,
-            "Dry run: reseal would rewrite {} closed segments; nothing was written",
-            r.segments
+            "Dry run: reseal would rewrite {} closed segments and seal {} blob files; nothing was \
+             written",
+            r.segments, r.blobs
         );
         out.push_str(&next(&[rerun.to_owned()]));
         return out;
@@ -306,6 +307,14 @@ fn render_reseal(r: &ResealResponse, rerun: &str) -> String {
         let _ = writeln!(out, "No closed segment needed resealing");
     } else {
         let _ = writeln!(out, "Resealed {} closed segments", r.segments);
+    }
+    if r.blobs > 0 {
+        let _ = writeln!(
+            out,
+            "Sealed {} blob files; the shipper replaces their objects in the bucket in its next \
+             round",
+            r.blobs
+        );
     }
     out.push_str(&next(&["kronik privacy status".to_owned()]));
     out

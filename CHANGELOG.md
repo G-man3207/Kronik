@@ -6,6 +6,17 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- Erasure reaches blobs (M26, docs/design/m26-blobs.md §9). Applying a
+  subject's erasure marks its blobs erased, and the node deletes their files
+  at once, in main's store and in every fork's space (`blobs` in the answer
+  of `POST /v1/privacy/erase`). `privacy status` counts the erasure as
+  pending while one of its blobs still has a file or an object in the bucket
+  (`pending_blob_objects` in the erase answer). `kronik privacy reseal`
+  seals the blobs a subject wrote while the mode was `off`, in place, and
+  marks them for the shipper to replace in the bucket (`reseal.blobs_sealed`
+  and `reseal.pending_blobs` in `GET /v1/privacy`). A restore refuses with
+  `KEYSTORE_INCOMPLETE` a blob reference whose subject key is neither in the
+  keystore backup nor erased.
 - `kronik serve`'s default `--concurrency` follows the CPUs the daemon may
   use: 8 turns at once per CPU, at least 8 and at most 64 (ADR 0140). Its
   CPU affinity and a cgroup's CPU quota count, so a 2-vCPU machine runs 16
