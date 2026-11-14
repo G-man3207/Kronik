@@ -22,6 +22,9 @@ impl BlobStore {
         space: &Space,
         ids: &[BlobId],
     ) -> Result<(u64, u64), BlobError> {
+        if self.mutation_erasure_keeps_files {
+            return Ok((0, 0));
+        }
         let mut by_shard: BTreeMap<String, Vec<&BlobId>> = BTreeMap::new();
         for id in ids {
             by_shard.entry(id.shard()).or_default().push(id);

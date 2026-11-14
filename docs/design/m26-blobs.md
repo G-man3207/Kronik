@@ -713,30 +713,57 @@ blobs`), run by `scripts/dst.sh` with the others (200 seeds per change,
   that ignores timers, and a store that skips `ensure_durable`; each must
   make some seed fail.
 
-What runs today (`crates/kronik-sim/src/scenario/blobs.rs`), before the holds
-of B14 and B16: the M25 operations of `media` (`write`, `fetch-sum`,
-`write-post`, `fetch-write`, and loose bytes from `write-discard`,
-`fail-after-write` and `open-writer`), threshold 256 bytes to 4 KiB, a few
-sizes per seed so that writes deduplicate onto each other's files, the node's
-pass every virtual second and passes of the workload every 5 to 205 ms
-(`immediate` on half the seeds), full-store windows below `[blobs]
-disk_reserve` (`SimFs::available`), slow opens under `blobs/objects` on some
-seeds, and the simulated service streaming both ways in seeded chunks with
-responses cut in their body. The targeted crashes are `SimFs` crash points
-(`fs::CrashPoint`: an operation that takes effect and never returns, then
-the node crashes): a blob's rename into place, a log fsync, a blob
-directory's sync, a sweep's deletion. Checked: B1 and B2 (with the index's
-pins) after every start, every workload pass and at the end; B3 (the
-recovered `blobs` and `blob_pins` rows against a rebuild); B5 (every blob
-a guest answered or the service received has the bytes written); B6; and
-the counter workload's exactly-once and logical-time checks. The mutations
-are `blob-skip-ensure-durable`, `blob-sweep-ignores-leases` and
-`blob-sweep-ignores-touches` (`kronik_blob::StoreConfig`). Not simulated:
-snapshots, retention and forks, which write through `std::fs` (the floor
-stays at the log's first LSN; their roots are covered by
-`kronik-sched/tests/blobs.rs` and the B11 tests). Holds, edges and timers
-(B14, B16), erasure (B15) and the mutation "a sweep that ignores timers"
-come with those slices.
+What runs today (`crates/kronik-sim/src/scenario/blobs.rs`): the M25
+operations of `media` (`write`, `fetch-sum`, `write-post`, `fetch-write`, and
+loose bytes from `write-discard`, `fail-after-write` and `open-writer`),
+threshold 256 bytes to 4 KiB, a few sizes per seed so that writes deduplicate
+onto each other's files, the node's pass every virtual second and passes of
+the workload every 5 to 205 ms (`immediate` on half the seeds), full-store
+windows below `[blobs] disk_reserve` (`SimFs::available`), slow opens under
+`blobs/objects` on some seeds, and the simulated service streaming both ways
+in seeded chunks with responses cut in their body. The targeted crashes are
+`SimFs` crash points (`fs::CrashPoint`: an operation that takes effect and
+never returns, then the node crashes): a blob's rename into place, a log
+fsync, a blob directory's sync, a sweep's deletion (also an erasure's).
+
+Erasure (B15) on 70 % of the seeds: up to three subjects, privacy mode on
+half of them (sealed blobs) and off on the others (keyed, plain), a keystore
+in memory for the run (outside the crash model, as committed keys are). Each
+subject has a strict actor, which `put`s blobs of the subject and keeps a
+copy of the reference in state written without a subject, and a racy actor,
+which writes and puts blobs of the subject at any time, also across the
+erasure. One or two subjects are erased while the clients run, each once its
+strict actor has no write in flight. Checked besides the above: E1, no file
+of an erased blob in main's store: when the erasure returns, of every blob
+of the subject a record referenced before the erasure; in mode on, once
+`privacy status` reports nothing pending, of every erased blob (a turn
+across the erasure may commit a blob of the subject after the erasure
+returned, ADR 0123; applying its record deletes the file, and the erasure
+is pending until then; in mode off the subject's plain values in the log
+keep it pending until a reseal); and after every start and at the end, of
+every erased blob (a row marked erased, or an erased version a record
+references). E2, a read of the strict actor's held blob asked after the
+erasure returned never sees the bytes (`erased`, or no reference, never
+the bytes). A request of the racy actor that ran across the erasure may be
+refused new blobs of the subject, have its saved response tombstoned, or
+run again after the erasure deleted its saved response: E1 is what holds
+for it. B2 skips erased blobs, whose rows the collector may forget, and B3
+compares the index without its erased rows for the same reason.
+
+Checked: B1 and B2 (with the index's pins) after every start, every workload
+pass and at the end; B3 (the recovered `blobs` and `blob_pins` rows against a
+rebuild); B5 (every blob a guest answered or the service received has the
+bytes written); B6; E1 and E2; and the counter workload's exactly-once and
+logical-time checks. The mutations are `blob-skip-ensure-durable`,
+`blob-sweep-ignores-leases`, `blob-sweep-ignores-touches` and
+`blob-erasure-keeps-files` (`kronik_blob::StoreConfig`). A run's storage root
+(snapshots, among them an erasure's, which go through `std::fs`) is a real
+directory of the run, so the node's periodic snapshots are off, the floor
+stays at the log's first LSN, and fork spaces, `privacy status`'s count of
+remaining files and the shipper's objects are not exercised (they use
+`std::fs`; their cases are covered by `kronik-sched/tests/blobs.rs` and the
+B11 and B15 tests). Timers and edges (B14, B16) and the mutation "a sweep
+that ignores timers" come with those slices.
 
 ## 15. The `media-ts` example
 

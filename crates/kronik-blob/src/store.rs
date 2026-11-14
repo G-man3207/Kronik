@@ -51,6 +51,9 @@ pub struct StoreConfig {
     /// the simulator: a sweep deletes what was named or claimed after it
     /// began.
     pub mutation_sweep_ignores_touches: bool,
+    /// Deliberate bug (mutation testing of the harness); never set outside
+    /// the simulator: [`BlobStore::delete_erased`] deletes nothing.
+    pub mutation_erasure_keeps_files: bool,
 }
 
 impl Default for StoreConfig {
@@ -61,6 +64,7 @@ impl Default for StoreConfig {
             mutation_skip_ensure_durable: false,
             mutation_sweep_ignores_leases: false,
             mutation_sweep_ignores_touches: false,
+            mutation_erasure_keeps_files: false,
         }
     }
 }
@@ -155,6 +159,7 @@ pub struct BlobStore {
     pub(crate) mutation_skip_ensure_durable: bool,
     pub(crate) mutation_sweep_ignores_leases: bool,
     pub(crate) mutation_sweep_ignores_touches: bool,
+    pub(crate) mutation_erasure_keeps_files: bool,
 }
 
 fn shard_dirs(root: &Path) -> impl Iterator<Item = PathBuf> + '_ {
@@ -186,6 +191,7 @@ impl BlobStore {
             mutation_skip_ensure_durable: cfg.mutation_skip_ensure_durable,
             mutation_sweep_ignores_leases: cfg.mutation_sweep_ignores_leases,
             mutation_sweep_ignores_touches: cfg.mutation_sweep_ignores_touches,
+            mutation_erasure_keeps_files: cfg.mutation_erasure_keeps_files,
         });
         store.prepare(&Space::Main).await?;
         Ok(store)

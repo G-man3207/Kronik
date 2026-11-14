@@ -199,6 +199,11 @@ impl Disk {
         }
     }
 
+    /// Whether a file has the name `path` now.
+    pub fn exists(&self, path: &Path) -> bool {
+        self.names.contains_key(path)
+    }
+
     /// The files whose names are under `dir` now.
     pub fn files_under(&self, dir: &Path) -> Vec<PathBuf> {
         self.names

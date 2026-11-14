@@ -80,7 +80,7 @@ jobs:
       # teeth.
       - name: DST, blob mutations are caught
         run: |
-          for mutation in blob-skip-ensure-durable blob-sweep-ignores-leases; do
+          for mutation in blob-skip-ensure-durable blob-sweep-ignores-leases blob-erasure-keeps-files; do
             if TMPDIR="$RUNNER_TEMP" scripts/dst.sh 0..1000 "$(nproc)" --scenario blobs --mutation "$mutation"; then
               echo "::error::no seed failed with the blob mutation $mutation"
               exit 1

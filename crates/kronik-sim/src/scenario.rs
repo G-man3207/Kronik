@@ -455,6 +455,13 @@ struct World {
     service: Option<Arc<SimService>>,
     /// The simulated OpenBao of the secret workloads.
     bao: Option<Arc<SimBao>>,
+    /// The node's storage root (`StorageConfig::data_dir`), a real directory
+    /// of this run, for what the node writes there through `std::fs`.
+    storage_root: tempfile::TempDir,
+    /// The privacy keystore of the blob workload's subjects (M26 §9): in
+    /// memory, one for the run, so it is outside the crash model as a
+    /// keystore's committed keys are.
+    keystore: Option<Arc<kronik_privacy::keystore::Keystore>>,
     /// The real directory backing the file-backed secret stores; held for
     /// the whole run. Each node start opens its own store under it with
     /// production custody (lock_data + open_owned) and passes the ownership
@@ -479,14 +486,12 @@ fn injected_start_failure(error: &StartError) -> Option<String> {
     cause.contains(INJECTED_FSYNC_EIO).then_some(cause)
 }
 
-/// The simulated node's data directory, on the simulated disk. Snapshots,
-/// retention and the collector's snapshot and fork roots work through
-/// `std::fs`, outside the simulated disk: this is a path no host has, so they
-/// find nothing of the host there, and the node takes no snapshot (see
-/// `node_main`), which would write onto the host. One write still reaches
-/// the host: every start publishes `privacy/keystore_retention_ms` under it
-/// (`reseal::publish_keystore_retention`), harmless, and refused without
-/// root.
+/// The simulated node's data directory on the simulated disk: its log and
+/// its blob store. What the node keeps under its storage root through
+/// `std::fs` (snapshots, among them the one every erasure takes, and the
+/// shipper's records) goes to a real directory of the run instead
+/// ([`World::storage_root`]), deleted with it, so a run neither writes on
+/// the host nor sees what an earlier run left there.
 pub(crate) const DATA_DIR: &str = "/kronik-sim/data";
 
 fn log_dir() -> PathBuf {
@@ -661,10 +666,13 @@ impl World {
                 // Production nodes always have a storage root; the simulated
                 // node's virtual data directory backs the coverage watermark
                 // (and its cold-start scan frontier) the same way, across
-                // restarts. No snapshot: they write through `std::fs`.
+                // restarts. The periodic snapshot never comes; an erasure's
+                // does, into the run's storage root.
                 storage: Some(kronik_sched::snapshots::StorageConfig {
                     snapshot_interval: Duration::from_secs(100 * 365 * 86_400),
-                    ..kronik_sched::snapshots::StorageConfig::new(PathBuf::from(DATA_DIR))
+                    ..kronik_sched::snapshots::StorageConfig::new(
+                        self.storage_root.path().to_path_buf(),
+                    )
                 }),
                 secret_settings: self.cfg.secrets.map(|w| w.settings()).unwrap_or_default(),
                 connections: self
@@ -696,6 +704,12 @@ impl World {
             ownership: None,
             blobs: blob_store,
         };
+        let mut parts = parts;
+        if let Some(keystore) = &self.keystore {
+            parts.sealer = Some(Arc::new(kronik_privacy::sealer::Sealer::new(
+                keystore.clone(),
+            )));
+        }
         let (parts, _store_guard) = match self.open_secrets(node_id, parts) {
             Ok(opened) => opened,
             Err(e) => return self.violation(format!("node {node_id} secret store: {e}")),
@@ -731,8 +745,10 @@ impl World {
             }
         }
         if self.cfg.blobs.is_some() {
-            self.check_blob_refs(&node, &format!("node {node_id}'s start"))
-                .await;
+            let when = format!("node {node_id}'s start");
+            self.check_blob_refs(&node, &when).await;
+            // The start deleted what an erasure left (M26 §9.3).
+            self.check_erased_files(&node, &when).await;
         }
         // The counter, unless every client opens connections; the room
         // with the connections workload.
@@ -1632,14 +1648,20 @@ impl World {
         {
             return self.violation(format!("reading the log: {e}"));
         }
-        let mut keys: BTreeMap<(String, String), (Lsn, String, u64)> = BTreeMap::new();
+        type Turn = (Lsn, String, u64, Option<String>);
+        let mut keys: BTreeMap<(String, String), Turn> = BTreeMap::new();
         let mut times: BTreeMap<ActorRef, u64> = BTreeMap::new();
+        // The LSN of each subject's latest erasure so far.
+        let mut erased: BTreeMap<String, Lsn> = BTreeMap::new();
         let mut prev = 0;
         for c in &records {
             if c.lsn != prev + 1 {
                 self.violation(format!("lsn {} after {prev}", c.lsn));
             }
             prev = c.lsn;
+            if let Record::Erasure(e) = &c.record {
+                erased.insert(e.subject.clone(), c.lsn);
+            }
             let Record::TurnRecord(t) = &c.record else {
                 continue;
             };
@@ -1663,15 +1685,53 @@ impl World {
             *last = t.logical_time_ms;
             match t.input.as_ref().and_then(|i| i.kind.as_ref()) {
                 Some(pb::input::Kind::Http(h)) if !h.idempotency_key.is_empty() => {
-                    let turn = (c.lsn, t.execution_id.clone(), t.logical_time_ms);
-                    if let Some((first, execution, time)) =
+                    // The subject of the saved response, as the store takes
+                    // it: the response's, else the request's.
+                    let tagged = |body: Option<&pb::Body>, headers: &[pb::Header]| {
+                        match body.and_then(|b| b.value.as_ref()) {
+                            Some(pb::body::Value::Inline(s)) => s.subject.clone(),
+                            _ => None,
+                        }
+                        .or_else(|| {
+                            headers
+                                .iter()
+                                .find_map(|h| h.value.as_ref()?.subject.clone())
+                        })
+                    };
+                    let subject = match t.outcome.as_ref().and_then(|o| o.output.as_ref()) {
+                        Some(pb::outcome::Output::Http(r)) => tagged(r.body.as_ref(), &r.headers),
+                        _ => None,
+                    }
+                    .or_else(|| h.sealed_path.as_ref().and_then(|p| p.subject.clone()))
+                    .or_else(|| tagged(h.body.as_ref(), &h.headers));
+                    let turn = (c.lsn, t.execution_id.clone(), t.logical_time_ms, subject);
+                    if let Some((first, execution, time, subject)) =
                         keys.insert((actor.to_string(), h.idempotency_key.clone()), turn)
                     {
-                        self.violation(format!(
-                            "{actor} key {} has turns at lsn {first} (execution {execution}, \
-                             time {time}) and {} (execution {}, time {})",
-                            h.idempotency_key, c.lsn, t.execution_id, t.logical_time_ms
-                        ));
+                        // An erasure deletes its subject's saved responses
+                        // (docs/design/m8-privacy.md §6.3): a retry after it
+                        // runs the request again.
+                        let forgotten = subject
+                            .as_ref()
+                            .and_then(|s| erased.get(s))
+                            .is_some_and(|at| *at > first);
+                        if forgotten {
+                            self.event(format!(
+                                "{actor} key {} ran again at lsn {} after its subject's erasure",
+                                h.idempotency_key, c.lsn
+                            ));
+                        } else {
+                            self.violation(format!(
+                                "{actor} key {} has turns at lsn {first} (execution {execution}, \
+                                 time {time}, subject {subject:?}, its erasure at {:?}) and {} \
+                                 (execution {}, time {})",
+                                h.idempotency_key,
+                                subject.as_ref().and_then(|s| erased.get(s)),
+                                c.lsn,
+                                t.execution_id,
+                                t.logical_time_ms
+                            ));
+                        }
                     }
                 }
                 Some(pb::input::Kind::Message(m)) if t.logical_time_ms < m.sent_logical_time_ms => {
@@ -1743,16 +1803,23 @@ fn derived_state(store: &Store) -> Result<String, String> {
             "id, kind, key, protocol, route, subject, opened_lsn, closing_lsn, closed_lsn, \
              cause, code, frames_in, next_seq, frames_written, restart_after_lsn",
         ),
-        // The blob index (M26 §5), outside the state hash.
+        // The blob index (M26 §5), outside the state hash. Without its erased
+        // rows: a node's collector forgets them once their files are gone
+        // (M26 §9.3), which a rebuild from the log does not.
         (
             "blobs",
             "hash, size, subject, key_version, first_lsn, last_ref_lsn, erased",
         ),
         ("blob_pins", "hash, source, owner, lsn"),
     ] {
+        let only = if table == "blobs" {
+            " WHERE erased = 0"
+        } else {
+            ""
+        };
         let mut st = db
             .conn()
-            .prepare(&format!("SELECT {cols} FROM {table} ORDER BY {cols}"))
+            .prepare(&format!("SELECT {cols} FROM {table}{only} ORDER BY {cols}"))
             .map_err(|e| e.to_string())?;
         let n = st.column_count();
         let rows = st
@@ -1854,7 +1921,63 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
         workload.prepare(&bao);
         bao
     });
+    let keystore = match cfg
+        .blobs
+        .as_ref()
+        .filter(|b| b.subjects > 0)
+        .map(|_| {
+            let master =
+                kronik_privacy::MasterKey::from_bytes([7; 32]).map_err(|e| e.to_string())?;
+            kronik_privacy::keystore::Keystore::open_memory(&master)
+                .map(Arc::new)
+                .map_err(|e| e.to_string())
+        })
+        .transpose()
+    {
+        Ok(keystore) => keystore,
+        Err(e) => {
+            return Report {
+                seed,
+                violations: vec![format!("keystore: {e}")],
+                trace_hash: String::new(),
+                events: 0,
+                crashes: 0,
+                requests: 0,
+                turns: 0,
+                end: RunEnd::Quiescent,
+                polls: 0,
+                virtual_time: Duration::ZERO,
+                wall: started.elapsed(),
+                recent: Vec::new(),
+                notes: String::new(),
+                start_failures: Vec::new(),
+            };
+        }
+    };
+    let storage_root = match tempfile::tempdir() {
+        Ok(root) => root,
+        Err(e) => {
+            return Report {
+                seed,
+                violations: vec![format!("storage root: {e}")],
+                trace_hash: String::new(),
+                events: 0,
+                crashes: 0,
+                requests: 0,
+                turns: 0,
+                end: RunEnd::Quiescent,
+                polls: 0,
+                virtual_time: Duration::ZERO,
+                wall: started.elapsed(),
+                recent: Vec::new(),
+                notes: String::new(),
+                start_failures: Vec::new(),
+            };
+        }
+    };
     let world = Arc::new(World {
+        storage_root,
+        keystore,
         secrets_root,
         service,
         bao,
@@ -1905,6 +2028,12 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
             SUPERVISOR,
             "blob-disk",
             Box::pin(async move { w.blob_disk().await }),
+        );
+        let w = world.clone();
+        handle.spawn(
+            SUPERVISOR,
+            "blob-eraser",
+            Box::pin(async move { w.blob_eraser().await }),
         );
     }
     let w = world.clone();

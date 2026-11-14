@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use kronik_blob::{BlobMeta, BlobStore, NoKeys, Space, StoreConfig, SweepOptions};
 use kronik_core::authority::AuthLease;
-use kronik_core::ids::ActorRef;
+use kronik_core::ids::{ActorRef, Lsn};
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{BlobsConfig, Ingress, Node, TurnResult};
 
@@ -70,6 +70,8 @@ pub enum BlobMutation {
     /// A sweep deletes what was named or claimed after it began: a blob a
     /// turn deduplicated onto during the pass.
     SweepIgnoresTouches,
+    /// An erasure deletes none of its subject's blob files (E1).
+    ErasureKeepsFiles,
 }
 
 impl BlobMutation {
@@ -78,6 +80,7 @@ impl BlobMutation {
             "blob-skip-ensure-durable" => Some(BlobMutation::SkipEnsureDurable),
             "blob-sweep-ignores-leases" => Some(BlobMutation::SweepIgnoresLeases),
             "blob-sweep-ignores-touches" => Some(BlobMutation::SweepIgnoresTouches),
+            "blob-erasure-keeps-files" => Some(BlobMutation::ErasureKeepsFiles),
             _ => None,
         }
     }
@@ -103,6 +106,14 @@ pub struct BlobWorkload {
     pub crash_points: Vec<CrashPoint>,
     /// The most an open of a blob file takes longer ([`crate::fs::Disk::slow_open`]).
     pub slow_open: Duration,
+    /// Data subjects (`user:0`, ...) whose blobs the workload writes and
+    /// holds (M26 §9); 0 runs without a keystore, as M25 did.
+    pub subjects: u32,
+    /// Whether privacy mode is on: subjects' blobs are sealed, not only
+    /// keyed.
+    pub privacy_on: bool,
+    /// How many of the subjects are erased while the clients run.
+    pub erasures: u32,
     pub mutation: Option<BlobMutation>,
     pub faults: ServiceFaults,
 }
@@ -163,6 +174,18 @@ impl BlobWorkload {
             };
             crash_points.push(point);
         }
+        // Drawn after the knobs above, which keep their values.
+        let subjects = if r.chance(0.7) {
+            1 + r.below(3) as u32
+        } else {
+            0
+        };
+        let privacy_on = r.chance(0.5);
+        let erasures = if subjects > 0 {
+            1 + r.below(u64::from(subjects.min(2))) as u32
+        } else {
+            0
+        };
         BlobWorkload {
             threshold,
             sizes,
@@ -172,6 +195,9 @@ impl BlobWorkload {
             full_windows: r.below(3) as u32,
             crash_points,
             slow_open: Duration::from_micros([0, 500, 3_000][r.below(3) as usize]),
+            subjects,
+            privacy_on,
+            erasures,
             mutation: None,
             faults: ServiceFaults {
                 connect_fail: [0.0, 0.05][r.below(2) as usize],
@@ -195,6 +221,7 @@ impl BlobWorkload {
             mutation_sweep_ignores_leases: self.mutation == Some(BlobMutation::SweepIgnoresLeases),
             mutation_sweep_ignores_touches: self.mutation
                 == Some(BlobMutation::SweepIgnoresTouches),
+            mutation_erasure_keeps_files: self.mutation == Some(BlobMutation::ErasureKeepsFiles),
         }
     }
 
@@ -225,6 +252,31 @@ enum Op {
     FailAfterWrite,
     /// Write into a writer never finished: a part file to discard.
     OpenWriter,
+    /// Put `size` bytes (at most 1 MiB): the actor holds the blob and
+    /// stores its reference (M26).
+    Put { size: u64 },
+    /// Read the stored reference whole: `<size> <fnv>`, or the error.
+    HeldSum,
+    /// Store `text` as the reference, in a turn without a subject: a copy
+    /// of a subject's reference that the subject's erasure does not delete.
+    RememberText { text: String },
+}
+
+/// Which actors a request goes to (M26 §9, the erasure part).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Group {
+    /// `k<n>`: blobs without a subject.
+    Plain,
+    /// `s<i>`: subject `i`'s actor whose writes stop before its erasure, so
+    /// a read of its held blob after the erasure must not see the bytes
+    /// (E2).
+    Strict(u32),
+    /// `r<i>`: subject `i`'s actor whose writes may run across its erasure.
+    Racy(u32),
+}
+
+fn subject_name(i: u32) -> String {
+    format!("user:{i}")
 }
 
 impl Op {
@@ -243,6 +295,9 @@ impl Op {
             Op::WriteDiscard { size } => ("write-discard", format!("size={size}"), None),
             Op::FailAfterWrite => ("fail-after-write", String::new(), None),
             Op::OpenWriter => ("open-writer", String::new(), None),
+            Op::Put { size } => ("put", format!("size={size}"), None),
+            Op::HeldSum => ("held-sum", String::new(), None),
+            Op::RememberText { text } => ("remember-text", String::new(), Some(text.clone())),
         };
         pb::HttpInput {
             method: "POST".into(),
@@ -346,6 +401,16 @@ pub(super) struct BlobState {
     sweeps: u64,
     /// Full-store windows so far.
     full: u32,
+    /// Subjects whose erasure has begun: their strict actors write no more.
+    erasing: BTreeSet<u32>,
+    /// Subjects whose erasure is done (its call returned, or a start
+    /// recovered it).
+    erased: BTreeSet<u32>,
+    /// The writes of each subject's strict actor in flight.
+    inflight: BTreeMap<u32, u32>,
+    /// Reads of a held blob after its subject's erasure (E2), and how many
+    /// of them reached the blob (`erased`) rather than a deleted reference.
+    erased_reads: (u32, u32),
 }
 
 /// What an attempt at a request came to.
@@ -413,6 +478,12 @@ impl World {
             .await
             .map_err(|e| format!("limits: {}", e.code))?;
         }
+        if workload.privacy_on && node.privacy_mode().0 != pb::PrivacyState::On {
+            node.set_privacy_mode(pb::PrivacyState::On, audit(), false, authority.clone())
+                .await
+                .map_err(|e| format!("privacy mode: {}", e.code))?;
+            self.event("privacy mode on");
+        }
         if config.http_grant(KIND, "payments").is_none() {
             node.grant(
                 KIND,
@@ -430,13 +501,22 @@ impl World {
         Ok(())
     }
 
-    /// A failed turn the workload asked for: `fail-after-write`.
+    /// A failed turn the workload asked for: `fail-after-write`, and a
+    /// read of a held reference that is not there or whose subject was
+    /// erased.
     pub(super) fn expected_blob_failure(&self, turn: &pb::TurnRecord) -> bool {
+        let Some(pb::input::Kind::Http(h)) = turn.input.as_ref().and_then(|i| i.kind.as_ref())
+        else {
+            return false;
+        };
+        let message = turn.outcome.as_ref().map_or("", |o| o.message.as_str());
         self.blobs().is_some()
-            && matches!(
-                turn.input.as_ref().and_then(|i| i.kind.as_ref()),
-                Some(pb::input::Kind::Http(h)) if h.path.ends_with("/fail-after-write")
-            )
+            && (h.path.ends_with("/fail-after-write")
+                || (h.path.ends_with("/held-sum")
+                    && (message == "no ref" || message == "get: erased"))
+                // A write of a subject's blob in a turn that ran across the
+                // subject's erasure (its path is sealed with the subject).
+                || message == "write: erased")
     }
 
     fn draw_op(&self) -> Op {
@@ -462,9 +542,59 @@ impl World {
         }
     }
 
+    fn draw_size(&self) -> u64 {
+        self.blobs().map_or(0, |w| {
+            w.sizes[self.work.below(w.sizes.len() as u64) as usize]
+        })
+    }
+
+    /// The next request: its actor's key, its operation and its group. A
+    /// strict write is counted in flight here, in the same step as the check
+    /// that its subject's erasure has not begun.
+    fn draw_request(&self) -> (String, Op, Group) {
+        let subjects = self.blobs().map_or(0, |w| w.subjects);
+        if subjects == 0 || self.work.below(100) < 40 {
+            let key = format!("k{}", self.work.below(self.cfg.actors as u64));
+            return (key, self.draw_op(), Group::Plain);
+        }
+        let i = self.work.below(u64::from(subjects)) as u32;
+        let size = self.draw_size().min(1 << 20);
+        let pick = self.work.below(100);
+        if self.work.chance(0.6) {
+            let op = match pick {
+                0..55 => Op::Put { size },
+                55..80 => Op::HeldSum,
+                _ => Op::Write {
+                    size,
+                    chunk: 65_536,
+                },
+            };
+            let mut st = self.st();
+            if matches!(op, Op::HeldSum) || st.blobs.erasing.contains(&i) {
+                return (format!("s{i}"), Op::HeldSum, Group::Strict(i));
+            }
+            *st.blobs.inflight.entry(i).or_default() += 1;
+            return (format!("s{i}"), op, Group::Strict(i));
+        }
+        let op = match pick {
+            0..50 => Op::Write {
+                size,
+                chunk: 65_536,
+            },
+            50..80 => Op::Put { size },
+            _ => Op::WriteDiscard { size },
+        };
+        (format!("r{i}"), op, Group::Racy(i))
+    }
+
     /// Asks the node that runs now; waits for the answer while that node
     /// runs.
-    async fn ask_media(&self, actor: &ActorRef, input: &pb::HttpInput) -> Attempt {
+    async fn ask_media(
+        &self,
+        actor: &ActorRef,
+        input: &pb::HttpInput,
+        subject: Option<&str>,
+    ) -> Attempt {
         let (node, node_id) = {
             let st = self.st();
             (st.node.clone(), st.node_id)
@@ -472,7 +602,7 @@ impl World {
         let Some(node) = node else {
             return Attempt::Again;
         };
-        let waiter = match node.ingress(actor.clone(), input.clone(), None) {
+        let waiter = match node.ingress(actor.clone(), input.clone(), subject.map(str::to_owned)) {
             Ok(Ingress::Done(r)) => return Attempt::Answer(r),
             Ok(Ingress::Started(w) | Ingress::Joined(w)) => w,
             Err(e) => {
@@ -507,58 +637,144 @@ impl World {
         }
     }
 
+    /// Sends `op` to `actor` under the Idempotency-Key `idem` until it is
+    /// answered.
+    async fn request(
+        &self,
+        actor: &ActorRef,
+        op: &Op,
+        idem: &str,
+        subject: Option<&str>,
+    ) -> Option<Box<TurnResult>> {
+        let mut input = op.input(actor);
+        input.idempotency_key = idem.to_owned();
+        input.request_hash = request_hash(&input);
+        self.st().requests += 1;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            if attempt > 2_000 {
+                self.violation(format!("{idem} {op:?} never answered"));
+                return None;
+            }
+            match self.ask_media(actor, &input, subject).await {
+                Attempt::Answer(result) => return Some(result),
+                Attempt::Again => {
+                    let backoff = self
+                        .work
+                        .duration(Duration::from_millis(5), Duration::from_millis(60));
+                    self.sleep(backoff).await;
+                }
+            }
+        }
+    }
+
     pub(super) async fn blob_client(self: Arc<Self>, client: usize) {
         for r in 0..self.cfg.requests_per_client {
-            let actor = match ActorRef::parse(&format!(
-                "{KIND}/k{}",
-                self.work.below(self.cfg.actors as u64)
-            )) {
+            let (key, op, group) = self.draw_request();
+            let actor = match ActorRef::parse(&format!("{KIND}/{key}")) {
                 Ok(actor) => actor,
                 Err(e) => return self.violation(format!("actor: {e}")),
             };
-            let op = self.draw_op();
-            let idem = format!("b{client}-{r}");
-            let mut input = op.input(&actor);
-            input.idempotency_key = idem.clone();
-            input.request_hash = request_hash(&input);
-            self.st().requests += 1;
-            let mut attempt = 0u32;
-            let result = loop {
-                attempt += 1;
-                if attempt > 2_000 {
-                    return self.violation(format!("{idem} {op:?} never answered"));
-                }
-                match self.ask_media(&actor, &input).await {
-                    Attempt::Answer(result) => break result,
-                    Attempt::Again => {
-                        let backoff = self
-                            .work
-                            .duration(Duration::from_millis(5), Duration::from_millis(60));
-                        self.sleep(backoff).await;
-                    }
-                }
+            let subject = match (group, &op) {
+                (Group::Plain, _) | (_, Op::HeldSum) => None,
+                (Group::Strict(i) | Group::Racy(i), _) => Some(subject_name(i)),
             };
-            self.check_answer(&idem, &op, &result).await;
+            // A read is held to E2 when its subject's erasure was done before
+            // it was asked.
+            let erased_before = match group {
+                Group::Strict(i) => self.st().blobs.erased.contains(&i),
+                _ => false,
+            };
+            let idem = format!("b{client}-{r}");
+            let Some(result) = self.request(&actor, &op, &idem, subject.as_deref()).await else {
+                return;
+            };
+            let text = self
+                .check_answer(&idem, &op, group, erased_before, &result)
+                .await;
+            // A strict put's reference is copied into state by a turn
+            // without a subject: the erasure deletes the subject's own copy,
+            // not this one, so a later read reaches the erased blob.
+            if let (Group::Strict(_), Op::Put { .. }, Some(text)) = (group, &op, &text)
+                && let Some(reference) = text.strip_prefix("blob ")
+            {
+                let remember = Op::RememberText {
+                    text: reference.to_owned(),
+                };
+                let idem = format!("{idem}-remember");
+                if let Some(result) = self.request(&actor, &remember, &idem, None).await {
+                    self.check_answer(&idem, &remember, group, false, &result)
+                        .await;
+                }
+            }
+            if let Group::Strict(i) = group
+                && !matches!(op, Op::HeldSum)
+                && let Some(n) = self.st().blobs.inflight.get_mut(&i)
+            {
+                *n = n.saturating_sub(1);
+            }
         }
         self.st().clients_done += 1;
     }
 
+    /// Whether subject `i`'s erasure has begun.
+    fn erasure_began(&self, i: u32) -> bool {
+        let st = self.st();
+        st.blobs.erasing.contains(&i) || st.blobs.erased.contains(&i)
+    }
+
     /// The answer to a request is the one its operation must give, the same
-    /// on every retry; a blob it names has its bytes (B5).
-    async fn check_answer(&self, idem: &str, op: &Op, result: &TurnResult) {
+    /// on every retry; a blob it names has its bytes (B5); a read of a held
+    /// blob after its subject's erasure never sees the bytes (E2). Returns
+    /// the answer's text when it was what the operation must give.
+    async fn check_answer(
+        &self,
+        idem: &str,
+        op: &Op,
+        group: Group,
+        erased_before: bool,
+        result: &TurnResult,
+    ) -> Option<String> {
+        // A racy request that ran across its subject's erasure: the turn may
+        // be refused new blobs of the subject (`erased`, a failed write), its
+        // saved response may be the erasure's tombstone, and a retry after
+        // the erasure runs again (the erasure deleted the saved response).
+        // E1 is what holds for it.
+        if let Group::Racy(i) = group
+            && self.erasure_began(i)
+        {
+            let what = match answer_text(result) {
+                Ok(text) => text,
+                Err(e) => e,
+            };
+            self.event(format!(
+                "{idem} {op:?} {group:?} across the erasure -> {what}"
+            ));
+            return None;
+        }
         let text = match (op, answer_text(result)) {
             (Op::FailAfterWrite, Err(e)) if e.starts_with("TURN_FAILED") => e,
+            (Op::HeldSum, Err(e))
+                if e == "TURN_FAILED no ref" || e == "TURN_FAILED get: erased" =>
+            {
+                e
+            }
             (_, Ok(text)) => text,
-            (_, Err(e)) => return self.violation(format!("{idem} {op:?}: {e}")),
+            (_, Err(e)) => {
+                self.violation(format!("{idem} {op:?}: {e}"));
+                return None;
+            }
         };
-        self.event(format!("{idem} {op:?} -> {text}"));
+        self.event(format!("{idem} {op:?} {group:?} -> {text}"));
         {
             let mut st = self.st();
             match st.blobs.answers.get(idem) {
                 Some(first) if *first != text => {
                     let v = format!("{idem}: answered {text:?}, first {first:?}");
                     drop(st);
-                    return self.violation(v);
+                    self.violation(v);
+                    return None;
                 }
                 Some(_) => {}
                 None => {
@@ -566,19 +782,25 @@ impl World {
                 }
             }
         }
+        let subject = match group {
+            Group::Plain => None,
+            Group::Strict(i) | Group::Racy(i) => Some(i),
+        };
         // A fetch the service failed or cut answers its error: nothing to
         // check of the bytes.
         let network = text.starts_with("network")
             || text.starts_with("timeout")
             || text.starts_with("outcome-unknown")
             || text.starts_with("too-large");
-        let expected_blob = |size: u64| {
-            let bytes = written(size);
-            format!("blob {} {size}", plain_hash(&bytes))
+        // A subject's blob is keyed (`b3s:`), so only its size is known
+        // here; its bytes are checked below.
+        let expected_blob = |size: u64| match subject {
+            None => text == format!("blob {} {size}", plain_hash(&written(size))),
+            Some(_) => text.starts_with("blob b3s:") && text.ends_with(&format!(" {size}")),
         };
         let ok = match op {
-            Op::Write { size, .. } => text == expected_blob(*size),
-            Op::FetchWrite { size, .. } => network || text == expected_blob(*size),
+            Op::Write { size, .. } | Op::Put { size } => expected_blob(*size),
+            Op::FetchWrite { size, .. } => network || expected_blob(*size),
             Op::FetchSum { n } => {
                 let body = content(*n);
                 let what = if *n > self.blobs().map_or(0, |w| w.threshold) {
@@ -592,47 +814,396 @@ impl World {
             Op::WriteDiscard { .. } => text == "discarded",
             Op::OpenWriter => text == "left open",
             Op::FailAfterWrite => text.starts_with("TURN_FAILED"),
+            Op::RememberText { .. } => text == "remembered",
+            Op::HeldSum => match text.split_once(' ') {
+                // The bytes of a blob the actor holds: never after its
+                // subject's erasure (E2).
+                Some((size, sum)) if !text.starts_with("TURN_FAILED") => {
+                    // An empty blob is read without a call: no bytes to see.
+                    if erased_before && size != "0" {
+                        let i = subject.unwrap_or_default();
+                        self.violation(format!(
+                            "{idem}: a read of {}'s held blob after its erasure got its bytes: \
+                             {text}",
+                            subject_name(i)
+                        ));
+                        return None;
+                    }
+                    size.parse::<u64>()
+                        .is_ok_and(|size| sum == fnv(&written(size)))
+                }
+                _ if text == "TURN_FAILED get: erased" => {
+                    if erased_before {
+                        self.st().blobs.erased_reads.1 += 1;
+                    }
+                    // Erased only once its erasure has begun.
+                    subject.is_some_and(|i| self.erasure_began(i))
+                }
+                _ => true,
+            },
         };
+        if erased_before && matches!(op, Op::HeldSum) {
+            self.st().blobs.erased_reads.0 += 1;
+        }
         if !ok {
-            return self.violation(format!("{idem} {op:?}: unexpected answer {text}"));
+            self.violation(format!("{idem} {op:?}: unexpected answer {text}"));
+            return None;
         }
         if let Some(blob) = text.strip_prefix("blob ") {
             // Its bytes are in the store now (B1 for a blob just answered).
             let mut words = blob.split(' ');
             if let (Some(hash), Some(size)) = (words.next(), words.next())
-                && let Ok(size) = size.parse()
+                && let Ok(size) = size.parse::<u64>()
             {
-                let r = pb::BlobRef {
-                    hash: hash.to_owned(),
-                    size,
-                    subject: None,
-                    key_version: 0,
-                };
-                if let Err(e) = self.read_blob(&r).await {
-                    self.violation(format!("{idem}: the blob it answered: {e}"));
+                match self.answered_ref(result, hash).await {
+                    Some(blob) => {
+                        if let Err(e) = self.read_blob(None, &blob).await
+                            && !subject.is_some_and(|i| self.erasure_began(i))
+                        {
+                            self.violation(format!("{idem}: the blob it answered: {e}"));
+                        }
+                    }
+                    // Its subject's erasure, and a pass, took its row.
+                    None if subject.is_some_and(|i| self.erasure_began(i)) => {}
+                    None => self.violation(format!(
+                        "{idem}: neither the record of its turn nor the index knows {hash} \
+                         ({size} bytes)"
+                    )),
                 }
+            }
+        }
+        Some(text)
+    }
+
+    /// The complete reference of `hash`, from the index once the record of
+    /// the turn that answered `result` is applied (a put of a blob the
+    /// actor held already records no reference, but its row is there).
+    /// Waits with the state store only: a supervisor task that kept the node
+    /// past a crash would keep its custody of the keystore from the next
+    /// node. `None` when the store went with a crash, or the row with the
+    /// subject's erasure.
+    async fn answered_ref(&self, result: &TurnResult, hash: &str) -> Option<pb::BlobRef> {
+        let store = self.st().node.as_ref()?.store().clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let applied = store.clone();
+        let lsn = result.turn_id.lsn;
+        self.exec.spawn(
+            crate::exec::SUPERVISOR,
+            "applied",
+            Box::pin(async move {
+                applied.applied.wait(lsn).await;
+                let _ = tx.send(());
+            }),
+        );
+        self.clock_timeout(Duration::from_secs(5), rx).await?.ok()?;
+        let row = store.db().blob(hash).ok()??;
+        Some(pb::BlobRef {
+            hash: row.hash,
+            size: row.size,
+            subject: row.subject,
+            key_version: row.key_version,
+        })
+    }
+
+    /// Reads and verifies a blob with the store of the node that runs now
+    /// (or the last one), with the node's keys for a subject's blob.
+    async fn read_blob(&self, node: Option<&Node>, blob: &pb::BlobRef) -> Result<(), String> {
+        // The keys are taken now, from the keystore of `node`, else of the
+        // node that runs now: the read below holds no part of the node (see
+        // `answered_ref`).
+        let (store, keys) = {
+            let st = self.st();
+            let keys = match (&blob.subject, node.or(st.node.as_deref())) {
+                (Some(subject), Some(node)) => {
+                    use kronik_blob::KeyAccess as _;
+                    let access = node.sealer().blob_key_access();
+                    Some(FixedKeys {
+                        subject: subject.clone(),
+                        version: blob.key_version,
+                        seal: access.seal_key(subject, blob.key_version),
+                        identity: access.identity_key(subject, blob.key_version),
+                    })
+                }
+                _ => None,
+            };
+            (st.blobs.store.clone(), keys)
+        };
+        let store = store.ok_or_else(|| "no blob store".to_string())?;
+        // Its subject's keys are erased: its erasure is under way, and E1
+        // checks its file once the erasure is done.
+        if keys.as_ref().is_some_and(|k| {
+            matches!(k.identity, kronik_blob::KeyAnswer::Erased)
+                || matches!(k.seal, kronik_blob::KeyAnswer::Erased)
+        }) {
+            return Ok(());
+        }
+        let meta = BlobMeta::from_pb(blob).map_err(|e| format!("{}: {e}", blob.hash))?;
+        let failed = |e: kronik_blob::BlobError| format!("{}: {e}", blob.hash);
+        match &keys {
+            Some(keys) => {
+                let reader = store
+                    .reader(&Space::Main, &meta, keys)
+                    .await
+                    .map_err(failed)?;
+                reader
+                    .verify(keys)
+                    .await
+                    .map_err(|e| format!("{} does not verify: {e}", blob.hash))
+            }
+            None => {
+                let reader = store
+                    .reader(&Space::Main, &meta, &NoKeys)
+                    .await
+                    .map_err(failed)?;
+                reader
+                    .verify(&NoKeys)
+                    .await
+                    .map_err(|e| format!("{} does not verify: {e}", blob.hash))
             }
         }
     }
 
-    /// Reads and verifies a blob with the store of the node that runs now
-    /// (or the last one).
-    async fn read_blob(&self, blob: &pb::BlobRef) -> Result<(), String> {
-        let store = self
-            .st()
-            .blobs
-            .store
-            .clone()
-            .ok_or_else(|| "no blob store".to_string())?;
-        let meta = BlobMeta::from_pb(blob).map_err(|e| format!("{}: {e}", blob.hash))?;
-        let reader = store
-            .reader(&Space::Main, &meta, &NoKeys)
-            .await
-            .map_err(|e| format!("{}: {e}", blob.hash))?;
-        reader
-            .verify(&NoKeys)
-            .await
-            .map_err(|e| format!("{} does not verify: {e}", blob.hash))
+    /// E1: no erased row of the index has a file in main's store. The node
+    /// deletes them once an erasure's record is applied and at every start
+    /// (M26 §9.3).
+    pub(super) async fn check_erased_files(&self, node: &Node, when: &str) {
+        if self.blobs().is_none_or(|w| w.subjects == 0) {
+            return;
+        }
+        let Some(store) = self.st().blobs.store.clone() else {
+            return;
+        };
+        let mut erased: BTreeSet<String> = match node.store().db().erased_blobs() {
+            Ok(erased) => erased.into_iter().collect(),
+            Err(e) => return self.violation(format!("{when}: reading the erased blobs: {e}")),
+        };
+        // And the erased blobs whose rows the collector already forgot.
+        let erasures = erased_versions(node);
+        if !erasures.is_empty() {
+            let read = node
+                .reader()
+                .read(1, node.applied_lsn(), |c| {
+                    for blob in kronik_proto::blobs::refs(&c.record) {
+                        if is_erased(&erasures, blob) {
+                            erased.insert(blob.hash.clone());
+                        }
+                    }
+                    Ok(())
+                })
+                .await;
+            if let Err(e) = read {
+                return self.violation(format!("{when}: reading the log: {e}"));
+            }
+        }
+        let left: Vec<String> = {
+            let disk = self.disk.lock().unwrap_or_else(|e| e.into_inner());
+            erased
+                .into_iter()
+                .filter(|hash| {
+                    kronik_blob::BlobId::parse(hash)
+                        .is_ok_and(|id| disk.exists(&store.object_path(&Space::Main, &id)))
+                })
+                .collect()
+        };
+        for hash in left {
+            let row = node.store().db().blob(&hash).ok().flatten();
+            self.violation(format!(
+                "{when}: the erased blob {hash} still has its file (index row {row:?})"
+            ));
+        }
+    }
+
+    /// E1 after `subject`'s erasure (its record at `lsn`, through
+    /// `key_version`) returned.
+    ///
+    /// At once: no erased blob of the subject that a record referenced
+    /// before the erasure has a file. The erasure deleted those files after
+    /// its record was applied, and no turn installs a blob of the subject
+    /// once its erasure marks are set (M26 §9.3, B15 part 6).
+    ///
+    /// Later, in privacy mode on: once `privacy status` reports nothing
+    /// pending, no erased blob has a file at all. A turn that ran across the
+    /// erasure may commit a blob of the subject after the erasure returned
+    /// (ADR 0123); applying its record deletes the file, and the erasure is
+    /// pending until then. In mode off the subject's plain values in the log
+    /// keep it pending until a reseal, so only the first check and the
+    /// checks after every start and at the end apply.
+    async fn after_erasure(&self, node: &Node, subject: &str, lsn: Lsn, key_version: u32) {
+        let when = format!("{subject}'s erasure (lsn {lsn})");
+        self.check_erased_at_return(node, subject, lsn, key_version, &when);
+        if self.blobs().is_none_or(|w| !w.privacy_on) {
+            return;
+        }
+        let mut waited = Duration::ZERO;
+        loop {
+            match node.pending_erasures().await {
+                Ok(0) => break,
+                // Bounded: the run ends, or the node with it, before long.
+                Ok(_) if waited < Duration::from_secs(5) => {}
+                Ok(n) => {
+                    return self.violation(format!(
+                        "{when}: privacy status still reports {n} pending erasure(s) after \
+                         {waited:?}"
+                    ));
+                }
+                Err(e) => return self.event(format!("{when}: privacy status: {}", e.code)),
+            }
+            self.sleep(Duration::from_millis(50)).await;
+            waited += Duration::from_millis(50);
+        }
+        if !waited.is_zero() {
+            self.event(format!("{when}: pending for {waited:?}"));
+        }
+        self.check_erased_files(node, &format!("{when}, once nothing was pending"))
+            .await;
+    }
+
+    /// The first check of [`World::after_erasure`].
+    fn check_erased_at_return(
+        &self,
+        node: &Node,
+        subject: &str,
+        lsn: Lsn,
+        key_version: u32,
+        when: &str,
+    ) {
+        let Some(store) = self.st().blobs.store.clone() else {
+            return;
+        };
+        let rows = match node.store().db().erased_subject_blobs() {
+            Ok(rows) => rows,
+            Err(e) => return self.violation(format!("{when}: reading the erased blobs: {e}")),
+        };
+        let mut left = Vec::new();
+        for (hash, of) in rows {
+            if of != subject {
+                continue;
+            }
+            let Ok(Some(row)) = node.store().db().blob(&hash) else {
+                continue;
+            };
+            if row.key_version > key_version || row.first_lsn >= lsn {
+                continue;
+            }
+            let Ok(id) = kronik_blob::BlobId::parse(&hash) else {
+                continue;
+            };
+            let path = store.object_path(&Space::Main, &id);
+            if self
+                .disk
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .exists(&path)
+            {
+                left.push(row);
+            }
+        }
+        for row in left {
+            self.violation(format!(
+                "{when} returned, but the erased blob {} (first referenced at lsn {}) still has \
+                 its file",
+                row.hash, row.first_lsn
+            ));
+        }
+    }
+
+    /// Erases the seed's subjects while the clients run, each once its
+    /// strict actor's writes are done, and checks E1 after each.
+    pub(super) async fn blob_eraser(self: Arc<Self>) {
+        let Some(workload) = self.blobs().cloned() else {
+            return;
+        };
+        for i in 0..workload.erasures {
+            let wait = self
+                .work
+                .duration(Duration::from_millis(50), Duration::from_millis(1500));
+            self.sleep(wait).await;
+            if self.st().clients_done == self.cfg.clients {
+                return;
+            }
+            let subject = subject_name(i);
+            self.st().blobs.erasing.insert(i);
+            self.event(format!(
+                "erasing {subject}: its strict actor writes no more"
+            ));
+            while self.st().blobs.inflight.get(&i).copied().unwrap_or(0) > 0 {
+                self.sleep(Duration::from_millis(5)).await;
+            }
+            let mut attempts = 0u32;
+            loop {
+                attempts += 1;
+                if attempts > 1_000 {
+                    return self.violation(format!("{subject} was never erased"));
+                }
+                let (node, node_id) = {
+                    let st = self.st();
+                    (st.node.clone(), st.node_id)
+                };
+                let Some(node) = node else {
+                    self.sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
+                // A start recovers an erasure whose keys went before a crash
+                // took its record (`recover_erasures`).
+                if attempts > 1
+                    && node
+                        .store()
+                        .db()
+                        .erasures()
+                        .is_ok_and(|e| e.iter().any(|(s, _)| *s == subject))
+                {
+                    self.event(format!("{subject}'s erasure was done by a start"));
+                    break;
+                }
+                let authority = match node.local_operator_authority() {
+                    Ok(authority) => authority,
+                    Err(_) => {
+                        self.sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                };
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let eraser = node.clone();
+                let erased = subject.clone();
+                // E1 runs in the node's task too: what holds the node ends
+                // with it.
+                let world = self.clone();
+                self.exec.spawn(
+                    node_id,
+                    "erase",
+                    Box::pin(async move {
+                        let audit = pb::Audit {
+                            token_id: "sim".into(),
+                            reason: "dst erasure".into(),
+                            wall_time_ms: 0,
+                        };
+                        let result = eraser.erase_subject(&erased, audit, false, authority).await;
+                        if let Ok(done) = &result
+                            && let Some(lsn) = done.lsn
+                        {
+                            world
+                                .after_erasure(&eraser, &erased, lsn, done.key_version)
+                                .await;
+                        }
+                        let _ = tx.send(result);
+                    }),
+                );
+                drop(node);
+                match self.clock_timeout(Duration::from_secs(60), rx).await {
+                    Some(Ok(Ok(done))) => {
+                        self.event(format!(
+                            "erased {subject}: lsn {:?}, {} blob files deleted",
+                            done.lsn, done.blobs
+                        ));
+                        break;
+                    }
+                    Some(Ok(Err(e))) => self.event(format!("erasing {subject}: {}", e.code)),
+                    _ => self.event(format!("erasing {subject}: ended with its node")),
+                }
+                self.sleep(Duration::from_millis(20)).await;
+            }
+            self.st().blobs.erased.insert(i);
+        }
     }
 
     /// Opens the seed's full-store windows at random times while the clients
@@ -681,11 +1252,19 @@ impl World {
             // in the middle of the pass ends it with the node.
             let (tx, rx) = tokio::sync::oneshot::channel();
             let gc_node = node.clone();
+            drop(node);
+            // The check runs in the node's task too: what holds the node
+            // ends with it.
+            let world = self.clone();
             self.exec.spawn(
                 node_id,
                 "blob-gc",
                 Box::pin(async move {
-                    let _ = tx.send(gc_node.blob_gc(options).await);
+                    let result = gc_node.blob_gc(options).await;
+                    if matches!(result, Ok(Some(_))) {
+                        world.check_blob_refs(&gc_node, "a pass").await;
+                    }
+                    let _ = tx.send(result);
                 }),
             );
             let Some(Ok(result)) = self.clock_timeout(Duration::from_secs(60), rx).await else {
@@ -701,7 +1280,6 @@ impl World {
                         gc.report.candidates
                     ));
                     self.st().blobs.sweeps += 1;
-                    self.check_blob_refs(&node, "a pass").await;
                 }
                 Ok(None) => self.violation("blob_gc: no blob store"),
                 Err(e) => self.event(format!("pass {pass}: {}", e.code)),
@@ -756,8 +1334,14 @@ impl World {
         {
             return self.violation(format!("{when}: reading the log: {e}"));
         }
+        let erasures = erased_versions(node);
         for (hash, (blob, lsn)) in &referenced {
-            if let Err(e) = self.read_blob(blob).await {
+            // An erased subject's blob has no file (E1 checks that), and the
+            // collector may have forgotten its row.
+            if is_erased(&erasures, blob) {
+                continue;
+            }
+            if let Err(e) = self.read_blob(Some(node), blob).await {
                 self.violation(format!(
                     "{when}: the record at lsn {lsn} references {hash}, which is not whole: {e}"
                 ));
@@ -785,6 +1369,7 @@ impl World {
                 return self.violation(format!("the last passes: {}", e.code));
             }
         }
+        self.check_erased_files(node, "the end").await;
         let mut referenced = BTreeSet::new();
         if let Err(e) = node
             .reader()
@@ -877,10 +1462,72 @@ impl World {
             .iter()
             .map(|p| format!("{:?}#{}", p.op, p.nth))
             .collect();
+        let (erased, reads) = {
+            let st = self.st();
+            (st.blobs.erased.len(), st.blobs.erased_reads)
+        };
         self.st().notes = format!(
-            " blobs={} files={} unrooted={left} passes={sweeps} full={full} crash-points={crashed:?}",
+            " blobs={} files={} unrooted={left} passes={sweeps} full={full} erased={erased} \
+             erased-reads={}/{} crash-points={crashed:?}",
             referenced.len(),
             objects.len(),
+            reads.1,
+            reads.0,
         );
+    }
+}
+
+/// The erased key versions by subject: a subject's blob keyed with one of
+/// them, or an older one, is erased (M26 §9.3).
+fn erased_versions(node: &Node) -> BTreeMap<String, u32> {
+    let mut out: BTreeMap<String, u32> = BTreeMap::new();
+    for (subject, version) in node.store().db().erasures().unwrap_or_default() {
+        let max = out.entry(subject).or_default();
+        *max = (*max).max(version);
+    }
+    out
+}
+
+fn is_erased(erasures: &BTreeMap<String, u32>, blob: &pb::BlobRef) -> bool {
+    blob.subject
+        .as_ref()
+        .and_then(|subject| erasures.get(subject))
+        .is_some_and(|version| blob.key_version <= *version)
+}
+
+/// One subject's blob keys, taken from the node's keystore before a read
+/// ([`World::read_blob`]).
+struct FixedKeys {
+    subject: String,
+    version: u32,
+    seal: kronik_blob::KeyAnswer,
+    identity: kronik_blob::KeyAnswer,
+}
+
+fn copy(answer: &kronik_blob::KeyAnswer) -> kronik_blob::KeyAnswer {
+    use kronik_blob::KeyAnswer;
+    match answer {
+        KeyAnswer::Found(key) => KeyAnswer::Found(key.clone()),
+        KeyAnswer::Erased => KeyAnswer::Erased,
+        KeyAnswer::Missing => KeyAnswer::Missing,
+        KeyAnswer::Unavailable(why) => KeyAnswer::Unavailable(why.clone()),
+    }
+}
+
+impl kronik_blob::KeyAccess for FixedKeys {
+    fn seal_key(&self, subject: &str, version: u32) -> kronik_blob::KeyAnswer {
+        if subject == self.subject && version == self.version {
+            copy(&self.seal)
+        } else {
+            kronik_blob::KeyAnswer::Missing
+        }
+    }
+
+    fn identity_key(&self, subject: &str, version: u32) -> kronik_blob::KeyAnswer {
+        if subject == self.subject && version == self.version {
+            copy(&self.identity)
+        } else {
+            kronik_blob::KeyAnswer::Missing
+        }
     }
 }

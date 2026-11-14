@@ -35,7 +35,8 @@
 //! violation that starts with `C3`. `--identity-replay` replays the log of
 //! every connections run (C8), not only every 10th seed's.
 //! The blob workload's mutations are `blob-skip-ensure-durable`,
-//! `blob-sweep-ignores-leases` and `blob-sweep-ignores-touches`.
+//! `blob-sweep-ignores-leases`, `blob-sweep-ignores-touches` and
+//! `blob-erasure-keeps-files`.
 //! A run line shows `start-failures=N` after its wall time when a node's
 //! start failed on an injected fsync error and the node was restarted; the
 //! lines under it say what failed.
@@ -160,8 +161,8 @@ fn main() -> ExitCode {
                 _ => {
                     eprintln!(
                         "--mutation needs ack-before-fsync, deliver-before-fsync, \
-                         blob-skip-ensure-durable, blob-sweep-ignores-leases or \
-                         blob-sweep-ignores-touches"
+                         blob-skip-ensure-durable, blob-sweep-ignores-leases, \
+                         blob-sweep-ignores-touches or blob-erasure-keeps-files"
                     );
                     return ExitCode::FAILURE;
                 }
