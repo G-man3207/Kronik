@@ -91,7 +91,7 @@ var hostMessages = map[string]map[string][2]string{
 	},
 	"blob": {
 		"not-held":       {"the turn neither holds nor borrows this blob", "BLOB_NOT_HELD"},
-		"quota-exceeded": {"over the actor's blob quota", "blob"},
+		"quota-exceeded": {"over the actor's blob quota", "BLOB_QUOTA_EXCEEDED"},
 		"erased":         {"the blob belonged to an erased subject", "SUBJECT_ERASED"},
 		"invalid":        {"blob call outside its limits", "blob"},
 	},

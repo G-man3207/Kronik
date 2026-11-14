@@ -602,6 +602,7 @@ class HoldTests(unittest.TestCase):
         with self.assertRaises(KronikError) as e:
             ctx.blobs.put_for(None, b"y")
         self.assertEqual(e.exception.kind, "blob.quota-exceeded")
+        self.assertEqual(e.exception.topic, "BLOB_QUOTA_EXCEEDED")
         self.assertEqual(blobs.subjects, ["user:2", None])
         self.assertEqual(ctx.current_subject(), "user:1")
 

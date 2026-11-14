@@ -346,7 +346,7 @@ frames and keeps the rest until the next write or `finish()`. A fetch sends
 a blob as its body with `body: b` (Python: `body=b`, Go:
 `FetchRequest{BodyBlob: &b}`), and its response's `body` and `blob` work as
 a request's. Blob errors are `KronikError`s (Go: `*kronik.Error`) whose
-topic is `BLOB_NOT_HELD`, `SUBJECT_ERASED` or `blob`. A TypeScript project
+topic is `BLOB_NOT_HELD`, `BLOB_QUOTA_EXCEEDED`, `SUBJECT_ERASED` or `blob`. A TypeScript project
 type-checks the SDK's blob writer with `esnext.disposable` in its
 tsconfig's `lib`, as `kronik init` writes it.
 
@@ -407,8 +407,8 @@ http: (req, ctx) => {
 
 `putFor` sets the default subject around the put and restores it, also when
 the put fails. The errors are those above: `BLOB_NOT_HELD` for a blob the
-turn may not use, `SUBJECT_ERASED`, and `blob` for the quota and the call
-limits.
+turn may not use, `BLOB_QUOTA_EXCEEDED` over the quota, `SUBJECT_ERASED`,
+and `blob` for the call limits.
 
 ## Building
 

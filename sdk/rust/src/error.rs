@@ -147,13 +147,16 @@ impl fmt::Display for Error {
             Error::Blob(e) => match e {
                 BlobError::NotHeld => write_error(
                     f,
-                    "the turn does not hold this blob: it may use only the blobs it received or wrote",
+                    "the turn may not use this blob: only the blobs its actor holds, it received or it wrote",
                     "",
                     "BLOB_NOT_HELD",
                 ),
-                BlobError::QuotaExceeded => {
-                    write_error(f, "the actor's blob quota is exceeded", "", "blob")
-                }
+                BlobError::QuotaExceeded => write_error(
+                    f,
+                    "the actor's blob quota is exceeded",
+                    "",
+                    "BLOB_QUOTA_EXCEEDED",
+                ),
                 BlobError::Erased => {
                     write_error(f, "the blob's subject was erased", "", "SUBJECT_ERASED")
                 }

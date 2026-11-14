@@ -246,7 +246,7 @@ test('a blob is sent as a fetch body as it is', () => {
 
 test('blob errors name their code', () => {
   assert.equal(hostError('blob', { payload: { tag: 'not-held' } }).topic, 'BLOB_NOT_HELD');
-  assert.equal(hostError('blob', { payload: { tag: 'quota-exceeded' } }).topic, 'blob');
+  assert.equal(hostError('blob', { payload: { tag: 'quota-exceeded' } }).topic, 'BLOB_QUOTA_EXCEEDED');
   assert.equal(hostError('blob', { payload: { tag: 'erased' } }).message, 'the blob belonged to an erased subject (see `kronik explain SUBJECT_ERASED`)');
   assert.equal(hostError('blob', { payload: { tag: 'invalid', val: 'more than 1 MiB in one call' } }).kind, 'blob.invalid');
 });

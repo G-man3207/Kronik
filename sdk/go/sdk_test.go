@@ -269,7 +269,7 @@ func TestBlobFetchBodiesAndResponses(t *testing.T) {
 }
 
 func TestBlobErrorsNameTheirCodes(t *testing.T) {
-	for tag, topic := range map[string]string{"not-held": "BLOB_NOT_HELD", "quota-exceeded": "blob", "erased": "SUBJECT_ERASED", "invalid": "blob"} {
+	for tag, topic := range map[string]string{"not-held": "BLOB_NOT_HELD", "quota-exceeded": "BLOB_QUOTA_EXCEEDED", "erased": "SUBJECT_ERASED", "invalid": "blob"} {
 		if e := hostError("blob", tag, "", nil); e.Topic != topic || e.Kind != "blob."+tag {
 			t.Errorf("%s: %+v", tag, e)
 		}
