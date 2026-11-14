@@ -28,8 +28,9 @@
 //!   below it.
 //! - C5: `send-now`: no frame before its turn's `TurnBegin` is durable (I14),
 //!   none performed twice, none performed by a re-run without a recorded
-//!   result (I17). Checked from the log and the clients' frames; the clients
-//!   ask for `send-now` frames once slice 8 implements it ([`SEND_NOW`]).
+//!   result (I17). Checked from the log and the frames the clients got: one
+//!   that no durable buffered record held must be a `send-now` with its
+//!   seq, or the one of an outcome-unknown send on its connection.
 //! - C6: a client gets frames only from its connection's owner.
 //! - C7: the recovered `connections` and `connection_history` tables equal a
 //!   rebuild from the log (every start's recovery check).
@@ -59,12 +60,6 @@ use crate::fs::Disk;
 /// The room guest (tests/guests/room.wasm), built for the world
 /// `actor-connections`.
 pub const ROOM: &[u8] = include_bytes!("../../../../tests/guests/room.wasm");
-
-/// Whether clients ask for `send-now` frames (`stream`, `stream-safe`).
-/// Off until slice 8 implements `connection.send-now`; then C5 has frames
-/// to check, and the C3 check at a client defers frames that no durable
-/// record holds to the end, where they must be `send-now` frames.
-const SEND_NOW: bool = false;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -145,6 +140,11 @@ struct ConnStats {
     frames_sent: u64,
     frames_out: u64,
     stops: u64,
+    /// C5's evidence: frames resolved as send-now with their seq or as
+    /// outcome-unknown sends, and re-run send-now effects checked.
+    now_ok: u64,
+    now_unknown: u64,
+    now_reruns: u64,
 }
 
 /// A frame a client got that no durable record held at that moment, with
@@ -152,6 +152,7 @@ struct ConnStats {
 struct Unresolved {
     conn: String,
     seq: u64,
+    frame: pb::Frame,
     begins: BTreeSet<String>,
 }
 
@@ -449,6 +450,83 @@ fn same_frame(recorded: &pb::Frame, sent: &pb::Frame) -> bool {
         && recorded.event == sent.event
         && recorded.id == sent.id
         && recorded.data.as_ref().map(|d| &d.subject) == sent.data.as_ref().map(|d| &d.subject)
+}
+
+fn describe(f: &pb::Frame) -> String {
+    let (kind, data, event, id) = content(f);
+    format!(
+        "kind {kind} {:?} {event} {id}",
+        String::from_utf8_lossy(&data)
+    )
+}
+
+/// Where the log has `conn`'s frame `seq`: the records whose buffered
+/// operations send it, and the connection's `send-now` effects.
+fn frame_history(records: &[(Lsn, Record)], conn: &str, seq: u64) -> String {
+    let mut out = Vec::new();
+    for (lsn, record) in records {
+        let (exec, effects, ops, outcome) = match record {
+            Record::TurnRecord(t) => (
+                &t.execution_id,
+                t.effects.as_slice(),
+                t.connection_ops.as_slice(),
+                t.outcome.as_ref().map(|o| o.kind),
+            ),
+            Record::EffectResult(r) => (
+                &r.execution_id,
+                r.effect.as_slice(),
+                &[][..],
+                None,
+            ),
+            Record::TurnBegin(b) if b.input.as_ref().is_some_and(|i| {
+                matches!(&i.kind, Some(pb::input::Kind::Connection(c)) if c.connection == conn)
+            }) => {
+                out.push(format!("lsn {lsn} begin {}", b.execution_id));
+                continue;
+            }
+            _ => continue,
+        };
+        for op in ops {
+            if let Some(pb::connection_op::Op::Send(frame)) = &op.op {
+                for (id, s) in op.connections.iter().zip(&op.seqs) {
+                    if id == conn && *s == seq {
+                        out.push(format!(
+                            "lsn {lsn} {exec} outcome {outcome:?} sends it: {}",
+                            describe(frame)
+                        ));
+                    }
+                }
+            }
+        }
+        for e in effects.iter().filter(|e| e.kind == "connection.send-now") {
+            if let Some(pb::sealable::Value::Plain(b)) =
+                e.request.as_ref().and_then(|r| r.value.as_ref())
+                && let Ok(req) = pb::ConnectionSendRequest::decode(b.as_slice())
+                && req.connection == conn
+            {
+                out.push(format!(
+                    "lsn {lsn} {exec} send-now {} status {} seq {} {:?}",
+                    e.ordinal,
+                    e.status,
+                    req.seq,
+                    String::from_utf8_lossy(&req.data)
+                ));
+            }
+        }
+    }
+    out.join("; ")
+}
+
+/// A frame's content as a `send-now` request records it: kind, data, SSE
+/// fields (the subject aside).
+type Content = (i32, Vec<u8>, String, String);
+
+fn content(f: &pb::Frame) -> Content {
+    let data = match f.data.as_ref().and_then(|d| d.value.as_ref()) {
+        Some(pb::sealable::Value::Plain(b)) => b.clone(),
+        _ => Vec::new(),
+    };
+    (f.kind, data, f.event.clone(), f.id.clone())
 }
 
 /// Standard base64 with padding: a WebSocket key.
@@ -791,7 +869,7 @@ impl World {
             let mut st = self.st();
             st.conns.stats.frames_out += 1;
             let found = st.conns.durable.lookup(&self.disk, &socket.id, seq);
-            if found.is_none() && SEND_NOW {
+            if found.is_none() {
                 let begins = st
                     .conns
                     .durable
@@ -803,17 +881,17 @@ impl World {
                 st.conns.unresolved.push(Unresolved {
                     conn: socket.id.clone(),
                     seq,
+                    frame: frame.clone(),
                     begins,
                 });
                 return;
             }
             found
         };
+        // A frame no durable record holds (yet) is resolved at the end: a
+        // send-now, or a buffered frame given out early (C3).
         let Some(found) = found else {
-            return self.violation(format!(
-                "C3: {} got seq {seq} before a durable record held it",
-                socket.id
-            ));
+            return;
         };
         let held: Vec<&DurableFrame> = found.iter().filter(|f| f.committed).collect();
         let Some(first) = held.first() else {
@@ -1063,8 +1141,12 @@ impl World {
             70..=71 => "fail".into(),
             72..=73 => "trap".into(),
             74..=77 => "bye".into(),
-            78..=81 if SEND_NOW => format!("stream {}", 1 + self.work.below(4)),
-            82..=85 if SEND_NOW => format!("stream-safe {}", 1 + self.work.below(4)),
+            78..=81 => format!("stream {}", 1 + self.work.below(4)),
+            82..=85 => format!("stream-safe {}", 1 + self.work.below(4)),
+            86..=88 => match self.random_peer(socket) {
+                Some(peer) => format!("now-to {peer} {tag}"),
+                None => "stream 1".into(),
+            },
             _ => format!("say {tag}"),
         }
     }
@@ -1240,7 +1322,9 @@ impl World {
                 match text.split(' ').next().unwrap_or_default() {
                     "fail" => failed,
                     "trap" => trapped,
-                    "send-to" | "kick" => {
+                    // A re-run's send-now without a recorded result.
+                    "stream" => failed && o.message.contains("outcome is unknown"),
+                    "send-to" | "kick" | "now-to" => {
                         trapped
                             && (o.error_code == "CONNECTION_NOT_HELD"
                                 || o.message.contains("CONNECTION_NOT_HELD"))
@@ -1310,14 +1394,17 @@ impl World {
         let mut st = self.st();
         let s = &st.conns.stats;
         let note = format!(
-            " conns={}/{} refused={} frames-in={} frames-out={} stops={} closes={}",
+            " conns={}/{} refused={} frames-in={} frames-out={} stops={} closes={} now={}/{}/{}",
             s.accepted,
             s.opens,
             s.refused,
             s.frames_sent,
             s.frames_out,
             s.stops,
-            causes.join(",")
+            causes.join(","),
+            s.now_ok,
+            s.now_unknown,
+            s.now_reruns
         );
         st.notes.push_str(&note);
     }
@@ -1454,14 +1541,17 @@ impl World {
         }
     }
 
-    /// C5 (`send-now`, slice 8), from the log: no re-run performs one
-    /// without a result recorded before its restart, no execution performs
-    /// one twice, and every frame a client got without a durable record is
-    /// a `send-now` whose `TurnBegin` was durable then.
+    /// C5 (`send-now`), from the log and the frames the clients got: no
+    /// re-run makes the call without a result recorded before its restart
+    /// (I17), no execution sends one twice, and every frame a client got
+    /// that no durable buffered record held is a `send-now`, with its seq or
+    /// as an outcome-unknown send on its connection, whose `TurnBegin` was
+    /// durable then (I14). A buffered frame given out early breaks C3.
     fn check_send_now(&self, records: &[(Lsn, Record)], f: &LogFacts) {
         const KIND: &str = "connection.send-now";
         let ok = pb::EffectStatus::Ok as i32;
         let unknown = pb::EffectStatus::OutcomeUnknown as i32;
+        let timeout = pb::EffectStatus::Timeout as i32;
         let decode = |e: &pb::EffectRecord| -> Option<pb::ConnectionSendRequest> {
             let bytes = match e.request.as_ref().and_then(|r| r.value.as_ref()) {
                 Some(pb::sealable::Value::Plain(b)) => b.as_slice(),
@@ -1473,22 +1563,31 @@ impl World {
         let mut begun: BTreeMap<String, Lsn> = BTreeMap::new();
         // (execution, ordinal) to the LSNs of their recorded results.
         let mut results: BTreeMap<(String, u32), Vec<Lsn>> = BTreeMap::new();
-        // (execution, ordinal) to the (connection, seq) of their OK sends.
+        // OK sends, both ways, and outcome-unknown ones.
         let mut performed: BTreeMap<(String, u32), BTreeSet<(String, u64)>> = BTreeMap::new();
-        let mut by_frame: BTreeMap<(String, u64), BTreeSet<String>> = BTreeMap::new();
+        let mut sent_now: BTreeMap<(String, u64), BTreeMap<String, Content>> = BTreeMap::new();
+        let mut unknowns: BTreeMap<(String, u32), (String, Content)> = BTreeMap::new();
         let mut note = |exec: &str, e: &pb::EffectRecord| {
-            if e.kind != KIND || e.status != ok {
+            let Some(req) = decode(e) else {
                 return;
-            }
-            if let Some(req) = decode(e) {
+            };
+            let content = (
+                req.kind,
+                req.data.clone(),
+                req.event.clone(),
+                req.id.clone(),
+            );
+            if e.status == ok {
                 performed
                     .entry((exec.to_owned(), e.ordinal))
                     .or_default()
                     .insert((req.connection.clone(), req.seq));
-                by_frame
+                sent_now
                     .entry((req.connection, req.seq))
                     .or_default()
-                    .insert(exec.to_owned());
+                    .insert(exec.to_owned(), content);
+            } else if e.status == unknown {
+                unknowns.insert((exec.to_owned(), e.ordinal), (req.connection, content));
             }
         };
         for (lsn, record) in records {
@@ -1518,10 +1617,12 @@ impl World {
                         else {
                             continue;
                         };
+                        self.st().conns.stats.now_reruns += 1;
                         let recorded = results
                             .get(&(t.execution_id.clone(), e.ordinal))
                             .is_some_and(|at| at.iter().any(|l| l <= restart));
-                        if !recorded && e.status != unknown {
+                        // Without a result, a re-run must not call the hub.
+                        if !recorded && (e.status == ok || e.status == timeout) {
                             self.violation(format!(
                                 "C5: the re-run at lsn {lsn} of {} has send-now {} with status {} and no result recorded before the restart at lsn {restart}",
                                 t.execution_id, e.ordinal, e.status
@@ -1540,30 +1641,72 @@ impl World {
                 ));
             }
         }
-        for ((conn, seq), execs) in &by_frame {
+        for ((conn, seq), execs) in &sent_now {
             if execs.len() > 1 || f.sent.contains_key(&(conn.clone(), *seq)) {
                 self.violation(format!(
-                    "C5: {conn} seq {seq} is a send-now of {execs:?} and also another frame"
+                    "C5: {conn} seq {seq} is a send-now of {:?} and also another frame",
+                    execs.keys().collect::<Vec<_>>()
                 ));
             }
         }
         let unresolved = std::mem::take(&mut self.st().conns.unresolved);
+        let mut claimed: BTreeSet<(String, u32)> = BTreeSet::new();
         for u in unresolved {
-            match by_frame.get(&(u.conn.clone(), u.seq)) {
-                None => self.violation(format!(
-                    "C3: {} got seq {}, which no durable record held then and no send-now sent",
-                    u.conn, u.seq
-                )),
-                Some(execs) => {
-                    for exec in execs {
-                        if !u.begins.contains(exec) {
-                            self.violation(format!(
-                                "C5: {} got send-now seq {} of {exec} before its TurnBegin was durable",
-                                u.conn, u.seq
-                            ));
-                        }
+            let key = (u.conn.clone(), u.seq);
+            let got = content(&u.frame);
+            // A send-now with this seq.
+            if let Some(execs) = sent_now.get(&key) {
+                self.st().conns.stats.now_ok += 1;
+                for (exec, sent) in execs {
+                    if !u.begins.contains(exec) {
+                        self.violation(format!(
+                            "C5: {} got send-now seq {} of {exec} before its TurnBegin was durable",
+                            u.conn, u.seq
+                        ));
+                    }
+                    if *sent != got {
+                        self.violation(format!(
+                            "C5: {} seq {} is not the frame its send-now recorded",
+                            u.conn, u.seq
+                        ));
                     }
                 }
+                continue;
+            }
+            // A send whose turn crashed before its result was durable: the
+            // re-run recorded it outcome-unknown without a seq (I17), and
+            // may have given the seq to a buffered frame that the restart's
+            // close dropped (C4 sees one written twice).
+            let explained = unknowns
+                .iter()
+                .find(|(k, (conn, sent))| {
+                    *conn == u.conn
+                        && u.begins.contains(&k.0)
+                        && !claimed.contains(*k)
+                        && *sent == got
+                })
+                .map(|(k, _)| k.clone());
+            if let Some(k) = explained {
+                claimed.insert(k);
+                self.st().conns.stats.now_unknown += 1;
+                continue;
+            }
+            if f.sent.contains_key(&key) {
+                self.violation(format!(
+                    "C3: {} got seq {} ({}), a buffered frame, before its record was durable; {}; starts at lsn {starts:?}",
+                    u.conn,
+                    u.seq,
+                    describe(&u.frame),
+                    frame_history(records, &u.conn, u.seq)
+                ));
+            } else {
+                self.violation(format!(
+                    "C3: {} got seq {} ({}), which no durable record held then and no send-now sent; {}",
+                    u.conn,
+                    u.seq,
+                    describe(&u.frame),
+                    frame_history(records, &u.conn, u.seq)
+                ));
             }
         }
     }

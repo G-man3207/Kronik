@@ -691,6 +691,37 @@ impl World {
             }
             self.event(format!("deployed {kind}"));
         }
+        // M24: the room sends frames during its turns (`send-now`).
+        if self.cfg.connections.is_some()
+            && node
+                .config_now()
+                .grant("room", kronik_effects::Capability::SEND_NOW)
+                .is_none()
+        {
+            let audit = pb::Audit {
+                token_id: "sim".into(),
+                reason: "dst".into(),
+                wall_time_ms: 0,
+            };
+            if let Err(e) = node
+                .grant(
+                    "room",
+                    kronik_effects::Capability::SEND_NOW,
+                    None,
+                    None,
+                    kronik_effects::InForks::default(),
+                    audit,
+                    false,
+                    authority.clone(),
+                )
+                .await
+            {
+                self.event(format!("grant failed: {}", e.code));
+                let _ = self.fatal_tx.send(node_id);
+                return;
+            }
+            self.event("granted connection:send-now");
+        }
         if let Some(fx) = self.cfg.effects
             && node
                 .config_now()

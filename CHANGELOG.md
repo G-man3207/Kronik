@@ -59,8 +59,9 @@ until the v1.0 compatibility promise takes effect.
   crashes, graceful stops and lost `state.db`. It checks that every
   accepted connection gets exactly one close input, that incoming seqs
   have no gaps, that no client gets a frame before its record is durable
-  or from another actor, that `frames_written` matches what the client
-  got, that recovery and identity replay agree with the log, and that a
+  or from another actor, that a `send-now` frame comes only after its
+  turn's `TurnBegin` is durable and is never sent twice or by a re-run,
+  that `frames_written` matches what the client got, that recovery and identity replay agree with the log, and that a
   run is a function of its seed. It is part of `--scenario all` and of
   the long run; `--mutation deliver-before-fsync` must make it fail.
   Found with it: a graceful stop closed connections in an order that

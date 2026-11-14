@@ -1647,10 +1647,12 @@ node reaches the log. C3 and C6 are checked as each frame enters the
 socket, against the durable bytes of the log's segments on the simulated
 disk; C1, C2, C4 and C5 at the end, from the log, after a final restart;
 C7 by every start's recovery check (`connection_history` included); C8 on
-every 10th seed (`--identity-replay`: every seed, as nightly). Until slice
-8 lands, the clients ask for no `send-now` frames (`SEND_NOW` in the
-workload); C5 already checks the log's `connection.send-now` effects and
-resolves the frames that no durable record held. `scripts/ci.sh dst` also
+every 10th seed (`--identity-replay`: every seed, as nightly). Clients send
+`stream`, `stream-safe` and `now-to` frames (`send-now`); a frame that no
+durable buffered record held when it reached the client is resolved at the
+end against the log's `connection.send-now` effects, by its seq or as an
+outcome-unknown send on its connection, and its `TurnBegin` must have been
+durable then (C5). `scripts/ci.sh dst` also
 runs `--seeds 0..20 --scenario connections --mutation deliver-before-fsync
 --expect-violation C3`, which passes only when C3 catches the mutation;
 the long run mixes three connection clients with its counter clients.
