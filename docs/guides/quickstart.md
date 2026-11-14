@@ -287,3 +287,92 @@ There is no `--token` flag. The agent starts from `kronik explain agent`
 guide names: list actors, read history, propose, read the diff, and ask for
 approval. A human approves and promotes, in a shell without the agent's
 token.
+
+## 11. Live updates over SSE and WebSocket
+
+An actor can hold long-lived connections: a route with the method `SSE` or
+`WEBSOCKET` names the actor that accepts them, and its turns send frames to
+them. Here is a counter that streams: create a second app next to `billing`
+and give it this `src/actor.ts`:
+
+```sh
+cd ..
+kronik init --lang ts live
+cd live
+```
+
+```ts
+import { actor, Frame, type Ctx } from "@kronik/sdk";
+
+// A counter that streams: POST /live/<key>/increment counts, and every
+// client following /live/<key>/events (SSE) or /live/<key>/ws (WebSocket)
+// gets {"n"} after each count.
+export default actor({
+  kind: "live",
+  schemaVersion: 1,
+  routes: [
+    { method: "POST", pattern: "/live/{key}/increment" },
+    { method: "SSE", pattern: "/live/{key}/events" },
+    { method: "WEBSOCKET", pattern: "/live/{key}/ws" },
+  ],
+  http(req, ctx) {
+    const n = (ctx.state.getJson<number>("n") ?? 0) + 1;
+    ctx.state.setJson("n", n);
+    // Sent to every follower after this turn commits.
+    ctx.connections.broadcast(followers(ctx), Frame.json({ n }));
+    return ctx.json(200, { n });
+  },
+  connections: {
+    open(req, ctx) {
+      ctx.state.setJson(`follower/${req.connection}`, true);
+      ctx.connections.send(req.connection, Frame.json({ n: ctx.state.getJson<number>("n") ?? 0 }));
+      return ctx.accept();
+    },
+    close(closed, ctx) {
+      ctx.state.delete(`follower/${closed.connection}`);
+    },
+  },
+});
+
+function followers(ctx: Ctx): string[] {
+  return ctx.state.keys("follower/").map((k) => k.slice("follower/".length));
+}
+```
+
+```sh
+npm install
+npm test
+kronik build
+kronik deploy dist/live.wasm --reason 'a live counter'
+```
+
+`live` is a new kind, so it deploys directly. Follow the counter from two
+more terminals, one command in each: `curl -N` prints each SSE event as it
+arrives, and Node.js's built-in client does the same over a WebSocket:
+
+```sh
+curl -N http://127.0.0.1:8080/live/demo/events
+node -e 'const ws = new WebSocket("ws://127.0.0.1:8080/live/demo/ws"); ws.onmessage = (e) => console.log(e.data)'
+```
+
+Each prints `{"n":0}` when it connects (`data: {"n":0}` on the SSE stream).
+Count in the first terminal, and both print the new value:
+
+```sh
+curl -s -X POST http://127.0.0.1:8080/live/demo/increment
+kronik connections list
+kronik history live/demo --connection <id>
+```
+
+`kronik connections list` shows each open connection with its actor,
+protocol and route, and how many frames went in and out. Opening a
+connection, each frame a client sends and its close are turns of the actor,
+recorded like any other input, and the frames a turn sends are recorded with
+it and go out only after it commits: `kronik history --connection` shows a
+connection's turns and what became of each frame (`written`, `queued`,
+`dropped`). A frame to a connection that has closed is dropped, not an
+error. Stop the clients with Ctrl-C: each connection gets its `close` turn.
+A restart of the daemon closes every connection (WebSocket code 1012), and
+clients reconnect: a browser's `EventSource` does so by itself.
+`examples/chat-ts` in the repository is a chat room built the same way, and
+[Connections](connections.md) has the rest.

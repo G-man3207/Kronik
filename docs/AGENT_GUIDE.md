@@ -178,8 +178,11 @@ To try one input by hand, call `create_fork` with
 `{"at": "now", "reason": "..."}`. Then call `send_to_fork` with
 `{"fork": "<name>", "actor": "kind/key", "name": "<message>", "text": "...",
 "reason": "..."}`. This runs one message against the fork's code and state
-and returns its outcome, reply and effects. `get_diff` with
-`{"fork": "<name>"}` shows a fork's diff.
+and returns its outcome, reply and effects. A fork has a diff only once
+recorded traffic has been replayed through it, which `kronik replay <name>`
+does and no tool of yours does: then `get_diff` with `{"fork": "<name>"}`
+shows it. Before that, `get_diff` answers `BAD_REQUEST`. A proposal's diff
+exists as soon as `propose_change` returns.
 
 ### 6. Ask for approval
 
