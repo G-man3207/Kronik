@@ -145,6 +145,18 @@ the same strict standalone verification path. Source tests cover GNU loader/
 dependency rejection, independent helper ELF/payload comparison and real
 consumer signature/write-failure boundaries; tests are not release/HSM claims.
 
+A release moves every version site with `scripts/set-version.py`: `--from
+0.5.0-dev --to 0.5.0` for the release commit, and `--from 0.5.0 --to
+0.6.0-dev` on `main` after the tag. The sites are the workspace's and the
+examples' manifests and lockfiles, the Rust and TypeScript SDKs' manifests and
+npm lockfiles, the `/v1/health` example of `docs/design/m1-core.md` and
+`info.version` of `docs/reference/openapi.json` (regenerate it afterwards; it
+must not change). The script checks every site before it edits any, refuses
+one at another version, and lists the tracked text that still names the old
+version: the changelog, ADRs and the evidence in the guides keep the version
+they were written with, as do binary fixtures. `--check` only checks that
+every site is at the workspace's version; a test runs it on the repository.
+
 CI (`.github/workflows/ci.yml`) and the long checks
 (`.github/workflows/nightly.yml`) start only from `workflow_dispatch`. A push
 or pull request does not spend hosted-runner minutes. Run `scripts/ci.sh`
