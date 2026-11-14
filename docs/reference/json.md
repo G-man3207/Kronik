@@ -8651,7 +8651,7 @@ against both.
       ]
     },
     "matches": {
-      "description": "Whether the owner and maps are what `user` gives (absent when either\nis unknown).",
+      "description": "Whether the owner and maps are what `user` gives and `setgroups` is\ndenied (absent when either is unknown).",
       "type": [
         "boolean",
         "null"
@@ -8673,6 +8673,13 @@ against both.
     "pinned": {
       "description": "Whether a user namespace is pinned there now (with `--dry-run`:\nbefore the command).",
       "type": "boolean"
+    },
+    "setgroups": {
+      "description": "The namespace's `setgroups` state, `deny` or `allow`: Kronik's\ndenies `setgroups(2)`, so that its uid 0 cannot drop the service's\nsupplementary groups (absent when it could not be read).",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "uid_map": {
       "description": "Its maps as `[inside, outside, count]` lines.",

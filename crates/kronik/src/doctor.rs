@@ -765,12 +765,28 @@ fn rootless() -> Vec<Check> {
         )
         .code(code)
         .hint("run doctor as root or as the daemon's user"),
+        (Ok(Some(p)), Ok(u))
+            if p.owner == u.uid
+                && p.maps.as_ref().ok() == Some(&u.maps())
+                && !p.denies_setgroups() =>
+        {
+            failed(
+                "pin",
+                format!(
+                    "{USERNS_PIN} has the right owner and maps, but {}",
+                    sys::SETGROUPS_ALLOWED
+                ),
+                ErrorCode::RootlessUnavailable,
+                "stop kronik.service, then sudo kronik userns unpin and sudo systemctl restart \
+                 kronik-userns, which pins a namespace that denies setgroups",
+            )
+        }
         (Ok(Some(p)), Ok(u)) if p.owner == u.uid && p.maps.as_ref().ok() == Some(&u.maps()) => {
             check(
                 "pin",
                 Status::Pass,
                 format!(
-                    "{USERNS_PIN} is owned by {} and maps 0 to it and 1-65535 to its ranges",
+                    "{USERNS_PIN} is owned by {}, maps 0 to it and 1-65535 to its ranges, and denies setgroups",
                     u.name
                 ),
             )

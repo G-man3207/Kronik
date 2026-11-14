@@ -428,7 +428,11 @@ says "`runsc` runs in rootless mode where the kernel allows it"; Kronik does
 not use `runsc --rootless`, whose limits ADR 0061 describes. The maintainers
 ratified that deviation from the brief's wording on 2026-11-13. A missing pin
 or delegation gives typed foreign unavailability (`FOREIGN_UNAVAILABLE` with
-the reason), never an automatic trusted runtime or a root fallback.
+the reason), never an automatic trusted runtime or a root fallback. The pinned
+namespace denies `setgroups(2)`: namespace root could otherwise drop the
+supplementary groups the unit runs with (`kvm`, the service user's groups) and
+so reach a file whose mode denies one of those groups, such as `0604
+root:kvm`. Every namespace made inside it inherits the denial.
 
 `serve --init` (or `serve --init --root`) installs the separate root service,
 which keeps the hardening decisions of

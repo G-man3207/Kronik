@@ -284,7 +284,20 @@ pub struct PinnedUserns {
     /// Its uid and gid maps, or why they could not be read: reading them
     /// enters the namespace, which only its owner and root may.
     pub maps: Result<(IdMap, IdMap), String>,
+    /// Its `/proc/<pid>/setgroups`, `deny` or `allow`, or why it could not be
+    /// read (as the maps).
+    pub setgroups: Result<String, String>,
 }
+
+impl PinnedUserns {
+    /// Whether `setgroups(2)` is denied in it, as [`pin_userns`] makes it.
+    pub fn denies_setgroups(&self) -> bool {
+        self.setgroups.as_deref() == Ok("deny")
+    }
+}
+
+/// Why Kronik's namespace denies `setgroups(2)`, for the operator.
+pub const SETGROUPS_ALLOWED: &str = "it allows setgroups(2), as Kronik before 0.5 pinned it: its uid 0 could drop the service's supplementary groups. Stop the service, `kronik userns unpin`, and start it again (or `kronik userns pin`)";
 
 /// What [`pin_userns`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -809,7 +822,7 @@ pub fn inspect_userns_fd(ns: &File) -> io::Result<Option<PinnedUserns>> {
         unsafe { libc::ioctl(fd, NS_GET_OWNER_UID as _, &raw mut owner) },
         "NS_GET_OWNER_UID",
     )?;
-    let maps = Helper::spawn(|| {
+    let read = Helper::spawn(|| {
         // SAFETY: setns on the inherited descriptor, in the single-threaded
         // child.
         if unsafe { libc::setns(fd, libc::CLONE_NEWUSER) } != 0 {
@@ -817,9 +830,27 @@ pub fn inspect_userns_fd(ns: &File) -> io::Result<Option<PinnedUserns>> {
         }
         Ok(None)
     })
-    .and_then(|helper| read_maps(helper.pid))
-    .map_err(|e| e.to_string());
-    Ok(Some(PinnedUserns { owner, maps }))
+    .and_then(|helper| Ok((read_maps(helper.pid)?, read_setgroups(helper.pid)?)));
+    let (maps, setgroups) = match read {
+        Ok((maps, setgroups)) => (Ok(maps), Ok(setgroups)),
+        Err(e) => (Err(e.to_string()), Err(e.to_string())),
+    };
+    Ok(Some(PinnedUserns {
+        owner,
+        maps,
+        setgroups,
+    }))
+}
+
+/// Reads `/proc/<pid>/setgroups`: `deny` or `allow`.
+fn read_setgroups(pid: libc::pid_t) -> io::Result<String> {
+    let path = format!("/proc/{pid}/setgroups");
+    let text = fs::read_to_string(&path)
+        .map_err(|e| io::Error::new(e.kind(), format!("reading {path}: {e}")))?;
+    match text.trim() {
+        state @ ("deny" | "allow") => Ok(state.to_owned()),
+        other => Err(io::Error::other(format!("{path} reads {other:?}"))),
+    }
 }
 
 /// Pins the Kronik user namespace at `path` (ADR 0060): owned by `uid`,
@@ -827,11 +858,32 @@ pub fn inspect_userns_fd(ns: &File) -> io::Result<Option<PinnedUserns>> {
 ///
 /// A child switches to `uid` and `gid` but keeps `CAP_SYS_ADMIN`, so that
 /// `uid` owns the namespace and its creation is privileged, creates it and
-/// passes its file back. This process writes both maps, each in one
-/// write(2) as the kernel requires, and bind-mounts the file at `path`
-/// (the parent directory is created with mode 0755). A namespace already
-/// pinned there with the same owner and maps is kept; mismatches are refused.
+/// passes its file back. This process denies `setgroups(2)` in it, then
+/// writes both maps, each in one write(2) as the kernel requires, and
+/// bind-mounts the file at `path` (the parent directory is created with mode
+/// 0755). A namespace already pinned there with the same owner and maps that
+/// denies `setgroups` is kept; mismatches are refused.
+///
+/// `setgroups` is denied because uid 0 of the namespace has `CAP_SETGID`
+/// there: it could otherwise drop the supplementary groups the service
+/// manager gave the unit (`kvm`, the service user's groups), and with a group
+/// the denial of a file whose mode excludes that group (`0604 root:kvm`). The
+/// kernel lets it be denied only before the gid map is written, and every
+/// namespace made inside it inherits the denial (user_namespaces(7)).
 pub fn pin_userns(uid: u32, gid: u32, uids: Range, gids: Range, path: &Path) -> io::Result<Pin> {
+    pin_userns_with(uid, gid, uids, gids, path, true)
+}
+
+/// [`pin_userns`], which a test can ask to leave `setgroups(2)` allowed, as
+/// Kronik before 0.5 did, to see that such a namespace is refused.
+fn pin_userns_with(
+    uid: u32,
+    gid: u32,
+    uids: Range,
+    gids: Range,
+    path: &Path,
+    deny_setgroups: bool,
+) -> io::Result<Pin> {
     if uid == 0
         || gid == 0
         || uid == u32::MAX
@@ -854,6 +906,15 @@ pub fn pin_userns(uid: u32, gid: u32, uids: Range, gids: Range, path: &Path) -> 
     let want = (kronik_map(uid, uids), kronik_map(gid, gids));
     let outcome = match inspect_userns(path)? {
         Some(p) if p.owner == uid && p.maps.as_ref().is_ok_and(|m| *m == want) => {
+            if !p.denies_setgroups() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "refusing to keep the pinned namespace {}: {SETGROUPS_ALLOWED}",
+                        path.display()
+                    ),
+                ));
+            }
             match validate_owned_userns(path) {
                 Ok(_) => {}
                 // A crash between the bind mount and the record leaves a
@@ -870,7 +931,10 @@ pub fn pin_userns(uid: u32, gid: u32, uids: Range, gids: Range, path: &Path) -> 
                         .open(path)?;
                     let pinned = inspect_userns_fd(&ns)?
                         .ok_or_else(|| io::Error::other("pin was replaced by a non-namespace"))?;
-                    if pinned.owner != uid || pinned.maps.as_ref().ok() != Some(&want) {
+                    if pinned.owner != uid
+                        || pinned.maps.as_ref().ok() != Some(&want)
+                        || !pinned.denies_setgroups()
+                    {
                         return Err(e);
                     }
                     write_pin_record(path, uid, &ns)?;
@@ -950,12 +1014,19 @@ pub fn pin_userns(uid: u32, gid: u32, uids: Range, gids: Range, path: &Path) -> 
         .fd
         .as_ref()
         .ok_or_else(|| io::Error::other("the helper passed no namespace"))?;
-    for (which, map) in [("uid_map", &want.0), ("gid_map", &want.1)] {
-        let file = format!("/proc/{}/{which}", helper.pid);
+    let denied = [("setgroups", "deny\n".to_owned())]
+        .into_iter()
+        .filter(|_| deny_setgroups);
+    let maps = [("uid_map", &want.0), ("gid_map", &want.1)].map(|(which, map)| {
         let text: String = map
             .iter()
             .map(|[a, b, c]| format!("{a} {b} {c}\n"))
             .collect();
+        (which, text)
+    });
+    // `setgroups` first: the kernel refuses `deny` once the gid map exists.
+    for (which, text) in denied.chain(maps) {
+        let file = format!("/proc/{}/{which}", helper.pid);
         let written = OpenOptions::new()
             .write(true)
             .open(&file)
@@ -1159,6 +1230,64 @@ pub fn threads_settled(at_most: u64) -> io::Result<u64> {
     Ok(seen)
 }
 
+/// Whether [`enter_userns`] may enter `pinned`, the namespace at `path`: it
+/// must be owned by `me`, map exactly `maps` and deny `setgroups(2)`.
+fn admissible(
+    path: &Path,
+    me: u32,
+    maps: &(IdMap, IdMap),
+    pinned: Option<PinnedUserns>,
+) -> io::Result<()> {
+    let Some(p) = pinned else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} is no pinned user namespace", path.display()),
+        ));
+    };
+    if p.owner != me {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "the user namespace {} is owned by uid {}, not by this process's uid {me}",
+                path.display(),
+                p.owner
+            ),
+        ));
+    }
+    match &p.maps {
+        Ok(m) if m != maps => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "the user namespace {} maps uids {:?} and gids {:?}, not {:?} and {:?}",
+                    path.display(),
+                    m.0,
+                    m.1,
+                    maps.0,
+                    maps.1
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(io::Error::other(format!(
+                "reading the maps of {}: {e}",
+                path.display()
+            )));
+        }
+    }
+    if !p.denies_setgroups() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to enter the user namespace {}: {SETGROUPS_ALLOWED}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Moves this process into the user namespace pinned at `path`, then into
 /// a private mount namespace of its own whose `/` receives the host's
 /// mounts but does not send its own (the network namespaces' bind mounts).
@@ -1167,8 +1296,9 @@ pub fn threads_settled(at_most: u64) -> io::Result<u64> {
 ///
 /// Refused unless the process has one thread (the kernel requires it; call
 /// this before any thread starts), the namespace is owned by this
-/// process's uid, and its uid and gid maps are `maps` exactly: never a
-/// namespace that maps host root, or ids that are not ours.
+/// process's uid, its uid and gid maps are `maps` exactly (never a
+/// namespace that maps host root, or ids that are not ours) and it denies
+/// `setgroups(2)` (see [`pin_userns`]).
 pub fn enter_userns(path: &Path, maps: &(IdMap, IdMap)) -> io::Result<()> {
     let n = threads()?;
     if n != 1 {
@@ -1202,46 +1332,7 @@ pub fn enter_userns(path: &Path, maps: &(IdMap, IdMap)) -> io::Result<()> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    match inspect_userns_fd(&ns)? {
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("{} is no pinned user namespace", path.display()),
-            ));
-        }
-        Some(p) if p.owner != me => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "the user namespace {} is owned by uid {}, not by this process's uid {me}",
-                    path.display(),
-                    p.owner
-                ),
-            ));
-        }
-        Some(p) => match p.maps {
-            Ok(m) if m == *maps => {}
-            Ok(m) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "the user namespace {} maps uids {:?} and gids {:?}, not {:?} and {:?}",
-                        path.display(),
-                        m.0,
-                        m.1,
-                        maps.0,
-                        maps.1
-                    ),
-                ));
-            }
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "reading the maps of {}: {e}",
-                    path.display()
-                )));
-            }
-        },
-    }
+    admissible(path, me, maps, inspect_userns_fd(&ns)?)?;
     // SAFETY: setns on an open namespace file; it changes this process's
     // credentials and nothing in memory.
     if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWUSER) } != 0 {
@@ -2355,6 +2446,190 @@ mod tests {
         ] {
             assert!(validate_child_cgroup("/unit", path).is_err(), "{path}");
         }
+    }
+
+    /// `enter_userns` admits only its owner's namespace with exactly its maps
+    /// that denies `setgroups(2)`; anything else is refused with the reason.
+    #[test]
+    fn only_the_owners_namespace_with_its_maps_that_denies_setgroups_is_entered() {
+        let range = Range {
+            start: 200_000,
+            count: COUNT,
+        };
+        let want = (kronik_map(1001, range), kronik_map(1001, range));
+        let path = Path::new("/run/kronik-userns/user");
+        let pinned = |owner, maps: Result<(IdMap, IdMap), String>, setgroups: &str| {
+            Some(PinnedUserns {
+                owner,
+                maps,
+                setgroups: Ok(setgroups.to_owned()),
+            })
+        };
+        admissible(path, 1001, &want, pinned(1001, Ok(want.clone()), "deny")).unwrap();
+        let allowed =
+            admissible(path, 1001, &want, pinned(1001, Ok(want.clone()), "allow")).unwrap_err();
+        assert_eq!(allowed.kind(), io::ErrorKind::PermissionDenied);
+        assert!(allowed.to_string().contains("setgroups"), "{allowed}");
+        let other = (kronik_map(1001, range), kronik_map(1002, range));
+        for (case, refused) in [
+            ("nothing pinned", admissible(path, 1001, &want, None)),
+            (
+                "another owner",
+                admissible(path, 1001, &want, pinned(1002, Ok(want.clone()), "deny")),
+            ),
+            (
+                "other maps",
+                admissible(path, 1001, &want, pinned(1001, Ok(other), "deny")),
+            ),
+            (
+                "unreadable",
+                admissible(path, 1001, &want, pinned(1001, Err("EPERM".into()), "deny")),
+            ),
+            (
+                "unreadable state",
+                admissible(
+                    path,
+                    1001,
+                    &want,
+                    Some(PinnedUserns {
+                        owner: 1001,
+                        maps: Ok(want.clone()),
+                        setgroups: Err("EPERM".into()),
+                    }),
+                ),
+            ),
+        ] {
+            assert!(refused.is_err(), "{case}");
+        }
+    }
+
+    /// The namespace `pin_userns` makes denies `setgroups(2)`: its state reads
+    /// `deny`, its uid 0 cannot call it, a namespace made inside inherits the
+    /// denial, and one that allows it (as an older pin did) is neither kept
+    /// nor admitted. The real pin, in a mount namespace made for the test so
+    /// that its bind mount never reaches the host's. Needs root; elsewhere it
+    /// says so, or fails under `KRONIK_FOREIGN_TESTS=require`.
+    #[test]
+    fn a_pinned_namespace_denies_setgroups_inside_it_and_below() {
+        if !is_root() {
+            assert!(
+                std::env::var("KRONIK_FOREIGN_TESTS").as_deref() != Ok("require"),
+                "KRONIK_FOREIGN_TESTS=require, but the pin rehearsal needs root"
+            );
+            eprintln!("skipped: the pin rehearsal needs root");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("unshare")
+            .args(["--mount", "--propagation", "private"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sys::tests::pin_rehearsal_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PIN_REHEARSAL_DIR, dir.path())
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success() && text.contains("pin rehearsal ok"),
+            "{text}"
+        );
+    }
+
+    /// The helper process of the test above; it does nothing on its own.
+    #[test]
+    #[ignore = "a helper process of the pin rehearsal"]
+    fn pin_rehearsal_child() {
+        let Some(dir) = std::env::var_os(PIN_REHEARSAL_DIR) else {
+            return;
+        };
+        let pins = Path::new(&dir).join("pins");
+        let (uid, gid) = (64_990, 64_990);
+        let range = Range {
+            start: 2_100_000_000,
+            count: COUNT,
+        };
+        let want = (kronik_map(uid, range), kronik_map(gid, range));
+        let pin = pins.join("user");
+        assert_eq!(
+            pin_userns(uid, gid, range, range, &pin).unwrap(),
+            Pin::Created
+        );
+        let pinned = inspect_userns(&pin).unwrap().unwrap();
+        assert_eq!(pinned.setgroups.as_deref(), Ok("deny"));
+        assert_eq!(pin_userns(uid, gid, range, range, &pin).unwrap(), Pin::Kept);
+        let ns = File::open(&pin).unwrap();
+        let fd = ns.as_raw_fd();
+        let inside = Helper::spawn(|| {
+            // SAFETY: system calls only, on a stack buffer and a static path,
+            // in the forked child (see `Helper::spawn`).
+            unsafe {
+                // As the daemon enters it: as the namespace's owner, which
+                // the namespace maps (a namespace can be made inside it only
+                // by a process whose ids it maps).
+                if libc::setgroups(0, std::ptr::null()) != 0 {
+                    return Err(2);
+                }
+                if libc::setresgid(gid, gid, gid) != 0 {
+                    return Err(3);
+                }
+                if libc::setresuid(uid, uid, uid) != 0 {
+                    return Err(4);
+                }
+                if libc::setns(fd, libc::CLONE_NEWUSER) != 0 {
+                    return Err(8);
+                }
+                // uid 0 of the namespace, with every capability in it.
+                if libc::setgroups(0, std::ptr::null()) == 0
+                    || *libc::__errno_location() != libc::EPERM
+                {
+                    return Err(2);
+                }
+                if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+                    return Err(6);
+                }
+                let file = libc::open(
+                    c"/proc/self/setgroups".as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                );
+                if file < 0 {
+                    return Err(7);
+                }
+                let mut state = [0u8; 8];
+                let read = libc::read(file, state.as_mut_ptr().cast(), state.len());
+                libc::close(file);
+                if read != 5 || state[..5] != *b"deny\n" {
+                    return Err(1);
+                }
+            }
+            Ok(None)
+        });
+        assert!(inside.is_ok(), "{:?}", inside.err());
+        drop(inside);
+        // A namespace that allows setgroups, as an older pin did.
+        let old = pins.join("old");
+        assert_eq!(
+            pin_userns_with(uid, gid, range, range, &old, false).unwrap(),
+            Pin::Created
+        );
+        let allowed = inspect_userns(&old).unwrap().unwrap();
+        assert_eq!(allowed.setgroups.as_deref(), Ok("allow"));
+        let kept = pin_userns(uid, gid, range, range, &old).unwrap_err();
+        assert!(kept.to_string().contains("setgroups"), "{kept}");
+        let entered = admissible(&old, uid, &want, Some(allowed)).unwrap_err();
+        assert!(entered.to_string().contains("setgroups"), "{entered}");
+        admissible(&pin, uid, &want, Some(pinned)).unwrap();
+        assert!(unpin_userns(&old).unwrap());
+        assert!(unpin_userns(&pin).unwrap());
+        println!("pin rehearsal ok");
     }
 
     #[test]

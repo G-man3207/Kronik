@@ -110,12 +110,16 @@ struct UsernsReport {
     gid_map: Option<IdMap>,
     /// Why the maps could not be read: only the owner and root may.
     maps_error: Option<String>,
+    /// The namespace's `setgroups` state, `deny` or `allow`: Kronik's
+    /// denies `setgroups(2)`, so that its uid 0 cannot drop the service's
+    /// supplementary groups (absent when it could not be read).
+    setgroups: Option<String>,
     /// The `kronik` user and its ranges, when they are set up.
     user: Option<KronikUser>,
     /// Why the `kronik` user or its ranges are missing.
     user_error: Option<String>,
-    /// Whether the owner and maps are what `user` gives (absent when either
-    /// is unknown).
+    /// Whether the owner and maps are what `user` gives and `setgroups` is
+    /// denied (absent when either is unknown).
     matches: Option<bool>,
 }
 
@@ -272,7 +276,7 @@ pub(super) fn userns(ctx: &Ctx, command: UsernsCommand) -> Result<ExitCode, Erro
             .maps
             .as_ref()
             .ok()
-            .map(|m| p.owner == u.uid && *m == u.maps()),
+            .map(|m| p.owner == u.uid && *m == u.maps() && p.denies_setgroups()),
         _ => None,
     };
     let report = UsernsReport {
@@ -284,6 +288,7 @@ pub(super) fn userns(ctx: &Ctx, command: UsernsCommand) -> Result<ExitCode, Erro
         uid_map,
         gid_map,
         maps_error,
+        setgroups: pinned.as_ref().and_then(|p| p.setgroups.clone().ok()),
         user_error: user.as_ref().err().cloned(),
         user: user.ok(),
         matches,
@@ -322,6 +327,13 @@ fn render(r: &UsernsReport) -> String {
     }
     if let Some(e) = &r.maps_error {
         out.push_str(&format!("Maps     unreadable: {e}\n"));
+    }
+    match r.setgroups.as_deref() {
+        Some("deny") => out.push_str("Groups   setgroups(2) is denied\n"),
+        Some(other) => out.push_str(&format!(
+            "Groups   setgroups(2): {other}: uid 0 there could drop the service's groups; pin it again\n"
+        )),
+        None => {}
     }
     match (&r.user, &r.user_error) {
         (Some(u), _) => out.push_str(&format!(
@@ -362,6 +374,17 @@ fn pin(path: &Path, name: &str, dry_run: bool) -> Result<Action, Error> {
             ApiError::new(ErrorCode::Internal, format!("reading {USERNS_PIN}: {e}"))
         })?;
         return Ok(match now {
+            Some(p)
+                if p.owner == user.uid
+                    && p.maps.as_ref().is_ok_and(|m| *m == want)
+                    && !p.denies_setgroups() =>
+            {
+                return Err(rootless(
+                    format!("refusing to keep {USERNS_PIN}: {}", sys::SETGROUPS_ALLOWED),
+                    "Stop consumers, then remove only the owned pin with `sudo kronik userns unpin`.",
+                )
+                .into());
+            }
             Some(p) if p.owner == user.uid && p.maps.as_ref().is_ok_and(|m| *m == want) => {
                 sys::validate_owned_userns(path).map_err(|e| {
                     ApiError::new(
@@ -583,6 +606,7 @@ mod tests {
             uid_map: None,
             gid_map: None,
             maps_error: None,
+            setgroups: None,
             user: None,
             user_error: Some("no user kronik in /etc/passwd".into()),
             matches: None,
@@ -590,5 +614,19 @@ mod tests {
         let text = render(&r);
         assert!(text.starts_with("Would pin"), "{text}");
         assert!(text.contains("no user kronik"), "{text}");
+        assert!(!text.contains("setgroups"), "{text}");
+        // A pinned namespace says whether it denies setgroups(2).
+        let denied = UsernsReport {
+            pinned: true,
+            owner: Some(1001),
+            setgroups: Some("deny".into()),
+            ..r
+        };
+        assert!(render(&denied).contains("setgroups(2) is denied"));
+        let allowed = UsernsReport {
+            setgroups: Some("allow".into()),
+            ..denied
+        };
+        assert!(render(&allowed).contains("pin it again"));
     }
 }

@@ -2220,9 +2220,12 @@ kronik foreign remove echo --reason "retire the owned echo fixture" --dry-run
 Host setup for the nonroot daemon (M21, ADR 0060). As root, creates the Kronik
 user namespace, owned by the `kronik` user, with id 0 mapped to that user and
 ids 1-65535 to its range in `/etc/subuid` and `/etc/subgid`, and pins it at
-`/run/kronik-userns/user`. A namespace already pinned there with the same owner
-and maps, and a matching root-only creation record, is kept; any other
-namespace or file at that path is refused, never replaced or adopted.
+`/run/kronik-userns/user`. The namespace denies `setgroups(2)`, so that its
+uid 0 cannot drop the supplementary groups the service runs with. A namespace
+already pinned there with the same owner and maps that denies `setgroups`, and
+a matching root-only creation record, is kept; any other namespace or file at
+that path (one pinned by an earlier version, which allows `setgroups`,
+included) is refused, never replaced or adopted.
 `kronik-userns.service` runs it before `kronik.service`. The identity files
 must be root-owned and not writable by others, and the user must not be
 root. Without user namespaces, the user or a safe range:
@@ -2252,8 +2255,9 @@ kronik userns unpin --dry-run
 
 `kronik userns status [--user <NAME>] [--json]`
 
-Whether a namespace is pinned, its owner and maps, the `kronik` user's ranges,
-and whether they match, so that the daemon can enter it. Any user may run it;
+Whether a namespace is pinned, its owner and maps, whether it denies
+`setgroups(2)`, the `kronik` user's ranges, and whether they match, so that the
+daemon can enter it. Any user may run it;
 only the owner and root can read the maps.
 
 ```sh

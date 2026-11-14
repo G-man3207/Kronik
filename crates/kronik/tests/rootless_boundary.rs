@@ -182,6 +182,9 @@ fn child(mode: &str, uid: u32, subuid: u32, subgid: u32) -> Result<()> {
         sys::enter_userns(Path::new("/run/kronik-userns/user"), &maps)?;
         assert_ne!(userns(std::process::id()), initial);
         assert_eq!(rustix::process::geteuid().as_raw(), 0);
+        // uid 0 here keeps the groups the unit was started with: setgroups(2)
+        // is denied in the namespace (and in every one made inside it).
+        assert_eq!(fs::read_to_string("/proc/self/setgroups")?.trim(), "deny");
     } else {
         assert_eq!(mode, "degraded");
         assert!(
@@ -303,6 +306,10 @@ fn owned_proof(ids: [u32; 5]) -> Result<()> {
     assert_eq!(
         sys::pin_userns(uid, gid, ranges[0], ranges[1], pin)?,
         Pin::Created
+    );
+    assert!(
+        sys::inspect_userns(pin)?.is_some_and(|p| p.denies_setgroups()),
+        "the pinned namespace allows setgroups(2)"
     );
     let held = fs::File::open(pin)?;
     let identity = held.metadata()?;
