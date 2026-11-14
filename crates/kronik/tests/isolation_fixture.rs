@@ -627,6 +627,12 @@ fn manager(root: &Path) -> Result<()> {
         fs::read_to_string("/proc/self/cgroup")?.trim() == "0::/",
         "manager cgroup namespace is not rooted"
     );
+    // The kernel refuses to mount a file system on a mount point where the
+    // same superblock is already the top mount (EBUSY, "already mounted"),
+    // and cgroup2 has one superblock for every cgroup namespace: the host's
+    // mount that this private mount namespace inherited is detached first,
+    // in this namespace only.
+    command(&["umount", "--lazy", "/sys/fs/cgroup"])?;
     command(&["mount", "-t", "cgroup2", "cgroup2", "/sys/fs/cgroup"])?;
     for path in [
         "/proc/sys",
