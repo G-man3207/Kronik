@@ -120,7 +120,8 @@ struct Dir {
 pub struct BlobStore {
     env: Env,
     data_dir: PathBuf,
-    cfg: StoreConfig,
+    /// `[blobs] disk_reserve`; a test can change it ([`BlobStore::set_reserve`]).
+    reserve: AtomicU64,
     leases: Arc<Leases>,
     /// The last free-space reading of `<data>/blobs`; `u64::MAX`: none yet.
     free: AtomicU64,
@@ -146,7 +147,7 @@ impl BlobStore {
         let store = Arc::new(BlobStore {
             env,
             data_dir: data_dir.to_path_buf(),
-            cfg,
+            reserve: AtomicU64::new(cfg.reserve),
             leases,
             free: AtomicU64::new(u64::MAX),
             prepared: tokio::sync::Mutex::new(BTreeSet::new()),
@@ -254,6 +255,13 @@ impl BlobStore {
         Ok(free)
     }
 
+    /// Test hook: changes `[blobs] disk_reserve` of a running store, so a
+    /// test can fill the store and give room back.
+    #[doc(hidden)]
+    pub fn set_reserve(&self, bytes: u64) {
+        self.reserve.store(bytes, Ordering::Relaxed);
+    }
+
     /// Sets the free-space reading (the node's disk loop, tests).
     pub fn set_free(&self, bytes: u64) {
         self.free.store(bytes, Ordering::Relaxed);
@@ -262,14 +270,15 @@ impl BlobStore {
     /// The free bytes when below `[blobs] disk_reserve`, else None.
     pub fn below_reserve(&self) -> Option<u64> {
         let free = self.free.load(Ordering::Relaxed);
-        (self.cfg.reserve > 0 && free != u64::MAX && free < self.cfg.reserve).then_some(free)
+        let reserve = self.reserve.load(Ordering::Relaxed);
+        (reserve > 0 && free != u64::MAX && free < reserve).then_some(free)
     }
 
     fn check_reserve(&self) -> Result<(), BlobError> {
         match self.below_reserve() {
             Some(free) => Err(BlobError::StoreFull {
                 free,
-                reserve: self.cfg.reserve,
+                reserve: self.reserve.load(Ordering::Relaxed),
             }),
             None => Ok(()),
         }

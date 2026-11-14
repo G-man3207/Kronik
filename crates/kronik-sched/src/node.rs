@@ -259,7 +259,18 @@ impl Job {
     }
 }
 
+/// What a job needs to run again unchanged after it met a full blob store.
+struct BlobRetry {
+    input: pb::Input,
+    key: pb::CausalKey,
+    subject: Option<String>,
+    rerun: Option<Rerun>,
+    origin: OperationOrigin,
+    born: Born,
+}
+
 /// A `TurnBegin` without a turn record, re-run at startup.
+#[derive(Clone)]
 struct Rerun {
     begin: pb::TurnBegin,
     recorded: Vec<pb::EffectRecord>,
@@ -430,6 +441,10 @@ pub struct Node {
     next_running: AtomicU64,
     /// The blob store (M25), when the node runs with blobs.
     pub(crate) blobs: Option<Arc<kronik_blob::BlobStore>>,
+    /// The `TurnBegin` (and its last effect result's LSN) of each actor's
+    /// turn that met a full blob store after writing it: the worker runs it
+    /// again as a re-run (ADR 0117 §9).
+    blob_waits: Mutex<HashMap<ActorRef, (pb::TurnBegin, u64)>>,
     /// The sandboxes behind `foreign://` (docs/design/m7-foreign.md).
     pub(crate) foreign: Option<Arc<dyn kronik_effects::foreign::ForeignHost>>,
     pub(crate) rates: RateLimiter,
@@ -924,6 +939,7 @@ impl Node {
             running_born: Mutex::new(HashMap::new()),
             next_running: AtomicU64::new(0),
             blobs,
+            blob_waits: Mutex::new(HashMap::new()),
             rates: RateLimiter::starting_full(env.clock.monotonic()),
             wheel: Mutex::new(Wheel::default()),
             wheel_notify: Arc::new(Notify::new()),
@@ -1307,6 +1323,16 @@ impl Node {
             let retry_begin = job.rerun.as_ref().map(|rerun| rerun.begin.clone());
             let retry_subject = job.subject.clone();
             let born = job.born;
+            // What an unchanged run needs, should the turn meet a full blob
+            // store (ADR 0117 §9).
+            let blob_retry = self.blobs.as_ref().map(|_| BlobRetry {
+                input: job.input.clone(),
+                key: job.causal_key.clone(),
+                subject: job.subject.clone(),
+                rerun: job.rerun.clone(),
+                origin: job.origin.clone(),
+                born,
+            });
             let mut result = self
                 .run_job(
                     &actor,
@@ -1381,6 +1407,11 @@ impl Node {
                         .await;
                 }
             }
+            if let Some(again) = blob_retry {
+                result = self
+                    .retry_blob_store_full(&actor, result, again, job.parent_time)
+                    .await;
+            }
             if let Some(lsn) = resend {
                 lock(&self.resending).remove(&lsn);
             }
@@ -1395,6 +1426,107 @@ impl Node {
             }
             self.gate.turn_ended();
         }
+    }
+
+    /// Runs a turn that met a full blob store again until there is room
+    /// (ADR 0117 §9, M25 §4.7): with backoff from 100 ms to 30 s, as a
+    /// re-run of its `TurnBegin` and recorded effects when it wrote one,
+    /// else unchanged. Nothing of a failed attempt was recorded.
+    async fn retry_blob_store_full(
+        &self,
+        actor: &ActorRef,
+        mut result: Result<TurnResult, ApiError>,
+        again: BlobRetry,
+        parent_time: u64,
+    ) -> Result<TurnResult, ApiError> {
+        const FIRST: Duration = Duration::from_millis(100);
+        const MAX: Duration = Duration::from_secs(30);
+        let mut delay = FIRST;
+        let mut attempts = 0u32;
+        while matches!(&result, Err(e) if e.code == ErrorCode::BlobStoreFull) {
+            if self.fatal().is_some() {
+                break;
+            }
+            if attempts.is_multiple_of(20) {
+                tracing::warn!(
+                    actor = %actor,
+                    attempts,
+                    "a turn is waiting for room in the blob store ([blobs] disk_reserve)"
+                );
+            }
+            attempts = attempts.saturating_add(1);
+            kronik_metrics::inc("kronik_blob_turn_retries_total", &[]);
+            self.env.clock.sleep(delay).await;
+            delay = delay.saturating_mul(2).min(MAX);
+            let begun = lock(&self.blob_waits).remove(actor);
+            result = match begun {
+                Some((begin, last_result_lsn)) => {
+                    tokio::select! {
+                        biased;
+                        () = self.store.applied.wait(last_result_lsn) => {}
+                        message = self.fatal.wait() => {
+                            return Err(ApiError::new(ErrorCode::Unavailable, message));
+                        }
+                    }
+                    let recorded = match self.store.db().open_effects(&begin.execution_id) {
+                        Ok(recorded) => recorded,
+                        Err(error) => return Err(store_err(error)),
+                    };
+                    let (Some(input), Some(key)) = (begin.input.clone(), begin.causal_key.clone())
+                    else {
+                        return Err(ApiError::new(
+                            ErrorCode::StorageCorrupt,
+                            "An open turn has no canonical input or causal key",
+                        ));
+                    };
+                    self.run_job(
+                        actor,
+                        input,
+                        key,
+                        parent_time,
+                        again.subject.clone(),
+                        Some(Rerun { begin, recorded }),
+                        OperationOrigin::Internal,
+                        again.born,
+                    )
+                    .await
+                }
+                None => {
+                    self.run_job(
+                        actor,
+                        again.input.clone(),
+                        again.key.clone(),
+                        parent_time,
+                        again.subject.clone(),
+                        again.rerun.clone(),
+                        again.origin.clone(),
+                        again.born,
+                    )
+                    .await
+                }
+            };
+        }
+        result
+    }
+
+    /// Remembers the `TurnBegin` of a turn that met a full blob store after
+    /// writing it, for [`Node::retry_blob_store_full`].
+    fn stash_blob_wait(
+        &self,
+        actor: &ActorRef,
+        begun: bool,
+        begin: &pb::TurnBegin,
+        last_result_lsn: u64,
+    ) {
+        if begun {
+            lock(&self.blob_waits).insert(actor.clone(), (begin.clone(), last_result_lsn));
+        }
+    }
+
+    /// The blob store, for tests.
+    #[doc(hidden)]
+    pub fn blob_store(&self) -> Option<&Arc<kronik_blob::BlobStore>> {
+        self.blobs.as_ref()
     }
 
     /// Queues a pending message of the mailbox.
@@ -2362,6 +2494,11 @@ impl Node {
             // store has room (ADR 0117 §9).
             Err(kronik_runtime::RunError::BlobStoreFull(message)) => {
                 let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
+                let (begun, last) = {
+                    let state = lock(&fx.state);
+                    (state.begun, state.last_result_lsn)
+                };
+                self.stash_blob_wait(actor, begun, fx.admitted_begin(), last);
                 return Err(ApiError::new(ErrorCode::BlobStoreFull, message));
             }
             Err(kronik_runtime::RunError::BlobMissing(message)) => {
@@ -2581,6 +2718,12 @@ impl Node {
         {
             return Err(match error {
                 kronik_blob::BlobError::StoreFull { .. } => {
+                    self.stash_blob_wait(
+                        actor,
+                        fxs.begun,
+                        fx.admitted_begin(),
+                        fxs.last_result_lsn,
+                    );
                     ApiError::new(ErrorCode::BlobStoreFull, error.to_string())
                 }
                 other => internal(other),

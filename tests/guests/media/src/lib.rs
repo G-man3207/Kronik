@@ -18,6 +18,9 @@
 //! - `fetch` (the body is a URL): GETs it and answers `status <s> <blob
 //!   <hash> <size> | inline <size>>`; `fetch-sum` also reads the response
 //!   body (`<size> <fnv1a-64 hex>`), `fetch-echo` answers with it.
+//! - `fetch-write` (`size=`; the body is a URL): GETs it, then writes `size`
+//!   bytes as `write` does and answers with the blob. Its turn has a
+//!   `TurnBegin` before it writes.
 //! - `post` (`url=`): POSTs the body (a blob stays a blob) and answers the
 //!   status, or the fetch error.
 //! - `remember`: stores the body's reference in state (`ref` = `<hash>
@@ -252,6 +255,18 @@ fn run(op: &str, query: &str, body: HttpBody) -> Result<Output, HandlerError> {
                 }
                 _ => respond(response.body),
             }
+        }
+        "fetch-write" => {
+            let url = match &body {
+                HttpBody::Inline(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                HttpBody::Blob(_) => return Err(HandlerError::Rejected("a URL body".into())),
+            };
+            if let Err(e) = fetch("GET", &url, HttpBody::Inline(Vec::new())) {
+                return Ok(text(fetch_error(&e)));
+            }
+            let blob = write_pattern(query_u64(query, "size", 0), MIB)
+                .map_err(|e| failed("write", &e))?;
+            respond(HttpBody::Blob(blob))
         }
         "post" => {
             let url = query_value(query, "url").unwrap_or("").to_string();

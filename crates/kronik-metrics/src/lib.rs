@@ -123,6 +123,11 @@ pub const METRICS: &[Def] = &[
         kind: Type::Gauge,
     },
     Def {
+        name: "kronik_blob_turn_retries_total",
+        help: "Runs of turns again because their blob writes met [blobs] disk_reserve.",
+        kind: Type::Counter,
+    },
+    Def {
         name: "kronik_blob_missing_total",
         help: "Reads of a committed blob whose bytes are not in the blob store (BLOB_MISSING).",
         kind: Type::Counter,

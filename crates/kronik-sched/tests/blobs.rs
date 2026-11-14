@@ -276,3 +276,81 @@ fn without_a_blob_store_blob_functions_trap() {
     assert_eq!(write.outcome.error_code, "NOT_IMPLEMENTED");
     assert!(!dir.path().join("blobs").exists());
 }
+
+/// Answers every request with 200 "ok" and counts them. A peer of the
+/// node, outside its `Env`, so it runs on an OS thread of its own.
+#[allow(clippy::disallowed_methods)]
+fn counting_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = count.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                line.clear();
+            }
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut stream = stream;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        }
+    });
+    (addr, count)
+}
+
+/// ADR 0117 §9: a turn whose blob write meets the reserve is not
+/// recorded and runs again once there is room. One that had already
+/// fetched runs again as a re-run with its recorded result, so the server
+/// sees one request and the record one effect.
+#[test]
+fn a_turn_that_meets_a_full_store_runs_again_when_there_is_room() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path(), Some(BlobsConfig::default()));
+    let owner = p.node.local_operator_authority().unwrap();
+    p.rt.block_on(p.node.grant(
+        "media",
+        "http:127.0.0.1",
+        None,
+        None,
+        kronik_effects::InForks::Recorded,
+        audit(),
+        false,
+        owner,
+    ))
+    .unwrap();
+    let (addr, requests) = counting_server();
+    let store = p.node.blob_store().unwrap().clone();
+    let body = format!("http://{addr}/doc");
+    for (op, query, fetches) in [("write", "size=5000", 0), ("fetch-write", "size=5000", 1)] {
+        store.set_reserve(u64::MAX);
+        let node = p.node.clone();
+        let input = http(op, query, inline(body.as_bytes()));
+        let pending = p.rt.spawn(async move {
+            match node
+                .ingress(ActorRef::parse("media/a").unwrap(), input, None)
+                .unwrap()
+            {
+                Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
+                Ingress::Done(r) => *r,
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        assert!(!pending.is_finished(), "{op} did not wait for room");
+        let before = requests.load(std::sync::atomic::Ordering::SeqCst);
+        store.set_reserve(0);
+        let r = p.rt.block_on(pending).unwrap();
+        let blob = blob_answer(&r);
+        assert_eq!(blob.size, 5000);
+        let expected: Vec<u8> = (0..5000u64).map(pattern).collect();
+        assert_eq!(p.stored(dir.path(), &blob), expected);
+        // The re-run used the recorded fetch: no request after the first.
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), before);
+        let record = p.record(&r);
+        assert_eq!(record.effects.len(), fetches, "{op}");
+    }
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

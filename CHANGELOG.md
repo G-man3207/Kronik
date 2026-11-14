@@ -221,9 +221,12 @@ until the v1.0 compatibility promise takes effect.
   revealed, named durably before the turn's record is appended, and covered
   by the turn's lease until the record is applied; a fetch whose body is a
   reference the turn may not use is a recorded denial (`BLOB_NOT_HELD`).
-  New codes `BLOB_STORE_FULL` (503) and `BLOB_MISSING` (500), the health
-  field `blobs_low_disk`, and the metrics `kronik_blob_written_bytes_total`,
-  `kronik_blob_read_bytes_total`, `kronik_blob_store_below_reserve` and
+  A turn whose blob write meets `[blobs] disk_reserve` is not recorded and
+  runs again once there is room, as a re-run with its recorded effects when
+  it had begun. New codes `BLOB_STORE_FULL` (503) and `BLOB_MISSING` (500),
+  the health field `blobs_low_disk`, and the metrics
+  `kronik_blob_written_bytes_total`, `kronik_blob_read_bytes_total`,
+  `kronik_blob_store_below_reserve`, `kronik_blob_turn_retries_total` and
   `kronik_blob_missing_total`.
 - Three new per-kind limits (M25, M26): `blob_threshold_bytes` (bodies above
   it become blobs for code that imports `blobs`, 1 MiB, never above

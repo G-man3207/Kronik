@@ -205,6 +205,7 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_blob_written_bytes_total` | counter | Bytes of new blobs, by source (guest, upload, effect). |
 | `kronik_blob_read_bytes_total` | counter | Blob bytes read, by reader (guest, gateway, ship, api). |
 | `kronik_blob_store_below_reserve` | gauge | 1 while the blob store is below [blobs] disk_reserve: no new blobs are written. |
+| `kronik_blob_turn_retries_total` | counter | Runs of turns again because their blob writes met [blobs] disk_reserve. |
 | `kronik_blob_missing_total` | counter | Reads of a committed blob whose bytes are not in the blob store (BLOB_MISSING). |
 | `kronik_gateway_requests_total` | counter | HTTP requests answered by the gateway, by status code. |
 | `kronik_gateway_request_duration_seconds` | histogram | Time to answer an HTTP request at the gateway, by status code. |
