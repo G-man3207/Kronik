@@ -763,6 +763,14 @@ impl Hub {
     pub fn attach(&self, conn: &str, transport: Arc<dyn Transport>) -> Result<(), ApiError> {
         let wake = {
             let mut inner = lock(&self.inner);
+            // An open that committed during a graceful stop gets its close
+            // from the next start (review L6).
+            if inner.stopping {
+                return Err(ApiError::new(
+                    ErrorCode::Unavailable,
+                    "the node is stopping",
+                ));
+            }
             let Some(live) = inner.live.get_mut(conn) else {
                 return Err(ApiError::new(
                     ErrorCode::Unavailable,

@@ -608,3 +608,34 @@ async fn sse_streams_do_not_hold_http_slots() {
     assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
     assert_eq!(node.hub().live(), 4);
 }
+
+/// Review L4: when the host ends an SSE stream, the frames hyper took
+/// count as written, the last one included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_sse_host_close_counts_every_frame_hyper_took() {
+    let cfg = quick();
+    let (_dir, node) = node(cfg.clone()).await;
+    for text in ["one", "two", "three"] {
+        say(&node, text).await;
+    }
+    let gw = Gateway::new(node.clone(), GatewayConfig::default());
+    let answer = gw
+        .open_connection(request("/room/lobby/events?user=ada", false))
+        .await;
+    let conn = answer.connection.unwrap();
+    let (chunks, mut body) = tokio::sync::mpsc::channel(1);
+    let driver = tokio::spawn(kronik_gateway::connections::sse::drive(
+        node.hub().clone(),
+        conn.clone(),
+        chunks,
+    ));
+    for _ in 0..3 {
+        body.recv().await.unwrap();
+    }
+    node.hub().close_host(&conn, pb::CloseCause::Operator);
+    let reader = tokio::spawn(async move { while body.recv().await.is_some() {} });
+    let row = closed(&node, &conn).await;
+    assert_eq!(row.frames_written, Some(3), "{row:?}");
+    driver.await.unwrap();
+    reader.await.unwrap();
+}

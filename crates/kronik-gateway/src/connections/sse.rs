@@ -6,7 +6,8 @@
 //! reads. A frame counts as written when hyper has taken it from the
 //! channel, which the driver learns when it gets room for the next chunk.
 //! The stream ends after the actor's close, or at once on a host close (a
-//! graceful stop sends `retry: 5000` first, so browsers reconnect in 5 s);
+//! graceful stop sends a `retry:` of 2 to 8 s first, spread per stream, so
+//! browsers do not all reconnect at once);
 //! a client that goes away drops the body, which the driver notices and
 //! reports as the client's close. SSE has no incoming frames.
 //!
@@ -27,9 +28,17 @@ use tokio::sync::{Notify, mpsc};
 /// The comment an idle stream gets every `sse_heartbeat`.
 pub const HEARTBEAT: &[u8] = b": keep-alive\n\n";
 
-/// What a graceful stop tells browsers before the stream ends: reconnect in
-/// 5 s.
-pub const RETRY_AFTER_RESTART: &[u8] = b"retry: 5000\n\n";
+/// What a graceful stop tells a browser before the stream ends: reconnect
+/// after 2 to 8 s, spread per stream so that a restart's reconnects do not
+/// all come at once (review L2).
+pub fn retry_after_restart(conn: &str) -> Vec<u8> {
+    let spread = u64::from_le_bytes(
+        blake3::hash(conn.as_bytes()).as_bytes()[..8]
+            .try_into()
+            .unwrap_or([0; 8]),
+    ) % 6000;
+    format!("retry: {}\n\n", 2000 + spread).into_bytes()
+}
 
 /// One SSE event of a frame: `id:` and `event:` when not empty, then one
 /// `data:` line per line of the data (CRLF and CR become LF), then an empty
@@ -143,10 +152,14 @@ pub async fn drive(hub: Arc<Hub>, conn: String, out: mpsc::Sender<Vec<u8>>) {
     let mut unconfirmed: Option<u64> = None;
     'run: loop {
         if let Some(code) = transport.host_close() {
-            if code == RESTART_CODE {
-                let _ =
-                    tokio::time::timeout(cfg.close_timeout, out.send(RETRY_AFTER_RESTART.to_vec()))
-                        .await;
+            // Room for one more chunk: hyper took the last frame (L4).
+            if let Ok(Ok(permit)) = tokio::time::timeout(cfg.close_timeout, out.reserve()).await {
+                if let Some(prev) = unconfirmed.take() {
+                    hub.written(&conn, prev);
+                }
+                if code == RESTART_CODE {
+                    permit.send(retry_after_restart(&conn));
+                }
             }
             break 'run;
         }
@@ -236,5 +249,24 @@ mod tests {
         // A line break in a field cannot end it early.
         let e = encode(&frame(pb::frame::Kind::Event, "x", "a\nb", "1\r2"));
         assert_eq!(e, b"id: 1 2\nevent: a b\ndata: x\n\n");
+    }
+
+    /// Review L2: the retry hint after a restart is between 2 and 8 s, the
+    /// same for one stream and spread across streams.
+    #[test]
+    fn the_restart_retry_is_spread_per_stream() {
+        let retry = |conn: &str| {
+            let text = String::from_utf8(retry_after_restart(conn)).unwrap();
+            text.trim_start_matches("retry: ")
+                .trim_end()
+                .parse::<u64>()
+                .unwrap()
+        };
+        let a = "c-00000000000000000000000000000001";
+        assert_eq!(retry(a), retry(a));
+        let spread: std::collections::BTreeSet<u64> =
+            (0..50).map(|i| retry(&format!("c-{i:032x}"))).collect();
+        assert!(spread.iter().all(|r| (2000..8000).contains(r)));
+        assert!(spread.len() > 40, "{spread:?}");
     }
 }

@@ -11,6 +11,7 @@
 //! `anon`, no subject):
 //! - `deny=1` refuses with 403, `fail=1` fails the open turn, `call=1` first
 //!   calls `room/callee` (`ping`), so the open turn has a `TurnBegin`;
+//!   `headers=<n>` adds `n` headers to the accept;
 //! - a WebSocket gets a `welcome` frame; an SSE stream gets the messages
 //!   after its `Last-Event-ID` (at most 100);
 //! - the other members get `joined`; the subprotocol `room.v1` is selected

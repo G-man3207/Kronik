@@ -306,12 +306,23 @@ impl ConnectionGuest for Room {
         } else {
             req.subprotocols.iter().find(|p| *p == "room.v1").cloned()
         };
+        let mut headers = vec![Header {
+            name: "x-room".to_string(),
+            value: context::self_ref().key,
+        }];
+        // `headers=<n>`: as many more (the host bounds them).
+        for i in 0..query_value(&q, "headers")
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(0)
+        {
+            headers.push(Header {
+                name: format!("x-h{i}"),
+                value: "v".to_string(),
+            });
+        }
         Ok(OpenReply::Accept(Accept {
             subprotocol,
-            headers: vec![Header {
-                name: "x-room".to_string(),
-                value: context::self_ref().key,
-            }],
+            headers,
             subject: query_value(&q, "user").map(|u| format!("user:{u}")),
         }))
     }

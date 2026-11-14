@@ -38,6 +38,12 @@ until the v1.0 compatibility promise takes effect.
   before it reads any connection; invalid UTF-8 closes with 1007, and a
   client that drops the connection without a close is a client close
   (1006).
+- Smaller connection fixes (M24 review): an SSE stream's `retry:` hint
+  after a restart is 2 to 8 s, spread per stream; an SSE stream the host
+  ends counts its last frame as written; an open's accept sets at most 64
+  headers of 16 KiB together; nothing attaches during a graceful stop.
+  The security guide covers `Origin` checks and bearer tokens in
+  `Sec-WebSocket-Protocol`.
 - The gateway serves WebSocket routes (M24): an upgrade to a `WEBSOCKET`
   route opens a connection whose owner's open turn accepts it, and the
   client gets `101 Switching Protocols` (with the selected subprotocol and

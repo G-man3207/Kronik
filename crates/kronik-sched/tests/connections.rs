@@ -743,3 +743,19 @@ fn the_queues_share_a_node_wide_budget() {
         }
     }
 }
+
+/// Review L6: during a graceful stop no transport attaches, also to an open
+/// that committed meanwhile; the next start closes it.
+#[test]
+fn nothing_attaches_during_a_graceful_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy(ROOM, false).unwrap();
+    let (a, r) = p.open("lobby", "user=ada");
+    assert!(r.committed(), "{r:?}");
+    p.rt.block_on(p.node.hub().shutdown(Duration::from_millis(100)));
+    let err = RecordingTransport::attach(p.node.hub(), &a)
+        .err()
+        .expect("no attach while stopping");
+    assert_eq!(err.code, ErrorCode::Unavailable, "{err:?}");
+}

@@ -298,7 +298,7 @@ async fn sse_streams_end_to_end() {
     );
     drop(eve);
 
-    // A graceful stop: `retry: 5000`, then the end.
+    // A graceful stop: a `retry:` of 2 to 8 s, then the end.
     let mut cid = Stream::open(
         s.addr,
         "/room/lobby/events?user=cid",
@@ -316,7 +316,8 @@ async fn sse_streams_end_to_end() {
         match cid.block().await {
             Some(b) if b.starts_with(':') => continue,
             Some(b) => {
-                assert_eq!(b, "retry: 5000");
+                let ms: u64 = b.strip_prefix("retry: ").unwrap().parse().unwrap();
+                assert!((2000..8000).contains(&ms), "{b}");
                 break;
             }
             None => panic!("the stream ended without retry"),

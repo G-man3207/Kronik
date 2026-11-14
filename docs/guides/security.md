@@ -353,6 +353,26 @@ page runs in an opaque origin and cannot read or use the production
 site's cookies.
 Prefer a preview domain wherever previews take traffic from browsers.
 
+## WebSocket and SSE connections
+
+- **Check `Origin` in `open`.** Browsers send cookies and an `Origin`
+  header with a WebSocket handshake, and the gateway does not check
+  `Origin` (cross-site WebSocket hijacking). An actor that authenticates
+  by cookie must check it in its open handler, as the chat example does.
+- **Tokens in `Sec-WebSocket-Protocol`.** Browsers cannot set
+  `Authorization` on a WebSocket, so apps pass bearer tokens in this
+  header. Kronik records it like `Authorization`: as a header of the open's
+  request, sealed when the request has a subject (`privacy.subject_from`),
+  and shown by the API only to callers with `pii:read`. An open without a
+  subject, the usual browser case, is recorded in plain text, so the log,
+  snapshots, backups and forks hold the token: prefer short-lived tokens,
+  or set a subject for the request. The accept records only the selected
+  subprotocol's position, never its value.
+- **Caps and memory.** Connections are capped in total, per actor and per
+  client (the forwarded client behind a trusted proxy, an IPv6 /64), and
+  their buffers per connection and node-wide (`[connections]`). A client
+  that stops reading is closed as a slow consumer within `ping_timeout`.
+
 ## Root
 
 `kronik serve --init` installs the root service of v0.1 to v0.4. Its opt-in
