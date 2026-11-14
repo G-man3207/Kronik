@@ -219,6 +219,20 @@ after the actor's `last_lsn`, so a turn's charge depends only on the log
 up to the actor's last turn. The actor's next turn record deletes the
 release.
 
+Known bounds (v0.5): two kinds of rows keep blobs without counting against
+any actor's quota.
+- A reply's blobs, in the caller's delivery (source 5). One per call the
+  caller made. They stay pinned until the floor passes the reply and no
+  turn older than it is open: normally `[retention] history` after it.
+- The dead letter of an input without a sending actor (an HTTP request, a
+  connection's frame or close). It keeps its blobs until it is resent or
+  erased: at most `upload_bytes` per failed request, with no cap on how
+  many. A connection's dead letters are capped at the newest 10 000,
+  node-wide.
+
+An operator watches both with `kronik dead-letters list` and the blob
+store's size (`kronik blobs status`).
+
 ### 5.2 Applying records
 
 The applier (single writer, LSN order, the same transaction as
