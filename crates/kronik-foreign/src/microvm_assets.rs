@@ -911,6 +911,13 @@ mod tests {
         let (_fixture, mut assets) = fixture();
         // Only filesystem tools execute here; the full pinned-asset/KVM gate stays separate.
         for name in ["mke2fs", "debugfs", "e2fsck"] {
+            // The fixture's placeholder is read-only (0500): a copy over it is
+            // refused to anyone but root, and the builder runs unprivileged.
+            match fs::remove_file(assets.dir.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("removing the placeholder {name}: {error}"),
+            }
             fs::copy(source.join(name), assets.dir.join(name)).unwrap();
             fs::set_permissions(assets.dir.join(name), Permissions::from_mode(0o500)).unwrap();
         }
