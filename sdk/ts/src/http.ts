@@ -1,7 +1,7 @@
 // HTTP for actors: the incoming request, outgoing requests and their
 // responses, and secret handles. No host calls here.
 
-import type { HttpRequest, Message as WitMessage } from 'kronik:actor/types@0.1.1';
+import type { BlobRef as WitBlobRef, HttpBody, HttpRequest, Message as WitMessage } from 'kronik:actor/types@0.1.1';
 import type { HeaderValue, Request as WitRequest, Response as WitResponse } from 'kronik:actor/http-client@0.1.1';
 import { KronikError } from './errors.ts';
 
@@ -20,6 +20,54 @@ export function own(bytes: ArrayBufferView): Uint8Array {
 /** Whether `value` is a `Uint8Array`, of this realm or another. */
 export function isBytes(value: unknown): value is Uint8Array {
   return value instanceof Uint8Array || Object.prototype.toString.call(value) === '[object Uint8Array]';
+}
+
+/** The most bytes one blob call moves: 1 MiB. */
+export const BLOB_CALL_BYTES = 1 << 20;
+
+/**
+ * A blob's frame: the store reads and checks whole frames, and a read is
+ * charged for every frame it touches, so readers fetch whole frames.
+ */
+export const BLOB_FRAME_BYTES = 1 << 16;
+
+/**
+ * A blob: a large body kept outside the log and named by its hash (see
+ * `kronik explain blob`). A handler gets one as `req.blob` or `res.blob`, or
+ * from `ctx.blobs.writer().finish()`, and may use it in the turn that got it:
+ * read it (`ctx.blobs`), answer with it (`ctx.blob`), or send it
+ * (`ctx.http.fetch({ body: blob })`).
+ */
+export class BlobRef {
+  /** `b3:<hex>`, or `b3s:<hex>` for a data subject's blob. */
+  readonly hash: string;
+  /** The blob's size in bytes. */
+  readonly size: bigint;
+
+  constructor(hash: string, size: bigint) {
+    this.hash = hash;
+    this.size = size;
+  }
+
+  /** The WIT value. */
+  toWit(): WitBlobRef {
+    return { hash: this.hash, size: this.size };
+  }
+}
+
+/** Reads a whole blob into memory; the turn's host calls (`ctx.blobs`). */
+export type BlobReader = (blob: BlobRef) => Uint8Array;
+
+/** An inline body's bytes, or its blob. */
+function splitBody(body: HttpBody): { inline?: Uint8Array; blob?: BlobRef } {
+  return body.tag === 'inline' ? { inline: own(body.val) } : { blob: new BlobRef(body.val.hash, body.val.size) };
+}
+
+/** The bytes of a body that is `inline` or a `blob` read with `read`. */
+function wholeBody(inline: Uint8Array | undefined, blob: BlobRef | undefined, read: BlobReader | undefined, what: string): Uint8Array {
+  if (inline !== undefined) return inline;
+  if (!blob || !read) throw new KronikError('blob', `${what} is a blob that this value cannot read`, '', 'blob');
+  return read(blob);
 }
 
 /** A body: bytes, text (UTF-8), or any other value as JSON. */
@@ -81,16 +129,31 @@ export class Request {
   /** The route parameters, such as `key` for `/notes/{key}`. */
   readonly params: Record<string, string>;
   readonly headers: Array<{ name: string; value: string }>;
-  /** The body's bytes (inline; a blob body, from M25, is empty here). */
-  readonly body: Uint8Array;
+  /** The body's blob, when the gateway stored a large body as one; else `undefined`. */
+  readonly blob: BlobRef | undefined;
+  #inline: Uint8Array | undefined;
+  readonly #read: BlobReader | undefined;
 
-  constructor(req: HttpRequest) {
+  constructor(req: HttpRequest, read?: BlobReader) {
     this.method = req.method;
     this.path = req.path;
     this.query = req.query;
     this.params = Object.fromEntries(req.params);
     this.headers = req.headers;
-    this.body = req.body.tag === 'inline' ? own(req.body.val) : new Uint8Array();
+    const { inline, blob } = splitBody(req.body);
+    this.#inline = inline;
+    this.blob = blob;
+    this.#read = read;
+  }
+
+  /**
+   * The body's bytes. A blob body is read on first use, whole, within the
+   * guest's memory limit (64 MiB by default); read a larger one in parts
+   * with `ctx.blobs.stream(req.blob)`.
+   */
+  get body(): Uint8Array {
+    this.#inline ??= wholeBody(this.#inline, this.blob, this.#read, 'the request body');
+    return this.#inline;
   }
 
   /** The route parameter `name`. */
@@ -180,8 +243,12 @@ export interface FetchRequest {
   url: string;
   /** Header values are text, or a secret's value inserted by the host (`ctx.secret(name).header()`). */
   headers?: Record<string, string | SecretHeader>;
-  /** Bytes, text, or a value sent as JSON (which also sets `content-type`). */
-  body?: Body;
+  /**
+   * Bytes, text, a value sent as JSON (which also sets `content-type`), or a
+   * blob, streamed from the blob store (`application/octet-stream` unless
+   * `headers` say otherwise).
+   */
+  body?: Body | BlobRef;
 }
 
 export function toWitRequest(req: FetchRequest): WitRequest {
@@ -193,6 +260,10 @@ export function toWitRequest(req: FetchRequest): WitRequest {
       name,
       value: value instanceof SecretHeader ? { tag: 'secret', val: { name: value.secret, template: value.template } } : { tag: 'text', val: value },
     });
+  }
+  if (req.body instanceof BlobRef) {
+    if (!hasContentType) headers.push({ name: 'content-type', value: { tag: 'text', val: 'application/octet-stream' } });
+    return { method: req.method ?? 'GET', url: req.url, headers, body: { tag: 'blob', val: req.body.toWit() } };
   }
   let bytes: Uint8Array = new Uint8Array();
   if (req.body !== undefined) {
@@ -207,12 +278,27 @@ export function toWitRequest(req: FetchRequest): WitRequest {
 export class FetchResponse {
   readonly status: number;
   readonly headers: Array<[string, string]>;
-  readonly body: Uint8Array;
+  /** The body's blob, when the host stored a large response as one; else `undefined`. */
+  readonly blob: BlobRef | undefined;
+  #inline: Uint8Array | undefined;
+  readonly #read: BlobReader | undefined;
 
-  constructor(res: WitResponse) {
+  constructor(res: WitResponse, read?: BlobReader) {
     this.status = res.status;
     this.headers = res.headers;
-    this.body = res.body.tag === 'inline' ? own(res.body.val) : new Uint8Array();
+    const { inline, blob } = splitBody(res.body);
+    this.#inline = inline;
+    this.blob = blob;
+    this.#read = read;
+  }
+
+  /**
+   * The body's bytes. A blob body is read on first use, whole, within the
+   * guest's memory limit; read a larger one with `ctx.blobs.stream(res.blob)`.
+   */
+  get body(): Uint8Array {
+    this.#inline ??= wholeBody(this.#inline, this.blob, this.#read, 'the response body');
+    return this.#inline;
   }
 
   /** Whether the status is 2xx. */

@@ -4,6 +4,7 @@ import { emit, type Level } from 'kronik:actor/log@0.1.1';
 import type { HandlerError, Input, Manifest, Output, Route } from 'kronik:actor/types@0.1.1';
 import type { Closed as WitClosed, IncomingFrame as WitIncomingFrame, OpenReply, OpenRequest as WitOpenRequest } from 'kronik:actor/connections@0.1.1';
 import { type Closed, closedOf, IncomingFrame, OpenRequest, refusal, toOpenReply } from './connections.ts';
+import { readBlob } from './blobs.ts';
 import { Ctx } from './ctx.ts';
 import { Rejected } from './errors.ts';
 import { Message, Request, toJson } from './http.ts';
@@ -146,7 +147,7 @@ function dispatch(spec: ActorSpec, input: Input, ctx: Ctx): Output | Promise<Out
   switch (input.tag) {
     case 'http':
       if (!spec.http) throw new Rejected(unhandled(ctx, 'HTTP requests', 'http', 'actor'));
-      return spec.http(new Request(input.val), ctx);
+      return spec.http(new Request(input.val, readBlob), ctx);
     case 'message':
       if (!spec.message) throw new Rejected(unhandled(ctx, 'messages', 'message', 'message'));
       return spec.message(new Message(input.val.msg, input.val.sender), ctx);

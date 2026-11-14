@@ -85,12 +85,19 @@ interface ReadableStreamDefaultController<R> {
   error(reason?: unknown): void;
 }
 
+interface ReadableStreamDefaultReader<R> {
+  read(): Promise<{ done: true; value?: undefined } | { done: false; value: R }>;
+  cancel(reason?: unknown): Promise<void>;
+  releaseLock(): void;
+}
+
 declare class ReadableStream<R = unknown> {
   constructor(source?: {
     start?(controller: ReadableStreamDefaultController<R>): void | Promise<void>;
     pull?(controller: ReadableStreamDefaultController<R>): void | Promise<void>;
     cancel?(reason?: unknown): void | Promise<void>;
   });
+  getReader(): ReadableStreamDefaultReader<R>;
 }
 
 interface RequestInit {

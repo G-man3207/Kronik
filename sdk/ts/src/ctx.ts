@@ -13,8 +13,9 @@ import { setSubject, currentSubject } from 'kronik:actor/privacy@0.1.1';
 import { broadcast as connBroadcast, close as connClose, send as connSend, sendNow as connSendNow, type OpenReply } from 'kronik:actor/connections@0.1.1';
 import type { ActorRef, Message as WitMessage, Output } from 'kronik:actor/types@0.1.1';
 import { accept, type AcceptOptions, type FrameLike, sendNowFailure, toWitFrame } from './connections.ts';
+import { Blobs, readBlob } from './blobs.ts';
 import { hostError } from './errors.ts';
-import { type Body, encodeBody, FetchResponse, type FetchRequest, json, Message, own, Secret, text, toJson, toWitRequest } from './http.ts';
+import { type Body, BlobRef, encodeBody, FetchResponse, type FetchRequest, json, Message, own, Secret, text, toJson, toWitRequest } from './http.ts';
 import { hasOrderBy, SqlRows, toSql, type SqlParam } from './sql.ts';
 
 const encoder = new TextEncoder();
@@ -138,7 +139,7 @@ export class Http {
   /** Sends `request` and waits for the response. */
   fetch(request: FetchRequest): FetchResponse {
     try {
-      return new FetchResponse(httpFetch(toWitRequest(request)));
+      return new FetchResponse(httpFetch(toWitRequest(request)), readBlob);
     } catch (e) {
       throw hostError('fetch', e);
     }
@@ -292,7 +293,7 @@ export class Log {
 /**
  * A turn's access to the host: the names Kronik's SDKs share (`state`,
  * `sql`, `send`, `call`, `http.fetch`, `crypto`, `timers`, `now`, `random`,
- * `causalId`, `secret`, `subject`, `log`) and helpers for outputs.
+ * `causalId`, `secret`, `subject`, `log`, `blobs`) and helpers for outputs.
  */
 export class Ctx {
   readonly state = new State();
@@ -304,6 +305,7 @@ export class Ctx {
   readonly timers = new Timers();
   readonly random = new Random();
   readonly connections = new Connections();
+  readonly blobs = new Blobs();
 
   /** Sends a message to `to`: buffered, delivered exactly once, only if this turn commits. */
   send(to: ActorLike, msg: OutgoingMessage): void {
@@ -373,6 +375,14 @@ export class Ctx {
   text(status: number, body: string): Output {
     const bytes = encoder.encode(body);
     return { tag: 'http', val: { status, headers: [{ name: 'content-type', value: 'text/plain; charset=utf-8' }], body: { tag: 'inline', val: bytes } } };
+  }
+
+  /**
+   * An HTTP response whose body is `blob` (one the turn got or wrote): the
+   * gateway streams it from the blob store.
+   */
+  blob(status: number, blob: BlobRef, contentType = 'application/octet-stream'): Output {
+    return { tag: 'http', val: { status, headers: [{ name: 'content-type', value: contentType }], body: { tag: 'blob', val: blob.toWit() } } };
   }
 
   /** An HTTP response with no body, such as 404. */

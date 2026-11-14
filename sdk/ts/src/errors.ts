@@ -65,6 +65,12 @@ const messages: Record<string, Record<string, [string, string]>> = {
     denied: ['crypto denied', 'secret-handle'],
     unsupported: ['crypto not supported', 'NOT_IMPLEMENTED'],
   },
+  blob: {
+    'not-held': ['the turn neither holds nor borrows this blob', 'BLOB_NOT_HELD'],
+    'quota-exceeded': ["over the actor's blob quota", 'blob'],
+    erased: ['the blob belonged to an erased subject', 'SUBJECT_ERASED'],
+    invalid: ['blob call outside its limits', 'blob'],
+  },
 };
 
 /**
@@ -72,7 +78,7 @@ const messages: Record<string, Record<string, [string, string]>> = {
  * ComponentizeJS throws a `ComponentError` whose `payload` is the WIT error
  * value: a variant for `area`, or a string for `reveal`.
  */
-export function hostError(area: 'sql' | 'fetch' | 'call' | 'crypto' | 'reveal', thrown: unknown): KronikError {
+export function hostError(area: 'sql' | 'fetch' | 'call' | 'crypto' | 'blob' | 'reveal', thrown: unknown): KronikError {
   const payload = (thrown as { payload?: unknown } | null)?.payload;
   if (area === 'reveal') {
     const detail = typeof payload === 'string' ? payload : String(thrown);

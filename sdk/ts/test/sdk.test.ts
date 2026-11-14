@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
 import { explainTopic, hostError, KronikError } from '../src/errors.ts';
-import { encodeBody, json, own, Request, Secret, toJson, toWitRequest } from '../src/http.ts';
+import { BlobRef, encodeBody, FetchResponse, json, own, Request, Secret, toJson, toWitRequest } from '../src/http.ts';
 import { fromSql, hasOrderBy, SqlRows, toSql } from '../src/sql.ts';
 import { accept, closedOf, Frame, IncomingFrame, OpenRequest, OutcomeUnknown, refusal, sendNowFailure, toOpenReply, toWitFrame } from '../src/connections.ts';
 
@@ -199,4 +199,54 @@ test('send-now failures: closed is false, the rest throw', () => {
   assert.equal(denied.kind, 'send-now.denied');
   assert.equal(denied.topic, 'CAPABILITY_NOT_GRANTED');
   assert.equal((sendNowFailure(new Error('boom')) as KronikError).kind, 'send-now.unknown');
+});
+
+test('a blob body is read once, when first used', () => {
+  let reads = 0;
+  const read = (b: BlobRef) => {
+    reads++;
+    assert.equal(b.hash, 'b3:' + 'ab'.repeat(32));
+    return new TextEncoder().encode('{"big":true}');
+  };
+  const blob = { hash: 'b3:' + 'ab'.repeat(32), size: 12n };
+  const req = new Request({ method: 'POST', path: '/p', query: '', params: [], headers: [], body: { tag: 'blob', val: blob } }, read);
+  assert.ok(req.blob instanceof BlobRef);
+  assert.equal(req.blob?.size, 12n);
+  assert.equal(reads, 0);
+  assert.deepEqual(req.json(), { big: true });
+  assert.equal(req.text(), '{"big":true}');
+  assert.equal(reads, 1);
+  const inline = new Request({ method: 'POST', path: '/p', query: '', params: [], headers: [], body: { tag: 'inline', val: new Uint8Array([1]) } }, read);
+  assert.equal(inline.blob, undefined);
+  assert.deepEqual(inline.body, new Uint8Array([1]));
+  assert.equal(reads, 1);
+  // Without a reader (a value built outside a turn) a blob body cannot be read.
+  const unread = new Request({ method: 'GET', path: '/p', query: '', params: [], headers: [], body: { tag: 'blob', val: blob } });
+  assert.throws(() => unread.body, /the request body is a blob that this value cannot read/);
+});
+
+test('a fetch response may be a blob, read lazily', () => {
+  const blob = { hash: 'b3:' + 'cd'.repeat(32), size: 3n };
+  const res = new FetchResponse({ status: 200, headers: [], body: { tag: 'blob', val: blob } }, () => new Uint8Array([7, 8, 9]));
+  assert.equal(res.blob?.hash, blob.hash);
+  assert.deepEqual(res.body, new Uint8Array([7, 8, 9]));
+});
+
+test('a blob is sent as a fetch body as it is', () => {
+  const blob = new BlobRef('b3:' + 'ef'.repeat(32), 5n);
+  const req = toWitRequest({ method: 'PUT', url: 'https://x.example/up', body: blob });
+  assert.deepEqual(req.body, { tag: 'blob', val: { hash: blob.hash, size: 5n } });
+  assert.deepEqual(req.headers, [{ name: 'content-type', value: { tag: 'text', val: 'application/octet-stream' } }]);
+  const typed = toWitRequest({ method: 'PUT', url: 'https://x.example/up', headers: { 'Content-Type': 'application/pdf' }, body: blob });
+  assert.deepEqual(typed.headers, [{ name: 'Content-Type', value: { tag: 'text', val: 'application/pdf' } }]);
+  // A plain object with the same fields is a JSON body, not a blob.
+  const json = toWitRequest({ method: 'POST', url: 'https://x.example/', body: { hash: blob.hash, size: 5 } });
+  assert.equal(json.body.tag, 'inline');
+});
+
+test('blob errors name their code', () => {
+  assert.equal(hostError('blob', { payload: { tag: 'not-held' } }).topic, 'BLOB_NOT_HELD');
+  assert.equal(hostError('blob', { payload: { tag: 'quota-exceeded' } }).topic, 'blob');
+  assert.equal(hostError('blob', { payload: { tag: 'erased' } }).message, 'the blob belonged to an erased subject (see `kronik explain SUBJECT_ERASED`)');
+  assert.equal(hostError('blob', { payload: { tag: 'invalid', val: 'more than 1 MiB in one call' } }).kind, 'blob.invalid');
 });
