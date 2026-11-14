@@ -541,6 +541,7 @@ of the Rust ones, with the same routes and JSON.
 | `notes-rs` | `notes-ts` | `notes-py` | `notes-go` | Notes in SQL state, paged, with a two-step migration |
 | | `todo-ts` | | | To-do lists with a timer that removes done items a day later |
 | | `chat-ts` | | | Chat rooms over WebSocket, followers over SSE, a bot that streams with `sendNow`; `src/step2.ts` changes the message format ([Connections](connections.md)) |
+| | `media-ts` | | | Image albums that hold their images as blobs, share them by message, import them by URL and let them expire by timer (M26) |
 | `webhook-relay-rs` | `webhook-relay-ts` | `webhook-relay-py` | `webhook-relay-go` | Signed webhook forwarding with retries by timer |
 | | `billing-ts` | | | Invoices with VAT, a `call` to a ledger with a compensation, charges through `payments.internal`; `src/eu-vat.ts` is the change to propose |
 

@@ -6,6 +6,7 @@
     "billing-ts",
     "chat-ts",
     "counter-ts",
+    "media-ts",
     "notes-ts",
     "todo-ts",
     "uptime-ts",

@@ -6,6 +6,7 @@
 #                                          for M1_GUESTS=ts
 #   counter-ts-step2.wasm                  counter-ts adding 2, for the M3
 #                                          demo (COUNTER_NEW)
+#   media-ts.wasm                          image albums holding blobs (M26)
 #   todo-ts.wasm                           to-do lists with a sweep timer
 #   chat-ts.wasm                           chat rooms over WebSocket and SSE
 #                                          (M24)
@@ -34,7 +35,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 bin="${KRONIK_BIN:-${CARGO_TARGET_DIR:-target}/release/kronik}"
 npm ci --prefix examples --no-audit --no-fund
 mkdir -p examples/dist
-for example in chat-ts counter-ts notes-ts todo-ts uptime-ts webhook-relay-ts; do
+for example in chat-ts counter-ts media-ts notes-ts todo-ts uptime-ts webhook-relay-ts; do
     "$bin" build --dir "examples/$example"
     cp "examples/$example/dist/$example.wasm" "examples/dist/$example.wasm"
 done
