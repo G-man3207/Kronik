@@ -552,6 +552,8 @@ pub struct CompiledScrubber<'a> {
     matcher: Option<CompiledMatcher>,
     max_len: usize,
     pattern_bytes: usize,
+    /// Values replaced so far (M25 §7.6: a spooled request body warns).
+    replaced: std::sync::atomic::AtomicU64,
 }
 
 impl<'a> CompiledScrubber<'a> {
@@ -582,7 +584,13 @@ impl<'a> CompiledScrubber<'a> {
             matcher: self.matcher,
             max_len: self.max_len,
             pattern_bytes: self.pattern_bytes,
+            replaced: self.replaced,
         }
+    }
+
+    /// How many values this matcher replaced so far.
+    pub fn replaced(&self) -> u64 {
+        self.replaced.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn build<N: AsRef<str>, V: AsRef<[u8]>>(
@@ -638,6 +646,7 @@ impl<'a> CompiledScrubber<'a> {
             matcher,
             max_len,
             pattern_bytes,
+            replaced: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -753,6 +762,8 @@ impl<'a> CompiledScrubber<'a> {
             out.extend_from_slice(name);
             out.push(b']');
             end = matched.end;
+            self.replaced
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let consumed = stable_through.max(end);
         let required = out
@@ -819,6 +830,8 @@ pub struct StreamScrubber<'a> {
     pending: zeroize::Zeroizing<Vec<u8>>,
     output: Vec<u8>,
     produced: usize,
+    /// Values replaced by the matchers this stream had before a rematch.
+    replaced_before: u64,
     failed: Option<ScrubError>,
     scratch: credential_output::Scratch,
 }
@@ -857,6 +870,7 @@ impl<'a> StreamScrubber<'a> {
             pending,
             output: Vec::new(),
             produced: 0,
+            replaced_before: 0,
             failed: None,
             scratch: credential_output::Scratch::default(),
         })
@@ -931,13 +945,25 @@ impl<'a> StreamScrubber<'a> {
         }
         let mut next = StreamScrubber::from_compiled(matcher, self.limits, self.buffer_bytes)?;
         next.produced = self.produced;
+        next.replaced_before = self.replaced();
         let held = std::mem::take(&mut self.pending);
         let emitted = next.push(&held)?.to_vec();
         Ok((next, emitted))
     }
 
+    /// How many values this stream replaced so far, across its rematches.
+    pub fn replaced(&self) -> u64 {
+        self.replaced_before + self.matcher.replaced()
+    }
+
     /// Flush final lookahead. An earlier error remains a failure, never a partial success.
-    pub fn finish(mut self) -> Result<Vec<u8>, ScrubError> {
+    pub fn finish(self) -> Result<Vec<u8>, ScrubError> {
+        self.finish_counted().map(|(out, _)| out)
+    }
+
+    /// [`StreamScrubber::finish`], with how many values the whole stream
+    /// replaced, its final lookahead included.
+    pub fn finish_counted(mut self) -> Result<(Vec<u8>, u64), ScrubError> {
         if let Some(error) = self.failed {
             return Err(error);
         }
@@ -949,7 +975,8 @@ impl<'a> StreamScrubber<'a> {
             (self.limits.output_bytes - self.produced).min(self.buffer_bytes),
             &mut self.scratch,
         )?;
-        Ok(self.output)
+        let replaced = self.replaced();
+        Ok((self.output, replaced))
     }
 }
 
@@ -1060,6 +1087,29 @@ mod tests {
         }
         result.extend_from_slice(&stream.finish().unwrap());
         assert_eq!(result, b"[secret:long]|[secret:long]|[secret:long]");
+    }
+
+    /// M25 §7.6: a stream counts the values it replaced, across chunk
+    /// borders, a rematch and its final lookahead.
+    #[test]
+    fn a_stream_counts_what_it_replaced() {
+        let one = [("a", b"alpha-secret".to_vec())];
+        let limits = ScrubLimits {
+            pattern_bytes: 1 << 20,
+            output_bytes: 1 << 20,
+        };
+        let mut stream = StreamScrubber::new(&one, limits, 1 << 20).unwrap();
+        stream.push(b"x alpha-sec").unwrap();
+        stream.push(b"ret y alpha-secret z").unwrap();
+        let two = [("a", b"alpha-secret".to_vec()), ("b", b"beta".to_vec())];
+        let matcher = CompiledScrubber::new(&two, 1 << 20).unwrap().into_owned();
+        let (mut stream, _) = stream.rematch(matcher).unwrap();
+        stream.push(b" beta and alpha-").unwrap();
+        let (_, replaced) = stream.finish_counted().unwrap();
+        assert_eq!(
+            replaced, 3,
+            "two alphas and a beta; the last alpha is cut off"
+        );
     }
 
     #[test]

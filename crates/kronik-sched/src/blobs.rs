@@ -92,6 +92,8 @@ struct Inner {
     readers: Mutex<Vec<(String, Arc<BlobReader>)>>,
     /// Blobs the turn finished, to make durable before its record.
     created: Mutex<Vec<BlobId>>,
+    /// The secret values each finished writer's scrubber replaced (§7.6).
+    replaced: Mutex<HashMap<u64, u64>>,
     options: HostOptions,
     /// The turn read an erased subject's blob (a fork marks it unverifiable).
     read_erased: std::sync::atomic::AtomicBool,
@@ -132,6 +134,7 @@ impl TurnBlobs {
             writers: Mutex::new(HashMap::new()),
             readers: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
+            replaced: Mutex::new(HashMap::new()),
             options,
             read_erased: std::sync::atomic::AtomicBool::new(false),
             read_masked: std::sync::atomic::AtomicBool::new(false),
@@ -556,7 +559,8 @@ impl BlobHost for TurnBlobs {
                 .writer
                 .ok_or_else(|| BlobHostError::Host(format!("blob writer {writer} is busy")))?;
             if let Some((scrubber, _)) = slot.scrub {
-                let tail = scrubber.finish().map_err(scrub_error)?;
+                let (tail, replaced) = scrubber.finish_counted().map_err(scrub_error)?;
+                lock(&inner.replaced).insert(writer, replaced);
                 w.write(&tail).await.map_err(host_error)?;
             }
             let meta = w.finish().await.map_err(host_error)?;
@@ -568,6 +572,13 @@ impl BlobHost for TurnBlobs {
             lock(&inner.created).push(meta.id);
             Ok(meta.to_pb())
         })
+    }
+
+    fn replaced(&self, writer: u64) -> u64 {
+        if let Some(slot) = lock(&self.0.writers).get(&writer) {
+            return slot.scrub.as_ref().map_or(0, |(s, _)| s.replaced());
+        }
+        lock(&self.0.replaced).get(&writer).copied().unwrap_or(0)
     }
 
     fn discard(&self, writer: u64) {
@@ -615,6 +626,9 @@ mod tests {
         )
     }
 
+    /// What `replaced` said after each finish of `written`, in order.
+    static COUNTED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
     async fn written(
         blobs: &TurnBlobs,
         store: &BlobStore,
@@ -632,6 +646,7 @@ mod tests {
         }
         let blob = blobs.finish(id).await.unwrap();
         blobs.ensure_durable().await.unwrap();
+        lock(&COUNTED).push(blobs.replaced(id));
         let meta = BlobMeta::from_pb(&blob).unwrap();
         let reader = store
             .reader(&Space::Main, &meta, &kronik_blob::NoKeys)
@@ -673,6 +688,10 @@ mod tests {
             late,
             b"[secret:late] and [secret:api-key] and [secret:late]"
         );
+        // How many values each writer replaced, readable after its finish
+        // (M25 §7.6): the last one's include the value held back across the
+        // reveal.
+        assert_eq!(*lock(&COUNTED), [0, 1, 3]);
     }
 
     /// An unfinished writer leaves nothing behind but what the store's
