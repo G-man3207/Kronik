@@ -20,6 +20,7 @@ pub const WIT: &str = include_str!("../../../../wit/kronik-actor.wit");
 pub const TS_SDK: &[File] = sdk_files!("../../../../sdk/ts/":
     "package.json",
     "src/actor.ts",
+    "src/blobs.ts",
     "src/connections.ts",
     "src/ctx.ts",
     "src/errors.ts",
