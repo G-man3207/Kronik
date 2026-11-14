@@ -233,6 +233,13 @@ until the v1.0 compatibility promise takes effect.
   as it arrives, scrubbed of the turn's secrets and named durably before
   its result is recorded, and a blob request body is streamed from the store
   with its length. The effect's record holds only the references.
+- Idempotency-Key request hashes are version 4 (M25): the body counts as
+  its BLAKE3 digest, so a large body read as a stream and a small one held
+  in memory hash alike. Responses saved under version 3 are still replayed
+  to a retry with an inline body until their TTL ends; a retry whose body
+  would be stored as a blob runs anew. A retry of a request still running or
+  answered no longer needs its large body stored again (the gateway can ask
+  `Node::ingress_peek` first).
 - Blob limits found in review (M25): a turn holds at most 64 blob writers
   open at once (constructing another traps); a writer creates its part file
   with its first full frame and holds at most one frame; a blob read is

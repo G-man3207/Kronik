@@ -306,6 +306,31 @@ impl Waiter {
     }
 }
 
+/// What the gateway adds to an HTTP root input (M25 §6.2, §6.3).
+#[derive(Default)]
+pub struct IngressExtras {
+    /// The request's version-3 hash, for an inline body: it matches a row
+    /// saved before version 4 during its TTL, and is never recorded.
+    pub legacy_hash: Option<Vec<u8>>,
+    /// The upload lease of a spooled body: it keeps the blob until the
+    /// turn's result arrives, when its record is applied; a join or a saved
+    /// answer ends it at once and the blob is loose.
+    pub upload: Option<kronik_blob::Lease>,
+    /// The body was only hashed, not kept (an idempotent retry, §6.2): the
+    /// request may join its turn or get the saved answer, never start one.
+    pub body_withheld: bool,
+}
+
+/// How the gateway reads a request body for a kind (M25 §6.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyPolicy {
+    /// Into memory, up to `[gateway] max_body`.
+    Inline,
+    /// The kind's code reads blobs and the node has a blob store: a body
+    /// above `threshold` bytes becomes a blob, up to `upload_bytes`.
+    Blobs { threshold: u64, upload_bytes: u64 },
+}
+
 /// How an ingress request with an `Idempotency-Key` was admitted.
 pub enum Ingress {
     /// A new root input; wait for its turn.
@@ -1089,7 +1114,7 @@ impl Node {
                     );
                     let (tx, rx) = oneshot::channel();
                     reply = Some(tx);
-                    node.complete_later(rx, waiter, Some(entry));
+                    node.complete_later(rx, waiter, Some(entry), None);
                 }
                 _ => {}
             }
@@ -3552,10 +3577,82 @@ impl Node {
     pub fn ingress(
         &self,
         actor: ActorRef,
-        mut http: pb::HttpInput,
+        http: pb::HttpInput,
         subject: Option<String>,
     ) -> Result<Ingress, ApiError> {
+        self.ingress_with(actor, http, subject, IngressExtras::default())
+    }
+
+    /// How the gateway reads a body for `kind` (M25 §6.2): as a blob above
+    /// the kind's threshold when its current code reads blobs and the node
+    /// has a blob store.
+    pub fn body_policy(&self, kind: &str) -> BodyPolicy {
+        if self.blobs.is_none() {
+            return BodyPolicy::Inline;
+        }
+        match self.kind(kind) {
+            Some(k) if k.program.reads_blobs() => {
+                let limits = self.config_now().limits(kind);
+                BodyPolicy::Blobs {
+                    threshold: limits.blob_threshold(),
+                    upload_bytes: limits.upload_bytes,
+                }
+            }
+            _ => BodyPolicy::Inline,
+        }
+    }
+
+    /// Whether `key` of `actor` has a turn in flight or a saved response
+    /// that a version-4 hash can match (M25 §6.2): the gateway then only
+    /// hashes a large body instead of keeping it. A version-3 row does not
+    /// count: it never matches a body the gateway did not hold.
+    pub fn ingress_peek(&self, actor: &ActorRef, key: &str) -> Result<bool, ApiError> {
+        if key.is_empty() {
+            return Ok(false);
+        }
+        if lock(&self.inflight).contains_key(&(actor.clone(), key.to_owned())) {
+            return Ok(true);
+        }
+        let saved = self
+            .store
+            .db()
+            .ingress(&actor.kind, &actor.key, key)
+            .map_err(store_err)?;
+        let ttl = self.cfg.ingress_ttl.as_millis() as u64;
+        let now = self.env.clock.wall_ms().max(self.clock.high_water());
+        Ok(saved.is_some_and(|row| {
+            row.request_hash.len() == 33
+                && row.request_hash.first() == Some(&crate::INGRESS_HASH_VERSION)
+                && row.logical_time_ms.saturating_add(ttl) > now
+        }))
+    }
+
+    /// [`Node::ingress`] with what the gateway adds (M25 §6.2, §6.3).
+    pub fn ingress_with(
+        &self,
+        actor: ActorRef,
+        mut http: pb::HttpInput,
+        subject: Option<String>,
+        extras: IngressExtras,
+    ) -> Result<Ingress, ApiError> {
         self.check_alive()?;
+        let IngressExtras {
+            legacy_hash,
+            upload,
+            body_withheld,
+        } = extras;
+        // A hash of this request: the recorded one, or for a row saved
+        // before version 4, the version-3 one of an inline body.
+        let same_request = |saved: &[u8]| {
+            saved == http.request_hash.as_slice() || legacy_hash.as_deref() == Some(saved)
+        };
+        let withheld = || {
+            ApiError::new(
+                ErrorCode::Unavailable,
+                "the request with this Idempotency-Key finished while its body was read, and its \
+                 saved response expired; send the request again",
+            )
+        };
         // The log requires a body (an empty one for bodiless requests); a
         // record without one could be written but not read back.
         if http.body.is_none() {
@@ -3571,6 +3668,9 @@ impl Node {
             kind: Some(pb::input::Kind::Http(http)),
         };
         if http.idempotency_key.is_empty() {
+            if body_withheld {
+                return Err(withheld());
+            }
             self.check_running()?;
             let rx = self.start_root(
                 actor,
@@ -3579,13 +3679,14 @@ impl Node {
                 subject,
                 OperationOrigin::Internal,
             );
-            self.complete_later(rx, waiter.clone(), None);
+            self.complete_later(rx, waiter.clone(), None, upload);
             return Ok(Ingress::Started(waiter));
         }
         let entry = (actor.clone(), http.idempotency_key.clone());
         let mut inflight = lock(&self.inflight);
         if let Some(e) = inflight.get(&entry) {
-            if e.request_hash != http.request_hash {
+            // A turn re-run after an upgrade carries its version-3 hash.
+            if !same_request(&e.request_hash) {
                 return Err(reused(&http.idempotency_key));
             }
             return Ok(Ingress::Joined(e.waiter.clone()));
@@ -3601,14 +3702,18 @@ impl Node {
         // refused for a credential that rotated.
         // A v1 hash is 32 bytes without a version byte; its first byte can
         // still be 3.
+        // A version-3 row matches only the version-3 hash of an inline body
+        // (M25 §6.3); without one it counts as expired.
         if let Some(row) = saved.filter(|r| {
             r.request_hash.len() == 33
-                && r.request_hash.first() == Some(&crate::INGRESS_HASH_VERSION)
+                && (r.request_hash.first() == Some(&crate::INGRESS_HASH_VERSION)
+                    || (legacy_hash.is_some()
+                        && r.request_hash.first() == Some(&crate::LEGACY_INGRESS_HASH_VERSION)))
         }) {
             let ttl = self.cfg.ingress_ttl.as_millis() as u64;
             let now = self.env.clock.wall_ms().max(self.clock.high_water());
             if row.logical_time_ms.saturating_add(ttl) > now {
-                if row.request_hash != http.request_hash {
+                if !same_request(&row.request_hash) {
                     return Err(reused(&http.idempotency_key));
                 }
                 let mut outcome = row.outcome;
@@ -3622,6 +3727,9 @@ impl Node {
                     scrubbed_with: None,
                 })));
             }
+        }
+        if body_withheld {
+            return Err(withheld());
         }
         // Joins and saved replies above write nothing: only a new turn
         // needs the disk reserve.
@@ -3641,15 +3749,19 @@ impl Node {
             subject,
             OperationOrigin::Internal,
         );
-        self.complete_later(rx, waiter.clone(), Some(entry));
+        self.complete_later(rx, waiter.clone(), Some(entry), upload);
         Ok(Ingress::Started(waiter))
     }
 
+    /// Hands the turn's result to `waiter` when it arrives. `upload`, the
+    /// lease of a spooled body, lives until then: the turn's record, which
+    /// references the blob, is applied before its result arrives.
     fn complete_later(
         &self,
         rx: oneshot::Receiver<Result<TurnResult, ApiError>>,
         waiter: Arc<Waiter>,
         entry: Option<(ActorRef, String)>,
+        upload: Option<kronik_blob::Lease>,
     ) {
         let Some(me) = self.me() else { return };
         self.env.spawn("ingress", async move {
@@ -3659,6 +3771,7 @@ impl Node {
                     "the turn was abandoned",
                 ))
             });
+            drop(upload);
             // The ingress row is applied before the result arrives, so
             // removing the in-flight entry leaves no window without either.
             if let Some(entry) = entry {

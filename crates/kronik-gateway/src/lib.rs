@@ -32,7 +32,7 @@ use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, valid_key};
 use kronik_privacy::sealer::is_erased;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{Ingress, Node, RouteEntry, TurnResult};
+use kronik_sched::{Ingress, IngressExtras, Node, RouteEntry, TurnResult};
 
 /// The path prefix of preview requests: `/__preview/<id>/...`.
 pub const PREVIEW_PREFIX: &str = "/__preview/";
@@ -488,9 +488,19 @@ fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
     }
 }
 
+/// A request as a root input ([`Gateway::input`]).
+struct Admitted {
+    actor: ActorRef,
+    http: pb::HttpInput,
+    subject: Option<String>,
+    /// The version-3 hash of a request with a key (M25 §6.3).
+    legacy_hash: Option<Vec<u8>>,
+}
+
 /// What must match for a repeated `Idempotency-Key`: a version byte
-/// ([`INGRESS_HASH_VERSION`]) and a hash of
-/// the request (method, path, query, body) and of who asks, so a saved
+/// ([`INGRESS_HASH_VERSION`], 4) and a hash of the request (method, path,
+/// query, and the body as its BLAKE3 digest, so a body the gateway spooled
+/// and one it held hash alike: M25 §6.3) and of who asks, so a saved
 /// response is never replayed to another requester. Who asks is the
 /// request's subject when it has one; without a subject, the value of its
 /// `Authorization` header (none: anonymous). Never `Cookie`, and never
@@ -499,9 +509,58 @@ fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
 /// IDEMPOTENCY_KEY_REUSED (v0.1 re-review R3). Keyed with a master-derived
 /// key when the node has one (it sits next to sealed values and must not
 /// confirm a guess of them); BLAKE3 with a domain string otherwise. Rows
-/// saved with an older version never match: such a key is used anew.
+/// saved with version 3 match [`legacy_request_hash`] during their TTL;
+/// rows of older versions never match: such a key is used anew.
 pub fn request_hash(
     req: &HttpRequest,
+    subject: Option<&str>,
+    sealer: &kronik_privacy::sealer::Sealer,
+) -> Vec<u8> {
+    request_hash_of_body(req, blake3::hash(&req.body).as_bytes(), subject, sealer)
+}
+
+/// [`request_hash`] of a request whose body was read as a stream:
+/// `body_digest` is the BLAKE3 digest of the body, and `req.body` is not
+/// read.
+pub fn request_hash_of_body(
+    req: &HttpRequest,
+    body_digest: &[u8; 32],
+    subject: Option<&str>,
+    sealer: &kronik_privacy::sealer::Sealer,
+) -> Vec<u8> {
+    hash_request(
+        INGRESS_HASH_VERSION,
+        "kronik.ingress.v4",
+        req,
+        body_digest,
+        subject,
+        sealer,
+    )
+}
+
+/// The version-3 hash of a request whose body the gateway holds (the body
+/// itself where version 4 has its digest), which rows saved before version 4
+/// hold. It is passed to the node, never recorded (M25 §6.3).
+pub fn legacy_request_hash(
+    req: &HttpRequest,
+    subject: Option<&str>,
+    sealer: &kronik_privacy::sealer::Sealer,
+) -> Vec<u8> {
+    hash_request(
+        kronik_sched::LEGACY_INGRESS_HASH_VERSION,
+        "kronik.ingress.v3",
+        req,
+        &req.body,
+        subject,
+        sealer,
+    )
+}
+
+fn hash_request(
+    version: u8,
+    purpose: &str,
+    req: &HttpRequest,
+    body: &[u8],
     subject: Option<&str>,
     sealer: &kronik_privacy::sealer::Sealer,
 ) -> Vec<u8> {
@@ -524,13 +583,12 @@ pub fn request_hash(
         req.method.as_bytes(),
         req.path.as_bytes(),
         req.query.as_bytes(),
-        &req.body,
+        body,
         &requester,
     ];
-    const PURPOSE: &str = "kronik.ingress.v3";
-    let hash = sealer.keyed_hash(PURPOSE, &parts).unwrap_or_else(|| {
+    let hash = sealer.keyed_hash(purpose, &parts).unwrap_or_else(|| {
         let mut h = blake3::Hasher::new();
-        h.update(PURPOSE.as_bytes());
+        h.update(purpose.as_bytes());
         h.update(b"\0");
         for p in parts {
             h.update(&(p.len() as u64).to_le_bytes());
@@ -539,7 +597,7 @@ pub fn request_hash(
         *h.finalize().as_bytes()
     });
     let mut out = Vec::with_capacity(33);
-    out.push(INGRESS_HASH_VERSION);
+    out.push(version);
     out.extend_from_slice(&hash);
     out
 }
@@ -804,8 +862,17 @@ impl Gateway {
                 "an SSE route needs the gateway's connection path (open_connection)",
             ));
         }
-        let (actor, http, subject) = self.input(req, m)?;
-        let (waiter, joined) = match self.node.ingress(actor, http, subject)? {
+        let Admitted {
+            actor,
+            http,
+            subject,
+            legacy_hash,
+        } = self.input(req, m)?;
+        let extras = IngressExtras {
+            legacy_hash,
+            ..IngressExtras::default()
+        };
+        let (waiter, joined) = match self.node.ingress_with(actor, http, subject, extras)? {
             Ingress::Done(r) => return Ok(turn_response(&r)),
             Ingress::Started(w) => (w, false),
             Ingress::Joined(w) => (w, true),
@@ -973,7 +1040,12 @@ impl Gateway {
         };
         let offered = offered_subprotocols(&req);
         let (client, exempt) = self.client_address(&req);
-        let (actor, http, subject) = self.input(req, m)?;
+        let Admitted {
+            actor,
+            http,
+            subject,
+            ..
+        } = self.input(req, m)?;
         let (conn, waiter) = self
             .node
             .connection_open(actor, http, protocol, subject, client, exempt)?;
@@ -1105,7 +1177,12 @@ impl Gateway {
         if m.method == "SSE" {
             return Err(previews_take_none());
         }
-        let (actor, mut http, subject) = self.input(req, m)?;
+        let Admitted {
+            actor,
+            mut http,
+            subject,
+            ..
+        } = self.input(req, m)?;
         http.idempotency_key.clear();
         http.request_hash.clear();
         // On main's origin the browser sends main's credentials (N2): the
@@ -1130,11 +1207,7 @@ impl Gateway {
 
     /// The root input of a matched request: its actor, the HTTP input and
     /// its subject.
-    fn input(
-        &self,
-        mut req: HttpRequest,
-        m: Matched,
-    ) -> Result<(ActorRef, pb::HttpInput, Option<String>), ApiError> {
+    fn input(&self, mut req: HttpRequest, m: Matched) -> Result<Admitted, ApiError> {
         strip_admin_cookies(&mut req.headers);
         let key = m
             .params
@@ -1186,10 +1259,19 @@ impl Gateway {
                 subject.map_err(|e| ApiError::new(ErrorCode::BadRequest, e))?
             }
         };
-        let request_hash = if idempotency_key.is_empty() {
-            Vec::new()
+        // With a key: the version-4 hash, recorded, and the version-3 one of
+        // rows saved before it (M25 §6.3), never recorded.
+        let (request_hash, legacy_hash) = if idempotency_key.is_empty() {
+            (Vec::new(), None)
         } else {
-            request_hash(&req, subject.as_deref(), self.node.sealer())
+            (
+                request_hash(&req, subject.as_deref(), self.node.sealer()),
+                Some(legacy_request_hash(
+                    &req,
+                    subject.as_deref(),
+                    self.node.sealer(),
+                )),
+            )
         };
         // The request is the subject's data: every value carries the tag
         // (I9). With a subject, path, query and parameter values go into
@@ -1247,7 +1329,12 @@ impl Gateway {
             sealed_path,
             sealed_query,
         };
-        Ok((actor, http, subject))
+        Ok(Admitted {
+            actor,
+            http,
+            subject,
+            legacy_hash,
+        })
     }
 }
 
@@ -1463,6 +1550,35 @@ mod tests {
 
     /// H8, M6: the idempotency hash covers who asks (subject, credential
     /// headers) and is keyed with the master-derived key.
+    /// M25 §6.3: version 4 hashes the body's BLAKE3 digest, so a body the
+    /// gateway streamed and one it held hash alike; version 3 (the body
+    /// itself) differs and carries its own version byte.
+    #[test]
+    fn version_4_hashes_held_and_streamed_bodies_alike() {
+        let req = |body: &[u8]| HttpRequest {
+            method: "POST".into(),
+            path: "/media/a/upload".into(),
+            query: "x=1".into(),
+            headers: vec![("authorization".into(), "Bearer t".into())],
+            peer: None,
+            body: body.to_vec(),
+        };
+        let keyed = Sealer::plain()
+            .with_pseudonyms(Pseudonyms::new(&MasterKey::from_bytes([1; 32]).unwrap()).unwrap());
+        for sealer in [&keyed, &Sealer::plain()] {
+            let body = vec![7u8; 100_000];
+            let held = request_hash(&req(&body), None, sealer);
+            let streamed =
+                request_hash_of_body(&req(&[]), blake3::hash(&body).as_bytes(), None, sealer);
+            assert_eq!(held, streamed);
+            assert_eq!((held.len(), held[0]), (33, 4));
+            let legacy = legacy_request_hash(&req(&body), None, sealer);
+            assert_eq!((legacy.len(), legacy[0]), (33, 3));
+            assert_ne!(legacy[1..], held[1..]);
+            assert_ne!(held, request_hash(&req(b"other"), None, sealer));
+        }
+    }
+
     #[test]
     fn the_request_hash_covers_the_requester_and_is_keyed() {
         let req = |headers: &[(&str, &str)]| HttpRequest {

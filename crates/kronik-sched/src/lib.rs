@@ -51,9 +51,9 @@ use kronik_store::sql::{FileOpener, Limits, SqlPool};
 
 pub use gate::Drain;
 pub use node::{
-    CONNECTION_METHODS, CodeSwitch, DeployResult, Ingress, METHODS, Node, NodeParts, Probe,
-    RouteEntry, ShardReadPoint, ShardReader, ShardRecordPage, StartError, SystemAudit, Waiter,
-    methods_conflict, normalize_pattern,
+    BodyPolicy, CONNECTION_METHODS, CodeSwitch, DeployResult, Ingress, IngressExtras, METHODS,
+    Node, NodeParts, Probe, RouteEntry, ShardReadPoint, ShardReader, ShardRecordPage, StartError,
+    SystemAudit, Waiter, methods_conflict, normalize_pattern,
 };
 pub use privacy::{ErasureDone, PrivacyModeChange};
 pub use reseal::{
@@ -61,11 +61,17 @@ pub use reseal::{
 };
 pub use subject_keys::SubjectKeyPlan;
 
-/// The first byte of an ingress `request_hash` (the gateway's): 3, the
-/// requester is the request's subject, or its `Authorization` value without
-/// one. A saved row of another version (1: no requester, 2: also `Cookie`)
-/// counts as expired: its key is used anew and its response never replayed.
-pub const INGRESS_HASH_VERSION: u8 = 3;
+/// The first byte of an ingress `request_hash` (the gateway's): 4, the body
+/// counts as its BLAKE3 digest, so a spooled body and an inline one hash
+/// alike (M25 §6.3); the requester is the request's subject, or its
+/// `Authorization` value without one. A row saved with version 3 (the body
+/// itself) still matches during its TTL the version-3 hash the gateway passes
+/// for an inline body ([`IngressExtras::legacy_hash`]); a row of another
+/// version (1: no requester, 2: also `Cookie`) counts as expired: its key is
+/// used anew and its response never replayed.
+pub const INGRESS_HASH_VERSION: u8 = 4;
+/// The version of the hashes [`IngressExtras::legacy_hash`] carries.
+pub const LEGACY_INGRESS_HASH_VERSION: u8 = 3;
 
 /// Scheduler settings.
 #[derive(Debug, Clone)]

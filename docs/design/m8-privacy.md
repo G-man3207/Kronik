@@ -511,7 +511,11 @@ Where the code differs from the sections above:
   master-derived key, purpose `kronik.ingress.v3`; plain BLAKE3 with that
   domain without a key). `Node::ingress` treats saved rows of other
   versions as expired (v1: no requester; v2: credential headers too, which
-  turned retries with a rotated cookie into 422). A subject
+  turned retries with a rotated cookie into 422). M25 made it version 4
+  (`kronik.ingress.v4`): the body counts as its BLAKE3 digest, so a spooled
+  body and an inline one hash alike; a version-3 row still matches the
+  version-3 hash of an inline body during its TTL
+  (docs/design/m25-streaming-bodies.md §6.3). A subject
   header (or `Authorization` for `jwt:`) that appears twice or holds a list
   is `400`. Effect fingerprints of a subject's `http.fetch` and
   `actor.call` requests are `0x02` and a keyed hash of the plain

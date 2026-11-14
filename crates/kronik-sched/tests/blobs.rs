@@ -13,7 +13,9 @@ use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{BlobsConfig, Ingress, Node, NodeConfig, TurnResult, start_local};
+use kronik_sched::{
+    BlobsConfig, BodyPolicy, Ingress, IngressExtras, Node, NodeConfig, TurnResult, start_local,
+};
 use tokio::runtime::Runtime;
 
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
@@ -859,4 +861,187 @@ fn a_blob_the_turn_wrote_is_durable_before_it_is_sent() {
         .position(|e| e == "request")
         .expect("the peer got the request");
     assert!(named < synced && synced < request, "{events:#?}");
+}
+
+impl Proc {
+    fn ingress_with(
+        &self,
+        input: pb::HttpInput,
+        extras: IngressExtras,
+    ) -> Result<TurnResult, kronik_core::error::ApiError> {
+        self.rt.block_on(async {
+            match self.node.ingress_with(
+                ActorRef::parse("media/a").unwrap(),
+                input,
+                None,
+                extras,
+            )? {
+                Ingress::Started(w) | Ingress::Joined(w) => w.wait().await,
+                Ingress::Done(r) => Ok(*r),
+            }
+        })
+    }
+}
+
+/// A request hash of `version`: a version byte and 32 bytes.
+fn hash_v(version: u8, of: &[u8]) -> Vec<u8> {
+    let mut h = vec![version];
+    h.extend_from_slice(blake3::hash(of).as_bytes());
+    h
+}
+
+fn keyed(op: &str, key: &str, hash: Vec<u8>) -> pb::HttpInput {
+    let mut h = http(op, "", inline(b"x"));
+    h.idempotency_key = key.into();
+    h.request_hash = hash;
+    h
+}
+
+/// M25 §6.3: request hashes are version 4. A row saved with version 3
+/// matches only the version-3 hash of an inline body, which the gateway
+/// passes unrecorded; without it (a spooled body) the row counts as
+/// expired. M25 §6.2: `ingress_peek` sees turns in flight and version-4
+/// rows only, and a withheld body joins or gets the saved answer but never
+/// starts a turn.
+#[test]
+fn version_3_rows_match_only_the_legacy_hash_of_an_inline_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path(), Some(BlobsConfig::default()));
+    let actor = ActorRef::parse("media/a").unwrap();
+    let legacy = |of: &[u8]| IngressExtras {
+        legacy_hash: Some(hash_v(3, of)),
+        ..IngressExtras::default()
+    };
+    let withheld = || IngressExtras {
+        body_withheld: true,
+        ..IngressExtras::default()
+    };
+    // A row saved before version 4.
+    let old = p.ingress(keyed("info", "k3", hash_v(3, b"v3 x")));
+    assert!(!p.node.ingress_peek(&actor, "k3").unwrap());
+    let again = p
+        .ingress_with(keyed("info", "k3", hash_v(4, b"x")), legacy(b"v3 x"))
+        .unwrap();
+    assert_eq!(again.turn_id, old.turn_id, "the saved answer");
+    let reused = p
+        .ingress_with(keyed("info", "k3", hash_v(4, b"y")), legacy(b"v3 y"))
+        .unwrap_err();
+    assert_eq!(
+        reused.code,
+        kronik_core::error::ErrorCode::IdempotencyKeyReused
+    );
+    // Without the legacy hash the version-3 row counts as expired.
+    let anew = p
+        .ingress_with(
+            keyed("info", "k3", hash_v(4, b"x")),
+            IngressExtras::default(),
+        )
+        .unwrap();
+    assert_ne!(anew.turn_id, old.turn_id);
+    // Now a version-4 row: peek sees it, and a withheld body gets its answer.
+    assert!(p.node.ingress_peek(&actor, "k3").unwrap());
+    let saved = p
+        .ingress_with(keyed("info", "k3", hash_v(4, b"x")), withheld())
+        .unwrap();
+    assert_eq!(saved.turn_id, anew.turn_id);
+    // A withheld body with nothing to join or answer never starts a turn.
+    assert!(!p.node.ingress_peek(&actor, "k-new").unwrap());
+    let refused = p
+        .ingress_with(keyed("info", "k-new", hash_v(4, b"x")), withheld())
+        .unwrap_err();
+    assert_eq!(refused.code, kronik_core::error::ErrorCode::Unavailable);
+    assert!(!p.node.ingress_peek(&actor, "k-new").unwrap());
+}
+
+/// M25 §6.2: an upload's lease lasts until the turn's result arrives (its
+/// record, which references the blob, is applied by then), and a saved
+/// answer ends it at once.
+#[allow(clippy::disallowed_methods)]
+#[test]
+fn an_upload_lease_lasts_until_the_turns_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path(), Some(BlobsConfig::default()));
+    p.effect_setup(1 << 20, None);
+    let store = p.node.blob_store().unwrap().clone();
+    let uploads = || {
+        store
+            .leases()
+            .holders()
+            .iter()
+            .filter(|h| **h == "upload")
+            .count()
+    };
+    // A server that answers after 500 ms keeps the turn running.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                line.clear();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let mut stream = stream;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        }
+    });
+    let mut slow = http(
+        "fetch",
+        "",
+        inline(format!("http://{addr}/slow").as_bytes()),
+    );
+    slow.idempotency_key = "up".into();
+    slow.request_hash = hash_v(4, b"slow");
+    let started = p.rt.block_on(async {
+        p.node.ingress_with(
+            ActorRef::parse("media/a").unwrap(),
+            slow.clone(),
+            None,
+            IngressExtras {
+                upload: Some(store.leases().take("upload")),
+                ..IngressExtras::default()
+            },
+        )
+    });
+    let Ok(Ingress::Started(waiter)) = started else {
+        panic!("not started")
+    };
+    assert_eq!(uploads(), 1, "the turn runs: the lease holds");
+    let result = p.rt.block_on(waiter.wait()).unwrap();
+    assert!(result.committed(), "{result:?}");
+    assert_eq!(uploads(), 0, "the result arrived: the lease ended");
+    // A retry gets the saved answer, and its lease ends at once.
+    let retry = p
+        .ingress_with(
+            slow,
+            IngressExtras {
+                upload: Some(store.leases().take("upload")),
+                ..IngressExtras::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(retry.turn_id, result.turn_id);
+    assert_eq!(uploads(), 0);
+}
+
+/// M25 §6.2: the gateway spools bodies only for a kind whose code reads
+/// blobs on a node with a blob store.
+#[test]
+fn the_body_policy_follows_the_kinds_code_and_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path(), Some(BlobsConfig::default()));
+    assert_eq!(
+        p.node.body_policy("media"),
+        BodyPolicy::Blobs {
+            threshold: 1 << 20,
+            upload_bytes: 64 << 20
+        }
+    );
+    assert_eq!(p.node.body_policy("nobody"), BodyPolicy::Inline);
+    drop(p);
+    let p = start(dir.path(), None);
+    assert_eq!(p.node.body_policy("media"), BodyPolicy::Inline);
 }
