@@ -7,14 +7,19 @@
 //! this node holds. Its only personal data is the subject, which needs
 //! `pii:read` (§8); routes and counts are not personal data.
 
+use std::collections::HashMap;
+
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, TurnId};
 use kronik_proto::connection as conn;
+use kronik_proto::log::v1 as pb;
+use kronik_sched::connections::LiveStats;
 use kronik_store::db::{ConnectionRow, ConnectionState};
 
 use crate::types::{
-    Connection, ConnectionCloseRequest, ConnectionCloseResponse, ConnectionClosed,
-    ConnectionFrames, ConnectionLive, ConnectionOpened, ConnectionsResponse,
+    Connection, ConnectionCloseRequest, ConnectionCloseResponse, ConnectionClosed, ConnectionFates,
+    ConnectionFrames, ConnectionLive, ConnectionOpSummary, ConnectionOpened, ConnectionsResponse,
+    TurnSummary,
 };
 use crate::{Api, ApiResponse, AuthorizedRequest, Query, Result, bad, internal, json, ok, reason};
 
@@ -30,7 +35,16 @@ fn valid_close_code(code: u16) -> bool {
     )
 }
 
-fn connection_id(id: &str) -> Result<&str> {
+/// How many target ids an operation's summary lists.
+const OP_TARGETS_SHOWN: usize = 20;
+
+/// History filtered to one connection reads its owner's turns in pages of
+/// this many records ...
+pub(crate) const HISTORY_SCAN_PAGE: usize = 200;
+/// ... and at most this many records per request.
+pub(crate) const HISTORY_SCAN: usize = 5000;
+
+pub(crate) fn connection_id(id: &str) -> Result<&str> {
     if conn::valid_id(id) {
         Ok(id)
     } else {
@@ -47,7 +61,107 @@ fn not_found(id: &str, what: &str) -> ApiError {
     )
 }
 
+/// A turn's connection operations as history shows them, without their
+/// fates, which need the node.
+pub(crate) fn op_summaries(t: &pb::TurnRecord) -> Vec<ConnectionOpSummary> {
+    t.connection_ops
+        .iter()
+        .map(|op| {
+            let targets: Vec<&String> = op.connections.iter().chain(&op.dropped).collect();
+            let (name, kind, bytes, code) = match &op.op {
+                Some(pb::connection_op::Op::Send(f)) => (
+                    "send",
+                    Some(conn::frame_kind_name(f.kind).to_owned()),
+                    Some(conn::frame_bytes(f) as u64),
+                    None,
+                ),
+                Some(pb::connection_op::Op::Close(c)) => ("close", None, None, Some(c.code)),
+                None => ("unspecified", None, None, None),
+            };
+            ConnectionOpSummary {
+                op: name.to_owned(),
+                targets: targets.len() as u64,
+                connections: targets
+                    .into_iter()
+                    .take(OP_TARGETS_SHOWN)
+                    .cloned()
+                    .collect(),
+                kind,
+                bytes,
+                code,
+                fates: None,
+            }
+        })
+        .collect()
+}
+
+/// Whether a turn is one of connection `id`'s: its input is one of the
+/// connection's, or it sent to it or closed it, now or buffered.
+pub(crate) fn touches(t: &pb::TurnRecord, id: &str) -> bool {
+    conn::input(t.input.as_ref()).is_some_and(|c| c.connection == id)
+        || t.connection_ops
+            .iter()
+            .any(|op| op.connections.iter().chain(&op.dropped).any(|c| c == id))
+        || t.effects.iter().any(|e| {
+            e.kind == "connection.send-now" && e.target.strip_prefix("connection:") == Some(id)
+        })
+}
+
+/// The connections that one history request looked up: a row (none when
+/// retention removed it) and the hub's counts while this node holds it.
+pub(crate) type FateCache = HashMap<String, Option<(ConnectionRow, Option<LiveStats>)>>;
+
 impl Api {
+    /// Adds the fates of a turn's sends to its summary (§4.7): the frame
+    /// with seq `s` of a connection was written if `s` is below its count
+    /// of frames written; queued after it while the writer has it; dropped
+    /// otherwise, or when no live connection had the id. After a restart,
+    /// the frames of turns up to the restart's LSN have an unknown fate,
+    /// and later ones were dropped.
+    pub(crate) fn fill_fates(
+        &self,
+        summary: &mut TurnSummary,
+        t: &pb::TurnRecord,
+        lsn: u64,
+        cache: &mut FateCache,
+    ) {
+        for (s, op) in summary.connection_ops.iter_mut().zip(&t.connection_ops) {
+            if !matches!(op.op, Some(pb::connection_op::Op::Send(_))) {
+                continue;
+            }
+            let mut fates = ConnectionFates {
+                dropped: op.dropped.len() as u64,
+                ..ConnectionFates::default()
+            };
+            for (id, &seq) in op.connections.iter().zip(&op.seqs) {
+                let entry = cache.entry(id.clone()).or_insert_with(|| {
+                    let row = self.node.store().db().connection_any(id).ok().flatten()?;
+                    let stats = self.node.hub().live_stats(id);
+                    Some((row, stats))
+                });
+                let fate = match entry {
+                    None => &mut fates.unknown,
+                    Some((row, stats)) => match (row.closed_lsn, stats, row.frames_written) {
+                        (None, Some(s), _) if seq < s.frames_written => &mut fates.written,
+                        (None, Some(s), _) if seq < s.frames_written + s.queued_frames => {
+                            &mut fates.queued
+                        }
+                        (None, Some(_), _) => &mut fates.dropped,
+                        (None, None, _) => &mut fates.unknown,
+                        (Some(_), _, Some(w)) if seq < w => &mut fates.written,
+                        (Some(_), _, Some(_)) => &mut fates.dropped,
+                        (Some(_), _, None) if row.restart_after_lsn.is_some_and(|r| lsn > r) => {
+                            &mut fates.dropped
+                        }
+                        (Some(_), _, None) => &mut fates.unknown,
+                    },
+                };
+                *fate += 1;
+            }
+            s.fates = Some(fates);
+        }
+    }
+
     fn turn_ref(&self, lsn: u64) -> String {
         TurnId {
             branch: self.node.branch().into(),

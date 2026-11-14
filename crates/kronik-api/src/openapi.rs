@@ -506,6 +506,12 @@ pub const OPERATIONS: &[Operation] = &[
                 kind: "integer",
                 description: "Only turns before this LSN: the previous page's `next`.",
             },
+            Param {
+                name: "connection",
+                kind: "string",
+                description: "Only this connection's inputs and the turns that sent to it or \
+                    closed it (M24); a page reads at most 5000 turns.",
+            },
             LIMIT,
         ],
         request: None,

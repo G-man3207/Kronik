@@ -360,6 +360,41 @@ pub struct TurnSummary {
     pub fuel_used: u64,
     #[serde(default)]
     pub effects: Vec<EffectSummary>,
+    /// The turn's buffered connection operations, in call order (M24);
+    /// absent when it has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connection_ops: Vec<ConnectionOpSummary>,
+}
+
+/// A turn's `send`, `broadcast` or `close` of connections (M24,
+/// docs/design/m24-connections.md §12), without the frame's data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConnectionOpSummary {
+    /// `send` (also a broadcast) or `close`.
+    pub op: String,
+    /// How many connections it was for, those that were not live included.
+    pub targets: u64,
+    /// The first 20 of them.
+    pub connections: Vec<String>,
+    /// A send's frame kind: `text`, `binary` or `event`.
+    pub kind: Option<String>,
+    /// A send's frame size in bytes.
+    pub bytes: Option<u64>,
+    /// A close's code.
+    pub code: Option<u32>,
+    /// A send's frames by fate (§4.7), in an actor's history.
+    pub fates: Option<ConnectionFates>,
+}
+
+/// How many frames of a send were written, are queued, were dropped (the
+/// connection was gone, closing or not live) or have an unknown fate (a
+/// restart hid it, or the connection's row is gone).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConnectionFates {
+    pub written: u64,
+    pub queued: u64,
+    pub dropped: u64,
+    pub unknown: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -443,6 +443,8 @@ fn summary(value: &mut TurnSummary, secrets: &mut Context<'_>) {
         sql_changes: _,
         fuel_used: _,
         effects: turn_effects,
+        // Connection ids, kinds and counts: no free text.
+        connection_ops: _,
     } = value;
 
     input(turn_input, secrets);
@@ -1217,6 +1219,7 @@ mod tests {
                 sql_changes: 0,
                 fuel_used: 1,
                 effects: vec![effect.clone()],
+                connection_ops: Vec::new(),
             }],
             next: None,
         };

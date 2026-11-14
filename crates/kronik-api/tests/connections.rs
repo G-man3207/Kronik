@@ -254,6 +254,53 @@ async fn connections_are_listed_and_inspected() {
     })
     .await;
 
+    // Ada's turns in the room's history: only those of her connection, her
+    // open's and her frame's, and bob's open, which sent her `joined`; with
+    // each send's fates.
+    let h = get(
+        &r.api,
+        &format!("/v1/actors/room/lobby/history?connection={ada}"),
+    )
+    .await;
+    let turns = h["turns"].as_array().unwrap();
+    assert!(turns.len() >= 3, "{h}");
+    assert!(turns.iter().all(|t| t.to_string().contains(&ada)), "{h}");
+    let bob_open = turns
+        .iter()
+        .find(|t| {
+            t["input"]["summary"]
+                .as_str()
+                .is_some_and(|s| s.starts_with(&format!("open {bob}")))
+        })
+        .unwrap_or_else(|| panic!("bob's open turn in {h}"));
+    let joined = bob_open["connection_ops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|op| op["connections"] == json!([ada]))
+        .unwrap_or_else(|| panic!("a send to ada in {bob_open}"));
+    assert_eq!(joined["op"], "send");
+    assert_eq!(joined["kind"], "text");
+    assert_eq!(
+        joined["fates"],
+        json!({"written": 1, "queued": 0, "dropped": 0, "unknown": 0})
+    );
+    // Unfiltered history shows the operations too, and none on turns
+    // without them.
+    let all_turns = get(&r.api, "/v1/actors/room/lobby/history").await;
+    assert!(
+        all_turns.to_string().contains("connection_ops"),
+        "{all_turns}"
+    );
+    let (status, v) = call(
+        &r.api,
+        "GET",
+        "/v1/actors/room/lobby/history?connection=nope",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 400, "{v}");
+
     // A closed connection: listed as closed, with its close.
     tb.client_close(Some((1001, "tab closed".into())));
     let v = r

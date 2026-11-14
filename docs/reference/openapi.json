@@ -937,6 +937,38 @@
         ],
         "type": "object"
       },
+      "ConnectionFates": {
+        "description": "How many frames of a send were written, are queued, were dropped (the\nconnection was gone, closing or not live) or have an unknown fate (a\nrestart hid it, or the connection's row is gone).",
+        "properties": {
+          "dropped": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "queued": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unknown": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "written": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "written",
+          "queued",
+          "dropped",
+          "unknown"
+        ],
+        "type": "object"
+      },
       "ConnectionFrames": {
         "description": "Counts of a connection's frames. Outgoing frames are `written`,\n`queued`, `dropped` or `unknown` (docs/design/m24-connections.md §4.7):\nafter a restart nobody knows which of the frames before it were\nwritten.",
         "properties": {
@@ -994,6 +1026,70 @@
         },
         "required": [
           "queued_bytes"
+        ],
+        "type": "object"
+      },
+      "ConnectionOpSummary": {
+        "description": "A turn's `send`, `broadcast` or `close` of connections (M24,\ndocs/design/m24-connections.md §12), without the frame's data.",
+        "properties": {
+          "bytes": {
+            "description": "A send's frame size in bytes.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "code": {
+            "description": "A close's code.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "connections": {
+            "description": "The first 20 of them.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "fates": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConnectionFates"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A send's frames by fate (§4.7), in an actor's history."
+          },
+          "kind": {
+            "description": "A send's frame kind: `text`, `binary` or `event`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "op": {
+            "description": "`send` (also a broadcast) or `close`.",
+            "type": "string"
+          },
+          "targets": {
+            "description": "How many connections it was for, those that were not live included.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "op",
+          "targets",
+          "connections"
         ],
         "type": "object"
       },
@@ -9540,6 +9636,13 @@
           "code_hash": {
             "type": "string"
           },
+          "connection_ops": {
+            "description": "The turn's buffered connection operations, in call order (M24);\nabsent when it has none.",
+            "items": {
+              "$ref": "#/components/schemas/ConnectionOpSummary"
+            },
+            "type": "array"
+          },
           "effects": {
             "default": [],
             "items": {
@@ -10510,6 +10613,15 @@
             "required": false,
             "schema": {
               "type": "integer"
+            }
+          },
+          {
+            "description": "Only this connection's inputs and the turns that sent to it or closed it (M24); a page reads at most 5000 turns.",
+            "in": "query",
+            "name": "connection",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           },
           {

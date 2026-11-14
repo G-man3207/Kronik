@@ -520,6 +520,7 @@ fn turn_summary(branch: &str, lsn: u64, t: &pb::TurnRecord, pii: bool) -> TurnSu
                 ..s
             })
             .collect(),
+        connection_ops: connections::op_summaries(t),
     }
 }
 
@@ -1763,28 +1764,56 @@ impl Api {
     async fn history(&self, kind: &str, key: &str, q: &Query, pii: bool) -> Result<ApiResponse> {
         let actor = Self::actor_ref(kind, key)?;
         let limit = q.limit()?;
-        let refs = {
-            let db = self.node.store().db();
-            if db
-                .actor(&actor.kind, &actor.key)
-                .map_err(internal)?
-                .is_none()
-            {
-                return Err(Self::not_found(kind, key));
-            }
-            db.history(&actor.kind, &actor.key, q.num("before")?, limit)
-                .map_err(internal)?
+        let connection = q
+            .get("connection")
+            .map(connections::connection_id)
+            .transpose()?;
+        if self
+            .node
+            .store()
+            .db()
+            .actor(&actor.kind, &actor.key)
+            .map_err(internal)?
+            .is_none()
+        {
+            return Err(Self::not_found(kind, key));
+        }
+        // A connection's turns are a sparse part of its owner's history
+        // (M24 §12): pages are read until `limit` turns match, at most
+        // `HISTORY_SCAN` records per request, and `next` continues where the
+        // scan stopped. Without a connection it is one page of `limit`.
+        let page = if connection.is_some() {
+            connections::HISTORY_SCAN_PAGE
+        } else {
+            limit
         };
-        let mut turns = Vec::with_capacity(refs.len());
-        for r in &refs {
-            let c = self
+        let mut before = q.num("before")?;
+        let mut turns = Vec::new();
+        let mut fates = connections::FateCache::new();
+        let mut scanned = 0usize;
+        let next = 'pages: loop {
+            let refs = self
                 .node
-                .reader()
-                .read_at(r.pos)
-                .await
-                .map_err(|e| ApiError::new(ErrorCode::StorageCorrupt, e.to_string()))?;
-            // A rebased turn (M13) is a turn of the history too.
-            if let Some(t) = c.record.turn() {
+                .store()
+                .db()
+                .history(&actor.kind, &actor.key, before, page)
+                .map_err(internal)?;
+            for r in &refs {
+                scanned += 1;
+                before = Some(r.lsn);
+                let c = self
+                    .node
+                    .reader()
+                    .read_at(r.pos)
+                    .await
+                    .map_err(|e| ApiError::new(ErrorCode::StorageCorrupt, e.to_string()))?;
+                // A rebased turn (M13) is a turn of the history too.
+                let Some(t) = c.record.turn() else {
+                    continue;
+                };
+                if connection.is_some_and(|id| !connections::touches(t, id)) {
+                    continue;
+                }
                 // With pii:read the summary shows the path: unsealed first.
                 let mut s = if pii && input_has_sealed(t.input.as_ref()) {
                     let mut u = t.clone();
@@ -1804,12 +1833,19 @@ impl Api {
                         .as_ref()
                         .is_some_and(|v| redact::is_erased(v, self.node.sealer()));
                 }
+                self.fill_fates(&mut s, t, c.lsn, &mut fates);
                 turns.push(s);
+                if turns.len() == limit {
+                    break 'pages Some(c.lsn);
+                }
             }
-        }
-        let next = (refs.len() == limit)
-            .then(|| refs.last().map(|r| r.lsn))
-            .flatten();
+            if refs.len() < page {
+                break None;
+            }
+            if connection.is_none() || scanned >= connections::HISTORY_SCAN {
+                break before;
+            }
+        };
         self.ok_scrubbed(HistoryResponse { turns, next })
     }
 

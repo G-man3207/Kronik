@@ -1486,6 +1486,7 @@ mod tests {
             sql_changes: 0,
             fuel_used: 1,
             effects,
+            connection_ops: Vec::new(),
         };
         let denied = kronik_api::types::EffectSummary {
             ordinal: 0,
@@ -1589,6 +1590,7 @@ mod tests {
             sql_changes: 0,
             fuel_used: 1,
             effects,
+            connection_ops: Vec::new(),
         };
         let effect = |kind: &str, request: Option<&str>, secrets| EffectSummary {
             ordinal: 0,
@@ -1730,6 +1732,7 @@ mod tests {
             sql_changes: 0,
             fuel_used: 1,
             effects: Vec::new(),
+            connection_ops: Vec::new(),
         };
         assert_eq!(changes(&t), "set s [erased], set t");
     }
