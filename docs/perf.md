@@ -775,8 +775,9 @@ yet (no log segment was removed during that run, so it is not compaction).
 The leading explanation is the room actors' SQLite page caches: each actor
 database is opened with a 512 KiB cache and kept open in a pool
 (`crates/kronik-store/src/sql/actor.rs`), so the growth would stop at about
-25 MiB for 50 rooms. It has not been tested: a run with 10 rooms of 100
-saturated the two CPUs instead.
+25 MiB for 50 rooms. A 60-minute run at the default concurrency of
+[ADR 0140](adr/0140-default-concurrency-follows-the-cpus.md) bears it out:
+the heap levels off (see [the default turn concurrency](#the-default-turn-concurrency-adr-0140)).
 In the first run the daemon recorded no turn over 0.5 s and no fsync over
 0.1 s: the latency maxima come from the delivery path.
 
@@ -849,6 +850,15 @@ criterion 1 passed every condition (1,199,600 of 1,199,600 deliveries,
 p50 27.8 ms, p99 151 ms, max 1.0 s, `VmHWM` 487 MiB, `VmRSS` +6.1 % over the
 10-minute steady phase, the heap +12.4 MiB), and criterion 4 passed every
 check (400 reconnects, the slowest after 3.1 s).
+
+Criterion 1 for 60 minutes at the new default (17:59 to 19:01 UTC, the same
+build) passed every condition too: 7,200,160 of 7,200,160 deliveries, p50
+27.8 ms, p99 197 ms, max 3.0 s, `VmHWM` 485 MiB and `VmRSS` +9.4 % over the
+hour. The heap (`RssAnon`, MiB) every 10 minutes: 261, 307, 314, 331, 336,
+338 and 339, growing 0.1 MiB per minute at the end. It levels off about
+31 MiB above where the warm-up left it, which fits the room actors' SQLite
+page caches (50 rooms of at most 512 KiB, 25 MiB) and the allocator's own
+share.
 
 ## M32 benchmark and regression contract
 
