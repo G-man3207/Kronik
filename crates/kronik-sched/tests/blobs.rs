@@ -1186,16 +1186,18 @@ fn a_blob_store_io_failure_stops_the_node_and_the_turn_runs_again() {
 /// Review R-1 (erasure): a reply's blobs reached the turn's record
 /// unchecked, so a made-up `b3s:` reference made the log undecodable at
 /// the next start, and a known one with another size made the node fatal.
-/// In M25 a reply cannot carry blobs (as a sent message cannot): the turn
-/// traps, the node stays up, and it starts again from its log.
+/// Since M26 a reply carries the references the turn may use (T), each
+/// completed from it: a made-up one, or a known identity with another
+/// size, fails the turn with BLOB_NOT_HELD; the node stays up, and it
+/// starts again from its log.
 #[test]
-fn a_reply_cannot_carry_blobs() {
+fn a_reply_carries_only_the_turns_references() {
     let dir = tempfile::tempdir().unwrap();
     let p = start(dir.path(), Some(BlobsConfig::default()));
     let made_up = p.ingress(http("reply-forged", "", inline(b"")));
     assert!(!made_up.committed());
     assert_eq!(
-        made_up.outcome.error_code, "NOT_IMPLEMENTED",
+        made_up.outcome.error_code, "BLOB_NOT_HELD",
         "{:?}",
         made_up.outcome
     );
@@ -1207,7 +1209,7 @@ fn a_reply_cannot_carry_blobs() {
     ));
     assert!(!resized.committed());
     assert_eq!(
-        resized.outcome.error_code, "NOT_IMPLEMENTED",
+        resized.outcome.error_code, "BLOB_NOT_HELD",
         "{:?}",
         resized.outcome
     );
