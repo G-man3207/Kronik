@@ -380,6 +380,16 @@ The receiving turn may read them, and holds one only if it retains it. An
 actor holds at most the type's quota (`kronik limits set <type>
 --blob-size-per-actor`) in the blobs' total size.
 
+A blob has the subject in effect when it was stored (the turn's default
+subject; `putFor` names another), and in privacy mode it is sealed with that
+subject's key; an erased subject's blob reads as `SUBJECT_ERASED`. Keep its
+reference in a value or row of the same subject, and send it under that
+subject (set it with `ctx.subject(...)` around `send` or `schedule`, and
+restore it after): a message carries its sender's subject, and what the
+receiving turn writes gets it. Then the bookkeeping is the same subject's
+data as the bytes, and erasing the subject takes both. `media-ts` shares
+and expires an image under its owner's subject, whoever asks.
+
 ```ts
 http: (req, ctx) => {
   if (req.method === 'POST') {
