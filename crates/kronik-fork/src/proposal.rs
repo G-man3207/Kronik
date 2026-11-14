@@ -288,6 +288,12 @@ pub struct Proposals {
     erasures: std::sync::atomic::AtomicU64,
     /// Requests a preview's state takes ([`preview::MAX_PREVIEW_REQUESTS`]).
     max_preview_requests: u64,
+    /// `[fork] preview_blob_bytes`: what a preview's blob space holds
+    /// (0: no cap).
+    preview_blob_bytes: u64,
+    /// The byte budgets of live previews' blob spaces, by id, made on first
+    /// use and dropped with the preview.
+    preview_budgets: std::sync::Mutex<BTreeMap<String, Arc<kronik_blob::SpaceBudget>>>,
     /// Live previews' serving state (M11), outside `entries` (P-F4).
     previews: std::sync::Mutex<BTreeMap<String, Arc<preview::Served>>>,
     /// Proposals whose replay runs as a job (M10), by id.
@@ -458,6 +464,8 @@ impl Proposals {
             jobs: std::sync::Mutex::new(BTreeMap::new()),
             erasures: std::sync::atomic::AtomicU64::new(0),
             max_preview_requests: preview::MAX_PREVIEW_REQUESTS,
+            preview_blob_bytes: preview::PREVIEW_BLOB_BYTES,
+            preview_budgets: std::sync::Mutex::new(BTreeMap::new()),
             gate: None,
         })
     }
@@ -776,6 +784,10 @@ impl Proposals {
             floor.keep_alive(self.node.env());
             floor
         });
+        // Anyone with a preview's URL writes to its blob space: it has a cap.
+        if preview {
+            setup.blob_budget = self.preview_budget(id);
+        }
         // Values of linked secrets this process holds; a preview computes nothing.
         if !preview {
             setup.held_secrets = self

@@ -413,6 +413,9 @@ and [0104](../adr/0104-admin-ui-as-a-public-api-client.md).
 | `idempotency_ttl` | `"24h"` | How long the gateway keeps a response for retries with the same `Idempotency-Key` | |
 | `trusted_proxies` | `[]` | Reverse proxies, as addresses or CIDR blocks (`["127.0.0.1", "10.0.0.0/8"]`). One client address may hold a quarter of the gateway's connections; a trusted proxy, which carries many users' traffic, may hold all of them. A connection over its client's share gets `503 UNAVAILABLE` with `connection: close`. When set, only these peers may set the request's subject (`privacy.subject_from`): a subject header or `jwt:` claim from any other peer gets `400 BAD_REQUEST`; IPv4-mapped entries (`::ffff:10.0.0.0/104`) mean their IPv4 block | |
 | `preview_domain` | none | The domain whose subdomains serve preview forks (`<id>.<domain>`), best a separate registrable domain; see [previews](#previews). With it, previews answer only there, not under `/__preview/`. With `[tls] mode = "acme"` it needs `dns01_hook` (the `*.<domain>` certificate); with `mode = "files"` the certificate must cover `*.<domain>`. It must not be, or be a parent of, a `[tls] domains` name. Lowercase, without scheme or port | |
+| `upload_min_rate` | `"8KiB"` | Bytes per second a request body read as it arrives (one a kind whose code reads blobs may turn into a blob) must average over the last `upload_rate_window`, once `upload_rate_grace` has passed; slower is `408 UPLOAD_TOO_SLOW`. Such a body has no whole-body timeout, only the idle timeout between chunks, so without this a client sending a byte now and then holds its connection and its upload indefinitely. `"0B"` turns the check off | |
+| `upload_rate_window` | `"30s"` | The window `upload_min_rate` averages over | |
+| `upload_rate_grace` | `"30s"` | How long a body is read before `upload_min_rate` applies | |
 
 ### [connections]
 
@@ -528,6 +531,7 @@ the script for the real clouds, are described in the design's §9.
 |---|---|---|
 | `live_allowlist` | `[]` | Hosts that forks may call live: an effect with no recording that is a `GET` without secret headers to a listed host goes out for real. Anything else never leaves a fork |
 | `preview_ttl` | `"24h"` | How long a preview fork lives unless `kronik preview create --ttl` says otherwise; see [previews](#previews) |
+| `preview_blob_bytes` | `"256MiB"` | What a preview's blob space holds: its uploads and the blobs its turns write, which no collector sweeps while it lives (the space is deleted with the preview). Past it an upload is `409 PREVIEW_FULL` and a turn's write answers `quota-exceeded`. `"0B"`: no cap |
 
 ### [simulators.model]
 

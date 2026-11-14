@@ -50,6 +50,12 @@ pub const MAX_PREVIEWS: usize = 16;
 /// write large values per request.
 pub const MAX_PREVIEW_REQUESTS: u64 = 10_000;
 
+/// What a preview's blob space holds unless configured otherwise (`[fork]
+/// preview_blob_bytes`): its uploads and what its turns write, which no
+/// collector sweeps while it lives. The upload or write past it answers
+/// `PREVIEW_FULL` (a guest's write: `quota-exceeded`).
+pub const PREVIEW_BLOB_BYTES: u64 = 256 << 20;
+
 /// A preview's id starts with this; no other fork's may (`create_fork`).
 pub(super) const ID_PREFIX: &str = "v-";
 
@@ -205,6 +211,28 @@ impl Proposals {
     pub fn with_preview_ttl(mut self, ttl: Duration) -> Proposals {
         self.preview_ttl = ttl;
         self
+    }
+
+    /// `[fork] preview_blob_bytes`: what a preview's blob space holds (0:
+    /// no cap).
+    pub fn with_preview_blob_bytes(mut self, bytes: u64) -> Proposals {
+        self.preview_blob_bytes = bytes;
+        self
+    }
+
+    /// The byte budget of preview `id`'s blob space: made on first use (it
+    /// counts what the space holds then), dropped with the preview. None
+    /// without blobs or without a cap.
+    pub(super) fn preview_budget(&self, id: &str) -> Option<Arc<kronik_blob::SpaceBudget>> {
+        if self.preview_blob_bytes == 0 || self.node.blob_store().is_none() {
+            return None;
+        }
+        Some(
+            lock(&self.preview_budgets)
+                .entry(id.to_owned())
+                .or_insert_with(|| kronik_blob::SpaceBudget::new(self.preview_blob_bytes))
+                .clone(),
+        )
     }
 
     /// Test hook: a lower [`MAX_PREVIEW_REQUESTS`].
@@ -537,6 +565,7 @@ impl Proposals {
         state.meta.preview = None;
         state.live = None;
         lock(&self.previews).remove(id);
+        lock(&self.preview_budgets).remove(id);
         drop(state);
         self.entries.lock().await.remove(id);
         if let Err(e) = std::fs::remove_dir_all(self.dir(id)).map_err(internal) {
@@ -578,6 +607,7 @@ impl Proposals {
             state.meta.preview = None;
             state.live = None;
             drop(state);
+            lock(&self.preview_budgets).remove(id);
             self.entries.lock().await.remove(id);
             match std::fs::remove_dir_all(self.dir(id)) {
                 Ok(()) => tracing::info!(preview = %id, "expired preview deleted"),
@@ -723,6 +753,12 @@ impl kronik_gateway::PreviewRouter for Proposals {
             .ok()
             .and_then(|s| s.policies.get(kind).copied())
             .unwrap_or(kronik_sched::BodyPolicy::Inline)
+    }
+
+    fn blob_budget(&self, id: &str) -> Option<Arc<kronik_blob::SpaceBudget>> {
+        // A live preview's only: no budget is made for an unknown id.
+        self.served(id).ok()?;
+        self.preview_budget(id)
     }
 
     fn send(

@@ -225,7 +225,7 @@ codes! {
         "A policy rule denies the change",
         "Read the diff with `kronik diff show <proposal>`, change the code and propose again.";
     PreviewFull = "PREVIEW_FULL", 409, "M11",
-        "The preview took as many requests as it can hold",
+        "The preview took as many requests, or as many blob bytes, as it can hold",
         "Delete it with `kronik preview delete <id>` and create a new one with `kronik preview create <proposal>`.";
     PreviewLimit = "PREVIEW_LIMIT", 409, "M11",
         "As many previews are live as there can be",
@@ -314,6 +314,9 @@ codes! {
     Unavailable = "UNAVAILABLE", 503, "M1",
         "The daemon is not accepting requests",
         "Retry shortly; if it persists, check the daemon log.";
+    UploadTooSlow = "UPLOAD_TOO_SLOW", 408, "M25",
+        "The request body arrived too slowly",
+        "Send the body faster; an operator can lower `[gateway] upload_min_rate` (0 turns the check off).";
     VerifyRequired = "VERIFY_REQUIRED", 409, "M1",
         "The actor type has history; verify the change first",
         "A kind with history changes through `kronik propose` and `kronik promote`.";

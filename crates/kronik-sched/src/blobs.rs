@@ -99,6 +99,9 @@ struct Inner {
     read_erased: std::sync::atomic::AtomicBool,
     /// The turn got a pseudonym for a subject's blob (`--no-pii`).
     read_masked: std::sync::atomic::AtomicBool,
+    /// The byte budget of the space it writes to: a preview's
+    /// ([`TurnBlobs::with_budget`]).
+    budget: std::sync::OnceLock<Arc<kronik_blob::SpaceBudget>>,
 }
 
 struct Slot {
@@ -138,6 +141,7 @@ impl TurnBlobs {
             options,
             read_erased: std::sync::atomic::AtomicBool::new(false),
             read_masked: std::sync::atomic::AtomicBool::new(false),
+            budget: std::sync::OnceLock::new(),
         });
         // The lease lives as long as the host, renewed while the turn runs,
         // however long it waits (ADR 0120 §4); the loop ends with the host.
@@ -154,6 +158,14 @@ impl TurnBlobs {
             }
         }));
         TurnBlobs(inner)
+    }
+
+    /// Charges what the turn writes to `budget`, a preview's blob space
+    /// (`[fork] preview_blob_bytes`): past it, a write answers
+    /// `quota-exceeded`, and an effect's response is too large to store.
+    pub fn with_budget(self, budget: Arc<kronik_blob::SpaceBudget>) -> TurnBlobs {
+        let _ = self.0.budget.set(budget);
+        self
     }
 
     /// The secret values of a turn's effect state, for its blob host. It
@@ -192,11 +204,15 @@ impl TurnBlobs {
                     .map_err(|e| StreamError::Store(format!("{e:?}")))?,
             ),
         };
-        let mut writer = inner
+        let writer = inner
             .store
             .writer(inner.space.clone(), keys, u64::MAX, inner.lease.clone())
             .await
             .map_err(StreamError::from_blob)?;
+        let mut writer = match inner.budget.get() {
+            Some(budget) => writer.with_budget(budget.clone()),
+            None => writer,
+        };
         let mut scrubber = StreamScrubber::from_compiled(
             matcher,
             crate::scrub::limits(usize::MAX),
@@ -329,6 +345,8 @@ impl StreamError {
         match error {
             BlobError::StoreFull { .. } => StreamError::StoreFull(error.to_string()),
             BlobError::Io(message) => StreamError::Io(message),
+            // A preview's blob space is full: the response does not fit.
+            BlobError::SpaceFull { .. } => StreamError::TooLarge,
             other => StreamError::Store(other.to_string()),
         }
     }
@@ -370,7 +388,7 @@ fn host_error(error: BlobError) -> BlobHostError {
         BlobError::StoreFull { free, reserve } => BlobHostError::StoreFull(format!(
             "the blob store has {free} bytes free, below its reserve of {reserve}"
         )),
-        BlobError::TooLarge { .. } => BlobHostError::TooLarge,
+        BlobError::TooLarge { .. } | BlobError::SpaceFull { .. } => BlobHostError::TooLarge,
         BlobError::NotFound(id) => {
             kronik_metrics::inc("kronik_blob_missing_total", &[]);
             BlobHostError::Missing(format!("blob {id} is not in the blob store"))
@@ -522,6 +540,10 @@ impl BlobHost for TurnBlobs {
                 .writer(inner.space.clone(), keys, inner.limit, inner.lease.clone())
                 .await
                 .map_err(host_error)?;
+            let writer = match inner.budget.get() {
+                Some(budget) => writer.with_budget(budget.clone()),
+                None => writer,
+            };
             let id = inner.next.fetch_add(1, Ordering::Relaxed);
             let mut slot = Slot {
                 writer: Some(writer),

@@ -10,6 +10,7 @@ mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use common::*;
 use kronik_core::ids::ActorRef;
@@ -706,4 +707,131 @@ fn blob_answer_of(r: &TurnResult) -> pb::BlobRef {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// Review M-1: anyone with a preview's URL uploads into its blob space,
+/// which no collector sweeps while the preview lives. The space holds at
+/// most `[fork] preview_blob_bytes`:
+/// - an upload past it is 409 PREVIEW_FULL and gives its bytes back;
+/// - a smaller one still fits;
+/// - a turn's write past it answers the guest `quota-exceeded`.
+///
+/// The space goes with the preview, when it is deleted or expires.
+#[test]
+fn a_previews_blob_space_is_capped_and_goes_with_the_preview() {
+    use kronik_gateway::{Gateway, GatewayConfig, HttpRequest, PREVIEW_PREFIX};
+    let dir = tempdir();
+    let p = blob_node(dir.path());
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "media".into(),
+            fuel: Some(2_000_000_000),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    ingress(&p, http("info", "", inline(b"x")));
+    p.settle();
+    let props = Arc::new(
+        Proposals::open(p.node.clone(), dir.path().to_path_buf())
+            .unwrap()
+            .with_preview_blob_bytes(3_500_000),
+    );
+    let (proposal, _) =
+        p.rt.block_on(props.propose(
+            kronik_fork::proposal::ProposeRequest {
+                wasm: vec![{
+                    let mut v2 = std::fs::read(guest("media")).unwrap();
+                    v2.extend_from_slice(&[0x00, 0x07, 0x04, b't', b'e', b's', b't', b'v', b'2']);
+                    v2
+                }],
+                names: Vec::new(),
+                window_ms: None,
+                at: None,
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
+        .unwrap();
+    let create = |ttl: Option<Duration>| {
+        p.rt.block_on(props.create_preview(&proposal.id, ttl, false, audit(), false, p.owner()))
+            .unwrap()
+            .0
+    };
+    let preview = create(None);
+    let gw = Gateway::new(p.node.clone(), GatewayConfig::default()).with_preview(props.clone());
+    let request = |id: &str, op: &str, query: &str, body: Vec<u8>| HttpRequest {
+        method: "POST".into(),
+        path: format!("{PREVIEW_PREFIX}{id}/media/a/{op}"),
+        query: query.into(),
+        headers: Vec::new(),
+        body,
+        peer: None,
+    };
+    let code = |r: &kronik_gateway::HttpResponse| -> String {
+        serde_json::from_slice::<serde_json::Value>(&r.body)
+            .ok()
+            .and_then(|v| v["error"]["code"].as_str().map(str::to_owned))
+            .unwrap_or_default()
+    };
+    let bytes =
+        |seed: u64, n: u64| -> Vec<u8> { (0..n).map(|i| ((i * 7 + seed) % 251) as u8).collect() };
+    let space = dir.path().join("branches").join(&preview.id).join("blobs");
+
+    let r =
+        p.rt.block_on(gw.handle(request(&preview.id, "info", "", bytes(1, 2_000_000))));
+    assert!(
+        String::from_utf8_lossy(&r.body).starts_with("blob "),
+        "{r:?}"
+    );
+    // Past the cap.
+    let r =
+        p.rt.block_on(gw.handle(request(&preview.id, "info", "", bytes(2, 2_000_000))));
+    assert_eq!((r.status, code(&r)), (409, "PREVIEW_FULL".into()), "{r:?}");
+    // What it took is back: a smaller one (still above the 1 MiB threshold)
+    // fits.
+    let r =
+        p.rt.block_on(gw.handle(request(&preview.id, "info", "", bytes(3, 1_200_000))));
+    assert!(
+        String::from_utf8_lossy(&r.body).starts_with("blob "),
+        "{r:?}"
+    );
+    // A turn that writes past it.
+    let r =
+        p.rt.block_on(gw.handle(request(&preview.id, "write", "size=500000", Vec::new())));
+    assert_ne!(r.status, 200, "{r:?}");
+    assert!(
+        String::from_utf8_lossy(&r.body).contains("quota"),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert!(space.exists());
+
+    // Deleted: its space too.
+    p.rt.block_on(props.delete_preview(&preview.id, audit(), false, p.owner()))
+        .unwrap();
+    assert!(!space.exists(), "the deleted preview's blob space is gone");
+
+    // Expired: its space too.
+    let short = create(Some(Duration::from_secs(2)));
+    let r =
+        p.rt.block_on(gw.handle(request(&short.id, "info", "", bytes(4, 2_000_000))));
+    assert!(
+        String::from_utf8_lossy(&r.body).starts_with("blob "),
+        "{r:?}"
+    );
+    let short_space = dir.path().join("branches").join(&short.id).join("blobs");
+    assert!(short_space.exists());
+    std::thread::sleep(Duration::from_millis(2100));
+    assert_eq!(p.rt.block_on(props.expire_previews()), 1);
+    assert!(
+        !short_space.exists(),
+        "the expired preview's blob space is gone"
+    );
 }

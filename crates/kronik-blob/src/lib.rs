@@ -23,12 +23,14 @@
 //! the store at every step. The crate holds no key: callers pass the keys of a
 //! subject's blob ([`BlobKeys`], [`KeyAccess`]).
 
+mod budget;
 pub mod format;
 mod id;
 mod lease;
 mod store;
 mod sweep;
 
+pub use budget::SpaceBudget;
 pub use id::{BlobId, BlobMeta};
 pub use lease::{Lease, Leases};
 pub use store::{
@@ -63,6 +65,10 @@ pub enum BlobError {
     /// A writer went over its limit.
     #[error("the blob is over its limit of {limit} bytes")]
     TooLarge { limit: u64 },
+    /// A writer went over its space's budget ([`SpaceBudget`]): a preview's
+    /// blob space is full.
+    #[error("the blob space holds at most {limit} bytes of blobs")]
+    SpaceFull { limit: u64 },
     /// A malformed identity, reference or argument.
     #[error("invalid blob: {0}")]
     Invalid(String),

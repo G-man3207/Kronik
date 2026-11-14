@@ -409,8 +409,9 @@ kronik diff show p-0123456789ab --summary
 
 ## PREVIEW_FULL
 
-A preview has consumed its allocated request/turn budget. Inspect its status
-and create an intentionally budgeted replacement rather than bypassing limits.
+A preview has consumed its allocated request/turn budget, or its blob space
+holds `[fork] preview_blob_bytes` already. Inspect its status and create an
+intentionally budgeted replacement rather than bypassing limits.
 
 ```sh
 kronik preview list
@@ -654,6 +655,17 @@ key; an arbitrary sleep is not proof of recovery.
 
 ```sh
 kronik doctor --config /owned/fixture/kronik.toml
+```
+
+## UPLOAD_TOO_SLOW
+
+A fixture client sends an upload to a kind whose code reads blobs a few
+bytes at a time, below `[gateway] upload_min_rate` once the grace has
+passed. Send the body at a steady rate, for example with a client that
+streams the file instead of trickling it.
+
+```sh
+curl -sS --data-binary @fixture.bin http://127.0.0.1:8080/media/a/sum
 ```
 
 ## VERIFY_REQUIRED

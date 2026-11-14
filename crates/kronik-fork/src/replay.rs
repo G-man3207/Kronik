@@ -126,6 +126,9 @@ pub struct ReplaySetup {
     /// main's collector keeps every blob a record from there on references.
     /// Renewed with every turn the run replays.
     pub blob_floor: Option<kronik_blob::Lease>,
+    /// A preview's blob byte budget (`[fork] preview_blob_bytes`): what its
+    /// turns write to its space counts against it. None for other forks.
+    pub blob_budget: Option<Arc<kronik_blob::SpaceBudget>>,
     dispatch: ReplayDispatch,
 }
 
@@ -215,6 +218,7 @@ impl ReplaySetup {
             record_limit: kronik_sched::record_budget::turn_limit(kronik_log::MAX_RECORD as usize),
             blobs: None,
             blob_floor: None,
+            blob_budget: None,
             dispatch,
         }
     }
@@ -1727,7 +1731,7 @@ fn fork_blob_host(
             .collect(),
         None => Vec::new(),
     });
-    Some(kronik_sched::blobs::TurnBlobs::new(
+    let host = kronik_sched::blobs::TurnBlobs::new(
         store.clone(),
         kronik_blob::Space::Fork(setup.fork.clone()),
         store.env().clone(),
@@ -1735,7 +1739,12 @@ fn fork_blob_host(
         secrets,
         limit,
         kronik_sched::blobs::HostOptions::fork(setup.privacy.no_pii),
-    ))
+    );
+    // A preview's blob space has a byte budget (`[fork] preview_blob_bytes`).
+    Some(match &setup.blob_budget {
+        Some(budget) => host.with_budget(budget.clone()),
+        None => host,
+    })
 }
 
 /// The replay effect gate of one fork turn.

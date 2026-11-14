@@ -4235,6 +4235,7 @@ against both.
             "TURN_TOO_LARGE",
             "UNAUTHENTICATED",
             "UNAVAILABLE",
+            "UPLOAD_TOO_SLOW",
             "VERIFY_REQUIRED",
             "WATCH_NOT_FOUND"
           ],

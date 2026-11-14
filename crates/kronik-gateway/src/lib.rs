@@ -14,6 +14,7 @@
 //! transport to the node's hub.
 
 pub mod body;
+mod pace;
 
 pub use body::{BlobBody, RequestBody, ResponseBody};
 #[cfg(feature = "server")]
@@ -63,6 +64,11 @@ pub trait PreviewRouter: Send + Sync {
     fn body_policy(&self, _id: &str, _kind: &str) -> BodyPolicy {
         BodyPolicy::Inline
     }
+    /// The byte budget of preview `id`'s blob space (`[fork]
+    /// preview_blob_bytes`): its uploads count against it. None: no cap.
+    fn blob_budget(&self, _id: &str) -> Option<Arc<kronik_blob::SpaceBudget>> {
+        None
+    }
 }
 
 /// Gateway settings.
@@ -87,6 +93,13 @@ pub struct GatewayConfig {
     /// it has no whole-body timeout, so a slow large upload is not cut off
     /// while bytes keep arriving.
     pub body_idle_timeout: Duration,
+    /// `[gateway] upload_min_rate`, bytes per second: once
+    /// `upload_rate_grace` has passed, a body read as it arrives (one that
+    /// may become a blob) must average this over the last
+    /// `upload_rate_window`, else it is 408 `UPLOAD_TOO_SLOW`. 0: no check.
+    pub upload_min_rate: u64,
+    pub upload_rate_window: Duration,
+    pub upload_rate_grace: Duration,
 }
 
 impl Default for GatewayConfig {
@@ -99,6 +112,9 @@ impl Default for GatewayConfig {
             preview_domain: None,
             trusted_proxies: Vec::new(),
             body_idle_timeout: Duration::from_secs(30),
+            upload_min_rate: 8 << 10,
+            upload_rate_window: Duration::from_secs(30),
+            upload_rate_grace: Duration::from_secs(30),
         }
     }
 }
@@ -982,7 +998,7 @@ impl Gateway {
                 let who = self.identify(&req, &m)?;
                 let main = kronik_blob::Space::Main;
                 match self
-                    .read_for_blobs(&req, &who, body, threshold, upload_bytes, &main)
+                    .read_for_blobs(&req, &who, body, threshold, upload_bytes, &main, None)
                     .await?
                 {
                     ReadBody::Inline(bytes) => {
@@ -1070,22 +1086,52 @@ impl Gateway {
     }
 
     /// The next chunk of an upload, which must come within
-    /// `[gateway] body_idle_timeout`.
+    /// `[gateway] body_idle_timeout` and keep the body's pace
+    /// (`[gateway] upload_min_rate`).
     async fn next_chunk(
         &self,
         source: &mut Box<dyn BodySource>,
+        pace: &mut pace::Pace,
     ) -> Result<Option<bytes::Bytes>, ApiError> {
         let idle = self.cfg.body_idle_timeout;
-        match self.node.env().timeout(idle, source.next()).await {
-            Ok(chunk) => chunk.map_err(unreadable),
-            Err(_) => Err(ApiError::new(
-                ErrorCode::BadRequest,
-                format!(
-                    "the request body stopped arriving: nothing for {} s",
-                    idle.as_secs()
-                ),
-            )),
+        let chunk = match self.node.env().timeout(idle, source.next()).await {
+            Ok(chunk) => chunk.map_err(unreadable)?,
+            Err(_) => {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "the request body stopped arriving: nothing for {} s",
+                        idle.as_secs()
+                    ),
+                ));
+            }
+        };
+        if let Some(chunk) = &chunk {
+            let now = self.node.env().clock.monotonic();
+            if let Err(slow) = pace.arrived(now, chunk.len() as u64) {
+                let span = slow.span.as_secs().max(1);
+                return Err(ApiError::new(
+                    ErrorCode::UploadTooSlow,
+                    format!(
+                        "the request body arrived at {} bytes/s over the last {span} s, below \
+                         [gateway] upload_min_rate of {} bytes/s",
+                        slow.bytes / span,
+                        self.cfg.upload_min_rate
+                    ),
+                ));
+            }
         }
+        Ok(chunk)
+    }
+
+    /// A body's pace, from now.
+    fn pace(&self) -> pace::Pace {
+        pace::Pace::new(
+            self.cfg.upload_min_rate,
+            self.cfg.upload_rate_window,
+            self.cfg.upload_rate_grace,
+            self.node.env().clock.monotonic(),
+        )
     }
 
     /// The body phase of a kind whose code reads blobs (M25 §6.2): a body
@@ -1093,7 +1139,10 @@ impl Gateway {
     /// as it arrives, up to `upload_bytes`, with no more than a frame of it
     /// in memory; the retry of a request running or answered is only
     /// hashed. Each chunk must arrive within `[gateway] body_idle_timeout`.
-    /// The blob goes to `space`: main's, or a preview's (§6.4).
+    /// The blob goes to `space`: main's, or a preview's (§6.4), charged to
+    /// the preview's `budget`.
+    // The request, its body and where and how much of it may be kept.
+    #[allow(clippy::too_many_arguments)]
     async fn read_for_blobs(
         &self,
         req: &HttpRequest,
@@ -1102,8 +1151,10 @@ impl Gateway {
         threshold: u64,
         upload_bytes: u64,
         space: &kronik_blob::Space,
+        budget: Option<Arc<kronik_blob::SpaceBudget>>,
     ) -> Result<ReadBody, ApiError> {
         let kind = who.actor.kind.as_str();
+        let mut pace = self.pace();
         let too_large = |size: String| {
             ApiError::new(
                 ErrorCode::PayloadTooLarge,
@@ -1126,7 +1177,7 @@ impl Gateway {
         if self.node.ingress_peek(&who.actor, &who.idempotency_key)? {
             let mut hasher = blake3::Hasher::new();
             let mut size = 0u64;
-            while let Some(chunk) = self.next_chunk(&mut source).await? {
+            while let Some(chunk) = self.next_chunk(&mut source, &mut pace).await? {
                 size += chunk.len() as u64;
                 if size > upload_bytes {
                     return Err(too_large(format!("over {upload_bytes} bytes")));
@@ -1138,7 +1189,7 @@ impl Gateway {
         // Up to the threshold, held.
         let mut held = Vec::new();
         while held.len() as u64 <= threshold {
-            match self.next_chunk(&mut source).await? {
+            match self.next_chunk(&mut source, &mut pace).await? {
                 Some(chunk) => held.extend_from_slice(&chunk),
                 None => return Ok(ReadBody::Inline(held)),
             }
@@ -1166,10 +1217,17 @@ impl Gateway {
         // and the turn's wait take.
         let lease = store.leases().take("upload");
         lease.keep_alive(self.node.env());
+        let preview_full = |limit: u64| {
+            ApiError::new(
+                ErrorCode::PreviewFull,
+                format!("the preview's blob space holds at most {limit} bytes"),
+            )
+        };
         let stored = |e: kronik_blob::BlobError| match e {
             kronik_blob::BlobError::TooLarge { .. } => {
                 too_large(format!("over {upload_bytes} bytes"))
             }
+            kronik_blob::BlobError::SpaceFull { limit } => preview_full(limit),
             kronik_blob::BlobError::StoreFull { .. } => {
                 ApiError::new(ErrorCode::BlobStoreFull, e.to_string())
             }
@@ -1178,15 +1236,27 @@ impl Gateway {
                 format!("storing the request body: {other}"),
             ),
         };
-        let mut writer = store
+        // A preview's space has room for this body, or the request is
+        // refused before a byte is stored.
+        if let Some(budget) = &budget {
+            budget.seed(&store, space).await.map_err(stored)?;
+            if content_length(req).is_some_and(|len| len > budget.remaining()) {
+                return Err(preview_full(budget.limit()));
+            }
+        }
+        let writer = store
             .writer(space.clone(), keys, upload_bytes, lease.clone())
             .await
             .map_err(stored)?;
+        let mut writer = match budget {
+            Some(budget) => writer.with_budget(budget),
+            None => writer,
+        };
         let mut digest = blake3::Hasher::new();
         digest.update(&held);
         writer.write(&held).await.map_err(stored)?;
         drop(held);
-        while let Some(chunk) = self.next_chunk(&mut source).await? {
+        while let Some(chunk) = self.next_chunk(&mut source, &mut pace).await? {
             digest.update(&chunk);
             writer.write(&chunk).await.map_err(stored)?;
         }
@@ -1601,7 +1671,15 @@ impl Gateway {
                 // a body is never only hashed.
                 who.idempotency_key.clear();
                 match self
-                    .read_for_blobs(&req, &who, body, threshold, upload_bytes, &space)
+                    .read_for_blobs(
+                        &req,
+                        &who,
+                        body,
+                        threshold,
+                        upload_bytes,
+                        &space,
+                        router.blob_budget(&id),
+                    )
                     .await?
                 {
                     ReadBody::Spooled {

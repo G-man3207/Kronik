@@ -53,6 +53,17 @@ until the v1.0 compatibility promise takes effect.
   far, v0.4.1 included, opened the log the old way. Found by the DST
   connections workload, whose graceful stops end a process without a power
   loss.
+- Uploads that may become blobs have a minimum pace, and previews a blob
+  cap (M25 review). Such a body has no whole-body timeout, so a client
+  sending a byte now and then could hold a connection and an upload
+  indefinitely. Once `[gateway] upload_rate_grace` (30 s) has passed, the
+  last `[gateway] upload_rate_window` (30 s) must bring at least `[gateway]
+  upload_min_rate` (8 KiB) per second, else `408 UPLOAD_TOO_SLOW`. A
+  preview's blob space, which anyone with its URL uploads into and no
+  collector sweeps, holds at most `[fork] preview_blob_bytes` (256 MiB): an
+  upload past it is `409 PREVIEW_FULL`, and a write by one of its turns
+  answers `quota-exceeded`. The space is deleted with the preview, when it
+  is deleted or expires.
 - `kronik promote` warns when the new code of a kind that holds open
   WebSocket or SSE connections does not handle connections: their frames
   and closes would fail (M24). The API's promote response carries it in

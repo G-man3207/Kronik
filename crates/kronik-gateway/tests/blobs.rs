@@ -469,3 +469,99 @@ async fn an_upload_lease_outlives_its_ttl_while_its_turn_waits() {
     );
     assert_eq!(slow.await.unwrap().status, 200);
 }
+
+/// A body sent `chunk` bytes at a time, `pause` apart: a client that drips.
+struct Drip {
+    data: Vec<u8>,
+    at: usize,
+    chunk: usize,
+    pause: Duration,
+}
+
+impl BodySource for Drip {
+    fn next(&mut self) -> BoxFuture<'_, std::io::Result<Option<Bytes>>> {
+        Box::pin(async move {
+            if self.at >= self.data.len() {
+                return Ok(None);
+            }
+            if self.at > 0 {
+                tokio::time::sleep(self.pause).await;
+            }
+            let end = (self.at + self.chunk).min(self.data.len());
+            let out = Bytes::copy_from_slice(&self.data[self.at..end]);
+            self.at = end;
+            Ok(Some(out))
+        })
+    }
+}
+
+/// `[gateway] upload_min_rate` (review I-1): an upload that keeps sending
+/// just inside the idle timeout, below the rate once the grace has passed,
+/// is 408 UPLOAD_TOO_SLOW and leaves nothing; the same bytes at a steady
+/// pace, and a slow one within the grace, become a blob as before. With
+/// the rate at 0 the drip is only bound by the idle timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upload_below_the_minimum_rate_is_refused_after_the_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = media_node(dir.path()).await;
+    let paced = GatewayConfig {
+        // Far above the drip's pauses: only the rate can stop it.
+        body_idle_timeout: Duration::from_secs(5),
+        upload_min_rate: 512 << 10,
+        upload_rate_window: Duration::from_millis(600),
+        upload_rate_grace: Duration::from_millis(600),
+        ..GatewayConfig::default()
+    };
+    let gw = Gateway::new(node.clone(), paced.clone());
+    // 2 MiB in 64 KiB pieces 200 ms apart: about 320 KiB/s.
+    let drip = || {
+        RequestBody::Stream(Box::new(Drip {
+            data: data(2 * MIB),
+            at: 0,
+            chunk: 64 << 10,
+            pause: Duration::from_millis(200),
+        }))
+    };
+    let started = std::time::Instant::now();
+    let r = send(&gw, request("info", &[]), drip()).await;
+    assert_eq!(
+        (r.status, code(&r)),
+        (408, "UPLOAD_TOO_SLOW".into()),
+        "{}",
+        text(&r)
+    );
+    assert!(text(&r).contains("upload_min_rate"), "{}", text(&r));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    no_part_files(dir.path()).await;
+    assert!(files(&dir.path().join("blobs/objects")).is_empty());
+
+    // The same bytes at once are a blob.
+    let r = send(&gw, request("info", &[]), chunks(data(2 * MIB), 64 << 10)).await;
+    assert!(text(&r).starts_with("blob "), "{}", text(&r));
+
+    // Slow, but done within the grace.
+    let lenient = Gateway::new(
+        node.clone(),
+        GatewayConfig {
+            upload_rate_grace: Duration::from_secs(60),
+            ..paced.clone()
+        },
+    );
+    let r = send(&lenient, request("info", &[]), drip()).await;
+    assert!(text(&r).starts_with("blob "), "{}", text(&r));
+
+    // No minimum rate.
+    let unpaced = Gateway::new(
+        node,
+        GatewayConfig {
+            upload_min_rate: 0,
+            ..paced
+        },
+    );
+    let r = send(&unpaced, request("info", &[]), drip()).await;
+    assert!(text(&r).starts_with("blob "), "{}", text(&r));
+}

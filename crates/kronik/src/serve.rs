@@ -823,6 +823,7 @@ async fn serve(args: ServeArgs, config: Config, early: Early) -> anyhow::Result<
         )
         .with_promote(config.promote.max_gap.0, config.promote.catch_up_timeout.0)
         .with_preview_ttl(config.fork.preview_ttl.0)
+        .with_preview_blob_bytes(config.fork.preview_blob_bytes.0)
         .with_rebase(config.rebase.max_pause.0);
     if let Some(path) = args.test_replay_permits.clone() {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -853,6 +854,9 @@ async fn serve(args: ServeArgs, config: Config, early: Early) -> anyhow::Result<
                 subject_from: config.subject_from(),
                 idempotency_header: config.gateway.idempotency_header.clone(),
                 preview_domain: config.gateway.preview_domain.clone(),
+                upload_min_rate: config.gateway.upload_min_rate.0,
+                upload_rate_window: config.gateway.upload_rate_window.0,
+                upload_rate_grace: config.gateway.upload_rate_grace.0,
                 // Checked when the configuration was read.
                 trusted_proxies: config
                     .gateway

@@ -363,6 +363,13 @@ pub struct Gateway {
     /// The domain whose subdomains serve preview forks (`<id>.<domain>`);
     /// see M11.
     pub preview_domain: Option<String>,
+    /// A body read as it arrives (one that may become a blob, M25 §6.2) must
+    /// average this many bytes per second over the last
+    /// `upload_rate_window`, once `upload_rate_grace` has passed; else it is
+    /// 408 UPLOAD_TOO_SLOW. "0B" turns the check off.
+    pub upload_min_rate: Size,
+    pub upload_rate_window: Dur,
+    pub upload_rate_grace: Dur,
 }
 
 impl Default for Gateway {
@@ -373,6 +380,9 @@ impl Default for Gateway {
             idempotency_ttl: Dur::secs(24 * 3600),
             trusted_proxies: Vec::new(),
             preview_domain: None,
+            upload_min_rate: Size(8 << 10),
+            upload_rate_window: Dur::secs(30),
+            upload_rate_grace: Dur::secs(30),
         }
     }
 }
@@ -502,6 +512,10 @@ pub struct Fork {
     pub live_allowlist: Vec<String>,
     /// How long a preview fork lives unless created with `--ttl` (M11).
     pub preview_ttl: Dur,
+    /// What a preview's blob space holds: its uploads and what its turns
+    /// write (M25 §6.4). Past it, an upload is 409 PREVIEW_FULL. "0B": no
+    /// cap.
+    pub preview_blob_bytes: Size,
 }
 
 impl Default for Fork {
@@ -509,6 +523,7 @@ impl Default for Fork {
         Fork {
             live_allowlist: Vec::new(),
             preview_ttl: Dur::secs(24 * 3600),
+            preview_blob_bytes: Size(256 << 20),
         }
     }
 }
@@ -1235,6 +1250,13 @@ impl Config {
         {
             return Err(
                 "[foreign] start_timeout must be between 1s and 1h, such as \"30s\"".into(),
+            );
+        }
+        if self.gateway.upload_min_rate.0 > 0 && self.gateway.upload_rate_window.0.is_zero() {
+            return Err(
+                "[gateway] upload_rate_window must be more than zero while upload_min_rate is set, \
+                 such as \"30s\""
+                    .into(),
             );
         }
         if self.fork.preview_ttl.0.is_zero() {

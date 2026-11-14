@@ -410,6 +410,9 @@ idempotency_header = "Idempotency-Key"
 idempotency_ttl = "24h"
 trusted_proxies = []                 # a reverse proxy here has no per-client connection cap
 # preview_domain = "example-preview.com"   # previews only at https://<id>.<domain>/; acme needs dns01_hook
+upload_min_rate = "8KiB"              # per second, averaged over upload_rate_window, for uploads that become blobs
+upload_rate_window = "30s"
+upload_rate_grace = "30s"             # before upload_min_rate applies
 
 # [connections]                      # WebSocket and SSE connections (M24)
 # max_open = 4096                    # live connections in total (the open-file limit may lower it)
@@ -460,6 +463,7 @@ sample = "100%"                       # isolated mode, stratified per route and 
 [fork]
 live_allowlist = []
 preview_ttl = "24h"                   # how long a preview fork lives
+preview_blob_bytes = "256MiB"         # what a preview's blob space holds
 
 # The model simulator for forks (M12): off unless configured, and only for
 # targets that allow it (`kronik stubs set`). It never sees personal data.

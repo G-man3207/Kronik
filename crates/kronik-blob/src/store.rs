@@ -11,6 +11,7 @@ use bytes::Bytes;
 use kronik_core::env::{Env, File, OpenMode};
 use zeroize::Zeroizing;
 
+use crate::SpaceBudget;
 use crate::format::{self, FRAME_SIZE, FrameKey, HEADER_LEN, Header};
 use crate::id::hex;
 use crate::{BlobError, BlobId, BlobMeta, Lease, Leases};
@@ -382,6 +383,7 @@ impl BlobStore {
             written: 0,
             limit,
             lease,
+            budget: None,
         })
     }
 
@@ -395,7 +397,7 @@ impl BlobStore {
         meta: &BlobMeta,
         sealed: bool,
         lease: &Lease,
-    ) -> Result<(), BlobError> {
+    ) -> Result<bool, BlobError> {
         let object = self.object_path(space, &meta.id);
         let dir_path = object
             .parent()
@@ -429,7 +431,37 @@ impl BlobStore {
         let touched = self.touch_seq.fetch_add(1, Ordering::AcqRel) + 1;
         lock(&dir.gens).touched.insert(meta.id.file_name(), touched);
         lease.add(meta.id);
-        Ok(())
+        Ok(claimable)
+    }
+
+    /// The bytes of the objects of `space` (its `objects` shards, not its
+    /// part files), for a [`SpaceBudget`]'s seed.
+    pub async fn space_bytes(&self, space: &Space) -> Result<u64, BlobError> {
+        let fs = &self.env.fs;
+        let mut total = 0u64;
+        for dir in shard_dirs(&self.root(space)) {
+            let names = match fs.read_dir(dir.clone()).await {
+                Ok(names) => names,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(BlobError::io("listing a blob directory", e)),
+            };
+            for name in names {
+                if BlobId::from_file_name(&name).is_none() {
+                    continue;
+                }
+                match fs.open(dir.join(&name), OpenMode::Read).await {
+                    Ok(file) => {
+                        total += file
+                            .len()
+                            .await
+                            .map_err(|e| BlobError::io("reading a blob's length", e))?;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(BlobError::io("opening a blob", e)),
+                }
+            }
+        }
+        Ok(total)
     }
 
     /// Makes blob `meta` present in `to` and joins it to `lease`: its file
@@ -520,7 +552,7 @@ impl BlobStore {
         if copied.is_err() {
             let _ = fs.remove_file(part).await;
         }
-        copied
+        copied.map(|_claimed| ())
     }
 
     /// Claims an object of `space` equal to `meta` for `lease`, under its
@@ -679,9 +711,28 @@ pub struct BlobWriter {
     written: u64,
     limit: u64,
     lease: Lease,
+    /// The space's budget, if it has one, and the bytes this writer took
+    /// from it.
+    budget: Option<(Arc<SpaceBudget>, u64)>,
 }
 
 impl BlobWriter {
+    /// Charges what this writer accepts to `budget` (a preview's blob
+    /// space): past it, `write` answers [`BlobError::SpaceFull`]. Set before
+    /// the first write.
+    pub fn with_budget(mut self, budget: Arc<SpaceBudget>) -> BlobWriter {
+        self.budget = Some((budget, 0));
+        self
+    }
+
+    /// Gives back what this writer took from its budget.
+    fn refund(&mut self) {
+        if let Some((budget, charged)) = &mut self.budget {
+            budget.refund(*charged);
+            *charged = 0;
+        }
+    }
+
     /// Plaintext bytes accepted so far.
     pub fn written(&self) -> u64 {
         self.written
@@ -762,6 +813,11 @@ impl BlobWriter {
             return Err(BlobError::TooLarge { limit: self.limit });
         }
         self.store.check_reserve()?;
+        if let Some((budget, charged)) = &mut self.budget {
+            budget.seed(&self.store, &self.space).await?;
+            budget.charge(data.len() as u64)?;
+            *charged += data.len() as u64;
+        }
         self.identity.update(data);
         self.written += data.len() as u64;
         while !data.is_empty() {
@@ -823,15 +879,24 @@ impl BlobWriter {
             .part
             .clone()
             .ok_or_else(|| BlobError::Invalid("a finished writer".into()))?;
-        self.store
+        let claimed = self
+            .store
             .install(&self.space, &part, &meta, sealed, &self.lease)
             .await?;
         self.part = None;
+        // A new object keeps what it took from the budget; an object that
+        // was there already took it before.
+        if claimed {
+            self.refund();
+        } else if let Some((_, charged)) = &mut self.budget {
+            *charged = 0;
+        }
         Ok(meta)
     }
 
     /// Discards the blob and deletes its part file now.
     pub async fn abort(mut self) {
+        self.refund();
         if let Some(part) = self.part.take() {
             let _ = self.store.env.fs.remove_file(part).await;
         }
@@ -840,6 +905,8 @@ impl BlobWriter {
 
 impl Drop for BlobWriter {
     fn drop(&mut self) {
+        // Unfinished (or finished with an error): nothing new is named.
+        self.refund();
         if let Some(part) = self.part.take() {
             let fs = self.store.env.fs.clone();
             drop(self.store.env.spawn("blob part cleanup", async move {

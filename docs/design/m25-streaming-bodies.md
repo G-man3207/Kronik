@@ -436,7 +436,16 @@ For a kind that reads blobs (`RouteEntry.blobs = Some(limits)`):
 
 The whole-body timeout of today (`BODY_TIMEOUT`, 30 s) keeps applying to
 inline bodies; a spooled upload has the idle timeout instead, so a slow
-300 MB upload is not cut off while bytes keep arriving.
+300 MB upload is not cut off while bytes keep arriving. Bytes must keep
+arriving at a pace, though: once `[gateway] upload_rate_grace` (30 s) has
+passed, the last `upload_rate_window` (30 s) must bring at least `[gateway]
+upload_min_rate` (8 KiB/s) per second, checked as each chunk arrives, else
+408 `UPLOAD_TOO_SLOW` and the part file goes. Without it, a byte just inside
+the idle timeout would hold a connection slot and a writer indefinitely
+(review I-1). A preview's uploads and its turns' blobs count against
+`[fork] preview_blob_bytes` (256 MiB): the preview's space is public and no
+collector sweeps it while the preview lives, and it is deleted with the
+preview (review M-1).
 
 ### 6.3 Idempotency with large bodies
 
@@ -748,6 +757,8 @@ turn permits.
 | `[blobs] gc_interval` | `"1h"` | The collector's pass (M26 §6); `"0s"` runs it only on `kronik blobs gc` |
 | `[blobs] lease_ttl` | `"5m"` | How long a lease lives without renewal |
 | `[gateway] body_idle_timeout` | `"30s"` | An upload that sends nothing for this long is refused |
+| `[gateway] upload_min_rate` | `"8KiB"` | Once `upload_rate_grace` (`"30s"`) has passed, a body read as it arrives must average this per second over the last `upload_rate_window` (`"30s"`), else 408 `UPLOAD_TOO_SLOW` (review I-1); `"0B"` turns it off |
+| `[fork] preview_blob_bytes` | `"256MiB"` | What a preview's blob space holds: its uploads and its turns' blobs; past it an upload is 409 `PREVIEW_FULL`, a turn's write `quota-exceeded` (review M-1) |
 
 Limits per kind (history, `kronik limits set`, `POST /v1/limits`):
 
@@ -783,6 +794,7 @@ reserve.
 | --- | --- | --- | --- |
 | `BLOB_NOT_HELD` | 403 | M25 | A reference outside the turn's references (outcome code, effect error, API) |
 | `BLOB_STORE_FULL` | 503 | M25 | The blob store is below `[blobs] disk_reserve` |
+| `UPLOAD_TOO_SLOW` | 408 | M25 | A body read as it arrives fell below `[gateway] upload_min_rate` after the grace |
 | `BLOB_MISSING` | 500 | M25 | A committed reference's bytes are not in the store (never expected; a restore with `--allow-missing-blobs` can cause it) |
 | `BLOB_NOT_FOUND` | 404 | M25 | The API knows no such blob (`/v1/blobs/{hash}`) |
 | `BLOB_QUOTA_EXCEEDED` | 409 | M26 | Over `blob_bytes_per_actor` |

@@ -75,7 +75,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`NOT_IMPLEMENTED`](#not_implemented) | 501 | M1 | Not available in this version |
 | [`PAYLOAD_TOO_LARGE`](#payload_too_large) | 413 | M1 | The body or message is over the limit |
 | [`POLICY_DENIED`](#policy_denied) | 403 | M3 | A policy rule denies the change |
-| [`PREVIEW_FULL`](#preview_full) | 409 | M11 | The preview took as many requests as it can hold |
+| [`PREVIEW_FULL`](#preview_full) | 409 | M11 | The preview took as many requests, or as many blob bytes, as it can hold |
 | [`PREVIEW_LIMIT`](#preview_limit) | 409 | M11 | As many previews are live as there can be |
 | [`PREVIEW_NOT_FOUND`](#preview_not_found) | 404 | M11 | No such preview, or it expired |
 | [`PROPOSAL_NOT_FOUND`](#proposal_not_found) | 404 | M3 | No such proposal |
@@ -105,6 +105,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`TURN_TOO_LARGE`](#turn_too_large) | 500 | M1 | The turn's record would not fit in one log record |
 | [`UNAUTHENTICATED`](#unauthenticated) | 401 | M5 | No valid token |
 | [`UNAVAILABLE`](#unavailable) | 503 | M1 | The daemon is not accepting requests |
+| [`UPLOAD_TOO_SLOW`](#upload_too_slow) | 408 | M25 | The request body arrived too slowly |
 | [`VERIFY_REQUIRED`](#verify_required) | 409 | M1 | The actor type has history; verify the change first |
 | [`WATCH_NOT_FOUND`](#watch_not_found) | 404 | M11 | No such watch |
 
@@ -823,11 +824,13 @@ See also: [`proposal`](concepts/glossary.md#proposal), [`behavior-diff`](concept
 
 ## PREVIEW_FULL
 
-HTTP status 409, milestone M11. The preview took as many requests as it can hold.
+HTTP status 409, milestone M11. The preview took as many requests, or as many blob bytes, as it can hold.
 
 Default hint: Delete it with `kronik preview delete <id>` and create a new one with `kronik preview create <proposal>`.
 
 A preview keeps every request's effect on its state in memory (an in-memory copy of production's state, plus each request's rows), and anyone with its URL can send it requests. So a preview takes at most 10,000 requests; the next one answers this code and changes nothing. The count starts again when the preview's state is rebuilt from its fork point (after a daemon restart or an erasure).
+
+Its blobs have a cap too. A preview's uploads, and the blobs its turns write, go to its own blob space, which no collector sweeps while the preview lives. The space holds at most `[fork] preview_blob_bytes` (256 MiB). An upload past it answers this code, and a turn's write past it answers `quota-exceeded` to the guest. The space is deleted with the preview, when it is deleted or expires.
 
 Delete the preview and create a new one:
 
@@ -1279,6 +1282,27 @@ To fix it, retry shortly. If it persists, read the message and the daemon log. B
 For `serve`, `restore`, `keys wrap` or first key creation during `serve --init`, this also means another daemon or offline operation owns the data-directory lock. Stop that owning process, or use a different `--data-dir`. A missing or stale API socket is not evidence that the directory is free. Do not remove key files or bypass the ownership check.
 
 As the outcome of an actor's call turn (input source `CALL`) that a start wrote, it means the daemon stopped while the call waited for its callee, after its caller had timed out: the call never ran. Its caller had already failed or gone on without the answer. A compensation the call carried is not sent, and nothing is orphaned. If the change still matters, send it again.
+
+## UPLOAD_TOO_SLOW
+
+HTTP status 408, milestone M25. The request body arrived too slowly.
+
+Default hint: Send the body faster; an operator can lower `[gateway] upload_min_rate` (0 turns the check off).
+
+A request body that may become a blob (a kind whose code reads blobs) is
+read as it arrives, with no whole-body timeout, so that a slow large upload
+is not cut off while bytes keep arriving. Instead, once `[gateway]
+upload_rate_grace` (30 s) has passed, the bytes that arrived in the last
+`[gateway] upload_rate_window` (30 s) must average at least `[gateway]
+upload_min_rate` (8 KiB/s) per second. A body slower than that is refused
+with `408 UPLOAD_TOO_SLOW`, and nothing of it is kept. Without the check, a
+client sending a byte just inside the idle timeout would hold its
+connection, and the upload's part file, indefinitely.
+
+Send the body faster. An operator who expects slower uploads can lower
+`[gateway] upload_min_rate`, or turn the check off with `"0B"`.
+
+See also: [`blob`](concepts/glossary.md#blob).
 
 ## VERIFY_REQUIRED
 
