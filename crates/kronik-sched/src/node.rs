@@ -1376,9 +1376,23 @@ impl Node {
         if !slot.running {
             slot.running = true;
             drop(actors);
-            self.env
-                .spawn("actor", async move { me.worker(actor).await });
+            self.env.spawn("actor", me.worker(actor));
         }
+    }
+
+    /// The size of an actor worker's future, which a turn spawns in a box
+    /// whenever its actor was idle; `tests/worker_size.rs` keeps it under the
+    /// release build allocator's 32 KiB line. A function of the library, and
+    /// not a unit test, so that it measures the layout without `cfg(test)`.
+    #[doc(hidden)]
+    pub fn worker_future_size() -> usize {
+        fn future_size<F, Fut>(_: F) -> usize
+        where
+            F: FnOnce(Arc<Node>, ActorRef) -> Fut,
+        {
+            std::mem::size_of::<Fut>()
+        }
+        future_size(Node::worker)
     }
 
     async fn worker(self: Arc<Self>, actor: ActorRef) {
@@ -1509,9 +1523,11 @@ impl Node {
                 }
             }
             if let Some(again) = blob_retry {
-                result = self
-                    .retry_blob_store_full(&actor, result, again, job.parent_time)
-                    .await;
+                // Rare branches on the turn path await boxed futures, so that
+                // the worker's own stays small (tests/worker_size.rs).
+                result =
+                    Box::pin(self.retry_blob_store_full(&actor, result, again, job.parent_time))
+                        .await;
             }
             if let Some(lsn) = resend {
                 lock(&self.resending).remove(&lsn);
@@ -2371,9 +2387,10 @@ impl Node {
                         .await
                     {
                         if error.code == ErrorCode::SecretVersionGone {
-                            return self
-                                .fail_recorded_secret(r.begin, r.recorded, error.code, born)
-                                .await;
+                            return Box::pin(
+                                self.fail_recorded_secret(r.begin, r.recorded, error.code, born),
+                            )
+                            .await;
                         }
                         return Err(error);
                     }
@@ -2466,20 +2483,19 @@ impl Node {
                 "the input of an open turn does not fit in a turn's record under this release's \
                  budget: the turn is closed as failed without running again"
             );
-            return self
-                .close_open_turn(
-                    begin,
-                    recorded.unwrap_or_default(),
-                    ErrorCode::TurnTooLarge,
-                    format!(
-                        "the turn's input needs {base} bytes of its record, which holds at \
+            return Box::pin(self.close_open_turn(
+                begin,
+                recorded.unwrap_or_default(),
+                ErrorCode::TurnTooLarge,
+                format!(
+                    "the turn's input needs {base} bytes of its record, which holds at \
                          most {record_limit}: the turn, begun by an earlier release, did not \
                          run again"
-                    ),
-                    false,
-                    born,
-                )
-                .await;
+                ),
+                false,
+                born,
+            ))
+            .await;
         }
         let fx = TurnFx::new(
             me,
@@ -2634,14 +2650,13 @@ impl Node {
                     }
                 }
                 canonical.sort_by_key(|effect| effect.ordinal);
-                return self
-                    .fail_recorded_secret(
-                        fx.admitted_begin().clone(),
-                        canonical,
-                        ErrorCode::SecretVersionGone,
-                        born,
-                    )
-                    .await;
+                return Box::pin(self.fail_recorded_secret(
+                    fx.admitted_begin().clone(),
+                    canonical,
+                    ErrorCode::SecretVersionGone,
+                    born,
+                ))
+                .await;
             }
             // Not recorded: the worker runs the turn again once the blob
             // store has room (ADR 0117 §9).
@@ -2673,16 +2688,15 @@ impl Node {
                 let begun = lock(&fx.state).begun;
                 if begun {
                     let effects = std::mem::take(&mut lock(&fx.state).records);
-                    return self
-                        .close_open_turn(
-                            fx.admitted_begin().clone(),
-                            effects,
-                            ErrorCode::BlobMissing,
-                            message,
-                            false,
-                            born,
-                        )
-                        .await;
+                    return Box::pin(self.close_open_turn(
+                        fx.admitted_begin().clone(),
+                        effects,
+                        ErrorCode::BlobMissing,
+                        message,
+                        false,
+                        born,
+                    ))
+                    .await;
                 }
                 return Err(ApiError::new(ErrorCode::BlobMissing, message));
             }
