@@ -23,9 +23,16 @@ name: isolation
 #                 no panic), with the restriction active.
 #
 # Manual only (ADR 0110): start it from the Actions tab, or with
-# `gh workflow run isolation.yml`.
+# `gh workflow run isolation.yml`; `-f proofs=m21` or `-f proofs=m20` runs
+# one milestone's jobs alone.
 on:
   workflow_dispatch:
+    inputs:
+      proofs:
+        description: Which proofs to run
+        type: choice
+        options: [all, m21, m20]
+        default: all
 
 permissions:
   contents: read
@@ -43,6 +50,7 @@ env:
 jobs:
   m21:
     name: M21 nonroot service, user namespaces ${{ matrix.userns }}
+    if: inputs.proofs != 'm20'
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     strategy:
@@ -135,6 +143,7 @@ jobs:
 
   microvm-tools:
     name: M20 pinned microVM tool bundle
+    if: inputs.proofs != 'm21'
     runs-on: ubuntu-24.04
     timeout-minutes: 340
     steps:

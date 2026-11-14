@@ -57,6 +57,11 @@ class GithubFixtureTest(unittest.TestCase):
         self.assertEqual(set(workflow["jobs"]), {"m21", "microvm-tools", "m20"})
         self.assertEqual(workflow["jobs"]["m21"]["strategy"]["matrix"]["userns"], ["restricted", "lifted"])
         self.assertEqual(workflow["jobs"]["m20"]["needs"], "microvm-tools")
+        # A dispatch may run one milestone's proofs alone; the default runs all.
+        inputs = workflow["on"]["workflow_dispatch"]["inputs"]["proofs"]
+        self.assertEqual((inputs["options"], inputs["default"]), (["all", "m21", "m20"], "all"))
+        self.assertEqual(workflow["jobs"]["m21"]["if"], "inputs.proofs != 'm20'")
+        self.assertEqual(workflow["jobs"]["microvm-tools"]["if"], "inputs.proofs != 'm21'")
         for name, job in workflow["jobs"].items():
             uploads = [step for step in job["steps"] if step.get("uses", "").startswith("actions/upload-artifact@")]
             self.assertEqual(len(uploads), 1, name)
