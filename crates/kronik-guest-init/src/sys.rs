@@ -950,6 +950,52 @@ fn reap(application: libc::pid_t) -> io::Result<bool> {
     }
 }
 
+/// Whether a child of this process is left, after reaping every child that
+/// has ended (`waitpid` until it has none to report or there are none).
+fn children_left(application: libc::pid_t) -> io::Result<bool> {
+    loop {
+        let mut status = 0;
+        // SAFETY: waitpid writes only this live status variable and never blocks.
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid > 0 {
+            if pid == application {
+                eprintln!("kronik-guest-init: application exited (wait status {status})");
+            }
+            continue;
+        }
+        if pid == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ECHILD) => return Ok(false),
+            Some(libc::EINTR) => {}
+            _ => return Err(error),
+        }
+    }
+}
+
+/// Waits until `left` says no process is left or `deadline` passes, looking
+/// every `step`; whether a process was still left at the deadline. The stop
+/// of the VM waits for its processes only as long as they live: the VMM must
+/// end within a second of the acknowledged STOP (ADR 0096), so a grace
+/// period that all of them outlive is not waited out.
+fn wait_until_gone(
+    deadline: Instant,
+    step: Duration,
+    mut left: impl FnMut() -> io::Result<bool>,
+) -> io::Result<bool> {
+    loop {
+        if !left()? {
+            return Ok(false);
+        }
+        if Instant::now() >= deadline {
+            return Ok(true);
+        }
+        thread::sleep(step);
+    }
+}
+
 fn stop_children(application: libc::pid_t) -> io::Result<()> {
     // SAFETY: run_guest verified PID1, so -1 reaches guest children only and
     // Linux explicitly excludes PID1/the caller from broadcast delivery.
@@ -958,9 +1004,10 @@ fn stop_children(application: libc::pid_t) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        reap(application)?;
-        thread::sleep(Duration::from_millis(20));
+    if !wait_until_gone(deadline, Duration::from_millis(10), || {
+        children_left(application)
+    })? {
+        return Ok(());
     }
     // SAFETY: same guest-only broadcast, after a bounded graceful shutdown.
     let rc = unsafe { libc::kill(-1, libc::SIGKILL) };
@@ -1158,6 +1205,50 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
+
+    /// The stop waits for the guest's processes only as long as one is left,
+    /// and says whether one outlived the deadline.
+    #[test]
+    fn the_stop_waits_only_while_a_process_is_left() {
+        let start = Instant::now();
+        let mut calls = 0;
+        let outlived = wait_until_gone(
+            start + Duration::from_secs(2),
+            Duration::from_millis(1),
+            || {
+                calls += 1;
+                Ok(calls < 3)
+            },
+        )
+        .unwrap();
+        assert!(!outlived);
+        assert_eq!(calls, 3);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+        // None left from the start: no wait at all.
+        assert!(
+            !wait_until_gone(
+                start + Duration::from_secs(2),
+                Duration::from_secs(1),
+                || Ok(false)
+            )
+            .unwrap()
+        );
+        // One that outlives the deadline is reported, after the deadline.
+        let deadline = Instant::now() + Duration::from_millis(30);
+        assert!(wait_until_gone(deadline, Duration::from_millis(5), || Ok(true)).unwrap());
+        assert!(Instant::now() >= deadline);
+        // An error is passed on.
+        assert!(
+            wait_until_gone(deadline, Duration::from_millis(5), || Err(
+                io::Error::other("x")
+            ))
+            .is_err()
+        );
+    }
 
     /// The command is pinned so that nobody turns it back into a power-off,
     /// which would leave a finished guest halted instead of gone (see
