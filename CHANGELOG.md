@@ -200,6 +200,28 @@ until the v1.0 compatibility promise takes effect.
   foreign actor with production's text and fits the answers it makes up
   (stub rules, contract fakes, neighbors, the model) to the record as it
   fits live ones.
+- The nonroot daemon (M21, opt-in; ADRs 0060–0065):
+  `kronik serve --init --rootless` installs a service that runs as its own
+  `kronik` user, with `runsc` as root of a pinned user namespace for foreign
+  actors, and `kronik doctor --rootless` checks its prerequisites
+  (`ROOTLESS_UNAVAILABLE` names a missing one). `kronik serve --init` still
+  installs the root service, the default until the nonroot service's
+  installed proofs pass: the manual `isolation` workflow runs them on
+  disposable GitHub-hosted runners (ADR 0133), and they do not pass yet.
+  `kronik restore` and `kronik upgrade check` do the part that needs root as
+  root and the rest as the data directory's owner.
+- MicroVM isolation (M20, experimental; ADRs 0095 and 0096 proposed): a
+  foreign actor added with `isolation = "microvm"` runs in a Firecracker VM,
+  on a host with a usable `/dev/kvm` and the pinned tool bundle in
+  `[foreign] microvm_dir` (`scripts/build-microvm-tools.sh` builds it);
+  without KVM the add answers `KVM_UNAVAILABLE` and suggests `gvisor`. Every
+  add warns that the level is experimental: it has not booted a VM on a KVM
+  host yet, its VMM runs as the daemon's user under Kronik's own launcher
+  instead of Firecracker's jailer, and every sandbox fork of a microVM actor
+  resumes the same snapshot. On the root service it needs a delegated cgroup
+  (a drop-in, in the operations guide). `[foreign] start_timeout` (30 s)
+  sets how long a started sandbox or microVM may take to answer before its
+  start is retried.
 - Forks, replays and proposals now work at every point of the
   `[retention] history` window, as the brief requires (#66). Retention kept
   the log for the window but only the newest `snapshots_kept` snapshots and
@@ -443,6 +465,52 @@ M23, key and secret backends:
   turn of its callee with `UNAVAILABLE` ("the call never ran"): its
   compensation is dropped and nothing is orphaned, in a rebuild of the log
   too.
+
+<!--
+Draft of the v0.5.0 section, to finish at the release. Then rename
+"## Unreleased" to "## v0.5.0 — <date>", open it with the summary below,
+sort the entries above into the groups below (keeping their text), and end
+it with the upgrade paragraph.
+
+Summary:
+
+  The "Isolation, standards and web" release (M20 to M26 of the build
+  brief). Log format v1 gains records, all additive, but a release before
+  this one cannot read a log that holds them; the actor WIT becomes
+  `kronik:actor@0.1.1`, also additive; API `/v1` and the CLI's JSON gain
+  fields and endpoints.
+
+Groups, in this order:
+
+1. Long-lived connections (M24): the WIT and log-format entries, WebSocket
+   and SSE routes, the hub and its limits, send-now, replay and diff, the
+   API, CLI and MCP, the SDKs and the chat example.
+2. Streaming bodies and blob storage (M25, M26), if they land.
+3. External secret backends (M23 B2-B6, accepted for this release): the
+   backends, the cache and outage handling, the PKCS#11 helper, the
+   scrub-only copies (ADR 0142: external secret values are now at rest,
+   encrypted, in the data directory), and their fixes.
+4. Isolation, opt-in: the nonroot daemon (M21) and the microVM level (M20,
+   experimental), with the state of their proofs at the release.
+5. Replay, forks and the upgrade check: every point of the log, erased
+   inputs as unverifiable (ADR 0109), calls and timers in forks.
+6. Privacy and erasure.
+7. The gateway, the API, the CLI and MCP.
+8. Recovery and records: the record budget (ADR 0130), open turns at
+   snapshots, the clock stepping back.
+
+Upgrade paragraph (checked on the v0.4.1 corpus with a 0.5.0-dev build;
+check the engine name against `kronik --version` of the release build):
+
+  The engine is now `kronik-0.5.0+wasmtime-50.0.1` (was
+  `kronik-0.4.1+wasmtime-50.0.1`). Data written by any earlier release
+  needs a passing `kronik upgrade check` with this binary before the first
+  start; without one the start stops with `ENGINE_VERSION_MISMATCH`, and a
+  passing start appends one `engine.upgrade` record. Going back to v0.4.1
+  needs its own check and works only until the log holds a record v0.4.1
+  cannot read, such as a connection's turn: the operations guide's
+  "Upgrading from v0.4.1" has the details.
+-->
 
 ## v0.4.1 — 2026-11-07
 
