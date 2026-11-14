@@ -1208,9 +1208,10 @@ Agreed with the M25/M26 design, so that the two never collide:
   missing oneof is refused).
 - A new fixture log, `tests/compatibility/m24-connections/`, holds a short
   recorded session (an open, frames, a `send-now`, an actor close, a
-  restart close), written by a test binary of this version. The test
-  reads, applies and rebuilds it, and checks the `connections` table and
-  the history fates.
+  restart close), written by a test binary of this version
+  (`crates/kronik-sched/tests/connections_fixture.rs`). The test reads,
+  applies and rebuilds it, and checks the `connections` table; the API's
+  tests check the history fates of its frames.
 - The existing fixtures (`v0.1.0` to `v0.4.1`) still read and replay
   unchanged. When v0.5.0 is released, a chat session enters the frozen
   release corpus like the earlier releases' logs.
