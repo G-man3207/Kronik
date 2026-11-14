@@ -59,7 +59,8 @@ pub(crate) struct TurnConnections {
     pub(crate) ops: Vec<pb::ConnectionOp>,
     /// The `connections` rows the turn looked at, as of its start.
     views: HashMap<String, Option<ConnectionView>>,
-    /// Frames each connection got with `send-now` in this turn (`OK`).
+    /// Frames each connection got with `send-now` in this turn: `OK` and
+    /// outcome-unknown ones, which may have been sent.
     pub(crate) sent_now: HashMap<String, u64>,
     calls: usize,
     targets: usize,
@@ -368,7 +369,12 @@ impl wit::Host for TurnHost {
                 Ok(())
             }
             SendNowOutcome::Closed => Err(wit::SendError::Closed),
-            SendNowOutcome::OutcomeUnknown => Err(wit::SendError::OutcomeUnknown),
+            // It may have been sent with its seq: the next frame takes the
+            // next one.
+            SendNowOutcome::OutcomeUnknown => {
+                *self.conns.sent_now.entry(conn).or_insert(0) += 1;
+                Err(wit::SendError::OutcomeUnknown)
+            }
             SendNowOutcome::Denied(m) => Err(wit::SendError::Denied(m)),
         })
     }

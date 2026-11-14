@@ -424,8 +424,10 @@ An external effect, as the brief requires:
 
 - Every outgoing frame has a per-connection `seq`, starting at 0. The host
   assigns it in the turn:
-  - a `send-now` frame takes `next_seq` + the number of earlier `OK`
-    `send-now` frames to the same connection in this turn;
+  - a `send-now` frame takes `next_seq` + the number of earlier `OK` or
+    `OUTCOME_UNKNOWN` `send-now` frames to the same connection in this
+    turn (an unknown one may have been sent with its seq, so no later frame
+    takes it);
   - at the end of the turn, the buffered frames take the following seqs,
     target by target, in operation order;
   - `next_seq` is the `connections` row as of the turn's start (§6.5), and
@@ -437,9 +439,9 @@ An external effect, as the brief requires:
   writes in `seq` order.
 - A `send-now` call and a later `send` in the same turn: the `send-now`
   frame goes first, whatever the call order. The docs say so.
-- The applier advances `next_seq` by every `OK` `connection.send-now`
-  effect of any turn record (failed turns keep their effects), and by every
-  buffered target of committed records.
+- The applier advances `next_seq` by every `OK` or `OUTCOME_UNKNOWN`
+  `connection.send-now` effect of any turn record (failed turns keep their
+  effects), and by every buffered target of committed records.
 - Diffs ignore `seq` (ADR 0116).
 
 ### 4.6 What an acknowledged turn means
@@ -1050,7 +1052,8 @@ subject). There is no response payload: the status is the result.
 // connection.send-now request (M24).
 message ConnectionSendRequest {
   string connection = 1;
-  // The frame's outgoing seq; 0 unless the status is OK.
+  // The frame's outgoing seq; 0 unless the status is OK or OUTCOME_UNKNOWN
+  // (it may have been sent).
   uint64 seq = 2;
   Frame.Kind kind = 3;
   bytes data = 4;
@@ -1143,8 +1146,8 @@ In `connections`, `closed_lsn`, `cause`, `code`, `frames_written` and
 The applier applies, per turn record, in this order:
 
 1. An open input with a committed `Outcome.output.accept` inserts the row.
-2. Every `OK` `connection.send-now` effect advances `next_seq` of its
-   target, also in failed turns.
+2. Every `OK` or `OUTCOME_UNKNOWN` `connection.send-now` effect advances
+   `next_seq` of its target, also in failed turns.
 3. Every SEND target of a committed record advances `next_seq`, and a
    committed CLOSE sets `closing_lsn` if it is still unset.
 4. A frame input increments `frames_in`, unless it is a resend.

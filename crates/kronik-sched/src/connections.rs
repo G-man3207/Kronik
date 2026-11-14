@@ -40,6 +40,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The queue slots a drained connection keeps.
+const QUEUE_KEPT: usize = 16;
+
 /// The close code and reason of a graceful stop (§5.9).
 pub const RESTART_CODE: u16 = 1012;
 pub const RESTART_REASON: &str = "kronik: restart";
@@ -354,6 +357,12 @@ impl Hub {
     /// Whether `conn` is live on this node, and how many bytes it queues.
     pub fn queued_bytes(&self, conn: &str) -> Option<usize> {
         lock(&self.inner).live.get(conn).map(|l| l.queued_bytes)
+    }
+
+    /// How many frames `conn`'s queue can hold without growing (tests).
+    #[doc(hidden)]
+    pub fn queue_capacity(&self, conn: &str) -> Option<usize> {
+        lock(&self.inner).live.get(conn).map(|l| l.queue.capacity())
     }
 
     /// Whether a graceful stop began: no open or frame is admitted.
@@ -882,6 +891,11 @@ impl Hub {
             let bytes = conn::frame_bytes(frame).min(live.queued_bytes);
             live.queued_bytes -= bytes;
             self.queued.fetch_sub(bytes, Ordering::Relaxed);
+        }
+        // A drained queue gives back what a burst made it hold: thousands
+        // of idle connections must not each keep their peak.
+        if live.queue.is_empty() && live.queue.capacity() > QUEUE_KEPT {
+            live.queue.shrink_to(QUEUE_KEPT);
         }
         live.room.notify_one();
         Some(item)

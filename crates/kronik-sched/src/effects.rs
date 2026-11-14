@@ -2322,7 +2322,8 @@ impl TurnFx {
             // I17: a send-now without a recorded result is not sent again.
             rec.status = pb::EffectStatus::OutcomeUnknown as i32;
             rec.error = "outcome unknown: the daemon stopped before the result was recorded".into();
-            rec.request = request(0);
+            // The seq it may have been sent with (§4.5).
+            rec.request = request(req.seq);
             self.record(rec).await?;
             send_now_metric(self.kind(), pb::EffectStatus::OutcomeUnknown);
             return Ok(SendNowOutcome::OutcomeUnknown);

@@ -3327,7 +3327,10 @@ impl ReplayGate {
                 &req.subject,
                 send_now_request(
                     &req.connection,
-                    if status == pb::EffectStatus::Ok {
+                    if matches!(
+                        status,
+                        pb::EffectStatus::Ok | pb::EffectStatus::OutcomeUnknown
+                    ) {
                         req.seq
                     } else {
                         0

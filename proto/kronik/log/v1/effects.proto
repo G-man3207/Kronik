@@ -94,7 +94,8 @@ message RevealEffectRequest {
 // status is the result.
 message ConnectionSendRequest {
   string connection = 1;
-  // The frame's outgoing seq; 0 unless the status is OK.
+  // The frame's outgoing seq; 0 unless the status is OK or OUTCOME_UNKNOWN
+  // (it may have been sent).
   uint64 seq = 2;
   Frame.Kind kind = 3;
   bytes data = 4;

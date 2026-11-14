@@ -1061,6 +1061,12 @@ fn a_crash_after_send_now_gives_outcome_unknown_and_never_resends() {
         let e = &rerun.effects[0];
         assert_eq!(e.status, pb::EffectStatus::OutcomeUnknown as i32, "{cmd}");
         assert_eq!(send_now_request(e).data, b"tok 0".to_vec());
+        // It may have reached the client with seq 1 (after the welcome), so
+        // it keeps that seq, and a buffered `done` would take the next.
+        assert_eq!(send_now_request(e).seq, 1, "{cmd}");
+        if safe {
+            assert_eq!(rerun.connection_ops[0].seqs, [2], "{cmd}");
+        }
         assert_eq!(rerun.effects.len(), 1, "{cmd}: nothing after it was sent");
         let dead = p.node.store().db().dead_letters(0, 10).unwrap();
         if safe {
@@ -1104,4 +1110,25 @@ fn a_rebase_closes_its_kinds_on_the_wire_without_an_input() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(p.node.applied_lsn(), before, "no close input from the hub");
     assert!(p.live(&a), "the rebased state's row is the node's to close");
+}
+
+/// The hub gives back the queue slots a burst made a connection hold once
+/// its writer drained them (design-m24's memory run).
+#[test]
+fn a_drained_queue_gives_its_slots_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy(ROOM, false).unwrap();
+    let (a, ta) = p.join("lobby", "ada");
+    ta.stall(true);
+    p.frame(&a, "burst 500 8");
+    p.until("the burst is queued", || {
+        p.node.hub().queued_bytes(&a).is_some_and(|b| b >= 500 * 8)
+    });
+    ta.stall(false);
+    p.until("the burst is written", || {
+        ta.recording().frames.len() == 501
+    });
+    assert_eq!(p.node.hub().queued_bytes(&a), Some(0));
+    assert!(p.node.hub().queue_capacity(&a).unwrap() <= 16);
 }

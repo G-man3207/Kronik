@@ -2581,7 +2581,8 @@ fn apply_turn(
 }
 
 /// A turn record's effect on the `connections` table (M24 §6.5), in this
-/// order: an accepted open inserts the row; every OK `connection.send-now`
+/// order: an accepted open inserts the row; every OK or OUTCOME_UNKNOWN
+/// `connection.send-now`
 /// advances its target's `next_seq` by one, also in failed turns; a
 /// committed record's live SEND targets advance it and its CLOSE sets
 /// `closing_lsn`; a frame input (not a resend) counts in `frames_in`; a
@@ -2632,7 +2633,11 @@ fn apply_connections(
     }
     // 2. Frames sent now, also by a turn that then failed.
     for e in &t.effects {
-        if e.kind != "connection.send-now" || e.status != pb::EffectStatus::Ok as i32 {
+        // An OUTCOME_UNKNOWN send-now may have reached its client with its
+        // seq, so it keeps it like an OK one.
+        let took_seq = e.status == pb::EffectStatus::Ok as i32
+            || e.status == pb::EffectStatus::OutcomeUnknown as i32;
+        if e.kind != "connection.send-now" || !took_seq {
             continue;
         }
         let Some(id) = e.target.strip_prefix("connection:") else {

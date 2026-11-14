@@ -476,3 +476,36 @@ fn connection_dead_letters_are_capped() {
     }
     assert_eq!(rebuilt.state_hash().unwrap(), store.state_hash().unwrap());
 }
+
+/// An OUTCOME_UNKNOWN send-now (a re-run after a crash) may have reached
+/// its client, so it advances `next_seq` like an OK one; a CLOSED one does
+/// not (design §4.5, §6.5).
+#[test]
+fn an_unknown_send_now_keeps_its_seq() {
+    let store = Store::memory().unwrap();
+    let mut records = records();
+    records.truncate(1); // the open of C1
+    let send_now = |status: pb::EffectStatus, ordinal: u32| pb::EffectRecord {
+        ordinal,
+        kind: "connection.send-now".into(),
+        target: format!("connection:{C1}"),
+        status: status as i32,
+        ..Default::default()
+    };
+    let mut t = turn(frame(C1, 0, ""), pb::OutcomeKind::EffectOutcomeUnknown);
+    t.effects = vec![
+        send_now(pb::EffectStatus::Ok, 0),
+        send_now(pb::EffectStatus::OutcomeUnknown, 1),
+        send_now(pb::EffectStatus::Closed, 2),
+    ];
+    t.execution_id = format!("{:032x}", 99);
+    records.push(committed(2, Record::TurnRecord(t)));
+    store.apply(&records).unwrap();
+    let before = {
+        let rebuilt = Store::memory().unwrap();
+        rebuilt.apply(&records[..1]).unwrap();
+        rebuilt.db().connection(C1).unwrap().unwrap().next_seq
+    };
+    let row = store.db().connection(C1).unwrap().unwrap();
+    assert_eq!(row.next_seq, before + 2, "{row:?}");
+}
