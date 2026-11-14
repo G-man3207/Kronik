@@ -514,6 +514,9 @@ check the engine name against `kronik --version` of the release build):
   cannot read, such as a connection's turn: the operations guide's
   "Upgrading from v0.4.1" has the details.
 -->
+- A reseal fails when the fsync of the log directory after it renames a
+  resealed segment into place fails; before, it went on as if the rename
+  were durable. v0.4.1 has the same gap.
 
 ## v0.4.1 — 2026-11-07
 

@@ -1021,6 +1021,72 @@ async fn a_torn_footer_is_truncated() {
     assert_eq!(h.read_all().await.unwrap().len(), 2);
 }
 
+/// A segment of two records, closed by its writer's drop, and its bytes.
+async fn closed_segment(h: &Harness) -> (PathBuf, Vec<u8>) {
+    let (log, _, _rx) = h.open().await.unwrap();
+    log.append_all(vec![begin("a"), finished("a")])
+        .await
+        .unwrap();
+    drop(log);
+    let path = h.segment_files().pop().unwrap();
+    let before = std::fs::read(&path).unwrap();
+    (path, before)
+}
+
+/// The edit of a reseal, as the tests make it: a longer execution id.
+fn longer_id(_lsn: Lsn, record: &mut Record) -> Result<bool, String> {
+    if let Record::TurnBegin(turn) = record {
+        turn.execution_id = "execution-id-long-enough-to-shift-later-offsets".into();
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// What must be durable before a rewritten image replaces its segment (a
+/// reseal's mark for the shipper) is written while the old segment is still
+/// in place, from the new image; when that fails, the segment stays as it
+/// was and no temporary file is left.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewrite_marks_the_new_image_before_it_replaces_the_segment() {
+    let h = harness();
+    let (path, before) = closed_segment(&h).await;
+    let refused = rewrite_segment_marked(&path, longer_id, |_image| {
+        Err(io::Error::other("the mark could not be made durable"))
+    });
+    assert!(matches!(refused, Err(LogError::Io(_))), "{refused:?}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!path.with_extension("seg.tmp").exists());
+
+    let mut marked = None;
+    let rewritten = rewrite_segment_marked(&path, longer_id, |image| {
+        // The old segment is still in place while the mark is written.
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        marked = Some(image.to_vec());
+        Ok(())
+    })
+    .unwrap();
+    assert!(rewritten.changed);
+    let image = std::fs::read(&path).unwrap();
+    assert_ne!(image, before);
+    assert_eq!(marked.as_deref(), Some(image.as_slice()));
+}
+
+/// A rewrite whose rename the directory's fsync did not make durable fails:
+/// a power loss could still bring the old image back, so nothing may build
+/// on the new one (v0.4.1 ignored the error).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewrite_fails_when_its_rename_is_not_made_durable() {
+    let h = harness();
+    let (path, _) = closed_segment(&h).await;
+    FAIL_DIR_SYNC.with(|f| f.set(true));
+    let rewritten = rewrite_segment(&path, longer_id);
+    FAIL_DIR_SYNC.with(|f| f.set(false));
+    assert!(
+        matches!(rewritten, Err(LogError::RenameNotDurable(_))),
+        "{rewritten:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rewrite_rebuilds_offsets_and_a_noop_leaves_a_missing_footer() {
     let h = harness();

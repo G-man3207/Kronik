@@ -143,6 +143,12 @@ pub enum LogError {
     Io(#[from] io::Error),
     #[error("log writer stopped: {0}")]
     Stopped(String),
+    /// A rewritten segment was renamed into place, but the fsync of its
+    /// directory failed: whether the old image or the new one survives a
+    /// power loss is unknown. The caller must stop, as after a failed log
+    /// fsync, and recover at the next start ([`rewrite_segment_marked`]).
+    #[error("the rename of a rewritten segment is not durable: {0}")]
+    RenameNotDurable(io::Error),
     /// An append whose body is over the record limit. Nothing was written,
     /// no LSN was used and the writer goes on: this is a refusal, not a
     /// storage failure.
@@ -672,10 +678,30 @@ pub struct SegmentRewrite {
 /// over [`MAX_RECORD`] fails with [`LogError::TooLarge`] and leaves the file
 /// alone.
 ///
+/// The rename is durable before this returns: a failed fsync of the
+/// directory fails the rewrite with [`LogError::RenameNotDurable`], so
+/// nothing that follows (the offsets in `state.db`, a reseal's progress)
+/// treats the new image as the segment's while a power loss could still
+/// bring the old one back.
+///
 /// The active segment must not be passed here: the writer holds it open.
 pub fn rewrite_segment(
     path: &Path,
+    edit: impl FnMut(Lsn, &mut Record) -> Result<bool, String>,
+) -> Result<SegmentRewrite, LogError> {
+    rewrite_segment_marked(path, edit, |_| Ok(()))
+}
+
+/// [`rewrite_segment`], calling `before_rename` with the new image once it
+/// is durable beside the old one and before it replaces it: what must be
+/// durable before the segment changes is written there, such as a reseal's
+/// mark for the shipper (docs/design/m8-privacy.md §8), which a power loss
+/// right after the rename must not lose. An error from it leaves the
+/// segment as it was.
+pub fn rewrite_segment_marked(
+    path: &Path,
     mut edit: impl FnMut(Lsn, &mut Record) -> Result<bool, String>,
+    before_rename: impl FnOnce(&[u8]) -> std::io::Result<()>,
 ) -> Result<SegmentRewrite, LogError> {
     let image = std::fs::read(path)?;
     let header = parse_header(&image)
@@ -748,16 +774,35 @@ pub fn rewrite_segment(
         f.write_all(&out)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
-    if let Some(parent) = path.parent()
-        && let Ok(d) = std::fs::File::open(parent)
-    {
-        let _ = d.sync_all();
+    if let Err(e) = before_rename(&out) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
     }
+    std::fs::rename(&tmp, path)?;
+    sync_dir_of(path).map_err(LogError::RenameNotDurable)?;
     Ok(SegmentRewrite {
         changed: true,
         offsets,
     })
+}
+
+/// fsyncs the directory of `path`: the names in it are durable then.
+fn sync_dir_of(path: &Path) -> std::io::Result<()> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    #[cfg(test)]
+    if FAIL_DIR_SYNC.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("injected directory fsync failure"));
+    }
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fails [`sync_dir_of`] on this thread (tests).
+    static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 async fn list_segments(env: &Env, dir: &Path) -> Result<Vec<Lsn>, LogError> {

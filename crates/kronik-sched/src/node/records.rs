@@ -40,7 +40,9 @@ pub struct ShardReader {
 fn source_error(error: LogError) -> ApiError {
     let code = match &error {
         LogError::Corrupt(_) => ErrorCode::StorageCorrupt,
-        LogError::Io(_) | LogError::Stopped(_) => ErrorCode::Unavailable,
+        LogError::Io(_) | LogError::Stopped(_) | LogError::RenameNotDurable(_) => {
+            ErrorCode::Unavailable
+        }
         // Only appends refuse a body; a read never returns this.
         LogError::TooLarge { .. } => ErrorCode::Internal,
     };
