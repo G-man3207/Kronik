@@ -529,6 +529,16 @@ check the engine name against `kronik --version` of the release build):
 - A reseal fails when the fsync of the log directory after it renames a
   resealed segment into place fails; before, it went on as if the rename
   were durable. v0.4.1 has the same gap.
+- A reseal that stops between renaming a resealed segment into place and
+  fixing `state.db` for it (a crash, an error) is finished at the next
+  start, or by the next reseal pass: the fix is journaled durably before
+  the rename (`privacy/reseal-fix/<start>`) and applied then from the
+  segment's records as they are. Before, no reseal found that segment
+  again: the state values, queued bodies, saved responses and dead letters
+  of its turns kept their plaintext in `state.db`, and the turn index
+  pointed into the old image. `privacy status` counts such a segment in
+  `reseal.pending_segments`, and every erasure as pending, until the fix is
+  done. v0.4.1 has the same gap.
 
 ## v0.4.1 — 2026-11-07
 

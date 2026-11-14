@@ -284,6 +284,11 @@ impl Node {
         // by a turn that runs across it (§6.8).
         pending.extend(self.queued_predating());
         pending.extend(self.running_predating());
+        // A resealed segment whose state.db rows are not fixed yet: they may
+        // still hold any erased subject's plaintext.
+        if self.reseal_fix_pending().await {
+            pending.extend(erased.iter().cloned());
+        }
         let upto = self.applied_lsn();
         if upto < 1 {
             return Ok(pending.len() as u64);

@@ -38,7 +38,8 @@ pub struct ResealProgress {
     pub segments_total: u64,
     pub values_sealed: u64,
     pub tombstones: u64,
-    /// Rewritten segments not yet replaced in object storage.
+    /// Rewritten segments whose reseal is not finished: not yet replaced in
+    /// object storage, or their rows in state.db not fixed yet.
     pub pending_segments: u64,
 }
 
@@ -64,6 +65,76 @@ fn reupload_dir(data: &Path) -> PathBuf {
 
 fn reupload_path(data: &Path, start: Lsn) -> PathBuf {
     reupload_dir(data).join(format!("{start:020}"))
+}
+
+/// Segments whose resealed image is renamed, or about to be renamed, into
+/// place before `state.db` is fixed for it ([`journal_fix`]).
+fn fix_dir(data: &Path) -> PathBuf {
+    privacy_dir(data).join("reseal-fix")
+}
+
+fn fix_path(data: &Path, start: Lsn) -> PathBuf {
+    fix_dir(data).join(format!("{start:020}"))
+}
+
+/// Journals the fix of `state.db` that a segment's resealed `image` needs
+/// ([`StateDb::fix_reseal`](kronik_store::db::StateDb::fix_reseal)),
+/// durably, before the image replaces the segment. Once the segment is
+/// resealed no reseal finds it again, so a crash or an error between the
+/// rename and the fix would leave the rows its turns own (state values,
+/// queued bodies, saved responses, dead letters) plain, and the offsets of
+/// its turns those of the old image, for good. The entry holds the image's
+/// BLAKE3; the next start or reseal pass fixes the rows from the segment's
+/// records when the segment is that image ([`Node::finish_reseal_fixes`]).
+fn journal_fix(data: &Path, start: Lsn, image: &[u8]) -> std::io::Result<()> {
+    crate::durable::create_dir_all(data, &fix_dir(data))?;
+    let hash = blake3::hash(image).to_hex().to_string();
+    crate::durable::write_synced(&fix_path(data, start), hash.as_bytes())
+}
+
+/// Drops the journal entry of `start`, durably: its fix is done.
+fn clear_fix(data: &Path, start: Lsn) -> std::io::Result<()> {
+    match crate::durable::remove_file(&fix_path(data, start)) {
+        Ok(()) => crate::durable::sync(&fix_dir(data)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The journal's entries: the segment, and the BLAKE3 of the image whose
+/// fix is pending.
+fn pending_fixes(data: &Path) -> std::io::Result<Vec<(Lsn, String)>> {
+    let entries = match std::fs::read_dir(fix_dir(data)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut fixes = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(start) = entry
+            .file_name()
+            .to_str()
+            .filter(|n| n.len() == 20)
+            .and_then(|n| n.parse::<Lsn>().ok())
+        else {
+            continue;
+        };
+        let hash = std::fs::read_to_string(entry.path())?;
+        fixes.push((start, hash.trim().to_owned()));
+    }
+    fixes.sort();
+    Ok(fixes)
+}
+
+/// The segments a reseal renamed into place whose `state.db` rows are not
+/// fixed yet: their reseal is not finished.
+pub fn pending_fix_segments(data: &Path) -> BTreeSet<Lsn> {
+    pending_fixes(data)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(start, _)| start)
+        .collect()
 }
 
 fn retention_path(data: &Path) -> PathBuf {
@@ -136,19 +207,20 @@ pub fn clear_reupload(data: &Path, start: Lsn) -> std::io::Result<()> {
 }
 
 /// Rewritten segments whose shipped copy has not been replaced.
-pub fn pending_reuploads(data: &Path) -> u64 {
+fn reupload_segments(data: &Path) -> BTreeSet<Lsn> {
     let Ok(entries) = std::fs::read_dir(reupload_dir(data)) else {
-        return 0;
+        return BTreeSet::new();
     };
     entries
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-        .filter(|e| {
+        .filter_map(|e| {
             e.file_name()
                 .to_str()
-                .is_some_and(|n| n.len() == 20 && n.bytes().all(|b| b.is_ascii_digit()))
+                .filter(|n| n.len() == 20 && n.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|n| n.parse::<Lsn>().ok())
         })
-        .count() as u64
+        .collect()
 }
 
 fn load_progress(data: &Path) -> ProgressFile {
@@ -176,12 +248,14 @@ fn save_progress(data: &Path, p: &ProgressFile) -> Result<(), ApiError> {
 /// Progress for `GET /v1/privacy`. `data` is the node's data directory.
 pub fn reseal_progress(data: &Path) -> ResealProgress {
     let p = load_progress(data);
+    let mut pending = reupload_segments(data);
+    pending.extend(pending_fix_segments(data));
     ResealProgress {
         segments_done: p.segments_done,
         segments_total: p.segments_total,
         values_sealed: p.values_sealed,
         tombstones: p.tombstones,
-        pending_segments: pending_reuploads(data),
+        pending_segments: pending.len() as u64,
     }
 }
 
@@ -255,6 +329,164 @@ impl Node {
 
     fn data_dir(&self) -> Option<&Path> {
         self.cfg.storage.as_ref().map(|s| s.data_dir.as_path())
+    }
+
+    /// The error of a segment's rewrite. When the segment was renamed into
+    /// place but the fsync of the log directory failed, which image a power
+    /// loss leaves is unknown and an fsync is never retried: the node
+    /// stops, as after a failed log fsync, and the next start syncs the log
+    /// directory and fixes state.db from the journal ([`journal_fix`]).
+    pub(crate) fn reseal_rewrite_error(&self, start: Lsn, e: kronik_log::LogError) -> ApiError {
+        if matches!(e, kronik_log::LogError::RenameNotDurable(_)) {
+            self.stop_fatal(format!("reseal of segment {start}: {e}"));
+        }
+        ApiError::new(ErrorCode::Internal, format!("reseal: {e}"))
+    }
+
+    /// The journal's entries ([`journal_fix`]), read through the node's file
+    /// system: a simulated node never reads the host's.
+    async fn journaled_fixes(&self, data: &Path) -> std::io::Result<Vec<(Lsn, String)>> {
+        let dir = fix_dir(data);
+        let names = match self.env.fs.read_dir(dir.clone()).await {
+            Ok(names) => names,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut fixes = Vec::new();
+        for name in names {
+            let Some(start) = Some(name.as_str())
+                .filter(|n| n.len() == 20)
+                .and_then(|n| n.parse::<Lsn>().ok())
+            else {
+                continue;
+            };
+            let file = self
+                .env
+                .fs
+                .open(dir.join(&name), kronik_core::env::OpenMode::Read)
+                .await?;
+            let len = file.len().await?;
+            let bytes = file.read_at(0, len as usize).await?;
+            fixes.push((start, String::from_utf8_lossy(&bytes).trim().to_owned()));
+        }
+        fixes.sort();
+        Ok(fixes)
+    }
+
+    /// Whether a resealed segment's fix of state.db is still journaled.
+    pub(crate) async fn reseal_fix_pending(&self) -> bool {
+        match self.data_dir() {
+            Some(data) => self
+                .journaled_fixes(data)
+                .await
+                .map_or(true, |fixes| !fixes.is_empty()),
+            None => false,
+        }
+    }
+
+    /// Fixes `state.db` for every segment a reseal renamed into place but
+    /// did not fix it for (a stop or an error in between, [`journal_fix`]),
+    /// from the segment's records as they are, then clears the entry
+    /// durably. Idempotent. Runs at start and before each reseal pass; an
+    /// entry whose segment is not the image it names (the rename did not
+    /// happen, or compaction deleted the segment) needs no fix. Returns the
+    /// segments it fixed.
+    pub(crate) async fn finish_reseal_fixes(&self) -> Result<u64, ApiError> {
+        let internal = |what: &str, e: String| {
+            ApiError::new(ErrorCode::Internal, format!("reseal fix: {what}: {e}"))
+        };
+        let Some(data) = self.data_dir().map(Path::to_path_buf) else {
+            return Ok(0);
+        };
+        let pending = self
+            .journaled_fixes(&data)
+            .await
+            .map_err(|e| internal("journal", e.to_string()))?;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        // The fix must not race the applier on the segment's records; an
+        // applier that stopped never gets there.
+        tokio::select! {
+            biased;
+            closed = self.wait_closed_applied() => {
+                closed?;
+            }
+            message = self.wait_fatal() => {
+                return Err(ApiError::new(ErrorCode::Unavailable, message));
+            }
+        }
+        let erased = self.erasure_versions()?;
+        let log_dir = self.reader().dir().to_path_buf();
+        let mut fixed = 0;
+        for (start, want) in pending {
+            let path = log_dir.join(kronik_log::segment_name(start));
+            let image = match std::fs::read(&path) {
+                Ok(image) => Some(image),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(internal("reading the segment", e.to_string())),
+            };
+            if let Some(image) = image
+                && blake3::hash(&image).to_hex().as_str() == want
+            {
+                let segment = kronik_log::decode_segment_image(
+                    &image,
+                    self.branch(),
+                    start,
+                    start,
+                    Lsn::MAX,
+                    false,
+                )
+                .map_err(|e| internal("decoding the segment", e.to_string()))?;
+                let mut offsets = Vec::with_capacity(segment.records.len());
+                let mut turns = Vec::new();
+                let mut effects = Vec::new();
+                for c in segment.records {
+                    offsets.push((c.lsn, c.pos.offset));
+                    let mut record = c.record;
+                    // A value of a subject erased since the reseal is a
+                    // tombstone, as its erasure left the rows.
+                    let mut plain = false;
+                    kronik_proto::sealables::record_mut(&mut record, &mut |s| {
+                        let Some(subject) = s.subject.as_ref() else {
+                            return;
+                        };
+                        match erased.get(subject).copied() {
+                            Some(version) => {
+                                let _ = self.sealer().reseal_value(s, Some(version), &|_| {}, 0);
+                            }
+                            None => plain |= matches!(s.value, Some(pb::sealable::Value::Plain(_))),
+                        }
+                    });
+                    if plain {
+                        return Err(internal(
+                            "the segment",
+                            format!(
+                                "segment {start} is the resealed image its journal names, but \
+                                 the record at lsn {} holds a plain value",
+                                c.lsn
+                            ),
+                        ));
+                    }
+                    if let Some(turn) = record.turn() {
+                        turns.push((c.lsn, turn.clone()));
+                    }
+                    if let Record::EffectResult(r) = &record
+                        && let Some(effect) = &r.effect
+                    {
+                        effects.push((r.execution_id.clone(), effect.clone()));
+                    }
+                }
+                self.store()
+                    .db()
+                    .fix_reseal(start, &offsets, &turns, &effects)
+                    .map_err(|e| internal("state.db", e.to_string()))?;
+                fixed += 1;
+                tracing::info!(start, "fixed the state of a resealed segment");
+            }
+            clear_fix(&data, start).map_err(|e| internal("journal", e.to_string()))?;
+        }
+        Ok(fixed)
     }
 
     /// Closed segments that still hold a tagged plain value, or a value of
@@ -367,6 +599,9 @@ impl Node {
             // The exact request and segment set were admitted together.
             node.commit_config_locked(&held, epoch, request, OperationOrigin::Internal, None)
                 .await?;
+            // What an earlier pass renamed into place without fixing
+            // state.db for it (it stopped, or failed, in between).
+            node.finish_reseal_fixes().await?;
             if todo.is_empty() {
                 return Ok(ResealDone {
                     started: false,
@@ -421,9 +656,13 @@ impl Node {
             // The changed effect results: an open turn's copies of them in
             // open_effects are what its re-run hands to the guest.
             let mut effects: Vec<(String, pb::EffectRecord)> = Vec::new();
-            // The shipper's mark is durable before the segment changes.
+            // The fix of state.db and the shipper's mark are journaled
+            // durably before the segment changes.
             let mark = |image: &[u8]| match &data {
-                Some(data) => mark_reupload(data, start, image),
+                Some(data) => {
+                    journal_fix(data, start, image)?;
+                    mark_reupload(data, start, image)
+                }
                 None => Ok(()),
             };
             let rewritten = kronik_log::rewrite_segment_marked(
@@ -450,14 +689,22 @@ impl Node {
                 },
                 mark,
             )
-            .map_err(|e| ApiError::new(ErrorCode::Internal, format!("reseal: {e}")))?;
+            .map_err(|e| self.reseal_rewrite_error(start, e))?;
             if !rewritten.changed {
                 continue;
             }
+            #[cfg(test)]
+            crate::durable::test_ops::point(&path, "resealed")
+                .map_err(|e| ApiError::new(ErrorCode::Internal, format!("reseal: {e}")))?;
             self.store()
                 .db()
                 .fix_reseal(start, &rewritten.offsets, &turns, &effects)
                 .map_err(|e| ApiError::new(ErrorCode::Internal, format!("reseal: {e}")))?;
+            if let Some(data) = &data {
+                clear_fix(data, start).map_err(|e| {
+                    ApiError::new(ErrorCode::Internal, format!("reseal journal: {e}"))
+                })?;
+            }
             values_sealed += counts.0;
             tombstones += counts.1;
             done += 1;

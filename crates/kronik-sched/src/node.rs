@@ -979,6 +979,17 @@ impl Node {
         node.recover_erasures()
             .await
             .map_err(|e| StartError::Erasure(e.message))?;
+        // A reseal that stopped between renaming a segment's resealed image
+        // into place and fixing state.db for it (docs/design/m8-privacy.md
+        // §8). A failure leaves its journal entry: `privacy status` reports
+        // the reseal pending, and the next pass tries again.
+        if let Err(e) = node.finish_reseal_fixes().await {
+            tracing::error!(
+                error = %e.message,
+                "fixing state.db for a resealed segment failed: the reseal, and every erasure, \
+                 stay pending in privacy status until a reseal pass fixes it"
+            );
+        }
         node.initialize_secret_versions(last == 0, node.native_recovery.clone())
             .await?;
         node.start_secret_refresh(node.native_recovery.clone());
@@ -1179,6 +1190,12 @@ impl Node {
     /// Resolves when a fatal storage failure happens.
     pub async fn wait_fatal(&self) -> String {
         self.fatal.wait().await
+    }
+
+    /// Stops the node as a failed log fsync does: a storage step whose
+    /// durability is unknown, which the next start recovers.
+    pub(crate) fn stop_fatal(&self, message: String) {
+        self.fatal.set(message);
     }
 
     pub fn kind_exists(&self, kind: &str) -> bool {

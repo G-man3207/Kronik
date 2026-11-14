@@ -320,6 +320,9 @@ starts a background compaction that requires the mode to be `on`:
 - It does the same for the `state.db` rows the rewritten records still own
   (state values, the bodies of pending timers and undelivered messages,
   saved responses, dead-letter inputs) and takes a snapshot afterwards.
+  That fix is journaled durably before the rename too: a reseal that
+  stops between the rename and the fix (a crash, an error) is finished at
+  the next start or reseal pass, from the segment's records as they are.
 - Progress (segments done/total, values sealed, tombstones) appears in
   `privacy status`. Docs recommend running reseal right after turning the
   mode on, before the first erasure.
@@ -569,10 +572,11 @@ Where the code differs from the sections above:
   only: same LSNs and order, tagged plain values sealed with the current
   key, erased subjects replaced by a tombstone `Sealed` (erased version,
   zero nonce, empty ciphertext), checksums recomputed, written beside the
-  old file and fsynced; its re-upload mark (below) is written and fsynced
-  with its directory; then the segment is renamed over the old file and
-  the log directory fsynced, whose failure fails the reseal. `turn_index`
-  and `open_turns` offsets,
+  old file and fsynced; its re-upload mark (below) and the journal entry
+  of its `state.db` fix (`privacy/reseal-fix/<start>`, the BLAKE3 of the
+  new image) are written and fsynced with their directories; then the
+  segment is renamed over the old file and the log directory fsynced,
+  whose failure fails the reseal. `turn_index` and `open_turns` offsets,
   and the rows the rewritten turns (a rebased turn of a `StateRebase`
   record too) still own (`kv` values, the bodies of their pending timers
   and undelivered messages, saved ingress and call responses, dead-letter
@@ -581,10 +585,20 @@ Where the code differs from the sections above:
   scheduled in `off` mode kept its plain body after a reseal and was
   handed to its guest after the subject's erasure). Rows of an erased
   subject are already gone or tombstoned by its `Erasure`; a value of it
-  in a row that remains becomes a tombstone. The active segment is left for the next roll. A snapshot
+  in a row that remains becomes a tombstone. Then the journal entry is
+  removed. A reseal that stopped after the rename and before the fix is
+  finished at the next start, or before the next reseal pass does
+  anything else: when a segment is the image its entry names, its offsets
+  and rows are fixed from its records as they are (a value of a subject
+  erased since is a tombstone, as its `Erasure` left the row), and the
+  entry is removed; an entry whose segment is not that image (the rename
+  did not happen, or compaction deleted it) is just removed. The active
+  segment is left for the next roll. A snapshot
   follows. Rewritten segments are marked for re-upload
   (`privacy/reupload/<start>`); `GET /v1/privacy` counts them in
-  `reseal.pending_segments` until the shipper replaces the object. Status
+  `reseal.pending_segments` until the shipper replaces the object, and a
+  segment whose fix is journaled until it is done; while one is, every
+  erased subject counts in `pending_erasures` too. Status
   also reports `pending_erasures` and `reseal.{segments_done,
   segments_total, values_sealed, tombstones}`. `pending_erasures` counts
   the erased subjects that still have a plain value in the log or in

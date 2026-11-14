@@ -25,6 +25,13 @@ pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
+/// Removes the file `path`, durable once its directory is synced.
+pub(crate) fn remove_file(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    test_ops::record(test_ops::Op::Remove(path.to_owned()))?;
+    std::fs::remove_file(path)
+}
+
 /// The directory of `path`, `.` for a bare name.
 fn parent(path: &Path) -> &Path {
     match path.parent() {
@@ -90,14 +97,26 @@ pub(crate) mod test_ops {
     pub(crate) enum Op {
         Sync(PathBuf),
         Rename(PathBuf, PathBuf),
+        Remove(PathBuf),
+        /// A named point of a step, where a test may stop it as a crash
+        /// would ([`point`]).
+        Point(PathBuf, &'static str),
     }
 
     impl Op {
         fn path(&self) -> &Path {
             match self {
-                Op::Sync(path) | Op::Rename(path, _) => path,
+                Op::Sync(path) | Op::Rename(path, _) | Op::Remove(path) | Op::Point(path, _) => {
+                    path
+                }
             }
         }
+    }
+
+    /// The point `name` of a step on `path`: an error there when a test
+    /// stops the step at it.
+    pub(crate) fn point(path: &Path, name: &'static str) -> io::Result<()> {
+        record(Op::Point(path.to_owned(), name))
     }
 
     type Fail = Box<dyn Fn(&Op) -> bool + Send>;

@@ -6842,7 +6842,7 @@ against both.
   "description": "Progress of the latest reseal, and segments whose shipped copy is still\nthe pre-reseal bytes.",
   "properties": {
     "pending_segments": {
-      "description": "Rewritten segments not yet replaced in object storage.",
+      "description": "Rewritten segments whose reseal is not finished: not yet replaced in\nobject storage, or their rows in state.db not fixed yet.",
       "format": "uint64",
       "minimum": 0,
       "type": "integer"

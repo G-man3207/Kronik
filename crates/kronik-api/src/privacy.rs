@@ -97,7 +97,8 @@ pub struct ResealStatus {
     pub segments_total: u64,
     pub values_sealed: u64,
     pub tombstones: u64,
-    /// Rewritten segments not yet replaced in object storage.
+    /// Rewritten segments whose reseal is not finished: not yet replaced in
+    /// object storage, or their rows in state.db not fixed yet.
     pub pending_segments: u64,
 }
 

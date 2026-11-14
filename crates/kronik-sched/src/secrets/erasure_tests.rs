@@ -682,9 +682,220 @@ fn a_reseal_marks_a_segment_durably_before_it_replaces_it() {
             }
         }
         assert_eq!(
-            crate::reseal::pending_reuploads(data.path()),
+            crate::reseal::reseal_progress(data.path()).pending_segments,
             done.segments,
             "a mark per resealed segment"
+        );
+    });
+}
+
+/// A turn of `begin`'s actor that sets `k` to `value`, tagged with `subject`:
+/// plain while the privacy mode is off.
+async fn wrote(node: &Node, id: u32, subject: &str, k: &str, value: &[u8]) -> u64 {
+    let mut begin = begin(node);
+    begin.execution_id = format!("{id:032x}");
+    node.commit(Record::TurnBegin(begin.clone())).await.unwrap();
+    node.commit(Record::TurnRecord(pb::TurnRecord {
+        execution_id: begin.execution_id,
+        actor: begin.actor,
+        code_hash: begin.code_hash,
+        engine_version: begin.engine_version,
+        causal_key: begin.causal_key,
+        logical_time_ms: begin.logical_time_ms,
+        random_seed: begin.random_seed,
+        input: begin.input,
+        writes: vec![pb::StateWrite {
+            op: pb::StateOp::Set as i32,
+            key: k.into(),
+            value: Some(pb::Sealable {
+                subject: Some(subject.into()),
+                value: Some(pb::sealable::Value::Plain(value.to_vec())),
+            }),
+        }],
+        outcome: Some(pb::Outcome {
+            kind: pb::OutcomeKind::Committed as i32,
+            ..Default::default()
+        }),
+        config_epoch: begin.config_epoch,
+        ..Default::default()
+    }))
+    .await
+    .unwrap()
+}
+
+const PLAIN: &[u8] = b"a value of user:7 written while the privacy mode was off";
+
+fn resealing_config(data: &Path) -> crate::NodeConfig {
+    crate::NodeConfig {
+        segment_max_bytes: Some(2_048),
+        storage: Some(crate::snapshots::StorageConfig::new(data.to_path_buf())),
+        ..config()
+    }
+}
+
+/// Closed segments that a reseal changes: a state value of `user:7` written
+/// in mode off, which it seals, and a request of `user:8`, erased, which it
+/// makes a tombstone. The privacy mode is on.
+async fn plain_history(data: &Path) -> Arc<Node> {
+    let node = crate::start_local(env(), data, resealing_config(data))
+        .await
+        .unwrap();
+    settle(&node).await;
+    wrote(&node, 7, "user:7", "secret", PLAIN).await;
+    finished(&node, 8, fetch(Some("user:8"), None)).await;
+    append_noise(&node, 80).await;
+    privacy(&node, pb::PrivacyState::On).await;
+    quiesce(&node).await;
+    erase(&node, "user:8").await;
+    node
+}
+
+/// The row of `user:7`'s value: whether it is sealed, and its bytes.
+fn secret_row(node: &Node) -> (bool, Vec<u8>) {
+    node.store()
+        .db()
+        .conn()
+        .query_row(
+            "SELECT sealed, value FROM kv WHERE kind = 'recover' AND key = 'blocked' \
+             AND k = 'secret'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+/// Every turn of a closed segment is indexed at its record's offset in the
+/// segment as it is now.
+fn turn_offsets_are_current(node: &Node) {
+    let log = node.reader().dir();
+    let starts = kronik_log::segment_starts(log).unwrap();
+    let mut checked = 0;
+    for start in &starts[..starts.len() - 1] {
+        let image = std::fs::read(log.join(kronik_log::segment_name(*start))).unwrap();
+        let decoded = kronik_log::decode_segment_image(
+            &image,
+            node.branch(),
+            *start,
+            *start,
+            kronik_core::ids::Lsn::MAX,
+            false,
+        )
+        .unwrap();
+        let actual: std::collections::BTreeMap<u64, u64> = decoded
+            .records
+            .iter()
+            .map(|c| (c.lsn, c.pos.offset))
+            .collect();
+        let db = node.store().db();
+        let mut statement = db
+            .conn()
+            .prepare("SELECT lsn, offset FROM turn_index WHERE segment = ?1")
+            .unwrap();
+        let rows: Vec<(i64, i64)> = statement
+            .query_map([*start as i64], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for (lsn, offset) in rows {
+            assert_eq!(
+                actual.get(&(lsn as u64)),
+                Some(&(offset as u64)),
+                "turn {lsn} of segment {start} is indexed at an offset of another image"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no turn of a closed segment was checked");
+}
+
+/// Stops a reseal right after it renamed its first resealed segment into
+/// place, as a crash there would: the segment is resealed, state.db is not.
+/// The reseal and the erasure stay pending then.
+async fn reseal_stopped_after_its_rename(node: &Node, data: &Path) {
+    use crate::durable::test_ops::{Op, watch};
+    let log = node.reader().dir().to_path_buf();
+    let stop = watch(&log, |op| matches!(op, Op::Point(_, "resealed")));
+    let stopped = node.reseal(audit(), false, authority(node)).await;
+    drop(stop);
+    assert!(stopped.is_err(), "{stopped:?}");
+    assert!(!secret_row(node).0, "the row was fixed before the stop");
+    assert!(!crate::reseal::pending_fix_segments(data).is_empty());
+    assert!(node.reseal_progress().pending_segments >= 1);
+    assert_eq!(node.pending_erasures().await.unwrap(), 1);
+}
+
+/// After the fix: the row holds no plaintext, the turns are indexed in the
+/// resealed images, and once a pass has resealed the rest, nothing is
+/// pending.
+async fn assert_fixed(node: &Node, data: &Path) {
+    let (sealed, value) = secret_row(node);
+    assert!(sealed, "the row of a resealed value is still plain");
+    assert!(!value.windows(PLAIN.len()).any(|w| w == PLAIN));
+    assert!(
+        !kronik_store::db::plain_subjects(node.store().db().conn())
+            .unwrap()
+            .contains("user:7")
+    );
+    turn_offsets_are_current(node);
+    assert!(crate::reseal::pending_fix_segments(data).is_empty());
+    node.reseal(audit(), false, authority(node)).await.unwrap();
+    assert_eq!(node.pending_erasures().await.unwrap(), 0);
+    assert!(crate::reseal::pending_fix_segments(data).is_empty());
+}
+
+/// A reseal that stopped between renaming a resealed segment into place and
+/// fixing state.db for it (a crash; v0.4.1 never fixed it afterwards, as no
+/// reseal finds the segment again) is finished by the next start.
+#[test]
+fn a_reseal_stopped_after_its_rename_is_finished_at_the_next_start() {
+    let data = tempfile::tempdir().unwrap();
+    run(async {
+        let node = plain_history(data.path()).await;
+        reseal_stopped_after_its_rename(&node, data.path()).await;
+    });
+    run(async {
+        let node = crate::start_local(env(), data.path(), resealing_config(data.path()))
+            .await
+            .unwrap();
+        settle(&node).await;
+        assert_fixed(&node, data.path()).await;
+    });
+}
+
+/// ... and by the next reseal pass of the same node.
+#[test]
+fn a_reseal_stopped_after_its_rename_is_finished_by_the_next_pass() {
+    let data = tempfile::tempdir().unwrap();
+    run(async {
+        let node = plain_history(data.path()).await;
+        reseal_stopped_after_its_rename(&node, data.path()).await;
+        node.reseal(audit(), false, authority(&node)).await.unwrap();
+        assert_fixed(&node, data.path()).await;
+    });
+}
+
+/// A rewrite whose rename the log directory's fsync did not make durable
+/// stops the node, as a failed log fsync does: the next start recovers it.
+/// Any other rewrite error only fails the reseal.
+#[test]
+fn a_reseal_whose_rename_is_not_durable_stops_the_node() {
+    run(async {
+        let data = tempfile::tempdir().unwrap();
+        let node = crate::start_local(env(), data.path(), resealing_config(data.path()))
+            .await
+            .unwrap();
+        let failed =
+            node.reseal_rewrite_error(7, kronik_log::LogError::Io(std::io::Error::other("x")));
+        assert_eq!(failed.code, ErrorCode::Internal);
+        assert_eq!(node.fatal(), None);
+        node.reseal_rewrite_error(
+            7,
+            kronik_log::LogError::RenameNotDurable(std::io::Error::other("injected")),
+        );
+        assert!(
+            node.fatal().is_some_and(|m| m.contains("segment 7")),
+            "{:?}",
+            node.fatal()
         );
     });
 }
