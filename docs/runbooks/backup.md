@@ -45,7 +45,10 @@ keys, with a recorded recovery point. A snapshot alone is not a backup.
 
 A `file:///owned/fixture/shipped` ship target exercises the real ship/restore
 format without credentials or an external service. It is **not off-host backup
-or disaster-resilience proof**. Use known non-secret data, let the actual
+or disaster-resilience proof**. Under the root service's hardened unit the
+directory must be outside `/root`, `/home` and `/tmp` and added with
+`ReadWritePaths=` in a drop-in ([shipping](../guides/operations.md#shipping-to-object-storage));
+`kronik doctor`'s `ship` check says whether the unit can write it. Use known non-secret data, let the actual
 shipper publish the recorded snapshot, then run restore and integrity checks
 against another fixture directory. Record exact versions, commands, hashes,
 source/shipped/restored LSNs, missing-key inventory and cleanup. Physical S3

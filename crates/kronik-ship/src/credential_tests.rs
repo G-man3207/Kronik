@@ -139,3 +139,50 @@ fn the_credentials_are_never_printed() {
         assert!(!shown.contains(secret));
     }
 }
+
+/// A `file://` target's failure is the directory's when this process may
+/// not write it (a hardened unit's read-only file system, a permission):
+/// its own code, the directory and the unit's way out. Any other failure,
+/// a missing object above all, is the store's as for S3, so the paths that
+/// tolerate a missing object still do; the directory gone is `file`.
+#[test]
+fn a_file_targets_failure_names_the_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("bucket");
+    let remote = Remote::open(&format!("file://{}", target.display()), None).unwrap();
+    let local = |kind: std::io::ErrorKind| object_store::Error::Generic {
+        store: "LocalFileSystem",
+        source: Box::new(std::io::Error::from(kind)),
+    };
+    for kind in [
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::ReadOnlyFilesystem,
+    ] {
+        let e = remote.store_error(local(kind));
+        assert_eq!(e.code(), "file_unwritable", "{kind:?}");
+        assert_eq!(e.target_dir(), Some(target.as_path()));
+        assert!(e.hint().unwrap().contains("ReadWritePaths="));
+        assert!(e.to_string().contains(&target.display().to_string()), "{e}");
+    }
+    let missing_object = || object_store::Error::NotFound {
+        path: "main/segments/00000000000000000038.seg.zst".into(),
+        source: Box::new(std::io::Error::from(std::io::ErrorKind::NotFound)),
+    };
+    let e = remote.store_error(missing_object());
+    assert!(
+        matches!(e, ShipError::Store(object_store::Error::NotFound { .. })),
+        "{e:?}"
+    );
+    assert_eq!(e.code(), "s3_not_found");
+    assert!(e.target_dir().is_none() && e.hint().is_none());
+    // The directory itself is gone.
+    std::fs::remove_dir(&target).unwrap();
+    let gone = remote.store_error(missing_object());
+    assert_eq!(gone.code(), "file");
+    assert_eq!(gone.target_dir(), Some(target.as_path()));
+    // An S3 remote's failures stay the store's.
+    let s3 = Remote::open("s3://bucket/prefix", None).unwrap();
+    let e = s3.store_error(local(std::io::ErrorKind::PermissionDenied));
+    assert_eq!(e.code(), "s3");
+    assert!(e.target_dir().is_none());
+}

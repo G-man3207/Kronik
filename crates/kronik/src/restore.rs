@@ -693,6 +693,8 @@ fn ship_error(e: ShipError) -> ApiError {
             ApiError::new(ErrorCode::Unavailable, format!("object storage: {e}"))
                 .with_hint("Check the URL, the endpoint and the AWS_* credentials.")
         }
+        e @ ShipError::Local { .. } => ApiError::new(ErrorCode::Unavailable, e.to_string())
+            .with_hint("Check that the directory of the file:// URL exists and that this user can read it."),
         e @ ShipError::CredentialsExpired(_) => ApiError::new(ErrorCode::Unavailable, e.to_string())
             .with_hint(
                 "Nothing was installed, and the work directory `.restore` was removed. A restore that is run as root against a nonroot installation reads the credentials once, before it gives up root, and cannot refresh them; use credentials that last as long as the restore takes.",

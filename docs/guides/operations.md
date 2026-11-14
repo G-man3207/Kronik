@@ -923,7 +923,7 @@ rather than fail, unless `kronik.toml` asks for what is missing
 | `clock` | The clock is not synchronized by NTP (warning) | `timedatectl set-ntp true` |
 | `tls` | The certificate has expired or can't be read (`CERTIFICATE_INVALID`, failure), or expires within 30 days (warning). With `acme` and no certificate cached yet, it warns | Renew the files; for ACME see [TLS](#tls): the gateway orders a certificate when it starts |
 | `dns01_hook` | `[tls] dns01_hook` is set and is not an executable file (`BAD_REQUEST`, failure); the cached `*.<preview_domain>` certificate has expired (`CERTIFICATE_INVALID`, failure), expires within 30 days or isn't cached yet (warning) | `chmod +x` the hook, or fix the path; for the certificate, read the hook's output in the daemon log; see [Preview forks](#preview-forks-a-wildcard-certificate-by-dns-01) |
-| `ship` | `[ship] endpoint` is not an `http://` or `https://` URL (`BAD_REQUEST`, failure) or is not reachable over TCP (`UNAVAILABLE`, failure); passes when shipping is off | Set an `http://` or `https://` endpoint, and check DNS and the firewall |
+| `ship` | `[ship] endpoint` is not an `http://` or `https://` URL (`BAD_REQUEST`, failure) or is not reachable over TCP (`UNAVAILABLE`, failure); for a `file://` URL, `kronik.service` cannot write the directory (`UNAVAILABLE`, failure: its `ProtectSystem=strict` without the directory in `ReadWritePaths=`, or the directory under `/root`, `/home` or `/tmp`); passes when shipping is off | Set an `http://` or `https://` endpoint, and check DNS and the firewall; for a directory, add it with `ReadWritePaths=` in a drop-in (see [shipping](#shipping-to-object-storage)) |
 | `export` | With `[otel]` or `[audit]` on and the daemon answering on `server.api_socket`: a stream with lag has not delivered for 10 × its `interval`, or the audit export has held retention for longer than `[retention] history` (warnings); passes without a daemon | `kronik export status` shows the sink's last error code; fix the sink, or see [the audit log](#the-audit-log) |
 | `key_source` | The configured master-key source cannot load the key (its error code, such as `KEY_SOURCE_UNAVAILABLE` or `KEY_HELPER_FAILED`, failure), or a bootstrap credential lies under the data directory (warning). With a running daemon it asks `GET /v1/keys` instead | Check the provider, the credentials, the key version and the memory-lock limit; see [the master key](#the-master-key) |
 | `secrets` | With the daemon answering on `server.api_socket`: an external secret backend's last request failed after its last answer, or a linked name has no cached value (`SECRET_UNAVAILABLE`, warning); passes without a daemon or without external backends | `kronik secret backends` shows each backend's last answer and error; the log's `secret fetch failed` lines say why. See [a turn whose effect cannot get its secret](#a-turn-whose-effect-cannot-get-its-secret) |
@@ -1669,6 +1669,22 @@ directory must be readable by that user).
 That runs the whole flow without a bucket, as the
 [quickstart](quickstart.md)'s step 9 does, but it is not a backup: the
 copy does not leave the machine.
+
+The root service's unit makes the file system read-only for the daemon
+(`ProtectSystem=strict`) except its own directories, and hides `/root`,
+`/home` and `/tmp` from it (`ProtectHome`, `PrivateTmp`). A directory
+elsewhere must be added to the unit in a drop-in (`systemctl edit kronik`),
+then the daemon restarted:
+
+```ini
+[Service]
+ReadWritePaths=/var/backups/kronik
+```
+
+Without it every round fails, and the daemon's log says `shipping failed`
+with the code `file_unwritable`, the directory and this way out.
+`kronik doctor`'s `ship` check reads the unit and says so before a round
+does.
 
 - **Credentials and region** come from the standard variables
   `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optionally

@@ -60,6 +60,15 @@ pub enum ShipError {
         "object storage: {0}; the credentials were resolved before the restore dropped its privileges and cannot be refreshed, so run it again with credentials that last as long as the restore takes"
     )]
     CredentialsExpired(object_store::Error),
+    /// A `file://` target's directory itself failed: this process may not
+    /// write it (`file_unwritable`), or it is gone (`file`). Every other
+    /// failure of such a target, a missing object above all, is the store's,
+    /// as for S3.
+    #[error("the ship target {}: {error}", dir.display())]
+    Local {
+        dir: PathBuf,
+        error: object_store::Error,
+    },
 }
 
 impl ShipError {
@@ -76,6 +85,13 @@ impl ShipError {
             ShipError::Keystore(_) => "keystore",
             ShipError::KeySource(_) => "key_source",
             ShipError::KeystoreIncomplete(_) => "keystore_incomplete",
+            ShipError::Local { error, .. } => {
+                if unwritable(error) {
+                    "file_unwritable"
+                } else {
+                    "file"
+                }
+            }
             ShipError::Store(e) | ShipError::CredentialsExpired(e) => match e {
                 E::NotFound { .. } => "s3_not_found",
                 E::PermissionDenied { .. } => "s3_forbidden",
@@ -89,6 +105,47 @@ impl ShipError {
     }
 }
 
+impl ShipError {
+    /// The way out of a failure, when there is a well-known one: for a
+    /// `file://` target this process may not write, the hardened unit's
+    /// writable directories.
+    pub fn hint(&self) -> Option<&'static str> {
+        match self {
+            ShipError::Local { error, .. } if unwritable(error) => Some(
+                "a hardened systemd unit (ProtectSystem=strict) writes only its own directories: \
+                 add the target with ReadWritePaths= in a drop-in (systemctl edit kronik), \
+                 outside /root, /home and /tmp, and restart",
+            ),
+            _ => None,
+        }
+    }
+
+    /// The directory of a failed `file://` target.
+    pub fn target_dir(&self) -> Option<&Path> {
+        match self {
+            ShipError::Local { dir, .. } => Some(dir),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a store's error comes from a file this process may not write:
+/// permission denied, or a read-only file system (a systemd unit's
+/// `ProtectSystem=strict` mounts everything but its own directories so).
+fn unwritable(error: &object_store::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = source {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) || io.raw_os_error() == Some(30); // EROFS
+        }
+        source = e.source();
+    }
+    false
+}
+
 /// zstd level for shipped objects.
 const LEVEL: i32 = 3;
 
@@ -100,6 +157,8 @@ pub const SHIP_INTERVAL: Duration = Duration::from_secs(10);
 pub struct Remote {
     store: Arc<dyn ObjectStore>,
     prefix: String,
+    /// A `file://` remote's directory: its failures are the directory's.
+    local: Option<PathBuf>,
     /// An S3 remote's provider of credentials, kept so that they can be
     /// resolved ([`Remote::resolve_credentials`]); none for a remote that is
     /// not signed.
@@ -229,6 +288,7 @@ impl Remote {
                 credentials: (!unsigned).then(|| s3.credentials().clone()),
                 store: Arc::new(s3),
                 prefix: prefix.trim_matches('/').to_owned(),
+                local: None,
                 stale_hint,
             });
         }
@@ -238,6 +298,7 @@ impl Remote {
             return Ok(Remote {
                 store: Arc::new(fs),
                 prefix: String::new(),
+                local: Some(PathBuf::from(path)),
                 credentials: None,
                 stale_hint: false,
             });
@@ -271,6 +332,14 @@ impl Remote {
     /// it is reported as that, with the way out. A refusal for another reason
     /// (a policy, a missing bucket) is not blamed on them.
     fn store_error(&self, error: object_store::Error) -> ShipError {
+        if let Some(dir) = &self.local
+            && (unwritable(&error) || !dir.is_dir())
+        {
+            return ShipError::Local {
+                dir: dir.clone(),
+                error,
+            };
+        }
         if self.stale_hint && credentials_ran_out(&error) {
             ShipError::CredentialsExpired(error)
         } else {
@@ -809,7 +878,14 @@ pub async fn ship_loop(
             }
             Ok(_) => {}
             Err(error) => {
-                tracing::warn!(code = error.code(), "shipping failed; retrying next round");
+                // A local directory names nothing secret; a store's text may
+                // echo credentials, so it is never logged (m28 review M9).
+                tracing::warn!(
+                    code = error.code(),
+                    target = error.target_dir().map(|d| d.display().to_string()),
+                    hint = error.hint(),
+                    "shipping failed; retrying next round"
+                );
                 reload = true;
             }
         }
@@ -852,6 +928,8 @@ pub async fn ship_loop(
             Ok(_) => {}
             Err(e) => tracing::warn!(
                 code = e.code(),
+                target = e.target_dir().map(|d| d.display().to_string()),
+                hint = e.hint(),
                 "keystore backup failed; retrying next round"
             ),
         }

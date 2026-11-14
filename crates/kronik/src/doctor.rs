@@ -1347,6 +1347,14 @@ fn ship(config: &Config) -> Check {
     if !config.ship.enabled {
         return check("ship", Status::Pass, "shipping is off");
     }
+    if let Some(dir) = config
+        .ship
+        .url
+        .as_deref()
+        .and_then(|u| u.strip_prefix("file://"))
+    {
+        return ship_directory(Path::new(dir), unit_sandbox().as_deref());
+    }
     let Some(endpoint) = config.ship.endpoint.as_deref().filter(|e| !e.is_empty()) else {
         return check(
             "ship",
@@ -1379,6 +1387,132 @@ fn ship(config: &Config) -> Check {
             ErrorCode::Unavailable,
             "check the endpoint, DNS and the firewall; snapshots cannot ship until it answers",
         ),
+    }
+}
+
+/// A `file://` ship target: a directory on this machine, which the root
+/// service's hardened unit must be able to write. `show` is `systemctl show`
+/// of the unit's sandbox ([`unit_sandbox`]); without it (no systemd, no unit)
+/// only the directory is checked.
+fn ship_directory(dir: &Path, show: Option<&str>) -> Check {
+    if !dir.is_absolute() {
+        return failed(
+            "ship",
+            format!(
+                "[ship] url file://{} is not an absolute path",
+                dir.display()
+            ),
+            ErrorCode::BadRequest,
+            "write the directory as file:///absolute/path",
+        );
+    }
+    if let Some(why) = show.and_then(|show| unit_cannot_write(show, dir)) {
+        return failed(
+            "ship",
+            format!(
+                "kronik.service cannot write the ship target {}: {why}",
+                dir.display()
+            ),
+            ErrorCode::Unavailable,
+            format!(
+                "add it in a drop-in (systemctl edit kronik): [Service] ReadWritePaths={}, then restart; or ship elsewhere",
+                dir.display()
+            ),
+        );
+    }
+    check(
+        "ship",
+        Status::Pass,
+        format!(
+            "ships to the directory {} on this machine (not an off-host backup)",
+            dir.display()
+        ),
+    )
+}
+
+/// The properties of `kronik.service` that decide where it may write, from
+/// `systemctl show`; `None` when systemd cannot be asked.
+fn unit_sandbox() -> Option<String> {
+    let output = Command::new("systemctl")
+        .args([
+            "show",
+            "--property=LoadState,ProtectSystem,ProtectHome,PrivateTmp,ReadWritePaths,\
+             StateDirectory,RuntimeDirectory,LogsDirectory,CacheDirectory",
+            "kronik.service",
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Why the unit that `show` describes (`systemctl show`, [`unit_sandbox`])
+/// cannot write `dir`; `None` when it can, or when no such unit is loaded.
+/// `ProtectSystem=strict` leaves writable only the unit's own directories
+/// (`StateDirectory=` and the others) and `ReadWritePaths=`; `full` and `yes`
+/// make /usr and /boot (and with `full`, /etc) read-only; `ProtectHome=`
+/// hides /home, /root and /run/user; `PrivateTmp=` gives the unit its own
+/// /tmp and /var/tmp, which nobody else sees and which go with the unit.
+fn unit_cannot_write(show: &str, dir: &Path) -> Option<String> {
+    let property = |name: &str| {
+        show.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix('='))
+            .unwrap_or("")
+    };
+    if property("LoadState") != "loaded" {
+        return None;
+    }
+    let yes = |value: &str| matches!(value, "yes" | "true" | "1" | "on");
+    let under = |roots: &[&str]| roots.iter().any(|root| dir.starts_with(root));
+    let home = property("ProtectHome");
+    if (yes(home) || matches!(home, "read-only" | "tmpfs"))
+        && under(&["/home", "/root", "/run/user"])
+    {
+        return Some(format!(
+            "ProtectHome={home} hides /home, /root and /run/user from it"
+        ));
+    }
+    if yes(property("PrivateTmp")) && under(&["/tmp", "/var/tmp"]) {
+        return Some(
+            "PrivateTmp=yes gives it a /tmp and /var/tmp of its own, which no other process sees"
+                .into(),
+        );
+    }
+    match property("ProtectSystem") {
+        "strict" => {
+            let own = |base: &str, names: &str| -> Vec<PathBuf> {
+                names
+                    .split_whitespace()
+                    .map(|name| Path::new(base).join(name))
+                    .collect()
+            };
+            let mut writable: Vec<PathBuf> = property("ReadWritePaths")
+                .split_whitespace()
+                .map(|p| PathBuf::from(p.trim_start_matches(['-', '+'])))
+                .collect();
+            writable.extend(own("/var/lib", property("StateDirectory")));
+            writable.extend(own("/run", property("RuntimeDirectory")));
+            writable.extend(own("/var/log", property("LogsDirectory")));
+            writable.extend(own("/var/cache", property("CacheDirectory")));
+            if writable.iter().any(|w| dir.starts_with(w)) {
+                return None;
+            }
+            let list = writable
+                .iter()
+                .map(|w| w.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!(
+                "ProtectSystem=strict makes everything read-only for it but {list}"
+            ))
+        }
+        "full" if under(&["/usr", "/boot", "/efi", "/etc"]) => {
+            Some("ProtectSystem=full makes /usr, /boot, /efi and /etc read-only for it".into())
+        }
+        value if yes(value) && under(&["/usr", "/boot", "/efi"]) => Some(format!(
+            "ProtectSystem={value} makes /usr, /boot and /efi read-only for it"
+        )),
+        _ => None,
     }
 }
 
@@ -2139,6 +2273,82 @@ mod tests {
     }
 
     /// Human output and `--json` both include the code and the hint.
+    /// A file:// ship target that the root service's hardened unit cannot
+    /// write fails the ship check with the drop-in that fixes it; one in
+    /// ReadWritePaths= or in the unit's own directories passes.
+    #[test]
+    fn a_ship_directory_the_unit_cannot_write_fails() {
+        let unit = "LoadState=loaded\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\n\
+                    ReadWritePaths=\nStateDirectory=kronik\nRuntimeDirectory=kronik\n\
+                    LogsDirectory=kronik\nCacheDirectory=\n";
+        let backups = Path::new("/var/backups/kronik");
+        let why = unit_cannot_write(unit, backups).unwrap();
+        assert!(
+            why.contains("ProtectSystem=strict") && why.contains("/var/lib/kronik"),
+            "{why}"
+        );
+        let fail = ship_directory(backups, Some(unit));
+        assert_i12(&fail, "UNAVAILABLE");
+        assert!(
+            fail.message.contains("/var/backups/kronik"),
+            "{}",
+            fail.message
+        );
+        assert!(
+            fail.hint
+                .as_deref()
+                .unwrap()
+                .contains("ReadWritePaths=/var/backups/kronik"),
+            "{fail:?}"
+        );
+        // The drop-in's ReadWritePaths= covers the target and what is in it.
+        let with = unit.replace(
+            "ReadWritePaths=\n",
+            "ReadWritePaths=-/var/backups/kronik /srv/x\n",
+        );
+        assert_eq!(unit_cannot_write(&with, &backups.join("main")), None);
+        assert_eq!(ship_directory(backups, Some(&with)).status, Status::Pass);
+        // The unit's own state directory is writable.
+        assert_eq!(
+            unit_cannot_write(unit, Path::new("/var/lib/kronik/backup")),
+            None
+        );
+        // /root and /tmp are out of reach, ReadWritePaths= or not.
+        let root = with.replace("/srv/x", "/root/b");
+        assert!(
+            unit_cannot_write(&root, Path::new("/root/b"))
+                .unwrap()
+                .contains("ProtectHome")
+        );
+        assert!(
+            unit_cannot_write(unit, Path::new("/tmp/b"))
+                .unwrap()
+                .contains("PrivateTmp")
+        );
+        // Weaker protection.
+        let full = unit.replace("ProtectSystem=strict", "ProtectSystem=full");
+        assert_eq!(unit_cannot_write(&full, backups), None);
+        assert!(unit_cannot_write(&full, Path::new("/etc/kronik/b")).is_some());
+        let none = unit.replace("ProtectSystem=strict", "ProtectSystem=no");
+        assert_eq!(unit_cannot_write(&none, backups), None);
+        // No unit, or no systemd: only the directory is checked.
+        assert_eq!(unit_cannot_write("LoadState=not-found\n", backups), None);
+        assert_eq!(ship_directory(backups, None).status, Status::Pass);
+        assert_i12(
+            &ship_directory(Path::new("relative/dir"), None),
+            "BAD_REQUEST",
+        );
+        // A file:// URL is not asked for an endpoint.
+        let mut config = Config::default();
+        config.ship.enabled = true;
+        config.ship.url = Some("file:///var/backups/kronik".into());
+        assert!(
+            !ship(&config).message.contains("endpoint"),
+            "{}",
+            ship(&config).message
+        );
+    }
+
     fn assert_i12(c: &Check, code: &str) {
         assert_eq!(c.status, Status::Fail, "{}", c.message);
         assert_eq!(c.code, Some(code), "{}", c.message);
