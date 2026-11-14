@@ -1132,3 +1132,63 @@ fn a_drained_queue_gives_its_slots_back() {
     assert_eq!(p.node.hub().queued_bytes(&a), Some(0));
     assert!(p.node.hub().queue_capacity(&a).unwrap() <= 16);
 }
+
+/// §12: the operator closes an open connection with a code and a message
+/// of its own. The client gets both; the close input has the cause
+/// `operator`, the code and the operator's audit (I12); the actor's close
+/// handler runs with the host's reason. A closed or unknown connection
+/// answers CONNECTION_NOT_FOUND. `live_stats` shows a connection held here.
+#[test]
+fn the_operator_closes_a_connection_with_its_audit() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy(ROOM, false).unwrap();
+    let (a, ta) = p.join("lobby", "ada");
+    p.until("the welcome", || !ta.recording().frames.is_empty());
+    let stats = p.node.hub().live_stats(&a).unwrap();
+    assert!(stats.open);
+    assert_eq!(stats.frames_written, ta.recording().frames.len() as u64);
+    assert_eq!(stats.queued_frames, 0);
+
+    let operator = pb::Audit {
+        token_id: "ops".into(),
+        reason: "an abusive client".into(),
+        wall_time_ms: 7,
+    };
+    p.node
+        .hub()
+        .close_operator(&a, 4001, "closed by the operator", operator.clone())
+        .unwrap();
+    assert_eq!(
+        ta.recording().closed,
+        Some((4001, "closed by the operator".into()))
+    );
+    p.until("ada's close", || {
+        p.row(&a).is_some_and(|r| r.closed_lsn.is_some())
+    });
+    let row = p.row(&a).unwrap();
+    assert_eq!(
+        (row.cause, row.code),
+        (Some(pb::CloseCause::Operator as i32), Some(4001))
+    );
+    let close = p.record(row.closed_lsn.unwrap());
+    let Some(pb::input::Kind::Connection(c)) = close.input.and_then(|i| i.kind) else {
+        panic!("not a connection input");
+    };
+    assert_eq!(c.audit, Some(operator));
+    let closes = reply(&p.send("room/lobby", "closes", ""));
+    assert!(
+        closes.contains(&format!("{a} host 4001 operator")),
+        "{closes}"
+    );
+    assert!(p.node.hub().live_stats(&a).is_none());
+
+    for conn in [a.as_str(), "c-00000000000000000000000000000000"] {
+        let e = p
+            .node
+            .hub()
+            .close_operator(conn, 1008, "", audit())
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::ConnectionNotFound, "{conn}");
+    }
+}

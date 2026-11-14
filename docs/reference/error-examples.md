@@ -80,6 +80,16 @@ raise the limit in `kronik.toml` and check the open-file limit.
 kronik doctor
 ```
 
+## CONNECTION_NOT_FOUND
+
+Inspect, or close as the operator, a connection id that no connection has,
+or close one that its client already closed. List the connections to find
+the right id; a closed connection can be inspected but not closed.
+
+```sh
+kronik connections inspect c-0123456789abcdef0123456789abcdef
+```
+
 ## CONNECTION_NOT_HELD
 
 A fixture room actor's frame turn sends to a connection id that another

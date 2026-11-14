@@ -40,6 +40,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`CAPABILITY_NOT_GRANTED`](#capability_not_granted) | 403 | M2 | The actor type lacks a capability for this effect |
 | [`CERTIFICATE_INVALID`](#certificate_invalid) | 400 | M6 | The TLS certificate cannot be used |
 | [`CONNECTION_LIMIT`](#connection_limit) | 503 | M24 | The gateway holds as many connections as it may |
+| [`CONNECTION_NOT_FOUND`](#connection_not_found) | 404 | M24 | No such connection, or it is not open |
 | [`CONNECTION_NOT_HELD`](#connection_not_held) | 403 | M24 | The actor used a connection it did not accept |
 | [`DEAD_LETTER_ALREADY_RESENT`](#dead_letter_already_resent) | 409 | M1 | The dead letter was already resent |
 | [`DEAD_LETTER_NOT_FOUND`](#dead_letter_not_found) | 404 | M1 | No such dead letter |
@@ -224,6 +225,21 @@ Clients should reconnect with jittered backoff. Operators who expect more connec
     kronik doctor
 
 See also: [`connections`](concepts/glossary.md#connections), [`UNAVAILABLE`](#unavailable).
+
+## CONNECTION_NOT_FOUND
+
+HTTP status 404, milestone M24. No such connection, or it is not open.
+
+Default hint: List connections with `kronik connections list`.
+
+No WebSocket or SSE connection has this id, or the operation needs an open one and this one is closed. Connection ids are `c-` and 32 lowercase hex characters. A closed connection stays listed until retention passes its close; after that it is gone, like its turns. Closing works only on a connection that is open on this node.
+
+List the connections, open ones by default, and look one up by its id:
+
+    kronik connections list --state all
+    kronik connections inspect c-0123456789abcdef0123456789abcdef
+
+See also: [`connections`](concepts/glossary.md#connections).
 
 ## CONNECTION_NOT_HELD
 

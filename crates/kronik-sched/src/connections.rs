@@ -239,6 +239,9 @@ struct Inner {
     open: HashMap<(String, &'static str), usize>,
     /// The counters that changed since they were last published.
     changed: Vec<(String, &'static str)>,
+    /// The operator's audit of a close the operator asked for, by
+    /// connection, until its close input takes it (§12).
+    operator_audits: HashMap<String, pb::Audit>,
 }
 
 impl Inner {
@@ -856,17 +859,7 @@ impl Hub {
                 live.abandoned |= cause == pb::CloseCause::Abandoned;
                 return;
             }
-            live.close.get_or_insert(CloseFacts {
-                cause,
-                code,
-                reason: String::new(),
-            });
-            live.state = State::Closing;
-            live.queue.clear();
-            self.queued.fetch_sub(live.queued_bytes, Ordering::Relaxed);
-            live.queued_bytes = 0;
-            live.room.notify_one();
-            (live.transport.clone(), live.transport.is_none())
+            self.begin_close(live, cause, code)
         };
         if matches!(
             cause,
@@ -879,6 +872,29 @@ impl Hub {
         } else if finish {
             self.finished(conn, None);
         }
+    }
+
+    /// A host's or an operator's close of a live connection: it is closing
+    /// at once (the first cause decided wins), its queue is dropped, and
+    /// the answer is its transport and whether nobody will report its end.
+    fn begin_close(
+        &self,
+        live: &mut Live,
+        cause: pb::CloseCause,
+        code: u16,
+    ) -> (Option<Arc<dyn Transport>>, bool) {
+        live.close.get_or_insert(CloseFacts {
+            cause,
+            code,
+            reason: String::new(),
+        });
+        live.state = State::Closing;
+        live.queue.clear();
+        self.queued.fetch_sub(live.queued_bytes, Ordering::Relaxed);
+        live.queued_bytes = 0;
+        // A send-now waiting for room in the queue wakes to the close.
+        live.room.notify_one();
+        (live.transport.clone(), live.transport.is_none())
     }
 
     /// The next thing `conn`'s writer sends, in seq order; `None` when
@@ -1137,6 +1153,9 @@ impl Hub {
         self.publish(gauges);
         self.gone.notify_waiters();
         if stopping || live.state == State::Opening {
+            // The next start closes it as a restart; the operator's own
+            // record of the close is its AuditEvent.
+            lock(&self.inner).operator_audits.remove(conn);
             return;
         }
         let facts = live.close.clone().unwrap_or_else(|| {
@@ -1184,11 +1203,14 @@ impl Hub {
         subject: Option<String>,
         close: pb::ConnectionClose,
     ) {
+        // An operator's close records who asked and why (I12).
+        let audit = lock(&self.inner).operator_audits.remove(&connection);
         let input = pb::ConnectionInput {
             connection,
             protocol,
             route: route.to_owned(),
             event: Some(pb::connection_input::Event::Close(close)),
+            audit,
             ..Default::default()
         };
         let id = input.connection.clone();
@@ -1289,6 +1311,78 @@ impl Hub {
             );
         }
     }
+
+    /// What the API shows of a connection this node holds (§12); `None`
+    /// when it holds none with this id.
+    pub fn live_stats(&self, conn: &str) -> Option<LiveStats> {
+        let inner = lock(&self.inner);
+        let live = inner.live.get(conn)?;
+        Some(LiveStats {
+            frames_written: live.frames_written,
+            queued_frames: live
+                .queue
+                .iter()
+                .filter(|o| matches!(o, Outgoing::Frame { .. }))
+                .count() as u64,
+            queued_bytes: live.queued_bytes,
+            open: live.state == State::Open,
+        })
+    }
+
+    /// The operator closes `conn` (§12): its client gets `code` and
+    /// `reason` (WebSocket; an event stream ends), what is still queued is
+    /// dropped, and its close input has the cause `operator`, the code and
+    /// `audit`. `CONNECTION_NOT_FOUND` when this node holds no open
+    /// connection with this id; `UNAVAILABLE` while the node stops.
+    pub fn close_operator(
+        &self,
+        conn: &str,
+        code: u16,
+        reason: &str,
+        audit: pb::Audit,
+    ) -> Result<(), ApiError> {
+        let (transport, finish) = {
+            let mut inner = lock(&self.inner);
+            if inner.stopping {
+                return Err(ApiError::new(
+                    ErrorCode::Unavailable,
+                    "the node is stopping: it closes every connection",
+                ));
+            }
+            let Some(live) = inner
+                .live
+                .get_mut(conn)
+                .filter(|live| live.state == State::Open)
+            else {
+                return Err(ApiError::new(
+                    ErrorCode::ConnectionNotFound,
+                    format!("connection {conn} is not open on this node"),
+                ));
+            };
+            let out = self.begin_close(live, pb::CloseCause::Operator, code);
+            inner.operator_audits.insert(conn.to_owned(), audit);
+            out
+        };
+        tracing::info!(connection = %conn, code, "the operator closes a connection");
+        if let Some(t) = transport {
+            t.close(code, reason);
+        } else if finish {
+            self.finished(conn, None);
+        }
+        Ok(())
+    }
+}
+
+/// A connection as [`Hub::live_stats`] shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveStats {
+    /// Outgoing frames its writer wrote.
+    pub frames_written: u64,
+    /// Outgoing frames waiting in its queue.
+    pub queued_frames: u64,
+    pub queued_bytes: usize,
+    /// Open: neither opening nor closing.
+    pub open: bool,
 }
 
 fn tagged(subject: Option<String>, bytes: Vec<u8>) -> pb::Sealable {

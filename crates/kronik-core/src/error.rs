@@ -119,6 +119,9 @@ codes! {
     ConnectionLimit = "CONNECTION_LIMIT", 503, "M24",
         "The gateway holds as many connections as it may",
         "Try again later; operators raise `[connections] max_open`, `max_per_actor` or `max_per_client`.";
+    ConnectionNotFound = "CONNECTION_NOT_FOUND", 404, "M24",
+        "No such connection, or it is not open",
+        "List connections with `kronik connections list`.";
     ConnectionNotHeld = "CONNECTION_NOT_HELD", 403, "M24",
         "The actor used a connection it did not accept",
         "Only the actor that accepted a connection can send on it or close it; send that actor a message instead (`kronik explain connections`).";
