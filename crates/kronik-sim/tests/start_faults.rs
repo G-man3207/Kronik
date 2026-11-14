@@ -74,33 +74,35 @@ fn an_fsync_that_fails_anywhere_in_the_first_writes_is_survived() {
     }
 }
 
-/// (seed, the write of the start that fails its fsync)
+/// (seed, the write of the start that fails its fsync), pinned again once
+/// the log open fsyncs what a dead process left, each start writes the
+/// keystore backup retention through the node's file system, and DST fixes
+/// the startup decode width at 4.
 const NIGHTLY_SEEDS: &[(u64, &str)] = &[
     (
-        291,
-        "the secret format fence of the first node, the first failure of the nightly run",
+        18,
+        "the log open of the first node: the fsync of a fresh log's first segment",
     ),
     (
-        7528,
-        "the fence of the first node, in a run that crashes often",
+        564,
+        "a record the first node's start appends to its fresh log, the store kept",
     ),
     (
-        5163,
-        "the fence of the second node, whose secret store exists already",
+        834,
+        "a record the first node's start appends to its fresh log, the store lost",
     ),
     (
-        3930,
-        "the fence of the first node, in a run with no crash budgeted: the failed start is \
-         the only reason to restart",
+        43,
+        "the log open of the second node, after a crash that kept the store",
     ),
     (
-        6222,
-        "a reserved secret version published as active by the eighth node, the crash budget \
-         spent",
+        229,
+        "a record the second node's start appends, after a crash that kept the store",
     ),
+    (727, "a record the fourth node's start appends"),
     (
-        8934,
-        "a reserved secret version published as failed by the second node",
+        314,
+        "the log opens of the fifth and of the ninth node: two failed starts in one run",
     ),
 ];
 
