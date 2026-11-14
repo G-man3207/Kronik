@@ -391,8 +391,10 @@ resolved_config = (sources / 'kernel-resolved.config').read_text()
 for feature in required:
     if '\nCONFIG_' + feature + '=y\n' not in '\n' + resolved_config:
         raise RuntimeError('upstream resolved config lacks built-in CONFIG_' + feature)
+# Off is `# CONFIG_X is not set`, or no line at all for an option whose dependencies are
+# not met (CRYPTO_FIPS without the loader): Kconfig writes such an option nowhere.
 for option in config_overrides:
-    if '\n# CONFIG_' + option + ' is not set\n' not in '\n' + resolved_config:
+    if '\nCONFIG_' + option + '=' in '\n' + resolved_config:
         raise RuntimeError('the resolved config did not keep CONFIG_' + option + ' off')
 if a.kernel_from is None:
     run('kernel-' + kernel_target, kargs + [kernel_target])
