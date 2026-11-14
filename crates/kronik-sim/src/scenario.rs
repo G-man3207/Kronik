@@ -1161,8 +1161,13 @@ impl World {
         self.start_node();
         let mut tick = 0u32;
         loop {
-            if self.st().clients_done == self.cfg.clients {
-                break;
+            {
+                let st = self.st();
+                // The blob workload's eraser is a client too while it
+                // erases: its requests must be answered before the end.
+                if st.clients_done == self.cfg.clients && !st.blobs.erasing_now {
+                    break;
+                }
             }
             tick = tick.saturating_add(1);
             let crash_in = Duration::from_micros(

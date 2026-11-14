@@ -252,6 +252,12 @@ impl Disk {
         self.durable_names.insert(path.to_path_buf(), ino);
     }
 
+    /// The bytes of `path` now, durable or not.
+    pub fn contents(&self, path: &Path) -> Option<Vec<u8>> {
+        let ino = self.names.get(path)?;
+        Some(self.inodes.get(ino)?.current.clone())
+    }
+
     /// The bytes of `path` that are guaranteed to survive a crash right now:
     /// durable contents of a durably named file.
     pub fn durable_contents(&self, path: &Path) -> Option<Vec<u8>> {

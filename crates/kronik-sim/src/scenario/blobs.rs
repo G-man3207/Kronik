@@ -76,6 +76,9 @@ pub enum BlobMutation {
     /// deleted before the timer fires (the node's
     /// `mutation_sweep_ignores_timers`; with a floor lag and edges).
     SweepIgnoresTimers,
+    /// A sweep ignores `erased_now`: an erased subject's loose files stay
+    /// (strict E1).
+    SweepIgnoresErasures,
 }
 
 impl BlobMutation {
@@ -86,6 +89,7 @@ impl BlobMutation {
             "blob-sweep-ignores-touches" => Some(BlobMutation::SweepIgnoresTouches),
             "blob-erasure-keeps-files" => Some(BlobMutation::ErasureKeepsFiles),
             "blob-sweep-ignores-timers" => Some(BlobMutation::SweepIgnoresTimers),
+            "blob-sweep-ignores-erasures" => Some(BlobMutation::SweepIgnoresErasures),
             _ => None,
         }
     }
@@ -255,6 +259,8 @@ impl BlobWorkload {
             mutation_sweep_ignores_touches: self.mutation
                 == Some(BlobMutation::SweepIgnoresTouches),
             mutation_erasure_keeps_files: self.mutation == Some(BlobMutation::ErasureKeepsFiles),
+            mutation_sweep_ignores_erasures: self.mutation
+                == Some(BlobMutation::SweepIgnoresErasures),
         }
     }
 
@@ -458,6 +464,9 @@ pub(super) struct BlobState {
     deleted: u64,
     /// Subjects whose erasure has begun: their strict actors write no more.
     erasing: BTreeSet<u32>,
+    /// The eraser is between the start of an erasure and its end: the run
+    /// does not end before (its requests must be answered).
+    pub(super) erasing_now: bool,
     /// Subjects whose erasure is done (its call returned, or a start
     /// recovered it).
     erased: BTreeSet<u32>,
@@ -1101,6 +1110,7 @@ impl World {
         if self.blobs().is_none_or(|w| w.subjects == 0) {
             return;
         }
+        self.check_erasure_headers(node, when);
         let Some(store) = self.st().blobs.store.clone() else {
             return;
         };
@@ -1162,6 +1172,21 @@ impl World {
     async fn after_erasure(&self, node: &Node, subject: &str, lsn: Lsn, key_version: u32) {
         let when = format!("{subject}'s erasure (lsn {lsn})");
         self.check_erased_at_return(node, subject, lsn, key_version, &when);
+        // In both modes: once the collector is done with the erasure (its
+        // first pass, which the erasure wakes, when no writer of the subject
+        // is left), no file of the subject is left, loose ones included.
+        let mut waited = Duration::ZERO;
+        while self.erasures_swept() < lsn {
+            if waited >= Duration::from_secs(15) {
+                return self.violation(format!(
+                    "{when}: the collector was not done with it after {waited:?} (watermark {})",
+                    self.erasures_swept()
+                ));
+            }
+            self.sleep(Duration::from_millis(20)).await;
+            waited += Duration::from_millis(20);
+        }
+        self.check_erasure_headers(node, &format!("{when}, the collector done with it"));
         if self.blobs().is_none_or(|w| !w.privacy_on) {
             return;
         }
@@ -1239,6 +1264,71 @@ impl World {
         }
     }
 
+    /// The collector's erasure watermark (`<data>/blobs/erasures-swept`, on
+    /// the simulated disk): every erasure at or below it is done with
+    /// (M26 §9.3): a pass deleted its subject's files, loose ones included,
+    /// with no writer of the subject left from before the pass.
+    fn erasures_swept(&self) -> u64 {
+        let path = self
+            .storage_root
+            .path()
+            .join("blobs")
+            .join("erasures-swept");
+        self.disk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contents(&path)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// E1, strict: no file in main's store whose header names a subject
+    /// through a key version that an erasure the collector is done with
+    /// erased, loose files included (a writer's part file under `tmp/`
+    /// goes with its writer, and is not one). Returns how many erasures it
+    /// checked.
+    fn check_erasure_headers(&self, node: &Node, when: &str) -> usize {
+        let swept = self.erasures_swept();
+        let done: Vec<(String, u32)> = match node.store().db().erasure_records() {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|(_, _, lsn)| *lsn <= swept)
+                .map(|(subject, version, _)| (subject, version))
+                .collect(),
+            Err(e) => {
+                self.violation(format!("{when}: reading the erasures: {e}"));
+                return 0;
+            }
+        };
+        if done.is_empty() {
+            return 0;
+        }
+        let left: Vec<(PathBuf, String, u32)> = {
+            let disk = self.disk.lock().unwrap_or_else(|e| e.into_inner());
+            disk.files_under(&BlobWorkload::objects())
+                .into_iter()
+                .filter_map(|path| {
+                    let bytes = disk.contents(&path)?;
+                    let header = bytes.get(..kronik_blob::format::HEADER_LEN)?;
+                    let header = kronik_blob::format::Header::decode(header).ok()?;
+                    let subject = header.subject?;
+                    done.iter()
+                        .any(|(s, v)| *s == subject && header.key_version <= *v)
+                        .then_some((path, subject, header.key_version))
+                })
+                .collect()
+        };
+        for (path, subject, version) in left {
+            self.violation(format!(
+                "{when}: {} is a file of {subject} (key version {version}), whose erasure \
+                 the collector is done with (watermark {swept})",
+                path.display()
+            ));
+        }
+        done.len()
+    }
+
     /// Erases the seed's subjects while the clients run, each once its
     /// strict actor's writes are done, and checks E1 after each.
     pub(super) async fn blob_eraser(self: Arc<Self>) {
@@ -1254,17 +1344,39 @@ impl World {
                 return;
             }
             let subject = subject_name(i);
-            self.st().blobs.erasing.insert(i);
+            {
+                let mut st = self.st();
+                st.blobs.erasing.insert(i);
+                st.blobs.erasing_now = true;
+            }
             self.event(format!(
                 "erasing {subject}: its strict actor writes no more"
             ));
             while self.st().blobs.inflight.get(&i).copied().unwrap_or(0) > 0 {
                 self.sleep(Duration::from_millis(5)).await;
             }
+            // Loose files of the subject, written just before: no record
+            // references them, so only the collector's pass for the erasure
+            // deletes them (`erased_now`) before their grace ends.
+            if let Ok(actor) = ActorRef::parse(&format!("{KIND}/r{i}")) {
+                for n in 0..1 + self.work.below(3) {
+                    let op = Op::WriteDiscard {
+                        size: 1 + self.work.below(70_000),
+                    };
+                    let idem = format!("eraser-{i}-{n}");
+                    if let Some(result) = self.request(&actor, &op, &idem, Some(&subject)).await {
+                        self.event(format!(
+                            "{idem} {op:?} before the erasure -> {:?}",
+                            answer_text(&result)
+                        ));
+                    }
+                }
+            }
             let mut attempts = 0u32;
             loop {
                 attempts += 1;
                 if attempts > 1_000 {
+                    self.st().blobs.erasing_now = false;
                     return self.violation(format!("{subject} was never erased"));
                 }
                 let (node, node_id) = {
@@ -1334,7 +1446,11 @@ impl World {
                 }
                 self.sleep(Duration::from_millis(20)).await;
             }
-            self.st().blobs.erased.insert(i);
+            {
+                let mut st = self.st();
+                st.blobs.erased.insert(i);
+                st.blobs.erasing_now = false;
+            }
         }
     }
 
@@ -1553,6 +1669,23 @@ impl World {
             }
         }
         self.check_erased_files(node, "the end").await;
+        let newest = node
+            .store()
+            .db()
+            .erasure_records()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, _, lsn)| lsn)
+            .max();
+        if let Some(newest) = newest
+            && self.erasures_swept() < newest
+        {
+            self.violation(format!(
+                "the end: after two passes the collector is not done with the erasure at lsn \
+                 {newest} (watermark {})",
+                self.erasures_swept()
+            ));
+        }
         let mut referenced = BTreeSet::new();
         if let Err(e) = node
             .reader()

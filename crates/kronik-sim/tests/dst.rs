@@ -36,7 +36,8 @@
 //! every connections run (C8), not only every 10th seed's.
 //! The blob workload's mutations are `blob-skip-ensure-durable`,
 //! `blob-sweep-ignores-leases`, `blob-sweep-ignores-touches`,
-//! `blob-erasure-keeps-files` and `blob-sweep-ignores-timers`.
+//! `blob-erasure-keeps-files`, `blob-sweep-ignores-timers` and
+//! `blob-sweep-ignores-erasures`.
 //! A run line shows `start-failures=N` after its wall time when a node's
 //! start failed on an injected fsync error and the node was restarted; the
 //! lines under it say what failed.
@@ -162,8 +163,8 @@ fn main() -> ExitCode {
                     eprintln!(
                         "--mutation needs ack-before-fsync, deliver-before-fsync, \
                          blob-skip-ensure-durable, blob-sweep-ignores-leases, \
-                         blob-sweep-ignores-touches, blob-erasure-keeps-files or \
-                         blob-sweep-ignores-timers"
+                         blob-sweep-ignores-touches, blob-erasure-keeps-files, \
+                         blob-sweep-ignores-timers or blob-sweep-ignores-erasures"
                     );
                     return ExitCode::FAILURE;
                 }

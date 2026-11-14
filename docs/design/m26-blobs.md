@@ -740,9 +740,15 @@ of the subject a record referenced before the erasure; in mode on, once
 across the erasure may commit a blob of the subject after the erasure
 returned, ADR 0123; applying its record deletes the file, and the erasure
 is pending until then; in mode off the subject's plain values in the log
-keep it pending until a reseal); and after every start and at the end, of
-every erased blob (a row marked erased, or an erased version a record
-references). E2, a read of the strict actor's held blob asked after the
+keep it pending until a reseal); once the collector is done with the
+erasure (its watermark `blobs/erasures-swept` covers it: the pass the
+erasure wakes found no writer of the subject from before it), in both
+modes, of every file whose header names the subject through an erased key
+version, loose files included (one to three `write-discard`s of the
+subject just before each erasure make some), a live writer's part file
+excepted; and after every start and at the end, of every erased blob (a
+row marked erased, or an erased version a record references), with the
+collector done with every erasure after the last two passes. E2, a read of the strict actor's held blob asked after the
 erasure returned never sees the bytes (`erased`, or no reference, never
 the bytes). A request of the racy actor that ran across the erasure may be
 refused new blobs of the subject, have its saved response tombstoned, or
@@ -780,7 +786,9 @@ rebuild); B5 (every blob a guest answered or the service received has the
 bytes written); B6; E1 and E2; and the counter workload's exactly-once and
 logical-time checks. The mutations are `blob-skip-ensure-durable`,
 `blob-sweep-ignores-leases`, `blob-sweep-ignores-touches` and
-`blob-erasure-keeps-files` (`kronik_blob::StoreConfig`), and
+`blob-erasure-keeps-files` and `blob-sweep-ignores-erasures` (a sweep ignores
+`erased_now`, so an erased subject's loose files stay)
+(`kronik_blob::StoreConfig`), and
 `blob-sweep-ignores-timers` (the node's hidden `[blobs]
 mutation_sweep_ignores_timers`: the collector's roots leave out what timers
 keep; the run gets edges and a floor 10 records behind). A run's storage root
