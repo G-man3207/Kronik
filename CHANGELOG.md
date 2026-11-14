@@ -13,6 +13,14 @@ until the v1.0 compatibility promise takes effect.
   warm (64 MiB instead of 256 MiB at most). From 8 CPUs nothing changes.
   An explicit `--concurrency` is used as given. The `kronik is serving` log
   line shows the value.
+- The CLI's replay summaries (`kronik replay`, `kronik diff show`, `kronik
+  proposals show` and the others) count the turns that met erased data as
+  `Unverifiable N turns met erased data and were not verified`, as `kronik
+  upgrade check` does. They said these turns had run on pseudonyms and asked for a re-run
+  with a `pii:read` token, which cannot verify them. A fork with personal
+  data shows no `PII-masked` line any more; a `--no-pii` fork keeps it, and
+  with erased data in the window it says the turns ran on pseudonyms or met
+  erased data.
 - `isolation = "microvm"` runs a foreign actor in a Firecracker microVM of
   its own (M20; ADRs 0095 and 0096, accepted on 2026-11-14), an opt-in
   level beside gVisor, which stays the default. It needs a usable `/dev/kvm`

@@ -1337,7 +1337,7 @@ fn diff_block(d: &Value) -> String {
         let _ = write!(errors, ", {} outcome unknown", int(&er["outcome_unknown"]));
     }
     field(&mut out, "Errors", &[errors], "");
-    pii_masked_field(&mut out, s);
+    pii_masked_field(&mut out, s, d["options"]["no_pii"].as_bool());
 
     let res = &d["resources"];
     field(
@@ -1460,26 +1460,51 @@ fn summary_lines(out: &mut String, s: &Value) {
         )],
         "",
     );
-    pii_masked_field(out, s);
+    pii_masked_field(out, s, None);
 }
 
-/// `PII-masked` when turns ran on pseudonyms (`summary.pii_masked`, and
-/// `pii_unverified` for those identical to production): they could not be
-/// verified, so the policy needs an approval (ADR 0031).
-fn pii_masked_field(out: &mut String, s: &Value) {
+/// The turns the replay could not verify. `Unverifiable` counts those that
+/// met erased data (`summary.unverifiable`, ADR 0109), as the upgrade check
+/// names them: no token makes them verifiable. `PII-masked` counts the
+/// turns of `summary.pii_masked`, and `pii_unverified` for those identical
+/// to production, which ran on pseudonyms: a `pii:read` token verifies
+/// them. A fork with personal data (`no_pii` false) ran none, so what it
+/// masks met erased data and only the first line applies. In a `--no-pii`
+/// fork, or when the fork is not known (a dry run's summary), the summary
+/// does not tell the two apart: with erased data in the window, the second
+/// line names both. Either needs the policy's approval (ADR 0031).
+fn pii_masked_field(out: &mut String, s: &Value, no_pii: Option<bool>) {
+    let unverifiable = int(&s["unverifiable"]);
+    if unverifiable > 0 {
+        let line = match unverifiable {
+            1 => "1 turn met erased data and was not verified".to_owned(),
+            n => format!("{n} turns met erased data and were not verified"),
+        };
+        field(out, "Unverifiable", &[line], "");
+    }
     let identical = int(&s["pii_unverified"]);
     let masked = int(&s["pii_masked"]) + identical;
-    if masked > 0 {
-        let mut line = format!(
-            "{masked} {} ran on pseudonyms and could not be verified",
-            plural(masked, "turn")
-        );
-        if identical > 0 {
-            let _ = write!(line, " ({identical} identical to production)");
-        }
-        line.push_str("; re-run with a pii:read token");
-        field(out, "PII-masked", &[line], "");
+    if masked == 0 || no_pii == Some(false) {
+        return;
     }
+    let ran = if unverifiable > 0 {
+        "ran on pseudonyms or met erased data"
+    } else {
+        "ran on pseudonyms"
+    };
+    let mut line = format!(
+        "{masked} {} {ran} and could not be verified",
+        plural(masked, "turn")
+    );
+    if identical > 0 {
+        let _ = write!(line, " ({identical} identical to production)");
+    }
+    line.push_str(if unverifiable > 0 {
+        "; a re-run with a pii:read token verifies those that ran on pseudonyms"
+    } else {
+        "; re-run with a pii:read token"
+    });
+    field(out, "PII-masked", &[line], "");
 }
 
 /// `Policy   <rule> -> <ACTION>` for every fired rule, on the one line as
@@ -2416,6 +2441,61 @@ mod tests {
             out,
             "Policy   any-change -> APPROVAL REQUIRED, pii-masked-needs-approval -> \
              APPROVAL REQUIRED: 8 turns could not be verified without personal data\n"
+        );
+    }
+
+    /// Turns that met erased data are `Unverifiable`, as the upgrade check
+    /// says, not turns that ran on pseudonyms: a `pii:read` token cannot
+    /// verify them (the privacy upgrade drill's identity replay printed
+    /// "9 turns ran on pseudonyms" for an operator's fork with personal
+    /// data). A fork with personal data ran no pseudonyms; a `--no-pii` one
+    /// keeps its pseudonym line, naming erased data as well when there is
+    /// some.
+    #[test]
+    fn turns_that_met_erased_data_are_unverifiable_not_pseudonymous() {
+        let shown = |summary: Value, no_pii: Option<bool>| {
+            let mut out = String::new();
+            pii_masked_field(&mut out, &summary, no_pii);
+            out
+        };
+        let erased = json!({"pii_masked": 9, "pii_unverified": 0, "unverifiable": 9});
+        assert_eq!(
+            shown(erased.clone(), Some(false)),
+            "  Unverifiable  9 turns met erased data and were not verified\n"
+        );
+        // A dry run's summary does not say which fork it was.
+        assert_eq!(
+            shown(erased, None),
+            "  Unverifiable  9 turns met erased data and were not verified\n  PII-masked    9 \
+             turns ran on pseudonyms or met erased data and could not be verified; a re-run \
+             with a pii:read token verifies those that ran on pseudonyms\n"
+        );
+        // A `--no-pii` fork without erased data: as before.
+        assert_eq!(
+            shown(
+                json!({"pii_masked": 8, "pii_unverified": 0, "unverifiable": 0}),
+                Some(true)
+            ),
+            "  PII-masked    8 turns ran on pseudonyms and could not be verified; re-run with a \
+             pii:read token\n"
+        );
+        assert_eq!(
+            shown(
+                json!({"pii_masked": 5, "pii_unverified": 2, "unverifiable": 1}),
+                Some(true)
+            ),
+            "  Unverifiable  1 turn met erased data and was not verified\n  PII-masked    7 \
+             turns ran on pseudonyms or met erased data and could not be verified (2 identical \
+             to production); a re-run with a pii:read token verifies those that ran on \
+             pseudonyms\n"
+        );
+        // Nothing masked, nothing unverifiable: no line.
+        assert_eq!(
+            shown(
+                json!({"pii_masked": 0, "pii_unverified": 0, "unverifiable": 0}),
+                None
+            ),
+            ""
         );
     }
 
