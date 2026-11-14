@@ -1650,10 +1650,13 @@ async fn lifecycle_audit_failure_prevents_publication_stop_and_job_spawn() {
         )
         .await
         .unwrap();
+        // The deployment's wall time starts the watch's window: a time in
+        // 1970 would end the 60 s window at the watch's first look, racing
+        // the status this test expects to stay `watching`.
         let audit = pb::Audit {
             token_id: "operator".into(),
             reason: "before fault".into(),
-            wall_time_ms: 123,
+            wall_time_ms: node.env().clock.wall_ms(),
         };
         let deployed = node
             .deploy(
