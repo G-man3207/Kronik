@@ -489,6 +489,24 @@ and regular files with one link. A link to a file that only root may read, a
 FIFO that would hang the restore, or a linked directory in the bucket fails
 the restore instead.
 
+On a nonroot installation, check the host with `sudo kronik doctor --rootless`.
+Plain `kronik doctor` run as root checks the host as root, by path, also in the
+service user's directories (the run directory, the data directory's key
+source). Nothing exploitable was found there, but the rule that root opens
+nothing in a tree another user controls
+([ADR 0062](../adr/0062-non-root-systemd-units.md)) holds only with
+`--rootless`, which reads the key source as root and then runs the other checks
+as the service user.
+
+The installer picks the `kronik` user's subordinate ranges so that they overlap
+no account and no range in `/etc/passwd`, `/etc/group`, `/etc/subuid`,
+`/etc/subgid` and the accounts the name service enumerates (`getent`). A
+directory service that does not enumerate its accounts (sssd or LDAP with
+`enumerate = false`) hides its users from that check, so the range can cover a
+real remote uid; namespace root can become any uid of the range, and so reach
+that user's files on the host. On such a host, make sure that the range that
+`kronik userns status` shows holds no remote account.
+
 `/run/kronik` is mode 0750 with group `kronik`: whoever may use the API socket
 can list it. The runtime state of the sandboxes beneath it (`runsc/`, `runc/`)
 is mode 0700, because a runtime's state file holds the container's
