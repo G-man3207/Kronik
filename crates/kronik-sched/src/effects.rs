@@ -178,7 +178,17 @@ pub fn prepare_inline_fetch_response(
         return Ok(FetchOutcome::HostRedactionFailure);
     }
     rec.status = pb::EffectStatus::Ok as i32;
+    // A blob response (M25 §7.3) is listed with the effect's blobs.
+    if let Some(blob) = &response.body_blob
+        && !rec.blobs.iter().any(|listed| listed.hash == blob.hash)
+    {
+        rec.blobs.push(blob.clone());
+    }
     rec.response = tagged(subject, response.encode_to_vec());
+    let body = match response.body_blob {
+        Some(blob) => FetchResponseBody::Blob(blob),
+        None => FetchResponseBody::Inline(response.body),
+    };
     Ok(FetchOutcome::Ok(FetchResponse {
         status,
         headers: response
@@ -186,8 +196,23 @@ pub fn prepare_inline_fetch_response(
             .into_iter()
             .map(|header| (header.name, header.value))
             .collect(),
-        body: FetchResponseBody::Inline(response.body),
+        body,
     }))
+}
+
+/// What an HTTP exchange gave the gate.
+enum Exchanged {
+    /// A response: its body inline, or a blob of the turn's (M25 §7.3).
+    Response {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        blob: Option<pb::BlobRef>,
+    },
+    /// The response could not be stored: the blob store is below its reserve.
+    StoreFull(String),
+    /// The response could not be stored for another reason.
+    Failed(String),
 }
 
 /// A successful reply must already be resolved through the gate's actual
@@ -724,6 +749,9 @@ pub(crate) struct TurnSpec {
     /// Where the turn's values came from: the callee input of a call carries
     /// it (crate::erasure).
     pub born: crate::erasure::Born,
+    /// The size above which an HTTP response becomes a blob, when the
+    /// turn's code reads blobs and the node has a blob store (M25 §7.3).
+    pub blob_threshold: Option<u64>,
 }
 
 #[derive(Default)]
@@ -899,6 +927,8 @@ pub(crate) struct TurnFx {
     spec: TurnSpec,
     original_execution: AuthLease,
     pub state: Mutex<FxState>,
+    /// The turn's blob host (M25), attached once the turn has one.
+    blobs: std::sync::OnceLock<crate::blobs::TurnBlobs>,
 }
 
 /// The `EffectGate` handed to the runtime.
@@ -940,7 +970,14 @@ impl TurnFx {
                 budget,
                 ..FxState::default()
             }),
+            blobs: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Gives the gate the turn's blob host, for blob request bodies and
+    /// responses above the threshold (M25 §7.2, §7.3).
+    pub(crate) fn attach_blobs(&self, blobs: crate::blobs::TurnBlobs) {
+        let _ = self.blobs.set(blobs);
     }
 
     /// Refuses a new effect whose `need` bytes (its request and a result
@@ -1402,6 +1439,7 @@ impl TurnFx {
         // A body the turn may not use is a denied effect (M25 §7.2): its
         // request is recorded without the reference, which no record may
         // list as the turn's. Blob request bodies arrive with slice B7.
+        let mut blob_body = None;
         let wire_body = match &req.body {
             FetchBody::Inline(bytes) => bytes.clone(),
             FetchBody::NotHeld { hash, size } => {
@@ -1414,9 +1452,14 @@ impl TurnFx {
                 ));
                 Vec::new()
             }
+            // M25 §7.2: recorded as the reference, streamed from the store.
+            FetchBody::Blob(blob) if !foreign && self.blobs.get().is_some() => {
+                blob_body = Some(blob.clone());
+                Vec::new()
+            }
             FetchBody::Blob(_) => {
                 return Err(GateError::Host(
-                    "NOT_IMPLEMENTED: blob request bodies are not supported yet".into(),
+                    "NOT_IMPLEMENTED: blob request bodies to foreign actors".into(),
                 ));
             }
         };
@@ -1426,6 +1469,7 @@ impl TurnFx {
             headers,
             body: wire_body.clone(),
             fingerprint_version: 2,
+            body_blob: blob_body.clone(),
             ..Default::default()
         };
         // Recorded and fingerprinted without the values of secrets revealed
@@ -1549,6 +1593,7 @@ impl TurnFx {
         let idem = causal::idempotency_key(&self.spec.causal_key, ordinal);
         let mut rec = self.base(ordinal, kind, recorded_cap, fp);
         rec.request = tagged(&subject, recorded.encode_to_vec());
+        rec.blobs = blob_body.iter().cloned().collect();
         rec.idempotency_key = idem.clone();
         rec.delivery = delivery.as_str().into();
         if let Some((status, error)) = failure {
@@ -1629,33 +1674,131 @@ impl TurnFx {
             need,
             self.spec.limits.effect_response_bytes,
         );
-        let wire = HttpRequest {
-            method: req.method,
-            url: req.url,
-            headers: wire_headers,
-            body: bytes::Bytes::from(wire_body),
-            max_response_bytes,
+        // A kind that reads blobs streams the exchange (M25 §7.3): a body
+        // above its threshold becomes a blob, under the effect timeout that
+        // covers the whole exchange.
+        let streamed = match (self.spec.blob_threshold, self.blobs.get()) {
+            (Some(threshold), Some(blobs)) if !foreign => Some((threshold, blobs.clone())),
+            _ => None,
         };
-        let call: BoxFuture<'static, Result<kronik_core::env::HttpResponse, NetError>> =
-            match (foreign, &self.node.foreign) {
-                (false, _) => self
-                    .node
-                    .env
-                    .net
-                    .http_authorized(wire, self.original_execution.clone()),
-                (true, Some(host)) => host.http(&target.host, wire),
-                (true, None) => {
-                    let e = kronik_effects::foreign::unavailable(
-                        &target.host,
-                        "foreign actors are not available in this process",
-                    );
-                    Box::pin(std::future::ready(Err(e)))
-                }
-            };
+        let blob_limit = streamed.is_some();
+        let exchange: BoxFuture<'static, Result<Exchanged, NetError>> = match streamed {
+            Some((threshold, blobs)) => {
+                let body = match &blob_body {
+                    Some(blob) => kronik_core::env::HttpBody::Stream {
+                        len: blob.size,
+                        source: blobs.source(blob).await.map_err(|e| {
+                            GateError::Host(format!("reading a request body blob: {e:?}"))
+                        })?,
+                    },
+                    None => kronik_core::env::HttpBody::Bytes(bytes::Bytes::from(wire_body)),
+                };
+                let limit = self.spec.limits.effect_response_bytes;
+                let call = self.node.env.net.http_stream_authorized(
+                    kronik_core::env::HttpStreamRequest {
+                        method: req.method,
+                        url: req.url,
+                        headers: wire_headers,
+                        body,
+                        max_response_bytes: limit,
+                    },
+                    self.original_execution.clone(),
+                );
+                let matcher = {
+                    let state = lock(&self.state);
+                    CompiledScrubber::new(
+                        &secret_patterns(&state.secrets),
+                        crate::scrub::MAX_SECRET_PATTERN_BYTES,
+                    )
+                    .map_err(|error| GateError::Host(error.to_string()))?
+                    .into_owned()
+                };
+                let subject = subject.clone();
+                Box::pin(async move {
+                    let mut response = call.await?;
+                    let mut first = bytes::BytesMut::new();
+                    while first.len() as u64 <= threshold {
+                        match response.body.next().await {
+                            Ok(Some(chunk)) => first.extend_from_slice(&chunk),
+                            Ok(None) => {
+                                if first.len() as u64 > max_response_bytes {
+                                    return Err(NetError::TooLarge);
+                                }
+                                return Ok(Exchanged::Response {
+                                    status: response.status,
+                                    headers: response.headers,
+                                    body: first.to_vec(),
+                                    blob: None,
+                                });
+                            }
+                            Err(e) if kronik_core::env::is_response_too_large(&e) => {
+                                return Err(NetError::TooLarge);
+                            }
+                            Err(e) => return Err(NetError::Io(e.to_string())),
+                        }
+                    }
+                    match blobs
+                        .store_stream(
+                            subject.as_deref(),
+                            first.freeze(),
+                            &mut *response.body,
+                            matcher,
+                            limit,
+                        )
+                        .await
+                    {
+                        Ok(blob) => Ok(Exchanged::Response {
+                            status: response.status,
+                            headers: response.headers,
+                            body: Vec::new(),
+                            blob: Some(blob),
+                        }),
+                        Err(crate::blobs::StreamError::TooLarge) => Err(NetError::TooLarge),
+                        Err(crate::blobs::StreamError::Source(e)) => Err(NetError::Io(e)),
+                        Err(crate::blobs::StreamError::StoreFull(m)) => Ok(Exchanged::StoreFull(m)),
+                        Err(crate::blobs::StreamError::Store(m)) => Ok(Exchanged::Failed(m)),
+                    }
+                })
+            }
+            None => {
+                let wire = HttpRequest {
+                    method: req.method,
+                    url: req.url,
+                    headers: wire_headers,
+                    body: bytes::Bytes::from(wire_body),
+                    max_response_bytes,
+                };
+                let call: BoxFuture<'static, Result<kronik_core::env::HttpResponse, NetError>> =
+                    match (foreign, &self.node.foreign) {
+                        (false, _) => self
+                            .node
+                            .env
+                            .net
+                            .http_authorized(wire, self.original_execution.clone()),
+                        (true, Some(host)) => host.http(&target.host, wire),
+                        (true, None) => {
+                            let e = kronik_effects::foreign::unavailable(
+                                &target.host,
+                                "foreign actors are not available in this process",
+                            );
+                            Box::pin(std::future::ready(Err(e)))
+                        }
+                    };
+                Box::pin(async move {
+                    let response = call.await?;
+                    Ok(Exchanged::Response {
+                        status: response.status,
+                        headers: response.headers,
+                        body: Vec::from(response.body),
+                        blob: None,
+                    })
+                })
+            }
+        };
         let res = self
             .node
             .env
-            .timeout(self.spec.limits.effect_timeout, call)
+            .timeout(self.spec.limits.effect_timeout, exchange)
             .await;
         rec.duration_us = self
             .node
@@ -1675,6 +1818,14 @@ impl TurnFx {
                     self.spec.limits.effect_timeout.as_millis()
                 );
                 FetchOutcome::Timeout
+            }
+            Ok(Err(NetError::TooLarge)) if blob_limit => {
+                rec.status = pb::EffectStatus::TooLarge as i32;
+                rec.error = format!(
+                    "the response exceeds {} bytes",
+                    self.spec.limits.effect_response_bytes
+                );
+                FetchOutcome::TooLarge
             }
             Ok(Err(NetError::TooLarge)) => {
                 rec.status = pb::EffectStatus::TooLarge as i32;
@@ -1703,18 +1854,32 @@ impl TurnFx {
                     }
                 }
             }
-            Ok(Ok(response)) => prepare_inline_fetch_response(
+            // Not recorded: the turn runs again once there is room, as after
+            // a crash once the request left (M25 §4.7, I17).
+            Ok(Ok(Exchanged::StoreFull(message))) => {
+                return Err(GateError::BlobStoreFull(message));
+            }
+            Ok(Ok(Exchanged::Failed(message))) => {
+                return Err(GateError::Host(format!(
+                    "storing a response blob: {message}"
+                )));
+            }
+            Ok(Ok(Exchanged::Response {
+                status,
+                headers,
+                body,
+                blob,
+            })) => prepare_inline_fetch_response(
                 &mut rec,
                 &subject,
                 pb::HttpEffectResponse {
-                    status: u32::from(response.status),
-                    headers: response
-                        .headers
+                    status: u32::from(status),
+                    headers: headers
                         .into_iter()
                         .map(|(name, value)| pb::HeaderPair { name, value })
                         .collect(),
-                    body: Vec::from(response.body),
-                    body_blob: None,
+                    body,
+                    body_blob: blob,
                 },
                 &matcher,
                 self.spec

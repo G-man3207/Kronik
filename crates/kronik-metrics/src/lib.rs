@@ -114,7 +114,7 @@ pub const METRICS: &[Def] = &[
     },
     Def {
         name: "kronik_blob_read_bytes_total",
-        help: "Blob bytes read, by reader (guest, gateway, ship, api).",
+        help: "Blob bytes read, by reader (guest, effect, gateway, ship, api).",
         kind: Type::Counter,
     },
     Def {

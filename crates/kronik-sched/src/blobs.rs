@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kronik_blob::{BlobError, BlobId, BlobMeta, BlobReader, BlobStore, BlobWriter, Lease, Space};
-use kronik_core::env::{BoxFuture, Env};
+use kronik_core::env::{BodySource, BoxFuture, Env};
 use kronik_effects::http::{CompiledScrubber, ScrubError, StreamScrubber};
 use kronik_privacy::sealer::Sealer;
 use kronik_proto::log::v1 as pb;
@@ -96,6 +96,114 @@ impl TurnBlobs {
         })
     }
 
+    /// Stores an effect's response body as a blob of `subject` (M25 §7.3):
+    /// `first` and the rest of `rest`, at most `limit` bytes as they arrive,
+    /// scrubbed with `matcher`, and named durably before it returns, so the
+    /// effect's result never precedes its blob.
+    pub(crate) async fn store_stream(
+        &self,
+        subject: Option<&str>,
+        first: bytes::Bytes,
+        rest: &mut dyn BodySource,
+        matcher: CompiledScrubber<'static>,
+        limit: u64,
+    ) -> Result<pb::BlobRef, StreamError> {
+        let inner = &self.0;
+        let keys = match subject {
+            None => None,
+            Some(subject) => {
+                let entropy = inner.env.entropy.clone();
+                let fill = move |bytes: &mut [u8]| entropy.fill(bytes);
+                Some(
+                    inner
+                        .sealer
+                        .blob_keys(subject, &fill, inner.env.clock.wall_ms())
+                        .map_err(|e| StreamError::Store(e.to_string()))?,
+                )
+            }
+        };
+        let mut writer = inner
+            .store
+            .writer(inner.space.clone(), keys, u64::MAX, inner.lease.clone())
+            .await
+            .map_err(StreamError::from_blob)?;
+        let mut scrubber = StreamScrubber::from_compiled(
+            matcher,
+            crate::scrub::limits(usize::MAX),
+            SCRUB_BUFFER_BYTES,
+        )
+        .map_err(|e| StreamError::Store(e.to_string()))?;
+        let mut read = 0u64;
+        let mut chunk = Some(first);
+        loop {
+            let bytes = match chunk.take() {
+                Some(bytes) => bytes,
+                None => match rest.next().await {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => break,
+                    Err(e) => {
+                        writer.abort().await;
+                        return Err(if kronik_core::env::is_response_too_large(&e) {
+                            StreamError::TooLarge
+                        } else {
+                            StreamError::Source(e.to_string())
+                        });
+                    }
+                },
+            };
+            read = read.saturating_add(bytes.len() as u64);
+            if read > limit {
+                writer.abort().await;
+                return Err(StreamError::TooLarge);
+            }
+            let scrubbed = match scrubber.push(&bytes) {
+                Ok(out) => out.to_vec(),
+                Err(e) => {
+                    writer.abort().await;
+                    return Err(StreamError::Store(format!("scrubbing a response: {e}")));
+                }
+            };
+            if let Err(e) = writer.write(&scrubbed).await {
+                writer.abort().await;
+                return Err(StreamError::from_blob(e));
+            }
+        }
+        let tail = match scrubber.finish() {
+            Ok(tail) => tail,
+            Err(e) => {
+                writer.abort().await;
+                return Err(StreamError::Store(format!("scrubbing a response: {e}")));
+            }
+        };
+        if let Err(e) = writer.write(&tail).await {
+            writer.abort().await;
+            return Err(StreamError::from_blob(e));
+        }
+        let meta = writer.finish().await.map_err(StreamError::from_blob)?;
+        inner
+            .store
+            .ensure_durable(&inner.space, &[meta.id])
+            .await
+            .map_err(StreamError::from_blob)?;
+        lock(&inner.created).push(meta.id);
+        kronik_metrics::add(
+            "kronik_blob_written_bytes_total",
+            &[("source", "effect")],
+            meta.size,
+        );
+        Ok(meta.to_pb())
+    }
+
+    /// A blob the turn may use, as a request body read frame by frame
+    /// (M25 §7.2); a sealed blob is opened with its subject's key.
+    pub(crate) async fn source(
+        &self,
+        blob: &pb::BlobRef,
+    ) -> Result<Box<dyn BodySource>, BlobHostError> {
+        let reader = self.0.reader(blob).await?;
+        Ok(Box::new(FrameSource { reader, next: 0 }))
+    }
+
     /// Names every blob the turn finished durably (ADR 0117 §4); called
     /// before the turn's record is appended.
     pub(crate) async fn ensure_durable(&self) -> Result<(), BlobError> {
@@ -104,6 +212,57 @@ impl TurnBlobs {
             return Ok(());
         }
         self.0.store.ensure_durable(&self.0.space, &ids).await
+    }
+}
+
+/// Why an effect's response could not become a blob.
+#[derive(Debug)]
+pub(crate) enum StreamError {
+    /// Past the effect's response limit: `TOO_LARGE` is recorded.
+    TooLarge,
+    /// Reading the response failed: a network error is recorded.
+    Source(String),
+    /// The blob store is below its reserve: the turn runs again later, as
+    /// after a crash once the request left (M25 §4.7).
+    StoreFull(String),
+    /// Any other store failure: a host failure.
+    Store(String),
+}
+
+impl StreamError {
+    fn from_blob(error: BlobError) -> StreamError {
+        match error {
+            BlobError::StoreFull { .. } => StreamError::StoreFull(error.to_string()),
+            other => StreamError::Store(other.to_string()),
+        }
+    }
+}
+
+/// A blob's plaintext, one frame per chunk.
+struct FrameSource {
+    reader: Arc<BlobReader>,
+    next: u64,
+}
+
+impl BodySource for FrameSource {
+    fn next(&mut self) -> BoxFuture<'_, std::io::Result<Option<bytes::Bytes>>> {
+        Box::pin(async move {
+            if self.next >= self.reader.frames() {
+                return Ok(None);
+            }
+            let frame = self
+                .reader
+                .frame(self.next)
+                .await
+                .map_err(std::io::Error::other)?;
+            self.next += 1;
+            kronik_metrics::add(
+                "kronik_blob_read_bytes_total",
+                &[("reader", "effect")],
+                frame.len() as u64,
+            );
+            Ok(Some(frame))
+        })
     }
 }
 

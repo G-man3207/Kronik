@@ -434,7 +434,16 @@ fn fingerprint_fields(req: &pb::HttpEffectRequest, t: &Target, policy: Policy<'_
     for q in query {
         field(q.as_bytes());
     }
-    field(blake3::hash(&req.body).as_bytes());
+    // A blob body (M25 §7.2) counts as its identity digest, which for a
+    // `b3:` blob is the BLAKE3 of the same bytes sent inline.
+    match &req.body_blob {
+        Some(blob) => field(
+            &kronik_proto::blobs::parse_hash(&blob.hash)
+                .map(|(_, digest)| digest)
+                .unwrap_or_else(|_| *blake3::hash(blob.hash.as_bytes()).as_bytes()),
+        ),
+        None => field(blake3::hash(&req.body).as_bytes()),
+    }
     let mut headers: Vec<(String, Vec<u8>)> = req
         .headers
         .iter()

@@ -2367,6 +2367,8 @@ impl Node {
                 limits: kind_limits,
                 call_chain,
                 budget: crate::record_budget::Budget::new(record_limit, base),
+                blob_threshold: (self.blobs.is_some() && program.reads_blobs())
+                    .then(|| kind_limits.blob_threshold()),
                 begin: recovery_begin.unwrap_or_else(|| pb::TurnBegin {
                     execution_id: execution_id.clone(),
                     actor: Some(actor.to_pb()),
@@ -2435,6 +2437,9 @@ impl Node {
                 kind_limits.blob_bytes_per_actor,
             )
         });
+        if let Some(blobs) = &turn_blobs {
+            fx.attach_blobs(blobs.clone());
+        }
         let run = program
             .run_with_blobs(
                 req,

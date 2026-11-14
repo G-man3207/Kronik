@@ -278,6 +278,10 @@ pub enum GateError {
     /// holds everything a turn records): the effect does not happen and the
     /// turn traps with `TURN_TOO_LARGE`.
     TurnTooLarge(String),
+    /// A response could not be stored as a blob: the blob store is below
+    /// its reserve. The turn attempt is abandoned without its result, as
+    /// after a crash once the request left (M25 §4.7), and runs again.
+    BlobStoreFull(String),
 }
 
 /// A typed trap cause; guest strings cannot forge this downcast.
@@ -608,6 +612,10 @@ impl TurnHost {
             }
             GateError::Diverged(msg) => wasmtime::format_err!("REPLAY_DIVERGED: {msg}"),
             GateError::TurnTooLarge(msg) => wasmtime::Error::new(TurnTooLarge(msg)),
+            GateError::BlobStoreFull(msg) => {
+                self.fatal = Some(RunError::BlobStoreFull(msg.clone()));
+                wasmtime::format_err!("BLOB_STORE_FULL: {msg}")
+            }
         }
     }
 

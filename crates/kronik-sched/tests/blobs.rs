@@ -354,3 +354,224 @@ fn a_turn_that_meets_a_full_store_runs_again_when_there_is_room() {
     }
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+/// The (head, body) of every request a peer kept.
+type Sunk = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// A peer for the effect tests: `GET /bytes/<n>` answers `n` bytes of the
+/// `write` pattern; `POST /sink` keeps the request's head and body and
+/// answers 201.
+#[allow(clippy::disallowed_methods)]
+fn peer() -> (String, Sunk) {
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let sunk = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = sunk.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                    head.push_str(&line);
+                    line.clear();
+                }
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        let (name, value) = l.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; len];
+                reader.read_exact(&mut body).unwrap();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_owned();
+                let mut stream = stream;
+                if let Some(n) = path.strip_prefix("/bytes/") {
+                    let n: u64 = n.parse().unwrap();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n"
+                    );
+                    let mut at = 0;
+                    while at < n {
+                        let end = (at + 65_536).min(n);
+                        let part: Vec<u8> = (at..end).map(pattern).collect();
+                        if stream.write_all(&part).is_err() {
+                            return;
+                        }
+                        at = end;
+                    }
+                } else {
+                    seen.lock().unwrap().push((head, body));
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    );
+                }
+            });
+        }
+    });
+    (addr, sunk)
+}
+
+fn fnv(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+impl Proc {
+    fn effect_setup(&self, threshold: u64, response_limit: Option<u64>) {
+        let owner = self.node.local_operator_authority().unwrap();
+        self.rt
+            .block_on(self.node.set_limits(
+                pb::Limits {
+                    kind: "media".into(),
+                    blob_threshold_bytes: Some(threshold),
+                    effect_response_bytes: response_limit,
+                    ..Default::default()
+                },
+                audit(),
+                false,
+                owner.clone(),
+            ))
+            .unwrap();
+        self.rt
+            .block_on(self.node.grant(
+                "media",
+                "http:127.0.0.1",
+                None,
+                None,
+                kronik_effects::InForks::Recorded,
+                audit(),
+                false,
+                owner,
+            ))
+            .unwrap();
+    }
+}
+
+/// M25 §7.3: for a kind that reads blobs, a response above the threshold
+/// is a blob of the turn, recorded as its reference; one at the threshold
+/// stays inline.
+#[test]
+fn a_response_above_the_threshold_is_a_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path(), Some(BlobsConfig::default()));
+    p.effect_setup(65_536, None);
+    let (addr, _) = peer();
+    let fetch = |n: u64| {
+        p.ingress(http(
+            "fetch-sum",
+            "",
+            inline(format!("http://{addr}/bytes/{n}").as_bytes()),
+        ))
+    };
+    let at = fetch(65_536);
+    let expected: Vec<u8> = (0..65_536u64).map(pattern).collect();
+    assert_eq!(
+        answer(&at),
+        format!("inline 65536 65536 {}", fnv(&expected))
+    );
+    assert!(p.record(&at).effects[0].blobs.is_empty());
+
+    for n in [65_537u64, 3_000_000] {
+        let r = fetch(n);
+        let expected: Vec<u8> = (0..n).map(pattern).collect();
+        let text = answer(&r);
+        let hash = format!("b3:{}", blake3::hash(&expected).to_hex());
+        assert_eq!(text, format!("blob {hash} {n} {n} {}", fnv(&expected)));
+        let record = p.record(&r);
+        let effect = &record.effects[0];
+        assert_eq!(effect.status, pb::EffectStatus::Ok as i32);
+        assert_eq!(effect.blobs.len(), 1);
+        assert_eq!(
+            (effect.blobs[0].hash.as_str(), effect.blobs[0].size),
+            (hash.as_str(), n)
+        );
+        let Some(pb::sealable::Value::Plain(payload)) =
+            effect.response.as_ref().and_then(|r| r.value.as_ref())
+        else {
+            panic!("{effect:?}")
+        };
+        let response: pb::HttpEffectResponse = prost::Message::decode(payload.as_slice()).unwrap();
+        assert!(response.body.is_empty());
+        assert_eq!(response.body_blob.as_ref(), Some(&effect.blobs[0]));
+        assert_eq!(p.stored(dir.path(), &effect.blobs[0]), expected);
+    }
+}
+
+/// M25 §7.2: a blob request body is recorded as its reference and streamed
+/// from the store with its length.
+#[test]
+fn a_blob_request_body_streams_from_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path(), Some(BlobsConfig::default()));
+    p.effect_setup(65_536, None);
+    let (addr, sunk) = peer();
+    let bytes: Vec<u8> = (0..1_500_000u64).map(|i| (i % 13) as u8).collect();
+    let upload = p.upload(dir.path(), &bytes);
+    let r = p.ingress(http(
+        "post",
+        &format!("url=http://{addr}/sink"),
+        pb::body::Value::Blob(upload.clone()),
+    ));
+    assert_eq!(answer(&r), "status 201");
+    let (head, body) = sunk.lock().unwrap().pop().unwrap();
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-length: 1500000"),
+        "{head}"
+    );
+    assert!(body == bytes, "the peer got {} other bytes", body.len());
+    let record = p.record(&r);
+    let effect = &record.effects[0];
+    assert_eq!(effect.blobs, std::slice::from_ref(&upload));
+    let Some(pb::sealable::Value::Plain(payload)) =
+        effect.request.as_ref().and_then(|r| r.value.as_ref())
+    else {
+        panic!("{effect:?}")
+    };
+    let request: pb::HttpEffectRequest = prost::Message::decode(payload.as_slice()).unwrap();
+    assert!(request.body.is_empty());
+    assert_eq!(request.body_blob, Some(upload));
+}
+
+/// A response past `effect_response_bytes` is TOO_LARGE, as before, and
+/// leaves no blob behind.
+#[test]
+fn a_response_over_its_limit_is_too_large_and_leaves_no_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path(), Some(BlobsConfig::default()));
+    p.effect_setup(65_536, Some(1 << 20));
+    let (addr, _) = peer();
+    let r = p.ingress(http(
+        "fetch-sum",
+        "",
+        inline(format!("http://{addr}/bytes/2000000").as_bytes()),
+    ));
+    assert_eq!(answer(&r), "too-large");
+    let record = p.record(&r);
+    assert_eq!(record.effects[0].status, pb::EffectStatus::TooLarge as i32);
+    assert!(record.effects[0].blobs.is_empty());
+    let objects = walk(&dir.path().join("blobs"));
+    assert!(objects.is_empty(), "{objects:?}");
+}
+
+/// The object files of a blob store (`objects/<shard>/<file>`).
+fn walk(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for shard in std::fs::read_dir(root.join("objects")).unwrap().flatten() {
+        for file in std::fs::read_dir(shard.path()).unwrap().flatten() {
+            out.push(file.path());
+        }
+    }
+    out
+}

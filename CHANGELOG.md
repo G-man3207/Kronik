@@ -228,6 +228,11 @@ until the v1.0 compatibility promise takes effect.
   `kronik_blob_written_bytes_total`, `kronik_blob_read_bytes_total`,
   `kronik_blob_store_below_reserve`, `kronik_blob_turn_retries_total` and
   `kronik_blob_missing_total`.
+- With blobs on, an HTTP effect of code that imports `blobs` streams
+  (M25): a response above the kind's blob threshold is written into a blob
+  as it arrives, scrubbed of the turn's secrets and named durably before
+  its result is recorded, and a blob request body is streamed from the store
+  with its length. The effect's record holds only the references.
 - Three new per-kind limits (M25, M26): `blob_threshold_bytes` (bodies above
   it become blobs for code that imports `blobs`, 1 MiB, never above
   `message_bytes`), `upload_bytes` (the largest upload for such code,
