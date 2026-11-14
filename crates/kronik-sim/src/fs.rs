@@ -159,6 +159,34 @@ impl Disk {
         Some(self.inodes.get(ino)?.durable.clone())
     }
 
+    /// Whether `path` holds writes that are not durable yet: what a process
+    /// killed now leaves in the page cache only.
+    pub fn has_unsynced(&self, path: &Path) -> bool {
+        self.names
+            .get(path)
+            .and_then(|ino| self.inodes.get(ino))
+            .is_some_and(|i| !i.pending.is_empty())
+    }
+
+    /// Whether `path` is a name the disk has, durable or not.
+    pub fn is_named(&self, path: &Path) -> bool {
+        self.names.contains_key(path)
+    }
+
+    /// The bytes of `path`'s file that are synced, whether its name is
+    /// durable or not; 0 when there is no such name.
+    pub fn synced_len(&self, path: &Path) -> usize {
+        self.names
+            .get(path)
+            .and_then(|ino| self.inodes.get(ino))
+            .map_or(0, |i| i.durable.len())
+    }
+
+    /// Whether `path`'s name survives a power loss.
+    pub fn is_durably_named(&self, path: &Path) -> bool {
+        self.durable_names.contains_key(path)
+    }
+
     /// The durably named files directly in `dir`, in name order: the files
     /// a crash right now would leave there.
     pub fn durable_files_in(&self, dir: &Path) -> Vec<PathBuf> {

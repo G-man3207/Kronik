@@ -1402,3 +1402,122 @@ async fn canceling_an_unpolled_real_writer_publishes_native_closure_synchronousl
     ));
     assert!(h.read_all().await.unwrap().is_empty());
 }
+
+/// A file system that records the syncs: `("dir", path)` and
+/// `("data", path)`.
+struct SyncFs {
+    inner: Arc<dyn Fs>,
+    syncs: Arc<Mutex<Vec<(&'static str, PathBuf)>>>,
+}
+
+impl Fs for SyncFs {
+    fn create_dir_all(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
+        self.inner.create_dir_all(path)
+    }
+
+    fn open(&self, path: PathBuf, mode: OpenMode) -> BoxFuture<'static, io::Result<Arc<dyn File>>> {
+        let opened = self.inner.open(path.clone(), mode);
+        let syncs = self.syncs.clone();
+        Box::pin(async move {
+            Ok(Arc::new(SyncFile {
+                inner: opened.await?,
+                path,
+                syncs,
+            }) as Arc<dyn File>)
+        })
+    }
+
+    fn exists(&self, path: PathBuf) -> BoxFuture<'static, io::Result<bool>> {
+        self.inner.exists(path)
+    }
+
+    fn read_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<Vec<String>>> {
+        self.inner.read_dir(path)
+    }
+
+    fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, io::Result<()>> {
+        self.inner.rename(from, to)
+    }
+
+    fn remove_file(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
+        self.inner.remove_file(path)
+    }
+
+    fn sync_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
+        self.syncs.lock().unwrap().push(("dir", path.clone()));
+        self.inner.sync_dir(path)
+    }
+}
+
+struct SyncFile {
+    inner: Arc<dyn File>,
+    path: PathBuf,
+    syncs: Arc<Mutex<Vec<(&'static str, PathBuf)>>>,
+}
+
+impl File for SyncFile {
+    fn len(&self) -> BoxFuture<'static, io::Result<u64>> {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, len: usize) -> BoxFuture<'static, io::Result<Vec<u8>>> {
+        self.inner.read_at(offset, len)
+    }
+
+    fn write_at(&self, offset: u64, data: Bytes) -> BoxFuture<'static, io::Result<()>> {
+        self.inner.write_at(offset, data)
+    }
+
+    fn set_len(&self, len: u64) -> BoxFuture<'static, io::Result<()>> {
+        self.inner.set_len(len)
+    }
+
+    fn sync_data(&self) -> BoxFuture<'static, io::Result<()>> {
+        self.syncs.lock().unwrap().push(("data", self.path.clone()));
+        self.inner.sync_data()
+    }
+}
+
+/// A process killed without a power loss leaves its last segment's tail,
+/// and the name of a segment it created before syncing the directory, in
+/// the page cache only. The next open makes both durable before it builds
+/// on them: it fsyncs the last segment, active or closed, and the
+/// directory, whichever way the segment ended.
+#[tokio::test]
+async fn open_makes_what_the_last_process_left_durable() {
+    for closed in [false, true] {
+        let mut h = harness();
+        if closed {
+            // Every append rolls: the last segment the next open finds is
+            // closed by a footer, and that open creates the next one.
+            h.cfg.segment_max_bytes = 1;
+        }
+        {
+            let (log, _, _rx) = h.open().await.unwrap();
+            for r in samples().into_iter().take(3) {
+                log.append(r).await.unwrap();
+            }
+        }
+        let segments = h.segment_files();
+        let last = segments.last().unwrap().clone();
+        let syncs = Arc::new(Mutex::new(Vec::new()));
+        let mut env = h.env.clone();
+        env.fs = Arc::new(SyncFs {
+            inner: h.env.fs.clone(),
+            syncs: syncs.clone(),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (ftx, _frx) = oneshot::channel();
+        let (_log, opened) = Log::open(&env, h.cfg.clone(), tx, ftx).await.unwrap();
+        assert_eq!(opened.next_lsn, 4, "closed {closed}");
+        let syncs = syncs.lock().unwrap().clone();
+        assert!(
+            syncs.contains(&("data", last.clone())),
+            "closed {closed}: the last segment {last:?} was not fsynced: {syncs:?}"
+        );
+        assert!(
+            syncs.contains(&("dir", h.cfg.dir.clone())),
+            "closed {closed}: the log directory was not synced: {syncs:?}"
+        );
+    }
+}

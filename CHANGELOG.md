@@ -33,6 +33,19 @@ until the v1.0 compatibility promise takes effect.
   (`ROOTLESS_UNAVAILABLE` names a missing one), and `kronik restore` and
   `kronik upgrade check` do the part that needs root as root and the rest as
   the data directory's owner.
+- The log no longer builds on writes that a dead process left unsynced. A
+  process that dies without a power loss (killed, out of memory) leaves in
+  the page cache what it had not fsynced yet: the tail of its last log
+  segment, a segment's closing footer, or the name of a segment whose
+  directory it had not synced. The next start replayed those records,
+  appended to them and answered from them without an fsync, so a power
+  loss afterwards could take back records it had applied, or tear the
+  footer of a closed segment, after which the node refused to start
+  (`STORAGE_CORRUPT`: "closed segment … is invalid"). Opening the log now
+  fsyncs the last segment and the log directory first. Every release so
+  far, v0.4.1 included, opened the log the old way. Found by the DST
+  connections workload, whose graceful stops end a process without a power
+  loss.
 - `kronik promote` warns when the new code of a kind that holds open
   WebSocket or SSE connections does not handle connections: their frames
   and closes would fail (M24). The API's promote response carries it in

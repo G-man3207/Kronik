@@ -892,6 +892,26 @@ impl Log {
     ) -> Result<(Log, Opened), LogError> {
         env.fs.create_dir_all(cfg.dir.clone()).await?;
         let starts = list_segments(env, &cfg.dir).await?;
+        // A process that died without a power loss (killed, out of memory)
+        // leaves in the page cache what it had not fsynced: the tail of its
+        // last segment, a footer, even the name of a segment it created and
+        // whose directory it had not synced yet. This process reads all of
+        // it, replays it and appends to it, so it makes it durable first: a
+        // power loss later must not take back a record this process applied
+        // or a segment it appends to. Only the last segment can hold such
+        // bytes: a segment is closed by an fsynced footer before the next
+        // one is created. Synced before it is read: after a failed fsync the
+        // kernel may have dropped the pages, which nothing then builds on.
+        // Read-only: a segment that vanished fails here rather than coming
+        // back empty.
+        if let Some(&last) = starts.last() {
+            env.fs
+                .open(cfg.dir.join(segment_name(last)), OpenMode::Read)
+                .await?
+                .sync_data()
+                .await?;
+        }
+        env.fs.sync_dir(cfg.dir.clone()).await?;
         let mut truncated_bytes = 0;
         let mut recreated_active = false;
         let mut extra_segment = false;
