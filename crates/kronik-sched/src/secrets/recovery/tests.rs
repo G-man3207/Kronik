@@ -1599,7 +1599,23 @@ async fn a_certification_takes_a_lost_version_from_its_copy_and_never_uses_it() 
         versions_before,
         "the provider was asked for the version its copy holds"
     );
-    let values = node.secret_values().unwrap();
+    // The node's own secret cycle may be in a pass meanwhile (the link and
+    // the refresh's own window wake it). The pass asks the provider for
+    // `token`, whose 404 retires the certificate the refresh installed (fail
+    // closed), and the pass's rebuild certifies again. Read as readers do:
+    // once the inventory is certified.
+    let values = node
+        .env
+        .timeout(Duration::from_secs(60), async {
+            loop {
+                if let Ok(values) = node.secret_values() {
+                    return values;
+                }
+                node.env.clock.sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
     assert!(
         values
             .iter()
