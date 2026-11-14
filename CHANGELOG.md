@@ -120,6 +120,16 @@ M23, key and secret backends:
 - The AWS Secrets Manager client takes an empty `NextToken` as the last page
   (moto sends one), and the Azure Key Vault client reads a secret whose
   `attributes` has no `enabled` (the emulator omits it).
+- The reads that remove secret values from what they show (the
+  OpenTelemetry and audit exports and event streams among them) could answer
+  503 `SECRET_UNAVAILABLE` for up to about a tenth of `[secrets] refresh`
+  (30 s with the default) in about half of the refresh windows. The
+  inventory of secret values stays valid for `refresh` after its rebuild
+  began, but the node began the next rebuild 90% to 110% of `refresh` after
+  the last one ended, and an inventory that expired woke nothing. The next
+  rebuild now begins 70% to 90% of `refresh` after the last one began, so
+  the new inventory is in place before the old one expires; the node reads
+  its secrets' sources about a quarter more often.
 - New metrics `kronik_secret_fetch_total`, `kronik_secret_fetch_seconds`,
   `kronik_secret_stale` and `kronik_secret_versions_total`, and
   `kronik_key_source_up` is exported at last: it was set on every scrape and

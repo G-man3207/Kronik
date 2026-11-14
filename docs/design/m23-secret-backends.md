@@ -614,8 +614,16 @@ secrets, and only once Kronik has no usable value.
   - At start, nothing blocks on a backend. Not even linked names are
     fetched synchronously.
   - A background refresher (`env.spawn`) fetches every linked name that a
-    current grant uses, then refetches each every `[secrets] refresh`
-    (default 5 min, with jitter from `env.random`).
+    current grant uses, then refetches each, and certifies the inventory
+    again, 70% to 90% of `[secrets] refresh` (default 5 min) after the
+    last certificate was captured; the share comes from `env.random`, so
+    nodes that share a backend do not refresh together. A certificate is
+    current for `refresh` after its capture, and a complete one that
+    expires wakes nothing, so the pass that replaces it begins at least a
+    tenth of `refresh` before it expires. (Before 0.5.0 it began 90% to
+    110% of `refresh` after the last pass ended, which left live
+    publications without a current certificate until the next pass in
+    about half of the windows.)
   - A refetch that finds a new `source_version` records it (§5.1). Later
     effects use it; earlier turns keep theirs.
 - **The cache** is in memory only: `name → {version, source_version, value,

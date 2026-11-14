@@ -41,7 +41,8 @@ const BACKEND: &str = "bao";
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SecretWorkload {
     /// "One allocator": a rotating backend observed by first uses, the
-    /// refresher (every `refresh`) and explicit refreshes, under crashes.
+    /// refresher (70% to 90% of `refresh` after each certificate) and
+    /// explicit refreshes, under crashes.
     Allocator { refresh: Duration, rotations: u32 },
     /// "secret-outage": the backend hangs for `outage` after a `baseline`.
     Outage {

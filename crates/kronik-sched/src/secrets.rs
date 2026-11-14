@@ -4124,12 +4124,17 @@ impl Node {
                     match &refreshed {
                         Ok(()) => {
                             rebuild_failures = 0;
-                            let jitter = u64::from_le_bytes(env.random_bytes::<8>()) % 21;
-                            deadline = env.clock.monotonic().saturating_add(
-                                runtime
-                                    .settings
-                                    .refresh
-                                    .mul_f64(0.9 + jitter as f64 / 100.0),
+                            // From the capture of the certificate this pass
+                            // installed or kept, not from now: the certificate
+                            // expires `refresh` after that capture.
+                            let captured_at = lock(&runtime.cache.state)
+                                .coverage
+                                .as_ref()
+                                .map_or_else(|| env.clock.monotonic(), |c| c.captured_at);
+                            deadline = next_pass_at(
+                                captured_at,
+                                runtime.settings.refresh,
+                                u64::from_le_bytes(env.random_bytes::<8>()),
                             );
                         }
                         Err(error) => {
@@ -4186,6 +4191,19 @@ impl Node {
             }
         });
     }
+}
+
+/// When the secret cycle begins its next pass after one that left a
+/// certificate captured at `captured_at`: between 70% and 90% of `refresh`
+/// later, the share drawn from `random`. A certificate is current for
+/// `refresh` after its capture ([`SecretSnapshotPublication`]'s `until`), and
+/// a complete one that expires wakes nothing, so the pass that replaces it
+/// must begin before then: at the latest a tenth of `refresh` before. The
+/// jitter still spreads the passes of nodes that share a backend over a fifth
+/// of `refresh`.
+fn next_pass_at(captured_at: Duration, refresh: Duration, random: u64) -> Duration {
+    let hundredths = 70 + (random % 21) as u32;
+    captured_at.saturating_add(refresh.saturating_mul(hundredths) / 100)
 }
 
 // Only typed coordinates and already-keyed immutable value hashes enter this cache stamp.

@@ -2965,3 +2965,201 @@ async fn a_poisoned_cache_mutex_is_taken_without_a_retry() {
             .is_some()
     );
 }
+
+/// Every share the jitter can draw puts the next secret pass between 70% and
+/// 90% of `refresh` after the capture of the certificate it replaces, a
+/// hundredth of `refresh` apart, so the pass begins at least a tenth of
+/// `refresh` before that certificate expires.
+#[test]
+fn the_next_secret_pass_is_drawn_from_70_to_90_percent_of_refresh() {
+    let captured = Duration::from_secs(1_000);
+    let refresh = Duration::from_secs(300);
+    let after: BTreeSet<Duration> = (0..21)
+        .chain([u64::MAX, 1 << 63])
+        .map(|random| next_pass_at(captured, refresh, random) - captured)
+        .collect();
+    assert_eq!(after.len(), 21, "{after:?}");
+    assert_eq!(after.first(), Some(&Duration::from_secs(210)));
+    assert_eq!(after.last(), Some(&Duration::from_secs(270)));
+}
+
+/// A clock for a whole node that moves only when the test advances it; a
+/// sleep ends when the clock passes its deadline, as with kronik-testhost's
+/// `ManualClock`, which this crate cannot use (it depends on this one).
+/// `woken` counts the sleeps a step ended whose futures have not finished,
+/// so a test can wait until every task the step woke has run on.
+struct SteppedClock {
+    state: Mutex<SteppedState>,
+    woken: Arc<AtomicUsize>,
+}
+
+struct SteppedState {
+    now: Duration,
+    sleepers: Vec<(Duration, tokio::sync::oneshot::Sender<()>, Arc<AtomicBool>)>,
+}
+
+/// Held by a sleep's future: once it is done or dropped, a sleep the clock
+/// ended is no longer waiting for its task.
+struct SleepEnd {
+    woken: Arc<AtomicBool>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl Drop for SleepEnd {
+    fn drop(&mut self) {
+        if self.woken.swap(false, Ordering::SeqCst) {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl SteppedClock {
+    fn new() -> Arc<SteppedClock> {
+        Arc::new(SteppedClock {
+            state: Mutex::new(SteppedState {
+                now: Duration::from_secs(1),
+                sleepers: Vec::new(),
+            }),
+            woken: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    fn advance(&self, step: Duration) {
+        let due = {
+            let mut state = lock(&self.state);
+            state.now += step;
+            let now = state.now;
+            let (due, pending) = std::mem::take(&mut state.sleepers)
+                .into_iter()
+                .partition::<Vec<_>, _>(|(at, _, _)| *at <= now);
+            state.sleepers = pending;
+            due
+        };
+        for (_, wake, woken) in due {
+            woken.store(true, Ordering::SeqCst);
+            self.woken.fetch_add(1, Ordering::SeqCst);
+            if wake.send(()).is_err() && woken.swap(false, Ordering::SeqCst) {
+                self.woken.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+impl Clock for SteppedClock {
+    fn wall_ms(&self) -> u64 {
+        1_767_225_600_000 + lock(&self.state).now.as_millis() as u64
+    }
+    fn monotonic(&self) -> Duration {
+        lock(&self.state).now
+    }
+    fn sleep(&self, d: Duration) -> BoxFuture<'static, ()> {
+        if d.is_zero() {
+            return Box::pin(std::future::ready(()));
+        }
+        let (wake, ended) = tokio::sync::oneshot::channel();
+        let woken = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = lock(&self.state);
+            state.sleepers.retain(|(_, wake, _)| !wake.is_closed());
+            let at = state.now + d;
+            state.sleepers.push((at, wake, woken.clone()));
+        }
+        let end = SleepEnd {
+            woken,
+            pending: self.woken.clone(),
+        };
+        Box::pin(async move {
+            let _end = end;
+            let _ = ended.await;
+        })
+    }
+}
+
+/// Lets the node run until it is idle at the clock's time: every sleep the
+/// last step ended has returned to its task, which on this single-threaded
+/// runtime then ran on to its next await (the secret cycle begins a pass
+/// before it awaits anything), and the secret cycle is between passes.
+async fn idle(node: &Node, clock: &SteppedClock) {
+    let runtime = node.secret_runtime.as_ref().unwrap();
+    let limit = std::time::Instant::now() + Duration::from_secs(60);
+    let mut yields = 0;
+    while clock.woken.load(Ordering::SeqCst) != 0 || !runtime.cycle.settled() {
+        assert!(
+            std::time::Instant::now() < limit,
+            "the node did not become idle at {:?}",
+            clock.monotonic()
+        );
+        // Woken tasks run when this one yields; only I/O needs real time.
+        if yields < 16 {
+            yields += 1;
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+}
+
+/// A certificate of the secret inventory is current for `[secrets] refresh`
+/// after its catalogue was captured (`SecretSnapshotPublication::until`), and
+/// only the cycle's own schedule renews one that is otherwise complete, so
+/// the next pass has to begin before the certificate expires. On a clock that
+/// only the test moves, a live publication is available at every half second
+/// of sixteen refresh windows, and the cycle runs one pass per 70% to 90% of
+/// `refresh`. The cycle used to begin its next pass 90% to 110% of `refresh`
+/// after the last one ended, so about half of its passes began after the
+/// certificate had expired, and live publications answered
+/// SECRET_UNAVAILABLE until they did.
+#[tokio::test]
+async fn a_live_secret_certificate_is_replaced_before_it_expires() {
+    let clock = SteppedClock::new();
+    let mut environment = env();
+    environment.clock = clock.clone();
+    let refresh = Duration::from_secs(100);
+    let mut config = crate::NodeConfig {
+        group_commit_window: Some(Duration::ZERO),
+        ..Default::default()
+    };
+    config.secret_settings.refresh = refresh;
+    let data = tempfile::tempdir().unwrap();
+    let node = crate::start_local(environment, data.path(), config)
+        .await
+        .unwrap();
+    let runtime = node.secret_runtime.clone().unwrap();
+    let finished = || runtime.cycle.0.load(Ordering::Relaxed) >> 32;
+    let original = node.local_operator_authority().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        node.secret_set("token", b"secret-value".to_vec(), &audit(), false, original),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    idle(&node, &clock).await;
+    node.native_secret_snapshot_with_publication().unwrap();
+    let before = finished();
+    let step = Duration::from_millis(500);
+    let windows = 16;
+    for _ in 0..(refresh * windows).as_millis() / step.as_millis() {
+        clock.advance(step);
+        idle(&node, &clock).await;
+        if let Err(error) = node.native_secret_snapshot_with_publication() {
+            let captured = lock(&runtime.cache.state)
+                .coverage
+                .as_ref()
+                .map(|coverage| coverage.captured_at);
+            panic!(
+                "no live secret publication at {:?}: {} (the certificate's catalogue was \
+                 captured at {captured:?}, so it was current until {:?}; {} passes had finished)",
+                clock.monotonic(),
+                error.code,
+                captured.map(|at| at + refresh),
+                finished(),
+            );
+        }
+    }
+    let passes = finished() - before;
+    assert!(
+        (17..=23).contains(&passes),
+        "{passes} passes in {windows} refresh windows"
+    );
+}
