@@ -6,6 +6,10 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- `kronik promote` warns when the new code of a kind that holds open
+  WebSocket or SSE connections does not handle connections: their frames
+  and closes would fail (M24). The API's promote response carries it in
+  `warnings`.
 - `connections.send-now` works (M24): with a grant of `connection:send-now`
   (always delivery class `unsafe`; `--delivery` other than `unsafe` and
   `--rate` are refused), an actor sends a frame on its connection during

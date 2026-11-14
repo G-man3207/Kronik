@@ -908,6 +908,7 @@ impl Api {
                 turns: r.turns,
                 irreversible_effects: r.irreversible_effects,
             }),
+            warnings: p.warnings,
         })
     }
 

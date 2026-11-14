@@ -567,6 +567,8 @@ impl Proposals {
                     turns,
                     irreversible_effects: irreversible,
                 }),
+                // The switch closes the rebased kinds' connections itself.
+                warnings: Vec::new(),
             });
         }
         // Staging appends up to a window of turns to main's log: not on a
@@ -709,6 +711,8 @@ impl Proposals {
                 turns,
                 irreversible_effects: irreversible,
             }),
+            // The switch closed the rebased kinds' connections (M24 §7.7).
+            warnings: Vec::new(),
         })
     }
 }

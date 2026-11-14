@@ -1213,6 +1213,10 @@ pub struct PromoteResponse {
     /// Set for a rollback via replay (M13).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebase: Option<RebaseSwitchInfo>,
+    /// What the operator should know about the switch, such as a kind whose
+    /// new code does not handle connections while it holds open ones (M24).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

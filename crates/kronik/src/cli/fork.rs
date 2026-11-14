@@ -1625,6 +1625,7 @@ pub fn promote(ctx: &Ctx, a: ProposalArgs) -> Result<ExitCode, Error> {
             "Promoted proposal {} at lsn {}, epoch {}",
             a.proposal, d.lsn, d.epoch
         );
+        warning_lines(&mut out, &r.warnings);
         switch_fields(&mut out, d);
         field(
             &mut out,

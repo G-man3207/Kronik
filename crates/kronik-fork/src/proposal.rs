@@ -1957,6 +1957,7 @@ impl Proposals {
             self.save_samples(id, live, &d)?;
             copies::retire(entry.live.take()).await;
         }
+        let warnings = connection_warnings(&self.node, &kinds);
         Ok(PromoteResult {
             epoch,
             lsn,
@@ -1965,6 +1966,7 @@ impl Proposals {
             kinds,
             policy,
             rebase: None,
+            warnings,
         })
     }
 
@@ -2677,6 +2679,38 @@ pub struct PromoteResult {
     pub policy: Value,
     /// A rollback via replay's switch (M13).
     pub rebase: Option<RebaseDone>,
+    /// What the operator should know about the switch: a kind whose new
+    /// code does not handle connections while it holds open ones (M24
+    /// §2.6).
+    pub warnings: Vec<String>,
+}
+
+/// M24 §2.6: a kind whose new code does not export `connection-handler`
+/// while it holds open connections: their frames and closes will fail.
+pub fn connection_warnings(node: &kronik_sched::Node, kinds: &[pb::KindVersion]) -> Vec<String> {
+    kinds
+        .iter()
+        .filter_map(|v| {
+            let hash = kronik_core::ids::CodeHash::from_slice(&v.code_hash)?;
+            let program = node.code().get(&hash).ok()?;
+            if program.handles_connections() {
+                return None;
+            }
+            let open = node.store().db().open_connection_count(&v.kind).ok()?;
+            (open > 0).then(|| {
+                format!(
+                    "kind {} has {open} open {}; the new code does not handle connections, \
+                     so their frames will fail",
+                    v.kind,
+                    if open == 1 {
+                        "connection"
+                    } else {
+                        "connections"
+                    }
+                )
+            })
+        })
+        .collect()
 }
 
 fn fired_names(policy: &Value) -> String {

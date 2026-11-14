@@ -820,3 +820,62 @@ fn proposal_save_failure_never_publishes_or_starts_a_job() {
     details.insert("code".into(), e.code.as_str().into());
     assert_eq!(events[1].details, details);
 }
+
+/// M24 §2.6: promoting code that does not handle connections over a kind
+/// that holds open ones warns, with their number; code that handles them,
+/// or a kind without open connections, does not.
+#[test]
+fn promoting_code_without_the_connection_export_over_open_connections_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = Proc::start(dir.path());
+    p.deploy("room");
+    let room_code = |name: &str| {
+        let (hash, _) = p
+            .node
+            .code()
+            .add(&std::fs::read(guest(name)).unwrap())
+            .unwrap();
+        pb::KindVersion {
+            kind: "room".into(),
+            code_hash: hash.0.to_vec(),
+            ..Default::default()
+        }
+    };
+    let bare = room_code("counter");
+    let handles = room_code("room-fmt2");
+    assert!(
+        kronik_fork::proposal::connection_warnings(&p.node, std::slice::from_ref(&bare)).is_empty()
+    );
+    let request = pb::HttpInput {
+        method: "GET".into(),
+        path: "/room/lobby/ws".into(),
+        query: "user=ada".into(),
+        params: vec![pb::Param {
+            name: "key".into(),
+            value: "lobby".into(),
+            sealed_value: None,
+        }],
+        route: "/room/{key}/ws".into(),
+        ..Default::default()
+    };
+    let (_id, waiter) = p
+        .node
+        .connection_open(
+            kronik_core::ids::ActorRef::parse("room/lobby").unwrap(),
+            request,
+            pb::ConnectionProtocol::Websocket,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+    assert!(p.rt.block_on(waiter.wait()).unwrap().committed());
+    let warnings = kronik_fork::proposal::connection_warnings(&p.node, &[bare, handles]);
+    assert_eq!(
+        warnings,
+        [
+            "kind room has 1 open connection; the new code does not handle connections, so \
+          their frames will fail"
+        ]
+    );
+}

@@ -5501,6 +5501,13 @@ against both.
         }
       ],
       "description": "Set for a rollback via replay (M13)."
+    },
+    "warnings": {
+      "description": "What the operator should know about the switch, such as a kind whose\nnew code does not handle connections while it holds open ones (M24).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     }
   },
   "required": [
