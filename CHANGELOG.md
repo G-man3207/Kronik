@@ -514,6 +514,12 @@ check the engine name against `kronik --version` of the release build):
   cannot read, such as a connection's turn: the operations guide's
   "Upgrading from v0.4.1" has the details.
 -->
+- A snapshot is durable before its marker is appended, and so before a
+  compaction may delete the segments it replaces: its files and directories
+  are fsynced before it is renamed into place, and the snapshots directory
+  after the rename, before its manifest. Before, the snapshots directory was
+  never fsynced: a power loss could keep a compaction's deletions and lose
+  the snapshot that replaced them. v0.4.1 has the same gap.
 - A reseal fails when the fsync of the log directory after it renames a
   resealed segment into place fails; before, it went on as if the rename
   were durable. v0.4.1 has the same gap.

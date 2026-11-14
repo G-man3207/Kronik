@@ -404,22 +404,7 @@ fn hash_file(path: &Path) -> std::io::Result<(u64, String)> {
     ))
 }
 
-/// Writes `path` durably: a temporary file, fsynced, renamed into place,
-/// and the directory fsynced.
-pub fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
-    let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)?;
-    if let Some(parent) = path.parent()
-        && let Ok(d) = std::fs::File::open(parent)
-    {
-        d.sync_all()?;
-    }
-    Ok(())
-}
+pub use crate::durable::write_synced;
 
 /// What [`prepare_state`] decides, without doing it.
 #[derive(Debug)]
@@ -736,6 +721,8 @@ impl Node {
         reason: &str,
     ) -> Result<(Manifest, Vec<u8>), ApiError> {
         let root = snapshots_dir(&storage.data_dir, branch);
+        crate::durable::create_dir_all(&storage.data_dir, &root)
+            .map_err(|e| io_err("snapshot directory", e))?;
         let copy = self
             .store()
             .snapshot_to(tmp)
@@ -783,11 +770,31 @@ impl Node {
             state_hash: copy.state_hash,
             reason: reason.to_owned(),
         };
+        // The copy is durable before its name, and its name before its
+        // manifest: every file and directory of it is fsynced, then it is
+        // renamed into place and the snapshots directory fsynced. The
+        // caller appends the snapshot's marker after this returns, and a
+        // compaction may then delete the segments the snapshot replaces;
+        // a power loss must not keep those deletions and lose the snapshot.
+        let mut dirs = std::collections::BTreeSet::new();
+        for r in &rel {
+            let path = tmp.join(r);
+            crate::durable::sync(&path).map_err(|e| io_err("syncing the snapshot", e))?;
+            let mut dir = path.parent();
+            while let Some(d) = dir.filter(|d| d.starts_with(tmp)) {
+                dirs.insert(d.to_path_buf());
+                dir = d.parent();
+            }
+        }
+        for dir in dirs.iter().rev() {
+            crate::durable::sync(dir).map_err(|e| io_err("syncing the snapshot", e))?;
+        }
         let dest = root.join(dir_name(copy.lsn));
         if dest.exists() {
             std::fs::remove_dir_all(&dest).map_err(|e| io_err("old snapshot", e))?;
         }
-        std::fs::rename(tmp, &dest).map_err(|e| io_err("snapshot rename", e))?;
+        crate::durable::rename(tmp, &dest).map_err(|e| io_err("snapshot rename", e))?;
+        crate::durable::sync(&root).map_err(|e| io_err("syncing the snapshots", e))?;
         let bytes = serde_json::to_vec_pretty(&manifest)
             .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
         write_synced(&dest.join("manifest.json"), &bytes).map_err(|e| io_err("manifest", e))?;

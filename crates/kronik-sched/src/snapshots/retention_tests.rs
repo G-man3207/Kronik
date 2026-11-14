@@ -220,3 +220,82 @@ fn a_crash_after_a_delete_leaves_a_log_every_database_reaches() {
     });
     assert_hello_survives(dir.path());
 }
+
+/// The snapshot markers among the records after `after`.
+async fn markers_after(node: &Node, after: Lsn) -> usize {
+    let mut markers = 0;
+    let upto = node.applied_lsn();
+    if upto > after {
+        node.reader()
+            .read(after + 1, upto, |c| {
+                markers += usize::from(matches!(c.record, Record::SnapshotMarker(_)));
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    markers
+}
+
+/// A snapshot is durable before its marker, and so before a compaction may
+/// delete what it replaces: every file and directory of the copy is fsynced
+/// before the copy is renamed into place, the snapshots directory after the
+/// rename, and only then is the manifest written. When that last fsync
+/// fails, the snapshot fails: no marker, nothing listed. (v0.4.1 never
+/// fsynced the snapshots directory, nor the copy's directories.)
+#[test]
+fn a_snapshot_is_durable_before_its_marker() {
+    use crate::durable::test_ops::{Op, watch};
+    let dir = tempfile::tempdir().unwrap();
+    life(async {
+        let node = start(dir.path()).await;
+        history(&node).await;
+        let branch = node.branch().to_owned();
+        let root = snapshots_dir(dir.path(), &branch);
+
+        let applied = node.applied_lsn();
+        let listed = list(dir.path(), &branch).len();
+        let failing = watch(&root, {
+            let root = root.clone();
+            move |op| *op == Op::Sync(root.clone())
+        });
+        let refused = node.snapshot_configured("manual").await;
+        drop(failing);
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(list(dir.path(), &branch).len(), listed);
+        assert_eq!(markers_after(&node, applied).await, 0);
+
+        let watching = watch(&root, |_| false);
+        let manifest = node.snapshot_configured("manual").await.unwrap();
+        let ops = watching.ops();
+        drop(watching);
+        let at = |want: &dyn Fn(&Op) -> bool| ops.iter().position(want);
+        let dest = root.join(dir_name(manifest.lsn));
+        let renamed = at(&|op| matches!(op, Op::Rename(_, to) if *to == dest))
+            .unwrap_or_else(|| panic!("no rename into {}: {ops:#?}", dest.display()));
+        let Op::Rename(tmp, _) = ops[renamed].clone() else {
+            unreachable!()
+        };
+        for file in &manifest.files {
+            let synced = at(&|op| *op == Op::Sync(tmp.join(&file.path)));
+            assert!(
+                synced.is_some_and(|s| s < renamed),
+                "{} is not synced before the rename: {ops:#?}",
+                file.path
+            );
+        }
+        let tmp_synced = at(&|op| *op == Op::Sync(tmp.clone()));
+        assert!(tmp_synced.is_some_and(|s| s < renamed), "{ops:#?}");
+        let root_synced = ops[renamed..]
+            .iter()
+            .position(|op| *op == Op::Sync(root.clone()))
+            .map(|p| p + renamed);
+        let manifest_renamed =
+            at(&|op| matches!(op, Op::Rename(_, to) if *to == dest.join("manifest.json")));
+        assert!(
+            root_synced.is_some() && manifest_renamed.is_some() && root_synced < manifest_renamed,
+            "{ops:#?}"
+        );
+        assert_eq!(ops.last(), Some(&Op::Sync(dest.clone())), "{ops:#?}");
+    });
+}

@@ -18,6 +18,7 @@
 //! audit metadata never chooses operation authority.
 
 pub mod connections;
+mod durable;
 pub mod effects;
 mod erasure;
 mod gate;
