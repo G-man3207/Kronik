@@ -37,7 +37,8 @@ pub use id::{BlobId, BlobMeta};
 pub use lease::{Lease, Leases};
 pub use reseal::Resealed;
 pub use store::{
-    BlobKeys, BlobReader, BlobStore, BlobWriter, KeyAccess, KeyAnswer, NoKeys, Space, StoreConfig,
+    BlobKeys, BlobReader, BlobStore, BlobWriter, KeyAccess, KeyAnswer, LiveWriter, NoKeys, Space,
+    StoreConfig,
 };
 pub use sweep::{Roots, SweepOptions, SweepReport, Unrooted};
 

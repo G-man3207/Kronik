@@ -1075,6 +1075,9 @@ impl Node {
         }
         // The files of erased blobs that a stop left behind (M26 §9.3).
         node.delete_erased_blobs_logged().await;
+        // And the files of erased subjects that no record references, which
+        // a stop may have left: the collector's first pass (M26 §9.3).
+        node.wake_for_loose_erasures().await;
         node.initialize_secret_versions(last == 0, node.native_recovery.clone())
             .await?;
         node.start_secret_refresh(node.native_recovery.clone());

@@ -149,6 +149,8 @@ pub struct BlobStore {
     pub(crate) touch_seq: AtomicU64,
     /// The collector's state between passes.
     pub(crate) sweep: crate::sweep::SweepState,
+    /// The writers that have not ended ([`BlobStore::live_writers`]).
+    writers: Arc<Writers>,
     /// The harness's mutations ([`StoreConfig`]).
     pub(crate) mutation_skip_ensure_durable: bool,
     pub(crate) mutation_sweep_ignores_leases: bool,
@@ -180,6 +182,7 @@ impl BlobStore {
             dirs: Mutex::new(HashMap::new()),
             touch_seq: AtomicU64::new(0),
             sweep: crate::sweep::SweepState::default(),
+            writers: Arc::new(Writers::default()),
             mutation_skip_ensure_durable: cfg.mutation_skip_ensure_durable,
             mutation_sweep_ignores_leases: cfg.mutation_sweep_ignores_leases,
             mutation_sweep_ignores_touches: cfg.mutation_sweep_ignores_touches,
@@ -194,6 +197,14 @@ impl BlobStore {
 
     pub fn leases(&self) -> &Arc<Leases> {
         &self.leases
+    }
+
+    /// The writers that have not ended: created, and neither finished,
+    /// aborted nor dropped with their part file deleted. A writer of an
+    /// erased subject that began before the erasure may still name a blob
+    /// no record references (M26 §9.3), so the erasure waits for it.
+    pub fn live_writers(&self) -> Vec<LiveWriter> {
+        lock(&self.writers.live).values().cloned().collect()
     }
 
     /// `[blobs] lease_ttl`: how long a lease lives without renewal.
@@ -366,7 +377,13 @@ impl BlobStore {
             Some(k) => blake3::Hasher::new_keyed(&k.identity),
             None => blake3::Hasher::new(),
         };
+        let registration = self.writers.register(LiveWriter {
+            space: space.clone(),
+            subject: keys.as_ref().map(|k| k.subject.clone()),
+            key_version: keys.as_ref().map_or(0, |k| k.key_version),
+        });
         Ok(BlobWriter {
+            registration: Some(registration),
             store: self.clone(),
             space,
             planned,
@@ -700,6 +717,9 @@ async fn existing_matches(file: &dyn File, meta: &BlobMeta, sealed: bool) -> boo
 
 /// Writes one blob. Dropping it before [`BlobWriter::finish`] discards it.
 pub struct BlobWriter {
+    /// Ends when the writer is done with its files: after the blob is named
+    /// or claimed, or after its part file is deleted.
+    registration: Option<WriterRegistration>,
     store: Arc<BlobStore>,
     space: Space,
     /// The part file's name, created with the first frame.
@@ -917,12 +937,54 @@ impl Drop for BlobWriter {
     fn drop(&mut self) {
         // Unfinished (or finished with an error): nothing new is named.
         self.refund();
+        let registration = self.registration.take();
         if let Some(part) = self.part.take() {
             let fs = self.store.env.fs.clone();
             drop(self.store.env.spawn("blob part cleanup", async move {
                 let _ = fs.remove_file(part).await;
+                // The writer ends with its part file.
+                drop(registration);
             }));
         }
+    }
+}
+
+/// A writer that has not ended ([`BlobStore::live_writers`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveWriter {
+    pub space: Space,
+    /// Its blob's subject and key version; none and 0 without a subject.
+    pub subject: Option<String>,
+    pub key_version: u32,
+}
+
+/// The live writers of a store.
+#[derive(Default)]
+struct Writers {
+    next: AtomicU64,
+    live: Mutex<BTreeMap<u64, LiveWriter>>,
+}
+
+impl Writers {
+    fn register(self: &Arc<Self>, writer: LiveWriter) -> WriterRegistration {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        lock(&self.live).insert(id, writer);
+        WriterRegistration {
+            writers: self.clone(),
+            id,
+        }
+    }
+}
+
+/// A writer's entry in [`Writers`]; dropping it ends the writer.
+struct WriterRegistration {
+    writers: Arc<Writers>,
+    id: u64,
+}
+
+impl Drop for WriterRegistration {
+    fn drop(&mut self) {
+        lock(&self.writers.live).remove(&self.id);
     }
 }
 

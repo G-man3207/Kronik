@@ -76,6 +76,36 @@ fn sealed(path: &Path) -> bool {
 }
 
 impl Proc {
+    /// A request of `subject` to the media guest's `op`.
+    fn run(&self, op: &str, query: &str, subject: &str) -> TurnResult {
+        let input = pb::HttpInput {
+            method: "POST".into(),
+            path: format!("/media/a/{op}"),
+            query: query.into(),
+            body: Some(pb::Body {
+                value: Some(pb::body::Value::Inline(pb::Sealable {
+                    subject: Some(subject.into()),
+                    value: Some(pb::sealable::Value::Plain(Vec::new())),
+                })),
+            }),
+            ..Default::default()
+        };
+        self.rt.block_on(async {
+            match self
+                .node
+                .ingress(
+                    ActorRef::parse("media/a").unwrap(),
+                    input,
+                    Some(subject.into()),
+                )
+                .unwrap()
+            {
+                Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
+                Ingress::Done(r) => *r,
+            }
+        })
+    }
+
     /// A blob the media guest writes as the response of a request of
     /// `subject`: the default subject of its turn, so the blob's.
     fn write(&self, subject: &str) -> pb::BlobRef {
@@ -188,6 +218,9 @@ fn erasing_a_subject_deletes_its_blobs_files_everywhere() {
     assert_eq!(pending(), 1);
     shipped
         .execute("DELETE FROM shipped WHERE name = ?1", [name(&one)])
+        .unwrap();
+    // And the collector has had its pass after the erasure (its loose files).
+    p.rt.block_on(p.node.blob_gc(kronik_blob::SweepOptions::default()))
         .unwrap();
     assert_eq!(pending(), 0);
 }
@@ -408,4 +441,134 @@ fn a_blob_first_referenced_after_its_erasure_is_deleted_when_the_record_applies(
     let row = p.node.store().db().blob(&blob.hash).unwrap().unwrap();
     assert!(row.erased, "{row:?}");
     assert!(!file.exists(), "the file went when the record applied");
+}
+
+/// The files of main's store whose header names `subject`, and whether each
+/// is sealed.
+fn files_of(dir: &Path, subject: &str) -> Vec<bool> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                if e.path().is_dir() {
+                    walk(&e.path(), out);
+                } else {
+                    out.push(e.path());
+                }
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    walk(&dir.join("blobs/objects"), &mut paths);
+    paths
+        .iter()
+        .filter_map(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            let header =
+                kronik_blob::format::Header::decode(bytes.get(..kronik_blob::format::HEADER_LEN)?)
+                    .ok()?;
+            (header.subject.as_deref() == Some(subject)).then_some(header.sealed)
+        })
+        .collect()
+}
+
+/// Review of log-integrity's blob DST (ruled by the lead): a blob a turn
+/// wrote and did not commit has no row of the index, so the erasure's own
+/// deletion cannot find it, and with privacy mode off its bytes are plain.
+/// The collector's first pass after the erasure deletes every such file of
+/// the subject at once: a failed turn's, one the turn discarded, and one a
+/// lease still holds (an upload whose turn has not run), which no number of
+/// ordinary passes would delete.
+#[test]
+fn the_first_pass_after_an_erasure_deletes_the_subjects_loose_plain_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start_in(dir.path(), pb::PrivacyState::Off);
+    let failed = p.run("fail-after-write", "", "user:1");
+    assert!(!failed.committed(), "{failed:?}");
+    let discarded = p.run("write-discard", "size=200000", "user:1");
+    assert!(discarded.committed(), "{discarded:?}");
+    let store = p.node.blob_store().unwrap().clone();
+    let keys = p
+        .node
+        .sealer()
+        .blob_keys("user:1", &|bytes: &mut [u8]| bytes.fill(7), 0)
+        .unwrap();
+    let lease = store.leases().take("upload");
+    let mut upload =
+        p.rt.block_on(store.writer(Space::Main, Some(keys), u64::MAX, lease.clone()))
+            .unwrap();
+    p.rt.block_on(upload.write(&[5u8; 90_000])).unwrap();
+    p.rt.block_on(upload.finish()).unwrap();
+    assert_eq!(
+        files_of(dir.path(), "user:1"),
+        [false, false, false],
+        "plain loose files"
+    );
+    let owner = p.node.local_operator_authority().unwrap();
+    p.rt.block_on(p.node.erase_subject("user:1", audit(), false, owner))
+        .unwrap();
+    p.rt.block_on(p.node.blob_gc(kronik_blob::SweepOptions::default()))
+        .unwrap();
+    assert_eq!(files_of(dir.path(), "user:1"), Vec::<bool>::new());
+    assert!(lease.is_live(), "the lease did not keep it");
+}
+
+/// The erasure is pending in `privacy status` until a collector pass after
+/// it is done with the subject's loose files: a writer of the subject that
+/// began before the erasure and still writes may yet leave one, so it
+/// holds the erasure back; once it ended, the next pass deletes its file
+/// and the erasure is done. The node remembers that over a restart.
+#[test]
+fn an_erasure_is_pending_until_the_collector_is_done_with_its_subjects_loose_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.write("user:1");
+    let store = p.node.blob_store().unwrap().clone();
+    let keys = p
+        .node
+        .sealer()
+        .blob_keys("user:1", &|bytes: &mut [u8]| bytes.fill(7), 0)
+        .unwrap();
+    let mut writer =
+        p.rt.block_on(store.writer(
+            Space::Main,
+            Some(keys),
+            u64::MAX,
+            store.leases().take("test"),
+        ))
+        .unwrap();
+    p.rt.block_on(writer.write(&[9u8; 70_000])).unwrap();
+    let owner = p.node.local_operator_authority().unwrap();
+    p.rt.block_on(p.node.erase_subject("user:1", audit(), false, owner))
+        .unwrap();
+    let pending = || p.rt.block_on(p.node.pending_erasures()).unwrap();
+    let pass = || {
+        p.rt.block_on(p.node.blob_gc(kronik_blob::SweepOptions::default()))
+            .unwrap()
+    };
+    pass();
+    assert_eq!(pending(), 1, "a writer of the subject still writes");
+    // It ends with a blob no record references, sealed under the erased key.
+    let meta = p.rt.block_on(writer.finish()).unwrap();
+    assert_eq!(meta.subject.as_deref(), Some("user:1"));
+    pass();
+    assert_eq!(files_of(dir.path(), "user:1"), Vec::<bool>::new());
+    assert_eq!(pending(), 0);
+    assert!(dir.path().join("blobs/erasures-swept").exists());
+    drop(p);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let pending = rt.block_on(async {
+        let env = Env::real(tokio::runtime::Handle::current());
+        let config = NodeConfig {
+            concurrency: 8,
+            blobs: Some(BlobsConfig::default()),
+            ..NodeConfig::default()
+        };
+        let node = start_local(env, dir.path(), config).await.unwrap();
+        node.pending_erasures().await.unwrap()
+    });
+    assert_eq!(pending, 0, "remembered over a restart");
 }

@@ -18,7 +18,12 @@ until the v1.0 compatibility promise takes effect.
   `KEYSTORE_INCOMPLETE` a blob reference whose subject key is neither in the
   keystore backup nor erased. A turn that runs across its subject's erasure
   can no longer read or write that subject's blobs (`erased`), so none
-  outlives the erasure under a new key version.
+  outlives the erasure under a new key version. Some files have no row for
+  the erasure to find: a blob a turn wrote and did not commit, or an
+  upload whose turn never ran. The erasure wakes the blob collector, whose
+  next pass deletes the subject's such files at once, also in fork spaces,
+  and `privacy status` counts the erasure as pending until it has. With the
+  mode `off`, these files are plain text until then.
 - `kronik serve`'s default `--concurrency` follows the CPUs the daemon may
   use: 8 turns at once per CPU, at least 8 and at most 64 (ADR 0140). Its
   CPU affinity and a cgroup's CPU quota count, so a 2-vCPU machine runs 16

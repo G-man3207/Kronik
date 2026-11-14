@@ -15,6 +15,12 @@
 //! - the leases taken when the pass began count as roots too: a blob whose
 //!   record is applied (and its lease ended) after the pass read its roots
 //!   was leased when the pass began.
+//!
+//! A pass with [`SweepOptions::erased_now`] also deletes, at once, every
+//! file without a root whose header names a subject erased through its key
+//! version ([`Roots::erased`]), leased, touched or not: no record can make
+//! such a blob readable again (a read answers erased), and with privacy
+//! mode off its bytes are plain (M26 §9.3).
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
@@ -22,8 +28,9 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, MutexGuard};
 
-use kronik_core::env::OpenMode;
+use kronik_core::env::{File, OpenMode};
 
+use crate::format::{HEADER_LEN, Header};
 use crate::id::hex;
 use crate::{BlobError, BlobId, BlobStore, Space};
 
@@ -37,6 +44,21 @@ pub trait Roots: Send {
     /// something keeps. Called once per shard, in increasing order, after
     /// the pass began.
     fn shard(&mut self, shard: u8) -> Result<BTreeSet<BlobId>, BlobError>;
+
+    /// Whether `subject` is erased through `key_version`: its blobs of that
+    /// version or an older one are erased data
+    /// ([`SweepOptions::erased_now`]).
+    fn erased(&self, _subject: &str, _key_version: u32) -> bool {
+        false
+    }
+}
+
+/// The subject and key version a blob file's header names; none for a
+/// blob without a subject or a header that does not decode.
+pub(crate) async fn header_subject(file: &dyn File) -> Option<(String, u32)> {
+    let bytes = file.read_at(0, HEADER_LEN).await.ok()?;
+    let header = Header::decode(&bytes).ok()?;
+    Some((header.subject?, header.key_version))
 }
 
 /// How a pass deletes.
@@ -46,6 +68,10 @@ pub struct SweepOptions {
     pub immediate: bool,
     /// Delete nothing and leave the candidates as they are: list instead.
     pub dry_run: bool,
+    /// Delete at once every file without a root whose subject is erased
+    /// through its key version ([`Roots::erased`]), leased or not (not in a
+    /// dry run).
+    pub erased_now: bool,
 }
 
 /// One file without a root that a dry run found.
@@ -71,6 +97,9 @@ pub struct SweepReport {
     /// The files without a root that the next pass deletes if they still
     /// have none.
     pub candidates: u64,
+    /// Of `deleted`, the files of erased subjects
+    /// ([`SweepOptions::erased_now`]).
+    pub erased_deleted: u64,
     /// A dry run's files without a root, in shard order.
     pub unrooted: Vec<Unrooted>,
 }
@@ -130,17 +159,44 @@ impl BlobStore {
                     continue;
                 };
                 let path = dir_path.join(&name);
-                let bytes = match fs.open(path.clone(), OpenMode::Read).await {
-                    Ok(file) => file
-                        .len()
-                        .await
-                        .map_err(|e| BlobError::io("reading a blob's length", e))?,
+                let file = match fs.open(path.clone(), OpenMode::Read).await {
+                    Ok(file) => file,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(BlobError::io("opening a blob", e)),
                 };
+                let bytes = file
+                    .len()
+                    .await
+                    .map_err(|e| BlobError::io("reading a blob's length", e))?;
                 report.objects += 1;
                 report.bytes += bytes;
-                if rooted.contains(&id) || leased_at_start.contains(&id) {
+                if rooted.contains(&id) {
+                    continue;
+                }
+                let erased = options.erased_now
+                    && !options.dry_run
+                    && header_subject(&*file)
+                        .await
+                        .is_some_and(|(subject, version)| roots.erased(&subject, version));
+                if erased {
+                    drop(file);
+                    let _claim = dir.claim.lock().await;
+                    match fs.remove_file(path).await {
+                        Ok(()) => {
+                            report.deleted += 1;
+                            report.deleted_bytes += bytes;
+                            report.erased_deleted += 1;
+                            deleted_here = true;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(BlobError::io("deleting an erased blob", e)),
+                    }
+                    report.objects -= 1;
+                    report.bytes -= bytes;
+                    continue;
+                }
+                drop(file);
+                if leased_at_start.contains(&id) {
                     continue;
                 }
                 let _claim = dir.claim.lock().await;

@@ -127,6 +127,25 @@ is new data: it is sealed under a new key version, as before.
   to the request that ran it hold tombstones.
 - What a guest copies into a value of another subject, or of none, still
   survives the erasure (m8-privacy, "What erasure does not do").
+- Blob files that no record references (M26 §9.3; added with M26 slice
+  B15 after the review of the blob DST). These are a blob a turn wrote and
+  did not commit, an upload whose turn never ran, and a writer still
+  writing. They are plaintext in flight too, outside the log and the
+  index.
+  - The erasure wakes the blob collector. Its next pass deletes every such
+    file of the subject at once, leased or not, in main's store and in
+    every fork space.
+  - The erasure stays pending in `privacy status` until a pass after it,
+    and after the last writer of the subject that began before it, is done.
+  - With the mode `on` the files are sealed with the erased key and
+    unreadable from the start. With the mode `off` they keep the subject's
+    bytes in plain text until that pass: like plain values in the log, which
+    a reseal seals.
+  - Verified by `crates/kronik-sched/tests/blob_erasure.rs`: the subject's
+    loose plain files, one a lease holds included, go in the first pass
+    after the erasure, and a writer that is still writing holds the erasure
+    back until a pass after it ended. Also by `crates/kronik-blob/tests/privacy.rs`
+    (the store's pass, a fork's files, the live writers).
 - Verified by `crates/kronik-sched/src/erasure/node_tests.rs` (a turn running
   across an erasure, its reply and a message queued behind it; an open
   turn's recorded value in `off` mode across a restart), the store tests of

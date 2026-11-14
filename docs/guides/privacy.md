@@ -303,7 +303,57 @@ complete when that time has passed and reseal and the snapshot replacement
 are done: `privacy status` counts an erasure as pending while its subject
 still has a plain value in the log, in `state.db` or in an input still queued
 from before the erasure, and while a turn that began before the erasure
-still runs.
+still runs. With blobs on, it is also pending while one of the subject's
+blobs has a file on the node or an object in the bucket, and until the blob
+collector has deleted the subject's files that no record references
+(below).
+
+### Blobs
+
+A blob (an upload, a large `fetch` response, or what an actor writes with
+`put` or a writer) has at most one subject, like any value: the request's,
+or the actor's default subject when it wrote the blob. A subject's blob is
+named by a keyed hash (`b3s:…`) that says nothing about its bytes. With the
+mode `on` its file is sealed with the subject's key, on disk, in the bucket
+and in a fork's space; with the mode `off` it is plain. The API shows a
+blob's subject only to a caller with `pii:read`, and only such a caller
+can read the content of a subject's blob.
+
+Erasing the subject erases its blobs:
+
+- Applying the `Erasure` record deletes their files at once, in main's
+  store and in every fork's space (`blobs` in the erase answer). The
+  shipper deletes their objects from the bucket in its next round
+  (`pending_blob_objects`). A guest's read of one answers `erased`, the API
+  `410 SUBJECT_ERASED`, and a replay counts the turn as unverifiable. The
+  holds, pins and log references that name the blob stay.
+- A turn that runs across the erasure can no longer read or write the
+  subject's blobs (`erased`).
+- A file that no record references has no row the erasure could find: a
+  blob a turn wrote and did not commit (it failed, or kept nothing), an
+  upload whose turn never ran, a writer still writing. The erasure wakes
+  the blob collector, whose next pass deletes every such file of the subject
+  at once, whatever lease it has, in main's store and in every fork's
+  space. A writer of the subject that began before that pass may still
+  leave one: the collector looks again every 30 seconds, at most, until
+  the writer has ended and a pass after it is done. Until then the erasure
+  is pending. With the mode `on`, these files are sealed with the erased key
+  and unreadable from the start; with the mode `off`, they keep the
+  subject's bytes in plain text until that pass.
+
+`kronik privacy reseal` also seals, in place, the files of the blobs a
+subject wrote while the mode was `off`, and marks them for the shipper to
+replace their objects in the bucket (`reseal.blobs_sealed` and
+`reseal.pending_blobs`). The blobs of an erased subject are left to the
+erasure, and a fork's blobs go with the fork. A restore refuses, with
+`KEYSTORE_INCOMPLETE`, a blob reference whose subject's key is neither in
+the keystore backup nor erased.
+
+In a fork, preview included, a blob is sealed like the fork's records: with
+the mode `on`, under the subject's key, created if the subject was never
+erased; a write of an erased subject's blob answers `erased`, and an upload
+to a preview `SUBJECT_ERASED`. A `--no-pii` fork reads a subject's blob as
+its pseudonym (16 bytes).
 
 ## Forks without personal data
 

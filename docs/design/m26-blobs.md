@@ -542,13 +542,39 @@ but first referenced by a record applied after it (an upload whose turn came
 later, a turn across the erasure) is erased when that record is applied, and
 its file goes then.
 
+A *loose* file has no row, so the erasure cannot find it through the index:
+a blob a turn wrote and did not commit (it failed, or kept nothing), an
+upload whose turn never ran, a writer still writing. Every erasure waits for
+the collector (review of the blob DST, as ruled):
+
+- Applying it wakes a pass. A pass that begins after an erasure deletes at
+  once every file without a root whose header names a subject erased through
+  its key version (`SweepOptions::erased_now`), whatever lease or claim it
+  has, in main's store. No record can make such a blob readable again: a read
+  answers `erased`. The pass also deletes every file of an erased subject in
+  every fork space, by its header (`BlobStore::delete_erased_subjects`): a
+  fork's blob has no row of main's index, and no collector sweeps a fork.
+- A writer of the subject that began before the pass may still name a blob
+  (`BlobStore::live_writers`). Its erasure waits for a pass after the writer
+  ended. The collector looks again every 30 seconds, or every quarter of
+  `[blobs] lease_ttl` if that is shorter.
+- The erasures a pass is done with are a watermark,
+  `<data>/blobs/erasures-swept`, so a restart does not count them again. A
+  watermark above every erasure the index knows belongs to another history,
+  a restore over the directory, and counts for nothing. After a restart, the
+  first pass does the erasures that were not done.
+- With the mode `on`, loose files are sealed with the erased key version and
+  unreadable as soon as the keys go. With the mode `off`, they keep the
+  subject's bytes in plain text until that pass.
+
 - A guest read returns `erased`; the API answers `SUBJECT_ERASED`; a replay
   marks the turn unverifiable (ADR 0109); holds, pins and log references
   remain and point at an erased blob.
 - `POST /v1/privacy/erase` answers also `blobs` (the files deleted) and
   `pending_blob_objects` (remote objects not yet deleted).
 - `privacy status` reports an erasure as pending while any of its blobs
-  still has a file on the node or an object in the bucket.
+  still has a file on the node or an object in the bucket, and until a
+  collector pass after it is done with its subject's loose files.
 - Rebuilding `state.db` from the log applies the same record: the rows are
   marked again, and the deletion finds nothing left.
 

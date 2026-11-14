@@ -262,7 +262,7 @@ impl Api {
             .node
             .blob_gc(SweepOptions {
                 immediate: r.immediate,
-                dry_run: false,
+                ..SweepOptions::default()
             })
             .await?;
         let answer = match &outcome {

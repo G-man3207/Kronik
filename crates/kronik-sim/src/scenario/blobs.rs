@@ -675,7 +675,7 @@ impl World {
             };
             let options = SweepOptions {
                 immediate: workload.immediate,
-                dry_run: false,
+                ..SweepOptions::default()
             };
             // A task of the node, as an operator's `kronik blobs gc`: a crash
             // in the middle of the pass ends it with the node.
@@ -832,8 +832,8 @@ impl World {
                 let row = node.store().db().blob(&id.to_string()).ok().flatten();
                 let dry = node
                     .blob_gc(SweepOptions {
-                        immediate: false,
                         dry_run: true,
+                        ..SweepOptions::default()
                     })
                     .await
                     .ok()

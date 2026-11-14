@@ -104,6 +104,15 @@ pub(crate) struct GcState {
     pub(crate) wake: Arc<tokio::sync::Notify>,
     /// The last pass that deleted (not a dry run).
     pub(crate) last: Mutex<Option<GcOutcome>>,
+    /// The erasures the collector is done with, through this LSN
+    /// (`blob_erasure`); `None` until read from the data directory.
+    pub(crate) erasures_swept: Mutex<Option<Lsn>>,
+    /// A later pass is asked for already (`blob_erasure`).
+    pub(crate) retry: std::sync::atomic::AtomicBool,
+    /// Held by an erasure from before its record until its own deletion of
+    /// its blobs' files is done; a pass reads what it is for under it, so it
+    /// never deletes, uncounted, a file the erasure is about to count.
+    pub(crate) erasing: tokio::sync::Mutex<()>,
 }
 
 fn store_error(e: impl std::fmt::Display) -> ApiError {
@@ -225,6 +234,19 @@ struct NodeRoots {
     floor: Lsn,
     /// Snapshots' and forks' roots, read when the pass began.
     other: BTreeSet<BlobId>,
+    /// Every erased subject and the last key version erased, when the pass
+    /// began (`SweepOptions::erased_now`).
+    erased: std::collections::HashMap<String, u32>,
+}
+
+/// Whether `erased` (subject → the last key version erased) covers a blob
+/// of `subject` with `version`.
+fn erased_through(
+    erased: &std::collections::HashMap<String, u32>,
+    subject: &str,
+    version: u32,
+) -> bool {
+    erased.get(subject).is_some_and(|last| version <= *last)
 }
 
 impl Roots for NodeRoots {
@@ -247,6 +269,10 @@ impl Roots for NodeRoots {
                 .copied(),
         );
         Ok(out)
+    }
+
+    fn erased(&self, subject: &str, key_version: u32) -> bool {
+        erased_through(&self.erased, subject, key_version)
     }
 }
 
@@ -311,15 +337,58 @@ impl Node {
             .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
         let started = self.env.clock.monotonic();
         let floor = self.blob_floor()?;
+        // The erasures this pass is for (M26 §9.3): it deletes their
+        // subjects' files without a root at once, and every such file of a
+        // fork space. The writers at the start may still name more.
+        let (loose, writing, erased) = {
+            let _quiet = self.blob_gc.erasing.lock().await;
+            let loose = if options.dry_run {
+                Vec::new()
+            } else {
+                self.loose_erasures().await?
+            };
+            let erased: std::collections::HashMap<String, u32> = self
+                .store()
+                .db()
+                .erasures()
+                .map_err(store_error)?
+                .into_iter()
+                .collect();
+            (loose, store.live_writers(), erased)
+        };
+        let options = SweepOptions {
+            erased_now: options.erased_now || !loose.is_empty(),
+            ..options
+        };
         let mut roots = NodeRoots {
             node,
             floor,
             other: self.other_blob_roots()?,
+            erased: erased.clone(),
         };
         let report = store
             .sweep(&Space::Main, &mut roots, options)
             .await
             .map_err(blob_error)?;
+        if options.erased_now
+            && !options.dry_run
+            && let Some(storage) = self.storage_config()
+        {
+            let is_erased =
+                move |subject: &str, version: u32| erased_through(&erased, subject, version);
+            for space in
+                crate::blob_erasure::fork_spaces(&*self.env.fs, &storage.data_dir, self.branch())
+                    .await?
+            {
+                let (files, bytes) = store
+                    .delete_erased_subjects(&space, &is_erased)
+                    .await
+                    .map_err(blob_error)?;
+                if files > 0 {
+                    tracing::info!(?space, files, bytes, "deleted the files of erased subjects");
+                }
+            }
+        }
         let mut forgotten = 0;
         let mut unrooted = Vec::with_capacity(report.unrooted.len());
         for file in &report.unrooted {
@@ -418,6 +487,7 @@ impl Node {
         };
         if !options.dry_run {
             *lock(&self.blob_gc.last) = Some(outcome.clone());
+            self.loose_swept(&loose, &writing).await?;
         }
         Ok(Some(outcome))
     }

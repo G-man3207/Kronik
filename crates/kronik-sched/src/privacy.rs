@@ -154,6 +154,9 @@ impl Node {
         let node = self
             .arc()
             .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        // A collector pass waits for this erasure's own deletion of its
+        // blobs' files, which counts them (M26 §9.3).
+        let erasing = self.blob_gc.erasing.lock().await;
         let erased = subject.to_owned();
         let subject = subject.to_owned();
         let (key_version, lsn) = self
@@ -182,6 +185,10 @@ impl Node {
         // Its blobs' files go now (M26 §9.3). A failure leaves them to the
         // next start's pass and to the collector: the erasure itself is done.
         let blobs = self.delete_erased_blobs_logged().await;
+        drop(erasing);
+        // Its files that no record references go in the collector's next
+        // pass, which this asks for.
+        self.wake_for_loose_erasures().await;
         // What the shipper still has in the bucket goes in its next round.
         let pending_blob_objects = self
             .erased_blobs_left()
@@ -282,8 +289,9 @@ impl Node {
     /// responses, dead letters, open turns' effects; issue #31), or in this
     /// process from before the erasure: an input still queued, or a turn that
     /// runs across it (§6.8); or while one of its blobs has a file on this
-    /// node or an object in the bucket (M26 §9.3). The count names no
-    /// subject.
+    /// node or an object in the bucket, or the collector has not yet deleted
+    /// the files of its blobs that no record references (M26 §9.3). The
+    /// count names no subject.
     pub async fn pending_erasures(&self) -> Result<u64, ApiError> {
         let erased: std::collections::HashSet<String> = self
             .store()
@@ -314,6 +322,15 @@ impl Node {
         // A blob of the subject with a file on this node or an object in the
         // bucket (M26 §9.3).
         pending.extend(self.erased_blobs_left().await?.into_keys());
+        // A file of the subject that no record references (a blob a turn
+        // wrote and did not commit, a writer still writing): until the
+        // collector has deleted such files after the erasure (M26 §9.3).
+        pending.extend(
+            self.loose_erasures()
+                .await?
+                .into_iter()
+                .map(|(_, subject, _)| subject),
+        );
         let upto = self.applied_lsn();
         if upto < 1 {
             return Ok(pending.len() as u64);

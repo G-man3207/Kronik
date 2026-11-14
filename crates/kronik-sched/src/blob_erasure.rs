@@ -6,19 +6,81 @@
 //! fork spaces are never swept: an erased blob's bytes must go now. The
 //! rows stay (pins, holds and log references point at an erased blob) until
 //! the collector forgets them.
+//!
+//! A *loose* file has no row: a blob a turn wrote and did not commit, or an
+//! upload whose turn never came; a writer still writing has a part file.
+//! The erasure cannot find those through the index. So every erasure waits
+//! for the collector (review of log-integrity's blob DST, ruled by the
+//! lead): a pass that begins after it was applied deletes every file
+//! without a root whose header names an erased subject through its key
+//! version (`SweepOptions::erased_now`), in main's store, and every such
+//! file of every fork space. The erasure is done with once such a pass has
+//! finished and no writer of the subject that began before the pass is
+//! left; until then `privacy status` counts it as pending. The erasures done
+//! with are kept as a watermark, `<data>/blobs/erasures-swept`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use kronik_blob::{BlobId, Space};
-use kronik_core::env::Fs;
+use kronik_core::env::{Fs, OpenMode};
 use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::ids::Lsn;
 
 use crate::Node;
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How often the collector looks again while a writer of an erased subject
+/// is still writing: as often as a lease is renewed, at most.
+const LOOSE_RETRY: Duration = Duration::from_secs(30);
+
+/// The watermark file: every erasure at or below this LSN is done with.
+fn swept_path(data: &Path) -> PathBuf {
+    data.join("blobs").join("erasures-swept")
+}
+
+/// Reads the watermark; 0 when there is none or it does not parse.
+async fn read_swept(fs: &dyn Fs, data: &Path) -> Lsn {
+    let Ok(file) = fs.open(swept_path(data), OpenMode::Read).await else {
+        return 0;
+    };
+    let Ok(bytes) = file.read_at(0, 21).await else {
+        return 0;
+    };
+    std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Writes the watermark durably: a fixed-width line written over the
+/// previous one, through a part file and a rename.
+async fn write_swept(fs: &dyn Fs, data: &Path, lsn: Lsn) -> std::io::Result<()> {
+    let path = swept_path(data);
+    let dir = data.join("blobs");
+    fs.create_dir_all(dir.clone()).await?;
+    let part = path.with_extension("part");
+    let file = fs.open(part.clone(), OpenMode::ReadWriteCreate).await?;
+    file.set_len(0).await?;
+    file.write_at(0, bytes::Bytes::from(format!("{lsn:020}\n")))
+        .await?;
+    file.sync_data().await?;
+    fs.rename(part, path).await?;
+    fs.sync_dir(dir).await
+}
 
 /// The fork spaces of the data directory: every branch but `branch` that
 /// has a blob space. Through the node's file system, so a simulation sees
 /// the same directories as the rest of the node.
-async fn fork_spaces(fs: &dyn Fs, data: &Path, branch: &str) -> Result<Vec<Space>, ApiError> {
+pub(crate) async fn fork_spaces(
+    fs: &dyn Fs,
+    data: &Path,
+    branch: &str,
+) -> Result<Vec<Space>, ApiError> {
     let branches = data.join("branches");
     let names = match fs.read_dir(branches.clone()).await {
         Ok(names) => names,
@@ -87,6 +149,132 @@ impl Node {
             deleted += files;
         }
         Ok(deleted)
+    }
+
+    /// The watermark of the erasures done with (module docs), read once
+    /// from the data directory. A watermark above every erasure the index
+    /// knows belongs to another history (a restore over this directory):
+    /// it counts for nothing.
+    async fn erasures_swept(&self) -> Result<Lsn, ApiError> {
+        if let Some(lsn) = *lock(&self.blob_gc.erasures_swept) {
+            return Ok(lsn);
+        }
+        let Some(data) = self.storage_config().map(|s| s.data_dir.clone()) else {
+            return Ok(0);
+        };
+        let mut lsn = read_swept(&*self.env.fs, &data).await;
+        let newest = self
+            .store()
+            .db()
+            .erasure_records()
+            .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?
+            .into_iter()
+            .map(|(_, _, at)| at)
+            .max()
+            .unwrap_or(0);
+        if lsn > newest {
+            lsn = 0;
+        }
+        let mut cached = lock(&self.blob_gc.erasures_swept);
+        Ok(*cached.get_or_insert(lsn))
+    }
+
+    /// The erasures the collector has not done with yet (module docs):
+    /// `(lsn, subject, key version)`, oldest first. None without a blob
+    /// store: there are no blob files.
+    pub(crate) async fn loose_erasures(&self) -> Result<Vec<(Lsn, String, u32)>, ApiError> {
+        if self.blob_store().is_none() {
+            return Ok(Vec::new());
+        }
+        let swept = self.erasures_swept().await?;
+        let mut out: Vec<(Lsn, String, u32)> = self
+            .store()
+            .db()
+            .erasure_records()
+            .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?
+            .into_iter()
+            .filter(|(_, _, lsn)| *lsn > swept)
+            .map(|(subject, version, lsn)| (lsn, subject, version))
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// After a collector pass with `erased_now` over `loose` (the erasures
+    /// it began with): the erasures it is done with are those below the
+    /// first whose subject had a writer when it began (`writing`), which may
+    /// still name a blob that no record references. Advances and stores the
+    /// watermark; asks for another pass while a writer holds one back.
+    pub(crate) async fn loose_swept(
+        &self,
+        loose: &[(Lsn, String, u32)],
+        writing: &[kronik_blob::LiveWriter],
+    ) -> Result<(), ApiError> {
+        let Some(newest) = loose.last().map(|(lsn, _, _)| *lsn) else {
+            return Ok(());
+        };
+        let held = loose
+            .iter()
+            .find(|(_, subject, version)| {
+                writing
+                    .iter()
+                    .any(|w| w.subject.as_deref() == Some(subject) && w.key_version <= *version)
+            })
+            .map(|(lsn, _, _)| *lsn);
+        let through = held.map_or(newest, |lsn| lsn - 1);
+        let swept = self.erasures_swept().await?;
+        if through > swept {
+            if let Some(data) = self.storage_config().map(|s| s.data_dir.clone()) {
+                write_swept(&*self.env.fs, &data, through)
+                    .await
+                    .map_err(|e| {
+                        ApiError::new(
+                            ErrorCode::Internal,
+                            format!("writing the erasures the collector is done with: {e}"),
+                        )
+                    })?;
+            }
+            *lock(&self.blob_gc.erasures_swept) = Some(through);
+        }
+        if held.is_some() {
+            self.wake_blob_gc_later(LOOSE_RETRY.min(self.blob_lease_ttl() / 4));
+        }
+        Ok(())
+    }
+
+    /// Wakes the collector for an erasure it has not done with yet: after
+    /// one is applied, and at start.
+    pub(crate) async fn wake_for_loose_erasures(&self) {
+        match self.loose_erasures().await {
+            Ok(loose) if !loose.is_empty() => self.wake_blob_gc(),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e.message, "reading the erasures for the collector"),
+        }
+    }
+
+    /// Wakes the collector after `delay`, once at a time.
+    fn wake_blob_gc_later(&self, delay: Duration) {
+        if self.blob_gc.retry.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(node) = self.me() else {
+            return;
+        };
+        let node = std::sync::Arc::downgrade(&node);
+        let clock = self.env.clock.clone();
+        drop(self.env.spawn("blob collector retry", async move {
+            clock.sleep(delay).await;
+            if let Some(node) = node.upgrade() {
+                node.blob_gc.retry.store(false, Ordering::Release);
+                node.wake_blob_gc();
+            }
+        }));
+    }
+
+    /// `[blobs] lease_ttl`; 5 minutes without a store.
+    fn blob_lease_ttl(&self) -> Duration {
+        self.blob_store()
+            .map_or(Duration::from_secs(300), |store| store.lease_ttl())
     }
 
     /// [`Node::delete_erased_blobs`], whose failure is logged: the erasure or
