@@ -236,6 +236,18 @@ impl Marks {
         });
         n
     }
+
+    /// [`Marks::tombstone`] over what a turn hands to its connections (M24):
+    /// its frames' data and its closes' reasons.
+    pub(crate) fn tombstone_connection_ops(
+        &self,
+        born: Born,
+        ops: &mut [pb::ConnectionOp],
+    ) -> usize {
+        self.tombstone(born, |f| {
+            kronik_proto::sealables::connection_ops_mut(ops, f);
+        })
+    }
 }
 
 /// What [`Marks::begin`] replaced.
@@ -337,6 +349,56 @@ mod tests {
         marks.predating_subjects(born, |f| again.iter_mut().for_each(f), &mut subjects);
         assert_eq!(subjects, ["user:1".to_owned()].into());
         assert!(marks.any_predating(born, |f| again.iter_mut().for_each(f)));
+    }
+
+    /// What a turn sends to its connections is tombstoned like the messages
+    /// it sends: the data of its frames and the reasons of its closes, of a
+    /// subject erased while it ran, and nothing else (M24, §6.8).
+    #[test]
+    fn tombstones_replace_the_predating_values_of_connection_operations() {
+        let mut marks = Marks::default();
+        let born = marks.now();
+        marks.begin("user:1");
+        marks.keys_erased("user:1", 4);
+        let send = |subject: &str| pb::ConnectionOp {
+            connections: vec!["c-1".into()],
+            seqs: vec![0],
+            op: Some(pb::connection_op::Op::Send(pb::Frame {
+                kind: pb::frame::Kind::Text as i32,
+                data: Some(value(subject)),
+                ..Default::default()
+            })),
+            dropped: vec![],
+        };
+        let mut ops = [
+            send("user:1"),
+            send("user:2"),
+            pb::ConnectionOp {
+                connections: vec!["c-1".into()],
+                seqs: vec![],
+                op: Some(pb::connection_op::Op::Close(pb::ConnectionCloseRequest {
+                    code: 4000,
+                    reason: Some(value("user:1")),
+                })),
+                dropped: vec![],
+            },
+        ];
+        assert_eq!(marks.tombstone_connection_ops(born, &mut ops), 2);
+        let tomb = Some(pb::sealable::Value::Sealed(
+            kronik_privacy::sealer::erased_value(4),
+        ));
+        let data = |op: &pb::ConnectionOp| match &op.op {
+            Some(pb::connection_op::Op::Send(f)) => f.data.clone().unwrap(),
+            Some(pb::connection_op::Op::Close(c)) => c.reason.clone().unwrap(),
+            None => unreachable!(),
+        };
+        assert_eq!(data(&ops[0]).value, tomb);
+        assert_eq!(data(&ops[1]), value("user:2"));
+        assert_eq!(data(&ops[2]).value, tomb);
+        // A turn born after the erasure's record keeps its values.
+        marks.recorded("user:1", 4, 9);
+        let mut later = [send("user:1")];
+        assert_eq!(marks.tombstone_connection_ops(marks.now(), &mut later), 0);
     }
 }
 

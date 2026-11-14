@@ -116,7 +116,8 @@ fn to_message(frame: &pb::Frame) -> Message {
     let data: &[u8] = match frame.data.as_ref().and_then(|d| d.value.as_ref()) {
         Some(pb::sealable::Value::Plain(b)) => b,
         // The hub gets the committed record's frames before they are
-        // sealed; a sealed one is never expected here.
+        // sealed. The one value that is not plain is the tombstone of a
+        // subject erased while the turn ran (§6.8): it goes out empty.
         _ => &[],
     };
     match pb::frame::Kind::try_from(frame.kind) {

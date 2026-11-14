@@ -2466,7 +2466,7 @@ impl Node {
         } else {
             Vec::new()
         };
-        let connection_ops = if committed {
+        let mut connection_ops = if committed {
             record.connection_ops.clone()
         } else {
             Vec::new()
@@ -2478,12 +2478,15 @@ impl Node {
             origin
         };
         // An erasure that began while the turn ran: its values of the subject
-        // become tombstones, in the record and in what it sends (§6.8).
+        // become tombstones, in the record and in what it sends (§6.8): its
+        // messages and compensations, and the frames and closes the hub
+        // writes to its connections' clients (M24).
         let mut record = Record::TurnRecord(record);
         let fence = self.seal_born(&mut record, born).await?;
         self.tombstone_outbound(&mut messages, born);
         let mut compensations = fxs.compensations;
         self.tombstone_outbound(&mut compensations, born);
+        lock(&self.erasure_marks).tombstone_connection_ops(born, &mut connection_ops);
         let lsn = self.commit_origin(record, completion).await;
         drop(fence);
         let lsn = lsn?;
