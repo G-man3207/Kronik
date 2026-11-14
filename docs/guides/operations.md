@@ -2049,8 +2049,11 @@ microVM), and they record their calls like other effects
   takes `--command-timeout` and `--kernel-jobs` for a slow machine;
   the daemon never downloads or builds it). Without KVM the add is refused
   with `KVM_UNAVAILABLE`, which suggests `gvisor`. The microVM level is
-  experimental: it has not been run on a host with KVM, and every add
-  answers with a warning that says so. Use `gvisor` for actors you rely on.
+  experimental: its proofs passed on 2026-11-14 on GitHub-hosted Ubuntu 24.04
+  runners, which are virtual machines on AMD hosts with nested KVM, and nowhere
+  else (no bare metal, no Intel, no aarch64), and every add answers with a
+  warning that says so.
+  Use `gvisor` for actors you rely on.
 
 Know two things before you enable `--isolation microvm`
 ([ADR 0095](../adr/0095-pinned-firecracker-guest.md),

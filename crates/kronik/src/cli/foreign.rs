@@ -22,8 +22,8 @@ pub enum Isolation {
     Gvisor,
     /// Plain runc on the host kernel: only for images you trust.
     Trusted,
-    /// Firecracker microVM (M20), experimental: not yet booted on KVM
-    /// hardware. Needs a usable /dev/kvm and the pinned tool bundle; without
+    /// Firecracker microVM (M20), experimental: proven only on hosted virtual
+    /// machines with nested KVM. Needs a usable /dev/kvm and the pinned tool bundle; without
     /// KVM the add is refused with KVM_UNAVAILABLE (use gvisor).
     Microvm,
 }

@@ -2114,7 +2114,8 @@ node's cache or the backend (`SECRET_UNAVAILABLE` while the backend does not
 answer and nothing is cached; the next start retries). A link made later is
 seen by the next start. `trusted` runs plain runc with a warning, a
 seccomp filter and no user namespace: it is not a security boundary.
-`microvm` (M20) is **experimental**: it has not yet booted on KVM hardware,
+`microvm` (M20) is **experimental**: its proofs have run only on hosted virtual
+machines with nested KVM (GitHub's Ubuntu 24.04 runners, 2026-11-14),
 and every add answers with a warning that says so. Its VMM runs as the
 daemon's own user under a launcher of Kronik's (not Firecracker's jailer),
 and its sandbox forks all resume one snapshot, so values a program holds in

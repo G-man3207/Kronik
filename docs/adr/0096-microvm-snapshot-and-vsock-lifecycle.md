@@ -1,6 +1,6 @@
 # 0096. microVM snapshot ownership and fixed vsock protocols
 
-- **Status:** Proposed. Implemented, never run on a host with KVM; awaits maintainer ratification.
+- **Status:** Proposed. Implemented; its KVM proofs passed on 2026-11-14 on a GitHub-hosted Ubuntu 24.04 runner (a virtual machine on an AMD host, with nested KVM), with the pinned tool bundle built there (ADR 0095); awaits maintainer ratification.
 - **Date:** 2026-11-07
 
 ## Control and readiness

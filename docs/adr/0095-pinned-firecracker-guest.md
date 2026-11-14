@@ -1,6 +1,6 @@
 # 0095. Pinned Firecracker guest and finite persistent drive
 
-- **Status:** Proposed. Implemented, never run on a host with KVM; awaits maintainer ratification.
+- **Status:** Proposed. Implemented; its KVM proofs passed on 2026-11-14 on a GitHub-hosted Ubuntu 24.04 runner (a virtual machine on an AMD host, with nested KVM), with the pinned tool bundle built there; awaits maintainer ratification.
 - **Date:** 2026-11-07
 
 ## Decision
@@ -43,6 +43,6 @@ What a VMM that escaped its guest can change of the host's files is bounded by t
 
 ## Proof and limits
 
-Required proof is actual boot, ordinary `foreign.http` over vsock, malicious-actor controls, finite-drive ENOSPC without losing existing data, full snapshot and sandbox-fork restore, independent fork writes, graceful stop and filtered cleanup. Parser, filesystem and lifecycle regressions supplement that proof; they cannot manufacture a KVM pass, and a run on a host without `/dev/kvm` is not one. None of this has been run: no real Firecracker instance has booted under this code, and the pinned tool bundle has not been built on this revision. Where the proof runs (a hosted runner with `/dev/kvm`, a self-hosted runner, or a documented script on a KVM host) is a separate decision.
+Required proof is actual boot, ordinary `foreign.http` over vsock, malicious-actor controls, finite-drive ENOSPC without losing existing data, full snapshot and sandbox-fork restore, independent fork writes, graceful stop and filtered cleanup. Parser, filesystem and lifecycle regressions supplement that proof; they cannot manufacture a KVM pass, and a run on a host without `/dev/kvm` is not one. All of it passed on 2026-11-14 in the manual `isolation` workflow (ADR 0133), on a GitHub-hosted Ubuntu 24.04 runner (a virtual machine on an AMD host, with nested KVM) and AppArmor's restriction on unprivileged user namespaces active, with the tool bundle built on the runner: boot, the ordinary call over vsock, the malicious actor, no network device (Firecracker's own configuration and the guest's interfaces), the configured resources, ENOSPC on the full drive, the full snapshot and the Postgres fork restore, independent fork writes, continuous replay, and the graceful stop, each VMM ending within 80 ms of its acknowledged STOP with no panic on its console. The first runs found what the rehearsals could not: the guest kernel's FIPS 140 loader, the bundle's ownership as the namespace shows it, the VM cgroup's dirty page cache and the guest's stop delay, all fixed. It has not run on bare metal, on Intel, on aarch64 or on another host's kernel.
 
 Images whose user or file owners lie outside the user namespace's mapped range cannot be unpacked in the rootless installation: unpacking changes ownership inside the namespace and there is no admission check for the range, so the failure shows when the actor starts, not at `foreign add`. The failed ownership change reports "owner U:G is outside the ids this installation maps" and what to do, instead of a bare errno.

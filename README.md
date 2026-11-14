@@ -58,9 +58,10 @@ The nonroot service of `kronik serve --init --rootless` (M21, opt-in) passed
 its installed proofs (ADR 0064) on 2026-11-14 on GitHub-hosted Ubuntu 24.04
 runners, once with AppArmor's restriction on unprivileged user namespaces (R1)
 active and once with it lifted; it has not run on other distributions. The
-microVM level (M20, `isolation = "microvm"`) is experimental and has not passed
-its proofs. The manual `isolation` workflow runs them on disposable hosted
-runners and keeps their evidence. The nonroot
+microVM level (M20, `isolation = "microvm"`) is experimental; its proofs passed
+on the same runners, which are virtual machines on AMD hosts with nested KVM,
+and nowhere else. The manual `isolation` workflow runs them on disposable hosted runners and
+keeps their evidence. The nonroot
 daemon's decisions, ADRs 0060–0065, were accepted on 2026-11-13; the microVM
 level's, ADRs 0095 and 0096, await the maintainers.
 See the [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
