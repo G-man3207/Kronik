@@ -384,6 +384,20 @@ fn open_outcome(
                     }
                 }
             }
+            // A handshake's headers are bounded like a request head (review
+            // L5): at most 64, of 16 KiB together.
+            let header_bytes: usize = accept
+                .headers
+                .iter()
+                .map(|h| h.name.len() + h.value.len())
+                .sum();
+            if accept.headers.len() > MAX_ACCEPT_HEADERS || header_bytes > MAX_ACCEPT_HEADER_BYTES {
+                return bad(format!(
+                    "the open's accept has {} headers of {header_bytes} bytes; the limit is \
+                     {MAX_ACCEPT_HEADERS} headers of {MAX_ACCEPT_HEADER_BYTES} bytes",
+                    accept.headers.len()
+                ));
+            }
             for h in &accept.headers {
                 if http::HeaderName::from_bytes(h.name.as_bytes()).is_err()
                     || http::HeaderValue::from_str(&h.value).is_err()
@@ -656,6 +670,10 @@ fn frame_to_wit(f: Option<&pb::Frame>) -> Result<conn_wit::Frame, RunError> {
         _ => return Err(RunError::Input("a frame without a kind".into())),
     })
 }
+
+/// The most headers an open's accept may set, and their bytes together.
+pub const MAX_ACCEPT_HEADERS: usize = 64;
+pub const MAX_ACCEPT_HEADER_BYTES: usize = 16 << 10;
 
 /// The subprotocols a WebSocket client offered: its `Sec-WebSocket-Protocol`
 /// headers in order, each split at commas and trimmed (RFC 6455 §4.1). They

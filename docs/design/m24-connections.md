@@ -785,7 +785,8 @@ ends with the code that applies.
   (2 s):
   1. stop admitting opens and frames;
   2. send every WebSocket a close frame with **code 1012 and the reason
-     `kronik: restart`**, and every SSE stream `retry: 5000` before its end;
+     `kronik: restart`**, and every SSE stream a `retry:` of 2 to 8 s,
+     spread per stream, before its end;
   3. wait up to the grace for the writers.
 - **After any restart, graceful or not,** the close inputs come from
   `Node::start` (§4.8). The dedicated reason is the same in history and in
@@ -868,7 +869,9 @@ close when the preview expires.
   header is recorded only as a sealable header of the open request, sealed
   like `Authorization` when the request has a subject, and the accept
   records only the selected value's position in it. The API redacts the
-  header like `Authorization` (§8).
+  header like `Authorization` (§8). Like `Authorization`, an open without a
+  subject (the usual browser case) records it in plain text in the log,
+  snapshots and forks; the security guide says so (review L7).
 - **Subjects.** Only trusted proxies may set them (§4.10).
 - **Caps.** Per client, per actor and in total (§5.11).
 - Memory per idle connection is bounded (§5.3 buffers). Incoming memory is

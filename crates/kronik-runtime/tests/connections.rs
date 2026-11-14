@@ -483,3 +483,16 @@ async fn a_broadcast_past_the_target_limit_traps_before_any_lookup() {
     );
     assert_eq!(view.0.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
+
+/// Review L5: an open's accept sets at most 64 headers, of 16 KiB together;
+/// one with more fails the open turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accept_with_too_many_headers_fails_the_open() {
+    let code = store();
+    let (_, room) = code.add(ROOM).unwrap();
+    let out = run_full(&room, "room/a", open("headers=63", &[])).await;
+    assert!(out.committed(), "{:?}", out.outcome);
+    let out = run_full(&room, "room/a", open("headers=64", &[])).await;
+    assert!(!out.committed(), "{:?}", out.outcome);
+    assert!(out.outcome.message.contains("headers"), "{:?}", out.outcome);
+}
