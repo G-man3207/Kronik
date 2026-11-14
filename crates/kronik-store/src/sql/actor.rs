@@ -433,6 +433,9 @@ pub struct SqlActor {
     /// Whether the schema has triggers (cached; refreshed after DDL).
     has_triggers: Option<bool>,
     page_size: u64,
+    /// Erasures applied while a turn had its savepoint open (subject, LSN):
+    /// they run when the turn ends ([`SqlActor::erase_subject`]).
+    deferred_erasures: Vec<(String, u64)>,
 }
 
 fn lock(m: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
@@ -609,6 +612,7 @@ impl SqlActor {
             poisoned: false,
             has_triggers: None,
             page_size: page_size.max(512) as u64,
+            deferred_erasures: Vec::new(),
         })
     }
 
@@ -847,9 +851,19 @@ impl SqlActor {
             .conn
             .pragma_update(None, "max_page_count", UNLIMITED_PAGES)
             .map_err(|e| e.to_string());
+        let erased = self.run_deferred_erasures();
         let t = res?;
         unlimit?;
+        erased?;
         Ok(t)
+    }
+
+    /// The erasures applied while the turn that just ended was open.
+    fn run_deferred_erasures(&mut self) -> Result<(), String> {
+        for (subject, lsn) in std::mem::take(&mut self.deferred_erasures) {
+            self.erase_subject(&subject, lsn)?;
+        }
+        Ok(())
     }
 
     /// Replaces every exact occurrence of each secret value in the text and
@@ -1095,7 +1109,18 @@ impl SqlActor {
     /// cannot write them (`subjects/table-without-subject`); rows written
     /// before that decision, and rows whose `_subject` is NULL, belong to
     /// nobody. See [`rows_without_subject_column`].
+    ///
+    /// While a turn of the actor has its savepoint open, the erasure waits
+    /// for the turn to end and runs right after its savepoint is rolled
+    /// back: run inside it, the turn's end would roll the deletes back with
+    /// it, and its session would record them as the turn's own changes.
+    /// Until then the database's applied LSN stays below `lsn`, so a stop
+    /// in between replays the erasure.
     pub fn erase_subject(&mut self, subject: &str, lsn: u64) -> Result<u64, String> {
+        if self.session.is_some() {
+            self.deferred_erasures.push((subject.to_owned(), lsn));
+            return Ok(0);
+        }
         lock(&self.shared).host = true;
         let tables: Vec<String> = {
             let mut st = self
@@ -1250,6 +1275,9 @@ impl SqlActor {
         }
         self.ddl.clear();
         self.poisoned = false;
+        // A failure leaves the applied LSN below the erasure's: the next
+        // start replays it.
+        let _ = self.run_deferred_erasures();
     }
 
     /// Every user table's rows in canonical order: primary-key order, or

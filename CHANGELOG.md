@@ -57,6 +57,11 @@ until the v1.0 compatibility promise takes effect.
   the turn (a warning for a turn open in the running state), the gauge
   `kronik_retention_open_turn_segments`, `retention_pin` in `/v1/health`,
   and the new `kronik doctor` check `retention`.
+- An erasure applied while a turn of an actor had its SQL savepoint open
+  left the subject's rows in that actor's live database: the deletes ran
+  inside the savepoint, the turn's end rolled them back, and a rebuild
+  from the log deleted them. The deletes now run right after the turn
+  ends.
 - An open turn whose re-run after a restart met an input of an erased
   subject, or a kind that is no longer deployed, is closed once: its failed
   record now carries the turn's own execution id and its recorded effects.

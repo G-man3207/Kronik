@@ -837,3 +837,51 @@ fn scrubbing_covers_blob_cells_and_binary_secrets() {
         ]
     );
 }
+
+/// Found with #72: an erasure applied while a turn of the actor has its
+/// savepoint open. Before, the deletes ran inside the savepoint, so the
+/// turn's end rolled them back (and the applied LSN with them): the
+/// subject's rows stayed in the live database, which a rebuild deletes. Now
+/// the erasure runs right after the turn's savepoint is rolled back, and the
+/// turn's changeset holds only its own changes.
+#[test]
+fn an_erasure_during_a_turn_is_not_rolled_back_by_its_end() {
+    let mut a = actor("mid-turn");
+    let (_, res) = commit(&mut a, &opts(1, 1, true), &SCHEMA[..1], 1);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let mut o = opts(2, 2, false);
+    o.default_subject = Some("user:1".into());
+    let (_, res) = commit(
+        &mut a,
+        &o,
+        &["INSERT INTO notes(body) VALUES ('personal')"],
+        2,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let mut o = opts(3, 3, false);
+    o.default_subject = Some("user:2".into());
+    a.begin_turn(&o).unwrap();
+    a.query("INSERT INTO notes(body) VALUES ('other')", &[])
+        .unwrap();
+    // The erasure's record is applied while the turn is open.
+    a.erase_subject("user:1", 4).unwrap();
+    let mut t = a.end_turn(true).unwrap();
+    assert!(
+        t.changesets
+            .iter()
+            .all(|(s, _)| s.as_deref() == Some("user:2")),
+        "the erasure's deletes became the turn's changes: {t:?}"
+    );
+    assert_eq!(a.applied_lsn().unwrap(), 4, "the erasure was rolled back");
+    t.whole.clear();
+    a.apply(&t, 5, &BTreeSet::new()).unwrap();
+    a.begin_turn(&opts(6, 6, false)).unwrap();
+    let rows = a
+        .query("SELECT body, _subject FROM notes ORDER BY id", &[])
+        .unwrap();
+    a.end_turn(false).unwrap();
+    assert_eq!(
+        rows.values,
+        [[Value::Text("other".into()), Value::Text("user:2".into())]]
+    );
+}
