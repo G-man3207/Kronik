@@ -431,5 +431,78 @@ pub fn blobs_need(blobs: &[pb::BlobRef]) -> usize {
 /// denial needs before it is recorded.
 pub const SMALL_NEED: usize = EFFECT_RESERVE;
 
+/// What one effect's result holds inline, for the actor type's
+/// `effect_bytes_per_turn` (ADR 0145): its request and its response as
+/// recorded. A body stored as a blob is only its reference there, so it
+/// counts no more than that; the blob quota bounds it.
+pub fn effect_bytes(e: &pb::EffectRecord) -> u64 {
+    let len = |s: &Option<pb::Sealable>| s.as_ref().map_or(0, |s| s.encoded_len());
+    (len(&e.request) + len(&e.response)) as u64
+}
+
+/// The most a crypto call or a secret reveal records inline (a hash, a
+/// secret reference, a signature): what it needs left of the effect bytes
+/// before it happens.
+pub const SMALL_EFFECT_BYTES: u64 = 4 << 10;
+
+/// The effect bytes a turn may still record (ADR 0145): every effect's
+/// result is charged what it holds inline ([`effect_bytes`]), and a new
+/// effect whose request, or whose response, would pass the actor type's
+/// `effect_bytes_per_turn` fails with `EFFECT_BYTES_EXCEEDED`, recorded as
+/// its result. The decisions depend only on what the turn records, so a
+/// re-run and a replay decide the same (I1). Results an earlier execution
+/// or production recorded are charged, never refused: they happened.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EffectBytes {
+    limit: u64,
+    used: u64,
+}
+
+impl EffectBytes {
+    /// A turn of an actor type whose `effect_bytes_per_turn` is `limit`.
+    pub fn new(limit: u64) -> EffectBytes {
+        EffectBytes { limit, used: 0 }
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// What is left.
+    pub fn remaining(&self) -> u64 {
+        self.limit.saturating_sub(self.used)
+    }
+
+    /// Whether `bytes` more fit.
+    pub fn fits(&self, bytes: u64) -> bool {
+        bytes <= self.remaining()
+    }
+
+    /// Takes what a recorded result holds, which may pass the limit only for
+    /// a result recorded before the limit existed.
+    pub fn charge(&mut self, bytes: u64) {
+        self.used = self.used.saturating_add(bytes);
+    }
+
+    /// The error of an effect that would pass the limit, recorded as its
+    /// result: `sent` when its request happened and its response did not
+    /// fit, else it did not happen.
+    pub fn exceeded(&self, sent: bool) -> String {
+        let code = ErrorCode::EffectBytesExceeded.as_str();
+        let limit = self.limit;
+        if sent {
+            format!(
+                "{code}: the response would make the turn's effects record more than \
+                 {limit} bytes (effect_bytes_per_turn); it was not recorded"
+            )
+        } else {
+            format!(
+                "{code}: the request would make the turn's effects record more than \
+                 {limit} bytes (effect_bytes_per_turn); it was not sent"
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

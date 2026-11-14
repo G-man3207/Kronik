@@ -653,10 +653,28 @@ it is not a setting, and `kronik limits set` does not raise it. A turn that
 would need more fails with `TURN_TOO_LARGE` instead (its writes and messages
 are discarded, its effects are recorded, a message input becomes a dead
 letter, and an HTTP client gets `TURN_FAILED`), and an HTTP response larger
-than what is left for the turn is `too-large` for the actor. So one turn
-writes at most about 256 MiB of log: its effect results as they happen and
-its record at the end. The per-kind limits (`effect_response_bytes`,
-`message_bytes`, `state_value_bytes`, `sql_bytes_per_actor`) apply within it.
+than what is left for the turn is `too-large` for the actor. The per-kind
+limits (`effect_response_bytes`, `message_bytes`, `state_value_bytes`,
+`sql_bytes_per_actor`) apply within it.
+
+What a turn's effects record as they happen is bounded per actor type by
+`effect_bytes_per_turn`, 32 MiB by default ([ADR
+0145](../adr/0145-effect-bytes-per-turn.md)). It counts the requests and
+responses the turn's effect results hold inline: HTTP bodies with their
+headers, `call` messages and replies, frames sent now. A body stored as a
+blob counts only its reference. An effect that would pass it fails with
+`EFFECT_BYTES_EXCEEDED`, recorded as its result, and the turn goes on.
+A request that does not fit is not sent; a response that does not fit was
+sent and is not recorded; the actor gets `too-large` for a fetch and an
+error with the code for the other kinds. So one turn writes at most about
+that limit plus 128 MiB of log. Raise it for a kind that needs more:
+
+```sh
+kronik limits set billing --effect-bytes-per-turn 64Mi --reason "monthly export fetches large pages"
+```
+
+Moving large bodies into blobs, or splitting the work over several turns,
+is usually better than a larger limit.
 
 Releases up to v0.4.1 had no such check: a turn could commit a record over
 128 MiB, which their own `history` then refused (`STORAGE_CORRUPT: entry

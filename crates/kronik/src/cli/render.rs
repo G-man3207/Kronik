@@ -995,7 +995,7 @@ pub fn limits_set(r: &LimitsResponse, rerun: &str) -> String {
 }
 
 /// Every limit, labelled, in human units.
-fn limit_values(l: &LimitsView) -> [(&'static str, String); 11] {
+fn limit_values(l: &LimitsView) -> [(&'static str, String); 12] {
     [
         ("Fuel", l.fuel.to_string()),
         ("Memory", units::size(l.memory_bytes)),
@@ -1004,6 +1004,7 @@ fn limit_values(l: &LimitsView) -> [(&'static str, String); 11] {
         ("SQL size", units::size(l.sql_bytes_per_actor)),
         ("Effect timeout", units::duration(l.effect_timeout_ms)),
         ("Effect response", units::size(l.effect_response_bytes)),
+        ("Effect bytes", units::size(l.effect_bytes_per_turn)),
         ("Not fingerprinted", not_fingerprinted(l)),
         ("Blob threshold", units::size(l.blob_threshold_bytes)),
         ("Upload size", units::size(l.upload_bytes)),
@@ -1056,6 +1057,7 @@ pub fn limits(r: &LimitsListResponse) -> String {
             "SQL",
             "EFFECT TIMEOUT",
             "EFFECT RESPONSE",
+            "EFFECT BYTES",
             "NOT FINGERPRINTED",
             "BLOB THRESHOLD",
             "UPLOAD",
@@ -1829,6 +1831,7 @@ mod tests {
             blob_threshold_bytes: 1 << 20,
             upload_bytes: 64 << 20,
             blob_bytes_per_actor: 1 << 30,
+            effect_bytes_per_turn: 32 << 20,
             fingerprint_exclude_headers: vec![],
             fingerprint_exclude_query: vec![],
             epoch: Some(4),

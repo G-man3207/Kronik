@@ -140,3 +140,4 @@
 - [ADR 0134: Per-kind HTTP fingerprint rules](adr/0134-per-kind-http-fingerprint-rules.md)
 - [ADR 0140: The default turn concurrency follows the CPUs](adr/0140-default-concurrency-follows-the-cpus.md)
 - [ADR 0142: Encrypted scrub-only copies of recorded external secret versions](adr/0142-scrub-only-copies-of-external-secret-versions.md)
+- [ADR 0145: A per-turn cap on the effect bytes a turn records](adr/0145-effect-bytes-per-turn.md)

@@ -470,3 +470,60 @@ fn an_undecodable_turn_record_fails_and_decodes() {
     assert!(outcome.output.is_none());
     Record::TurnRecord(t).validate().unwrap();
 }
+
+/// What an effect records inline (ADR 0145) is its request and its
+/// response as recorded; a body stored as a blob is only its reference
+/// there, and a result without either counts nothing.
+#[test]
+fn effect_bytes_are_the_request_and_response_as_recorded() {
+    let e = effect(1, 1000);
+    let request = e.request.as_ref().unwrap().encoded_len() as u64;
+    let response = e.response.as_ref().unwrap().encoded_len() as u64;
+    assert_eq!(effect_bytes(&e), request + response);
+    assert!(effect_bytes(&e) > 1000);
+    let refused = pb::EffectRecord {
+        request: None,
+        response: None,
+        ..effect(2, 0)
+    };
+    assert_eq!(effect_bytes(&refused), 0);
+    // A response stored as a blob: its reference, not its million bytes.
+    let blob = pb::HttpEffectResponse {
+        status: 200,
+        headers: vec![],
+        body: vec![],
+        body_blob: Some(pb::BlobRef {
+            hash: format!("b3:{}", "ab".repeat(32)),
+            size: 1 << 20,
+            subject: None,
+            key_version: 0,
+        }),
+    };
+    let blobbed = pb::EffectRecord {
+        response: tagged(&blob.encode_to_vec()),
+        ..effect(3, 0)
+    };
+    assert!(effect_bytes(&blobbed) < 200, "{}", effect_bytes(&blobbed));
+}
+
+/// The effect bytes take what fits up to their limit, exactly; a charge
+/// (a result that happened) may pass it, and the refusals name the code.
+#[test]
+fn effect_bytes_fit_up_to_their_limit_and_charge_what_happened() {
+    let mut bytes = EffectBytes::new(100);
+    assert!(bytes.fits(100) && !bytes.fits(101));
+    bytes.charge(60);
+    assert_eq!(bytes.remaining(), 40);
+    assert!(bytes.fits(40) && !bytes.fits(41));
+    bytes.charge(60);
+    assert_eq!(bytes.remaining(), 0);
+    assert!(bytes.fits(0) && !bytes.fits(1));
+    let refused = bytes.exceeded(false);
+    assert!(refused.starts_with("EFFECT_BYTES_EXCEEDED: "), "{refused}");
+    assert!(
+        refused.contains("100 bytes") && refused.contains("not sent"),
+        "{refused}"
+    );
+    assert!(bytes.exceeded(true).contains("not recorded"));
+    assert_eq!(EffectBytes::default().remaining(), 0);
+}

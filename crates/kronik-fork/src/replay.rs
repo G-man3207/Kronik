@@ -1227,6 +1227,9 @@ impl Runner {
             call_chain,
             state: Mutex::new(GateState {
                 budget,
+                effect_bytes: kronik_sched::record_budget::EffectBytes::new(
+                    kl.effect_bytes_per_turn,
+                ),
                 ..GateState::default()
             }),
             erased_effects,
@@ -1697,6 +1700,9 @@ struct GateState {
     /// What the turn's record may still take, charged as in production
     /// (`kronik_sched::record_budget`).
     budget: kronik_sched::record_budget::Budget,
+    /// What the turn's effects may still record inline, charged as in
+    /// production (ADR 0145).
+    effect_bytes: kronik_sched::record_budget::EffectBytes,
     /// The keys this turn computed with on the host, for scrubbing. Not
     /// every secret use: see [`used_a_secret`].
     secrets: Vec<(String, Vec<u8>)>,
@@ -2286,30 +2292,96 @@ impl ReplayGate {
         let cost = kronik_sched::record_budget::effect_cost(&mut rec);
         let mut state = lock(&self.state);
         state.budget.take(cost, rec.ordinal, &rec.kind)?;
+        // Every result is charged its inline bytes, as in production; one
+        // production recorded is never refused for them (ADR 0145).
+        state
+            .effect_bytes
+            .charge(kronik_sched::record_budget::effect_bytes(&rec));
         state.records.push(rec);
         Ok(())
     }
 
+    /// What is left of the turn's effect bytes (ADR 0145).
+    fn effect_room(&self) -> kronik_sched::record_budget::EffectBytes {
+        lock(&self.state).effect_bytes.clone()
+    }
+
+    /// Production's refusal of a new effect whose request, or whose request
+    /// and largest response, does not fit in what is left of the turn's
+    /// effect bytes: it does not happen, and its result says so in
+    /// production's words (ADR 0145). `status` gives the guest the outcome
+    /// production gives.
+    fn refuse_effect_bytes(
+        &self,
+        ordinal: u32,
+        kind: &str,
+        target: String,
+        fingerprint: Vec<u8>,
+        status: pb::EffectStatus,
+    ) -> Result<String, GateError> {
+        let error = self.effect_room().exceeded(false);
+        self.push(pb::EffectRecord {
+            ordinal,
+            kind: kind.into(),
+            target,
+            fingerprint,
+            status: status as i32,
+            error: error.clone(),
+            grounding: pb::Grounding::Live as i32,
+            ..Default::default()
+        })?;
+        Ok(error)
+    }
+
+    /// Whether a new fetch whose recorded request is `encoded` must be
+    /// refused for the turn's effect bytes before it happens (ADR 0145).
+    fn request_over_effect_bytes(&self, encoded: Option<&pb::Sealable>) -> bool {
+        let bytes = encoded.map_or(0, |s| s.encoded_len()) as u64;
+        !self.effect_room().fits(bytes)
+    }
+
     /// Production's response cap for a new fetch whose recorded request is
     /// `encoded`: what is left of the turn's record after the request and a
-    /// result without a body, at most the kind's `effect_response_bytes`.
-    fn response_cap(&self, encoded: Option<&pb::Sealable>, effect_response_bytes: u64) -> u64 {
+    /// result without a body, at most the kind's `effect_response_bytes`,
+    /// and at most what is left of the turn's effect bytes after the request
+    /// (ADR 0145). The flag says that the effect bytes are the smaller.
+    fn response_cap(
+        &self,
+        encoded: Option<&pb::Sealable>,
+        effect_response_bytes: u64,
+    ) -> (u64, bool) {
         let len = match encoded.and_then(|s| s.value.as_ref()) {
             Some(pb::sealable::Value::Plain(bytes)) => bytes.len(),
             _ => 0,
         };
-        let room = lock(&self.state).budget.clone();
-        kronik_sched::record_budget::response_room(
+        let (room, effect_room) = {
+            let state = lock(&self.state);
+            (state.budget.clone(), state.effect_bytes.clone())
+        };
+        let record_room = kronik_sched::record_budget::response_room(
             &room,
             kronik_sched::record_budget::fetch_need(len),
             effect_response_bytes,
+        );
+        let effect_bytes_room = effect_room
+            .remaining()
+            .saturating_sub(encoded.map_or(0, |s| s.encoded_len()) as u64);
+        (
+            record_room.min(effect_bytes_room),
+            effect_bytes_room < record_room,
         )
     }
 
     /// The error of a response over `cap` ([`ReplayGate::response_cap`]),
     /// worded as production words it.
-    fn too_large_error(cap: u64, effect_response_bytes: u64) -> String {
-        if cap < effect_response_bytes {
+    fn too_large_error(
+        &self,
+        (cap, effect_bytes): (u64, bool),
+        effect_response_bytes: u64,
+    ) -> String {
+        if effect_bytes {
+            self.effect_room().exceeded(true)
+        } else if cap < effect_response_bytes {
             format!("the response exceeds {cap} bytes, what is left of the turn's record")
         } else {
             format!("the response exceeds {cap} bytes")
@@ -2330,14 +2402,25 @@ impl ReplayGate {
         if matches!(out, Ok(FetchOutcome::HostRedactionFailure) | Err(_)) {
             return out;
         }
-        let room = lock(&self.state).budget.clone();
-        if room.fits(kronik_sched::record_budget::effect_cost(rec)) {
-            return out;
+        let (room, effect_room) = {
+            let state = lock(&self.state);
+            (state.budget.clone(), state.effect_bytes.clone())
+        };
+        if !room.fits(kronik_sched::record_budget::effect_cost(rec)) {
+            rec.response = None;
+            rec.status = pb::EffectStatus::TooLarge as i32;
+            rec.error = "the response does not fit in what is left of the turn's record".into();
+            return Ok(FetchOutcome::TooLarge);
         }
-        rec.response = None;
-        rec.status = pb::EffectStatus::TooLarge as i32;
-        rec.error = "the response does not fit in what is left of the turn's record".into();
-        Ok(FetchOutcome::TooLarge)
+        // With its headers the answer may still pass what is left of the
+        // turn's effect bytes, as in production (ADR 0145).
+        if !effect_room.fits(kronik_sched::record_budget::effect_bytes(rec)) {
+            rec.response = None;
+            rec.status = pb::EffectStatus::TooLarge as i32;
+            rec.error = effect_room.exceeded(true);
+            return Ok(FetchOutcome::TooLarge);
+        }
+        out
     }
 
     /// Production's admission of a new effect: its `need` bytes must fit in
@@ -2506,9 +2589,15 @@ impl ReplayGate {
             return Ok(FetchOutcome::Denied(e));
         }
         let prod = self.prod_at(ordinal).cloned();
-        let prod_req = prod.as_ref().filter(|p| p.kind == kind).and_then(|p| {
-            pb::HttpEffectRequest::decode(sealable_bytes(p.request.as_ref()).as_slice()).ok()
-        });
+        // A result without a request (a refusal for the turn's effect bytes,
+        // ADR 0145) has nothing to match: the fork decides that effect
+        // itself, as production did.
+        let prod_req = prod
+            .as_ref()
+            .filter(|p| p.kind == kind && p.request.is_some())
+            .and_then(|p| {
+                pb::HttpEffectRequest::decode(sealable_bytes(p.request.as_ref()).as_slice()).ok()
+            });
         let mut headers = Vec::new();
         for (name, value) in &req.headers {
             if name.eq_ignore_ascii_case("idempotency-key") {
@@ -2707,6 +2796,12 @@ impl ReplayGate {
             let error = kronik_sched::effects::not_held_error(hash, *size);
             self.push(self.denied(ordinal, kind, cap, error.clone()))?;
             return Ok(FetchOutcome::Denied(error));
+        }
+        // A new fetch whose request does not fit in what is left of the
+        // turn's effect bytes is not sent, as in production (ADR 0145).
+        if self.request_over_effect_bytes(encoded.as_ref()) {
+            self.refuse_effect_bytes(ordinal, kind, cap, fp, pb::EffectStatus::TooLarge)?;
+            return Ok(FetchOutcome::TooLarge);
         }
         let setup = &self.runner.setup;
         let sims = setup.simulators.target(&original_cap);
@@ -2935,6 +3030,12 @@ impl ReplayGate {
         let exact = prod.as_ref().is_some_and(|p| {
             sealer.fingerprint_matches(req.subject.as_deref(), &p.fingerprint, &matching_fp)
         });
+        // Production's own result is served below when the request is the
+        // same; a new one that does not fit is not sent (ADR 0145).
+        if !exact && self.request_over_effect_bytes(encoded.as_ref()) {
+            self.refuse_effect_bytes(ordinal, "foreign.http", cap, fp, pb::EffectStatus::TooLarge)?;
+            return Ok(FetchOutcome::TooLarge);
+        }
         let headers = req
             .headers
             .iter()
@@ -2948,7 +3049,7 @@ impl ReplayGate {
             url: req.url,
             headers,
             body: inline_request_body(&req.body)?.to_vec().into(),
-            max_response_bytes: cap_bytes,
+            max_response_bytes: cap_bytes.0,
         });
         let answer = env.timeout(limits.effect_timeout, call).await;
         if let Some(p) = prod.filter(|_| exact) {
@@ -2976,7 +3077,7 @@ impl ReplayGate {
                 pb::EffectStatus::Timeout
             }
             Ok(Err(kronik_core::env::NetError::TooLarge)) => {
-                rec.error = Self::too_large_error(cap_bytes, limits.effect_response_bytes);
+                rec.error = self.too_large_error(cap_bytes, limits.effect_response_bytes);
                 pb::EffectStatus::TooLarge
             }
             Ok(Err(kronik_core::env::NetError::Connect(e) | kronik_core::env::NetError::Io(e))) => {
@@ -3053,7 +3154,7 @@ impl ReplayGate {
                 url: req.url,
                 headers,
                 body: inline_request_body(&req.body)?.to_vec().into(),
-                max_response_bytes: cap_bytes,
+                max_response_bytes: cap_bytes.0,
             },
             self.original()?.clone(),
         );
@@ -3066,7 +3167,7 @@ impl ReplayGate {
                 pb::EffectStatus::Timeout
             }
             Ok(Err(kronik_core::env::NetError::TooLarge)) => {
-                rec.error = Self::too_large_error(cap_bytes, limits.effect_response_bytes);
+                rec.error = self.too_large_error(cap_bytes, limits.effect_response_bytes);
                 pb::EffectStatus::TooLarge
             }
             Ok(Err(kronik_core::env::NetError::Connect(e) | kronik_core::env::NetError::Io(e))) => {
@@ -3165,6 +3266,29 @@ impl ReplayGate {
         let msg_subject = msg.body.as_ref().and_then(|b| b.subject.clone());
         let plain = blake3::hash(&encoded).as_bytes().to_vec();
         let sealer = &self.runner.setup.privacy.sealer;
+        // As in production: its request and the largest reply must fit in
+        // what is left of the turn's effect bytes (ADR 0145).
+        let request_bytes = tagged(&msg_subject, encoded.clone())
+            .as_ref()
+            .map_or(0, |s| s.encoded_len()) as u64;
+        let reply_bytes_most = self
+            .config()
+            .limits(&to.kind)
+            .message_bytes
+            .saturating_add(kronik_sched::record_budget::SMALL_EFFECT_BYTES);
+        if !self
+            .effect_room()
+            .fits(request_bytes.saturating_add(reply_bytes_most))
+        {
+            let error = self.refuse_effect_bytes(
+                ordinal,
+                "actor.call",
+                format!("actor:{to}"),
+                sealer.effect_fingerprint(msg_subject.as_deref(), plain),
+                pb::EffectStatus::Failed,
+            )?;
+            return Ok(CallOutcome::Failed(error));
+        }
         // The same request that timed out in production: the fork's own call
         // never times out, so it serves the recorded outcome instead.
         let recorded_timeout = self
@@ -3413,6 +3537,16 @@ impl ReplayGate {
             self.push(rec)?;
             return Ok(out);
         }
+        // A new crypto effect needs room in the turn's effect bytes, as in
+        // production (ADR 0145).
+        if !self
+            .effect_room()
+            .fits(kronik_sched::record_budget::SMALL_EFFECT_BYTES)
+        {
+            let error =
+                self.refuse_effect_bytes(ordinal, kind, cap, fp, pb::EffectStatus::Denied)?;
+            return Ok(CryptoOutcome::Denied(error));
+        }
         // Unmatched. A recorded grant does not compute. Compute signs on the
         // host with the built-in store's value, or with the value held for
         // the fork point's link of a linked name; the key never leaves it.
@@ -3561,6 +3695,24 @@ impl ReplayGate {
             self.push(rec)?;
             return Ok(outcome);
         }
+        // A new frame that does not fit in what is left of the turn's effect
+        // bytes is not sent, as in production (ADR 0145).
+        if req.live && !req.closing {
+            let frame = record(pb::EffectStatus::Ok, pb::Grounding::Synthetic);
+            if !self
+                .effect_room()
+                .fits(kronik_sched::record_budget::effect_bytes(&frame))
+            {
+                let error = self.refuse_effect_bytes(
+                    ordinal,
+                    KIND,
+                    target.clone(),
+                    fp.clone(),
+                    pb::EffectStatus::Denied,
+                )?;
+                return Ok(SendNowOutcome::Denied(error));
+            }
+        }
         let (status, outcome) = if !req.live || req.closing {
             (pb::EffectStatus::Closed, SendNowOutcome::Closed)
         } else {
@@ -3602,6 +3754,15 @@ impl ReplayGate {
         let matched = self
             .prod_at(ordinal)
             .is_some_and(|p| p.kind == kind && p.fingerprint == fp);
+        if !matched
+            && !self
+                .effect_room()
+                .fits(kronik_sched::record_budget::SMALL_EFFECT_BYTES)
+        {
+            let error =
+                self.refuse_effect_bytes(ordinal, kind, cap, fp, pb::EffectStatus::Denied)?;
+            return Ok(Err(error));
+        }
         self.push(pb::EffectRecord {
             ordinal,
             kind: kind.into(),

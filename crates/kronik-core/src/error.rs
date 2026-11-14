@@ -146,6 +146,9 @@ codes! {
     DeploymentNotFound = "DEPLOYMENT_NOT_FOUND", 404, "M3",
         "No such deployment",
         "List the deployments and their epochs with `kronik deployments list`.";
+    EffectBytesExceeded = "EFFECT_BYTES_EXCEEDED", 413, "M1",
+        "The turn's effects would record more than its effect bytes allow",
+        "Raise the kind's limit with `kronik limits set <kind> --effect-bytes-per-turn <size>`, move large bodies to blobs (streaming), or split the work over several turns.";
     EffectOutcomeUnknown = "EFFECT_OUTCOME_UNKNOWN", 500, "M2",
         "An unsafe effect may or may not have happened",
         "Check the target system; resend the dead letter only if the effect did not happen.";

@@ -835,6 +835,7 @@ fn projected_lines(
                 ("blob_threshold_bytes", l.blob_threshold_bytes),
                 ("upload_bytes", l.upload_bytes),
                 ("blob_bytes_per_actor", l.blob_bytes_per_actor),
+                ("effect_bytes_per_turn", l.effect_bytes_per_turn),
             ] {
                 if let Some(v) = v {
                     details.insert(name.into(), v.into());

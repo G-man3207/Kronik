@@ -224,6 +224,9 @@ enum Exchanged {
     StoreFailed(String),
     /// The response could not be stored for another reason.
     Failed(String),
+    /// The inline response would pass what is left of the turn's effect
+    /// bytes (ADR 0145).
+    OverEffectBytes,
 }
 
 /// A successful reply must already be resolved through the gate's actual
@@ -804,6 +807,10 @@ pub(crate) struct FxState {
     /// is charged here, and a new effect that does not fit is refused before
     /// it happens (`TURN_TOO_LARGE`).
     pub budget: crate::record_budget::Budget,
+    /// What the turn's effects may still record inline (ADR 0145): every
+    /// result is charged, and a new effect that would pass it fails with
+    /// `EFFECT_BYTES_EXCEEDED`.
+    pub effect_bytes: crate::record_budget::EffectBytes,
     pub last_result_lsn: u64,
     /// Compensations of successful calls, delivered if the turn fails.
     pub compensations: Vec<pb::OutboundMessage>,
@@ -1002,6 +1009,8 @@ impl TurnFx {
     pub fn new(node: Arc<Node>, spec: TurnSpec, original_execution: AuthLease) -> Arc<TurnFx> {
         let begun = spec.recorded.is_some();
         let budget = spec.budget.clone();
+        let effect_bytes =
+            crate::record_budget::EffectBytes::new(spec.limits.effect_bytes_per_turn);
         Arc::new(TurnFx {
             node,
             spec,
@@ -1009,6 +1018,7 @@ impl TurnFx {
             state: Mutex::new(FxState {
                 begun,
                 budget,
+                effect_bytes,
                 ..FxState::default()
             }),
             blobs: std::sync::OnceLock::new(),
@@ -1038,12 +1048,20 @@ impl TurnFx {
         lock(&self.state).budget.clone()
     }
 
+    /// What is left of the turn's effect bytes (ADR 0145).
+    fn effect_room(&self) -> crate::record_budget::EffectBytes {
+        lock(&self.state).effect_bytes.clone()
+    }
+
     /// A result an earlier execution recorded (a re-run): the guest sees
     /// it whatever its size, so it is charged and never refused.
     fn push_recorded(&self, mut rec: pb::EffectRecord) {
         let cost = crate::record_budget::effect_cost(&mut rec);
         let mut state = lock(&self.state);
         state.budget.charge(cost);
+        state
+            .effect_bytes
+            .charge(crate::record_budget::effect_bytes(&rec));
         state.records.push(rec);
     }
 
@@ -1167,6 +1185,9 @@ impl TurnFx {
                 return Err(state.budget.refuse(rec.ordinal, &rec.kind));
             }
             state.budget.charge(cost);
+            state
+                .effect_bytes
+                .charge(crate::record_budget::effect_bytes(&rec));
         }
         let mut result = Record::EffectResult(pb::EffectResult {
             execution_id: self.spec.execution_id.clone(),
@@ -1196,8 +1217,32 @@ impl TurnFx {
         let cost = crate::record_budget::effect_cost(&mut rec);
         let mut state = lock(&self.state);
         state.budget.take(cost, rec.ordinal, &rec.kind)?;
+        state
+            .effect_bytes
+            .charge(crate::record_budget::effect_bytes(&rec));
         state.records.push(rec);
         Ok(())
+    }
+
+    /// A new effect whose request, or whose request and largest response,
+    /// does not fit in what is left of the turn's effect bytes: it does not
+    /// happen, and its result says so (ADR 0145). Deterministic, so noted
+    /// without an fsync, as a denial is. `status` is the one whose outcome
+    /// the guest sees for the effect's kind.
+    fn refuse_effect_bytes(
+        &self,
+        ordinal: u32,
+        kind: &str,
+        target: String,
+        fingerprint: Vec<u8>,
+        status: pb::EffectStatus,
+    ) -> Result<String, GateError> {
+        let mut rec = self.base(ordinal, kind, target, fingerprint);
+        rec.status = status as i32;
+        rec.error = self.effect_room().exceeded(false);
+        let error = rec.error.clone();
+        self.note(rec)?;
+        Ok(error)
     }
 
     fn base(&self, ordinal: u32, kind: &str, target: String, fp: Vec<u8>) -> pb::EffectRecord {
@@ -1628,6 +1673,20 @@ impl TurnFx {
         let idem = causal::idempotency_key(&self.spec.causal_key, ordinal);
         let mut rec = self.base(ordinal, kind, recorded_cap, fp);
         rec.request = tagged(&subject, recorded.encode_to_vec());
+        // Its request as recorded must fit in what is left of the turn's
+        // effect bytes, or it is not sent (ADR 0145).
+        let effect_room = self.effect_room();
+        let request_bytes = crate::record_budget::effect_bytes(&rec);
+        if !effect_room.fits(request_bytes) {
+            self.refuse_effect_bytes(
+                ordinal,
+                kind,
+                rec.target.clone(),
+                rec.fingerprint.clone(),
+                pb::EffectStatus::TooLarge,
+            )?;
+            return Ok(FetchOutcome::TooLarge);
+        }
         rec.blobs = blob_body.iter().cloned().collect();
         // The record must not precede its blob (ADR 0117 §4): a body the
         // turn wrote itself is named durably only at its commit otherwise.
@@ -1716,12 +1775,16 @@ impl TurnFx {
         let started = self.node.env.clock.monotonic();
         rec.offset_us = started.saturating_sub(self.spec.started).as_micros() as u64;
         // The response may take what is left of the turn's record after
-        // the request, at most the kind's effect_response_bytes.
-        let max_response_bytes = crate::record_budget::response_room(
+        // the request, at most the kind's effect_response_bytes, and an
+        // inline one at most what is left of the turn's effect bytes after
+        // the request (ADR 0145).
+        let record_room = crate::record_budget::response_room(
             &self.room(),
             need,
             self.spec.limits.effect_response_bytes,
         );
+        let effect_bytes_room = effect_room.remaining().saturating_sub(request_bytes);
+        let max_response_bytes = record_room.min(effect_bytes_room);
         // A kind that reads blobs streams the exchange (M25 §7.3): a body
         // above its threshold becomes a blob, under the effect timeout that
         // covers the whole exchange.
@@ -1769,8 +1832,11 @@ impl TurnFx {
                         match response.body.next().await {
                             Ok(Some(chunk)) => first.extend_from_slice(&chunk),
                             Ok(None) => {
-                                if first.len() as u64 > max_response_bytes {
+                                if first.len() as u64 > record_room {
                                     return Err(NetError::TooLarge);
+                                }
+                                if first.len() as u64 > effect_bytes_room {
+                                    return Ok(Exchanged::OverEffectBytes);
                                 }
                                 return Ok(Exchanged::Response {
                                     status: response.status,
@@ -1876,6 +1942,16 @@ impl TurnFx {
                 );
                 FetchOutcome::TooLarge
             }
+            Ok(Err(NetError::TooLarge)) if effect_bytes_room < record_room => {
+                rec.status = pb::EffectStatus::TooLarge as i32;
+                rec.error = effect_room.exceeded(true);
+                FetchOutcome::TooLarge
+            }
+            Ok(Ok(Exchanged::OverEffectBytes)) => {
+                rec.status = pb::EffectStatus::TooLarge as i32;
+                rec.error = effect_room.exceeded(true);
+                FetchOutcome::TooLarge
+            }
             Ok(Err(NetError::TooLarge)) => {
                 rec.status = pb::EffectStatus::TooLarge as i32;
                 rec.error = if max_response_bytes < self.spec.limits.effect_response_bytes {
@@ -1954,6 +2030,15 @@ impl TurnFx {
                 rec.response = None;
                 rec.status = pb::EffectStatus::TooLarge as i32;
                 rec.error = "the response does not fit in what is left of the turn's record".into();
+                FetchOutcome::TooLarge
+            }
+            // With its headers the response may still pass what is left of
+            // the turn's effect bytes (ADR 0145): it is not recorded, and the
+            // guest never sees it.
+            _ if !effect_room.fits(crate::record_budget::effect_bytes(&rec)) => {
+                rec.response = None;
+                rec.status = pb::EffectStatus::TooLarge as i32;
+                rec.error = effect_room.exceeded(true);
                 FetchOutcome::TooLarge
             }
             outcome => outcome,
@@ -2217,9 +2302,33 @@ impl TurnFx {
         let need = crate::record_budget::call_need(encoded.len(), cleanup.as_ref(), &to.to_pb())
             + crate::record_budget::blobs_need(&blobs);
         self.admit(ordinal, kind, need)?;
+        // Its request as recorded and the largest reply the callee may send
+        // (its type's message size) must fit in what is left of the turn's
+        // effect bytes, or it does not happen (ADR 0145).
+        let request = tagged(&subject, encoded);
+        let reply_bytes_most = self
+            .spec
+            .config
+            .limits(&to.kind)
+            .message_bytes
+            .saturating_add(crate::record_budget::SMALL_EFFECT_BYTES);
+        let request_bytes = request.as_ref().map_or(0, |s| s.encoded_len()) as u64;
+        if !self
+            .effect_room()
+            .fits(request_bytes.saturating_add(reply_bytes_most))
+        {
+            let error = self.refuse_effect_bytes(
+                ordinal,
+                kind,
+                target,
+                fingerprint,
+                pb::EffectStatus::Failed,
+            )?;
+            return Ok(CallOutcome::Failed(error));
+        }
         self.begin().await?;
         let mut record = self.base(ordinal, kind, target, fingerprint);
-        record.request = tagged(&subject, encoded);
+        record.request = request;
         record.blobs = blobs;
         let (outcome, source, prepared_scope) =
             self.perform_call(ordinal, &to, msg, &message_id).await?;
@@ -2453,6 +2562,14 @@ impl TurnFx {
             });
         }
         self.admit(ordinal, kind, crate::record_budget::SMALL_NEED)?;
+        if !self
+            .effect_room()
+            .fits(crate::record_budget::SMALL_EFFECT_BYTES)
+        {
+            let error =
+                self.refuse_effect_bytes(ordinal, kind, cap, fp, pb::EffectStatus::Denied)?;
+            return Ok(CryptoOutcome::Denied(error));
+        }
         self.begin().await?;
         let mut rec = self.base(ordinal, kind, cap, fp);
         let outcome = match self.new_secret_value(&secret).await? {
@@ -2564,6 +2681,15 @@ impl TurnFx {
             send_now_request(&req.connection, req.seq, &req.frame).encoded_len(),
         );
         self.admit(ordinal, KIND, need)?;
+        // The frame as recorded must fit in what is left of the turn's
+        // effect bytes, or it is not sent (ADR 0145).
+        let frame_bytes = request(req.seq).as_ref().map_or(0, |s| s.encoded_len()) as u64;
+        if !self.effect_room().fits(frame_bytes) {
+            let error =
+                self.refuse_effect_bytes(ordinal, KIND, target, fp, pb::EffectStatus::Denied)?;
+            send_now_metric(self.kind(), pb::EffectStatus::Denied);
+            return Ok(SendNowOutcome::Denied(error));
+        }
         let mut rec = self.base(ordinal, KIND, target, fp);
         rec.delivery = Delivery::Unsafe.as_str().into();
         if self.rerun() {
@@ -2667,6 +2793,14 @@ impl TurnFx {
             });
         }
         self.admit(ordinal, kind, crate::record_budget::SMALL_NEED)?;
+        if !self
+            .effect_room()
+            .fits(crate::record_budget::SMALL_EFFECT_BYTES)
+        {
+            let error =
+                self.refuse_effect_bytes(ordinal, kind, cap, fp, pb::EffectStatus::Denied)?;
+            return Ok(Err(error));
+        }
         self.begin().await?;
         let mut rec = self.base(ordinal, kind, cap, fp);
         let out = match self.new_secret_value(&name).await? {

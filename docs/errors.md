@@ -49,6 +49,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`DEAD_LETTER_ALREADY_RESENT`](#dead_letter_already_resent) | 409 | M1 | The dead letter was already resent |
 | [`DEAD_LETTER_NOT_FOUND`](#dead_letter_not_found) | 404 | M1 | No such dead letter |
 | [`DEPLOYMENT_NOT_FOUND`](#deployment_not_found) | 404 | M3 | No such deployment |
+| [`EFFECT_BYTES_EXCEEDED`](#effect_bytes_exceeded) | 413 | M1 | The turn's effects would record more than its effect bytes allow |
 | [`EFFECT_OUTCOME_UNKNOWN`](#effect_outcome_unknown) | 500 | M2 | An unsafe effect may or may not have happened |
 | [`ENGINE_UPGRADE_DIVERGED`](#engine_upgrade_diverged) | 409 | M6 | The new engine version changes behavior |
 | [`ENGINE_VERSION_MISMATCH`](#engine_version_mismatch) | 409 | M6 | The engine version differs from the recorded one |
@@ -401,6 +402,24 @@ Typical causes: a typo, or an epoch that belongs to another configuration change
     kronik deployments list
 
 See also: [`deployment`](concepts/glossary.md#deployment), [`configuration-epoch`](concepts/glossary.md#configuration-epoch), [`ROLLBACK_SCHEMA_CHANGED`](#rollback_schema_changed).
+
+## EFFECT_BYTES_EXCEEDED
+
+HTTP status 413, milestone M1. The turn's effects would record more than its effect bytes allow.
+
+Default hint: Raise the kind's limit with `kronik limits set <kind> --effect-bytes-per-turn <size>`, move large bodies to blobs (streaming), or split the work over several turns.
+
+An effect of a turn would have made the turn's effects record more than the actor type's `effect_bytes_per_turn` (32 MiB by default) in the log. The bytes counted are what the turn's effect results hold inline: the request and the response of every effect as recorded (an HTTP body with its headers, a `call`'s message and reply, a frame sent now, the small records of crypto and secret reveals). A body stored as a blob counts only its reference: the blob quota bounds it.
+
+The effect fails; the turn goes on and its code decides what to do. When the request alone does not fit in what is left, the effect does not happen: nothing is sent. When the response would not fit, the request was sent and the response is not recorded: an `http.fetch` gets `too-large`, a `call` gets `failed` with this code in its text, a `send-now` gets `denied`, a crypto call `denied` and a secret reveal an error, each with this code. The failure is recorded as the effect's result, so a re-run and a fork's replay get the same answer.
+
+The limit is per actor type, set in the log like every limit, so every node and every replay decides the same way:
+
+    kronik limits set billing --effect-bytes-per-turn 64Mi --reason "monthly export fetches large pages"
+
+Typical causes: a loop that fetches many pages in one turn, or responses that should be streamed into blobs. Prefer streaming large bodies into blobs (a kind whose code reads blobs keeps bodies above its blob threshold out of the log), or splitting the work over several turns, to a larger limit.
+
+See also: [`effect`](concepts/glossary.md#effect), [`TURN_TOO_LARGE`](#turn_too_large), [`blob`](concepts/glossary.md#blob).
 
 ## EFFECT_OUTCOME_UNKNOWN
 

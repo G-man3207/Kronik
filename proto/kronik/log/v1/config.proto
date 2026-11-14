@@ -126,6 +126,10 @@ message Limits {
   // its timers, waiting messages and dead letters; ADR 0119 as amended
   // 2026-11-14), and the bytes one turn creates.
   optional uint64 blob_bytes_per_actor = 15;
+  // The bytes one turn's effects record inline: the requests and responses
+  // of its effect results as recorded, a body stored as a blob counting only
+  // its reference (ADR 0145).
+  optional uint64 effect_bytes_per_turn = 18;
 }
 
 // A list a record sets as a whole, so that an empty list and no list differ.

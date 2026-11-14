@@ -33,6 +33,15 @@ until the v1.0 compatibility promise takes effect.
   the coverage watermark had got. The keystore now answers "erased" for every
   version an erasure covers, 0 included; a tombstone of a subject it never
   erased still fails closed. v0.4.1 had the same defect.
+- A per-kind limit on what one turn's effects record in the log (#74, ADR
+  0145): `effect_bytes_per_turn`, 32 MiB by default, set with `kronik limits
+  set <kind> --effect-bytes-per-turn <size>`. It counts the requests and
+  responses of the turn's effect results as recorded; a body stored as a
+  blob counts only its reference. An effect that would pass it fails with
+  the new code `EFFECT_BYTES_EXCEEDED`, recorded as its result, and the turn
+  goes on. A request that does not fit is not sent; a response that does not
+  fit is not recorded. One turn now writes at most about that limit plus one
+  record (128 MiB) to the log, instead of about twice the record limit.
 - `isolation = "microvm"` runs a foreign actor in a Firecracker microVM of
   its own (M20; ADRs 0095 and 0096, accepted on 2026-11-14), an opt-in
   level beside gVisor, which stays the default. It needs a usable `/dev/kvm`

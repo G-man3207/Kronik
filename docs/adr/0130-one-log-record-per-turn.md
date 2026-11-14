@@ -1,6 +1,6 @@
 # 0130. A turn's record fits in one log record
 
-- **Status:** Accepted (2026-11-13)
+- **Status:** Accepted (2026-11-13), amended 2026-11-14
 - **Date:** 2026-11-13
 
 ## Context
@@ -76,3 +76,11 @@ re-run and in a fork's replay.
   with a small test-only limit, and an identity replay over such turns.
 - Revisit with the per-turn effect cap, or when blobs (M26) move large
   bodies out of the record.
+
+## Amendment (2026-11-14): the per-turn effect cap
+
+The alternative "a per-turn cap on effect bytes" was decided (issue #74):
+[ADR 0145](0145-effect-bytes-per-turn.md) adds the per-kind limit
+`effect_bytes_per_turn` (32 MiB by default). An effect that would pass it
+fails with `EFFECT_BYTES_EXCEEDED`, recorded as its result. One turn now
+writes at most about that limit plus one record limit to the log.

@@ -2001,6 +2001,7 @@ impl Api {
             blob_threshold_bytes: l.blob_threshold_bytes,
             upload_bytes: l.upload_bytes,
             blob_bytes_per_actor: l.blob_bytes_per_actor,
+            effect_bytes_per_turn: l.effect_bytes_per_turn,
             epoch: None,
             lsn: None,
         }
@@ -2031,6 +2032,7 @@ impl Api {
             blob_bytes_per_actor: r.blob_bytes_per_actor,
             blob_threshold_bytes: r.blob_threshold_bytes,
             upload_bytes: r.upload_bytes,
+            effect_bytes_per_turn: r.effect_bytes_per_turn,
         };
         let (epoch, lsn, effective, rules) = self
             .node

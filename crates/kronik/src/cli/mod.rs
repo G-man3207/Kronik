@@ -522,6 +522,7 @@ pub enum LimitsCommand {
             "blob_threshold",
             "upload_size",
             "blob_size_per_actor",
+            "effect_bytes_per_turn",
         ])
 ))]
 pub struct LimitsSetArgs {
@@ -568,6 +569,11 @@ pub struct LimitsSetArgs {
     /// dead letters) and one turn may create, e.g. 2Gi.
     #[arg(long, value_name = "SIZE", value_parser = units::parse_size)]
     blob_size_per_actor: Option<u64>,
+    /// Bytes one turn's effects may record in the log: their requests and
+    /// responses, a body stored as a blob counting only its reference, e.g.
+    /// 64Mi.
+    #[arg(long, value_name = "SIZE", value_parser = units::parse_size)]
+    effect_bytes_per_turn: Option<u64>,
     #[command(flatten)]
     mutation: Mutation,
 }
@@ -1697,6 +1703,7 @@ fn limits_set(ctx: &Ctx, a: LimitsSetArgs) -> Result<ExitCode, Error> {
             blob_threshold_bytes: a.blob_threshold,
             upload_bytes: a.upload_size,
             blob_bytes_per_actor: a.blob_size_per_actor,
+            effect_bytes_per_turn: a.effect_bytes_per_turn,
             reason: reason.to_owned(),
             dry_run: a.mutation.dry_run,
         },
@@ -1734,6 +1741,10 @@ fn limits_set(ctx: &Ctx, a: LimitsSetArgs) -> Result<ExitCode, Error> {
         (
             "--blob-size-per-actor",
             a.blob_size_per_actor.map(units::size_flag),
+        ),
+        (
+            "--effect-bytes-per-turn",
+            a.effect_bytes_per_turn.map(units::size_flag),
         ),
     ] {
         if let Some(v) = value {

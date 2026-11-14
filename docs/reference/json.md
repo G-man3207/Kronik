@@ -4179,6 +4179,7 @@ against both.
             "DEAD_LETTER_ALREADY_RESENT",
             "DEAD_LETTER_NOT_FOUND",
             "DEPLOYMENT_NOT_FOUND",
+            "EFFECT_BYTES_EXCEEDED",
             "EFFECT_OUTCOME_UNKNOWN",
             "ENGINE_UPGRADE_DIVERGED",
             "ENGINE_VERSION_MISMATCH",
@@ -5794,6 +5795,12 @@ against both.
       "minimum": 0,
       "type": "integer"
     },
+    "effect_bytes_per_turn": {
+      "description": "The bytes one turn's effects may record inline (ADR 0145).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
     "effect_response_bytes": {
       "format": "uint64",
       "minimum": 0,
@@ -5882,7 +5889,8 @@ against both.
     "effect_response_bytes",
     "blob_threshold_bytes",
     "upload_bytes",
-    "blob_bytes_per_actor"
+    "blob_bytes_per_actor",
+    "effect_bytes_per_turn"
   ],
   "type": "object"
 }

@@ -172,6 +172,18 @@ deployment history before selecting a rollback target.
 kronik deployments list
 ```
 
+## EFFECT_BYTES_EXCEEDED
+
+Have a fixture actor fetch, in one turn, responses that add up past its kind's
+`effect_bytes_per_turn` (32 MiB by default). The effect that would pass it
+fails with this code in its recorded result and the turn goes on. Stream
+large bodies into blobs, split the work over several turns, or raise the
+limit for the kind.
+
+```sh
+kronik limits set billing --effect-bytes-per-turn 64Mi --reason "monthly export fetches large pages"
+```
+
 ## EFFECT_OUTCOME_UNKNOWN
 
 An unsafe fixture effect was admitted before a crash, but no result was

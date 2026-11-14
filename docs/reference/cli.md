@@ -1057,7 +1057,7 @@ Next     kronik revoke counter http:api.example.com --reason "..."
 
 ## kronik limits set
 
-`kronik limits set <KIND> [--fuel <N>] [--memory <SIZE>] [--message-size <SIZE>] [--state-value-size <SIZE>] [--sql-size <SIZE>] [--effect-timeout <DURATION>] [--effect-response-size <SIZE>] [--fingerprint-exclude-header <NAMES>] [--fingerprint-exclude-query <NAMES>] [--blob-threshold <SIZE>] [--upload-size <SIZE>] [--blob-size-per-actor <SIZE>] --reason <REASON> [--dry-run]`
+`kronik limits set <KIND> [--fuel <N>] [--memory <SIZE>] [--message-size <SIZE>] [--state-value-size <SIZE>] [--sql-size <SIZE>] [--effect-timeout <DURATION>] [--effect-response-size <SIZE>] [--fingerprint-exclude-header <NAMES>] [--fingerprint-exclude-query <NAMES>] [--blob-threshold <SIZE>] [--upload-size <SIZE>] [--blob-size-per-actor <SIZE>] [--effect-bytes-per-turn <SIZE>] --reason <REASON> [--dry-run]`
 
 Changes an actor type's limits (M2); limits that are not named keep their
 value, and at least one must be named. Turns use the limits of their
@@ -1083,6 +1083,7 @@ configuration epoch. The output shows every limit in force afterwards.
 | `--blob-threshold` | Bodies above it become blobs, for code that imports `blobs` (M25); at most the message size, and a smaller message size lowers it too | 1 MiB |
 | `--upload-size` | Largest HTTP request body, for code that imports `blobs` (M25) | 64 MiB |
 | `--blob-size-per-actor` | Blob bytes one actor may keep alive (M26): its holds, and the blobs of its timers, of the messages and compensations it sent while they wait, and of the dead letters of its messages and timers, each blob once; and the bytes one turn may create | 1 GiB |
+| `--effect-bytes-per-turn` | Bytes one turn's effects may record in the log: the requests and responses of its effect results, a body stored as a blob counting only its reference; an effect that would pass it fails with `EFFECT_BYTES_EXCEEDED` (ADR 0145) | 32 MiB |
 
 `--fingerprint-exclude-header` and `--fingerprint-exclude-query` take
 comma-separated names (ADR 0134). They leave a header or query parameter
@@ -1109,6 +1110,7 @@ Set the limits of counter at lsn 5, epoch 4
   SQL size          1 GiB
   Effect timeout    2s
   Effect response   10 MiB
+  Effect bytes      32 MiB
   Not fingerprinted -
   Blob threshold    1 MiB
   Upload size       64 MiB
@@ -1125,8 +1127,8 @@ deployed or not.
 
 ```text
 $ kronik limits show
-KIND     FUEL       MEMORY   MESSAGE  STATE VALUE  SQL    EFFECT TIMEOUT  EFFECT RESPONSE  NOT FINGERPRINTED  BLOB THRESHOLD  UPLOAD  BLOBS PER ACTOR
-counter  100000000  128 MiB  1 MiB    1 MiB        1 GiB  2s              10 MiB           -                  1 MiB           64 MiB  1 GiB
+KIND     FUEL       MEMORY   MESSAGE  STATE VALUE  SQL    EFFECT TIMEOUT  EFFECT RESPONSE  EFFECT BYTES  NOT FINGERPRINTED  BLOB THRESHOLD  UPLOAD  BLOBS PER ACTOR
+counter  100000000  128 MiB  1 MiB    1 MiB        1 GiB  2s              10 MiB           32 MiB        -                  1 MiB           64 MiB  1 GiB
 Next     kronik limits set counter --fuel <n> --reason "..."
 ```
 

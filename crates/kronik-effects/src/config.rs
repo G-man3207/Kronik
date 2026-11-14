@@ -252,6 +252,10 @@ pub struct KindLimits {
     pub upload_bytes: u64,
     /// The blob bytes one actor may hold (M26), and one turn may create.
     pub blob_bytes_per_actor: u64,
+    /// The bytes one turn's effects may record inline (ADR 0145): their
+    /// requests and responses as recorded, a blob body counting only its
+    /// reference.
+    pub effect_bytes_per_turn: u64,
 }
 
 impl Default for KindLimits {
@@ -267,6 +271,7 @@ impl Default for KindLimits {
             blob_threshold_bytes: 1 << 20,
             upload_bytes: 64 << 20,
             blob_bytes_per_actor: 1 << 30,
+            effect_bytes_per_turn: 32 << 20,
         }
     }
 }
@@ -294,6 +299,7 @@ impl KindLimits {
         set(&mut self.blob_threshold_bytes, l.blob_threshold_bytes);
         set(&mut self.upload_bytes, l.upload_bytes);
         set(&mut self.blob_bytes_per_actor, l.blob_bytes_per_actor);
+        set(&mut self.effect_bytes_per_turn, l.effect_bytes_per_turn);
         if let Some(ms) = l.effect_timeout_ms {
             self.effect_timeout = Duration::from_millis(ms);
         }

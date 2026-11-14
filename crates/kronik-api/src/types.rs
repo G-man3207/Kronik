@@ -594,6 +594,11 @@ pub struct LimitsRequest {
     /// may create.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_bytes_per_actor: Option<u64>,
+    /// The bytes one turn's effects may record inline: the requests and
+    /// responses of its effect results, a body stored as a blob counting only
+    /// its reference (ADR 0145).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_bytes_per_turn: Option<u64>,
     /// Required: missing or blank answers REASON_REQUIRED.
     #[serde(default)]
     pub reason: String,
@@ -621,6 +626,8 @@ pub struct LimitsView {
     pub blob_threshold_bytes: u64,
     pub upload_bytes: u64,
     pub blob_bytes_per_actor: u64,
+    /// The bytes one turn's effects may record inline (ADR 0145).
+    pub effect_bytes_per_turn: u64,
     /// Set in responses to `POST /v1/limits` (lsn 0 for dry runs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<u64>,

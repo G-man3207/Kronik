@@ -1047,6 +1047,104 @@ fn identity_replay_over_turns_too_large_for_their_record_is_empty() {
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
+/// The only effect the turn `r` recorded.
+fn only_effect(p: &Proc, r: &kronik_sched::TurnResult) -> kronik_proto::log::v1::EffectRecord {
+    match p
+        .rt
+        .block_on(p.node.read_record(r.turn_id.lsn))
+        .unwrap()
+        .unwrap()
+        .record
+    {
+        kronik_proto::Record::TurnRecord(t) => {
+            assert_eq!(t.effects.len(), 1, "{:?}", t.effects);
+            t.effects[0].clone()
+        }
+        other => panic!("not a turn record: {other:?}"),
+    }
+}
+
+/// Identity replay is empty over turns whose effects hit the actor type's
+/// effect bytes (ADR 0145, issue #74): a response that would pass them
+/// (sent, not recorded), a request that would pass them (not sent), and a
+/// second fetch refused after a first one took most of them. The failures
+/// are recorded as the effects' results, the fork keeps production's count
+/// and decides the same, and the replay sends nothing.
+#[test]
+fn identity_replay_over_turns_past_their_effect_bytes_is_empty() {
+    use kronik_proto::log::v1 as pb;
+    use prost::Message as _;
+    let (addr, hits) = server();
+    let dir = tempdir();
+    let p = Proc::start_with(
+        dir.path(),
+        kronik_sched::NodeConfig {
+            concurrency: 8,
+            ..kronik_sched::NodeConfig::default()
+        },
+    );
+    p.grant("http:127.0.0.1");
+    let fork_lsn = p.settle();
+    let body = "a".repeat(20 << 10);
+    let post = |path: &str, body: &str| format!("POST http://{addr}{path}\n\n{body}");
+    // Measured under the default limit: the request, and with its response.
+    let first = p.send("counter/a", "fetch", &post("/one", &body));
+    assert!(first.committed(), "{:?}", first.outcome);
+    let effect = only_effect(&p, &first);
+    let request = effect.request.as_ref().unwrap().encoded_len() as u64;
+    let total = kronik_sched::record_budget::effect_bytes(&effect);
+    assert!(total > request);
+    // Room for the request, not for its response.
+    let owner = p.owner();
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "counter".into(),
+            effect_bytes_per_turn: Some(request + (total - request) / 2),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        owner,
+    ))
+    .unwrap();
+    let response = p.send("counter/b", "fetch", &post("/one", &body));
+    assert!(!response.committed());
+    let refused = only_effect(&p, &response);
+    assert_eq!(refused.status, pb::EffectStatus::TooLarge as i32);
+    assert!(refused.response.is_none() && refused.request.is_some());
+    assert!(
+        refused.error.starts_with("EFFECT_BYTES_EXCEEDED:")
+            && refused.error.contains("not recorded"),
+        "{}",
+        refused.error
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // A larger request is not sent at all.
+    let larger = "a".repeat(40 << 10);
+    let request_over = p.send("counter/c", "fetch", &post("/one", &larger));
+    assert!(!request_over.committed());
+    let refused = only_effect(&p, &request_over);
+    assert!(refused.request.is_none() && refused.response.is_none());
+    assert!(refused.error.contains("not sent"), "{}", refused.error);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // Two fetches: the first takes most of what a turn may record.
+    let half = "a".repeat(12 << 10);
+    let two = p.send(
+        "counter/d",
+        "fetch2",
+        &format!("{}\n---\n{}", post("/one", &half), post("/two", &half)),
+    );
+    assert!(!two.committed());
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    p.http("e", "increment", "");
+    let out = replay(&p, None, fork_lsn, &opts(Mode::Both), 2);
+    let s = &out.diff.summary;
+    assert!(!s.changed, "{}", String::from_utf8_lossy(&out.bytes));
+    assert_eq!(s.divergent_turns, 0);
+    // The replay sent nothing (I7).
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+}
+
 #[test]
 fn isolated_identity_over_timers_and_calls_is_empty() {
     let dir = tempdir();
