@@ -322,3 +322,146 @@ fn websocket_connections_with_a_real_daemon() {
     let health = d.api("GET", "/v1/health", Value::Null);
     assert!(health.is_object());
 }
+
+/// The real CLI over the API socket (§12): `kronik connections list`,
+/// `inspect`, `history --connection` and the operator's `close`, which
+/// the WebSocket client receives as its close frame; and a failed frame
+/// turn listed in `kronik dead-letters list` as a connection input.
+#[test]
+fn the_cli_lists_inspects_and_closes_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
+    let wasm = base64::engine::general_purpose::STANDARD.encode(std::fs::read(ROOM).unwrap());
+    d.api(
+        "POST",
+        "/v1/deployments",
+        json!({"wasm_base64": wasm, "reason": "deploy the room"}),
+    );
+    let cli = |args: &[&str]| -> (bool, String) {
+        let out = Command::new(env!("CARGO_BIN_EXE_kronik"))
+            .arg("--socket")
+            .arg(d.dir.join("api.sock"))
+            .args(args)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        (out.status.success(), text)
+    };
+    let json = |args: &[&str]| -> Value {
+        let mut all = vec!["--json"];
+        all.extend_from_slice(args);
+        let (ok, text) = cli(&all);
+        assert!(ok, "kronik {args:?}: {text}");
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
+    };
+
+    let (mut ada, _) = d.connect("/room/lobby/ws?user=ada", None).unwrap();
+    assert!(text(&mut ada).contains("\"welcome\""));
+    ada.send(Message::text("echo hi")).unwrap();
+    assert_eq!(text(&mut ada), "hi");
+
+    // List and inspect: the open connection with its frames.
+    let list = json(&["connections", "list", "--actor", "room/lobby"]);
+    let id = list["connections"][0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(list["connections"][0]["state"], "open", "{list}");
+    until("ada's echo is counted", || {
+        let v = json(&["connections", "inspect", &id]);
+        v["frames"]["in"] == 1 && v["frames"]["written"] == 2
+    });
+    let (ok, table) = cli(&["connections", "list"]);
+    assert!(
+        ok && table.contains(&id) && table.contains("open"),
+        "{table}"
+    );
+    let (ok, shown) = cli(&["connections", "inspect", &id]);
+    assert!(
+        ok && shown.contains("Frames     1 in; 2 out: 2 written"),
+        "{shown}"
+    );
+
+    // Its history: the open and the frame, with what each sent.
+    let h = json(&["history", "room/lobby", "--connection", &id]);
+    let inputs: Vec<&str> = h["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["input"]["summary"].as_str().unwrap())
+        .collect();
+    assert!(
+        inputs
+            .iter()
+            .any(|s| s.starts_with(&format!("frame {id} #0"))),
+        "{h}"
+    );
+    assert!(
+        inputs.iter().any(|s| s.starts_with(&format!("open {id}"))),
+        "{h}"
+    );
+
+    // A frame turn that fails is a dead letter, listed as a connection
+    // input.
+    ada.send(Message::text("fail")).unwrap();
+    until("the dead letter", || {
+        json(&["dead-letters", "list"])["dead_letters"]
+            .as_array()
+            .is_some_and(|d| !d.is_empty())
+    });
+    let dead = json(&["dead-letters", "list"]);
+    assert_eq!(
+        dead["dead_letters"][0]["input"]["type"], "connection",
+        "{dead}"
+    );
+
+    // The operator's close: a dry run changes nothing, then the client gets
+    // the code and the message.
+    let (ok, text_out) = cli(&[
+        "connections",
+        "close",
+        &id,
+        "--code",
+        "4001",
+        "--message",
+        "bye from ops",
+        "--reason",
+        "check",
+        "--dry-run",
+    ]);
+    assert!(ok && text_out.contains("(dry run)"), "{text_out}");
+    let (ok, text_out) = cli(&[
+        "connections",
+        "close",
+        &id,
+        "--code",
+        "4001",
+        "--message",
+        "bye from ops",
+        "--reason",
+        "an operator test",
+    ]);
+    assert!(ok, "{text_out}");
+    match next(&mut ada) {
+        Message::Close(Some(f)) => {
+            assert_eq!(
+                (u16::from(f.code), f.reason.as_str()),
+                (4001, "bye from ops")
+            )
+        }
+        other => panic!("expected a close, got {other:?}"),
+    }
+    let _ = ada.close(None);
+    until("the operator's close", || {
+        json(&["connections", "inspect", &id])["state"] == "closed"
+    });
+    let v = json(&["connections", "inspect", &id]);
+    assert_eq!(
+        (v["closed"]["cause"].as_str(), v["closed"]["code"].as_u64()),
+        (Some("operator"), Some(4001)),
+        "{v}"
+    );
+    let (ok, text_out) = cli(&["connections", "close", &id, "--reason", "again"]);
+    assert!(
+        !ok && text_out.contains("CONNECTION_NOT_FOUND"),
+        "{text_out}"
+    );
+}
