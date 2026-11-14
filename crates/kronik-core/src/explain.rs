@@ -125,6 +125,7 @@ concepts! {
     "capability" => "M2", "Permission for an actor type to use an effect against a target";
     "delivery-class" => "M2", "How a target tolerates retries";
     "secret-handle" => "M2", "A secret referred to by name; the value never reaches the guest";
+    "linked-secret" => "M23", "A secret name bound to an external backend, read through a cache";
     "sql-state" => "M1", "A SQLite database per actor, owned by the host";
     "dead-letters" => "M1", "Inputs whose turn failed, kept for inspection and resend";
     "orphaned-change" => "M2", "A callee's committed change whose caller then failed";
@@ -134,6 +135,7 @@ concepts! {
     "foreign-actor" => "M7", "A Linux binary in gVisor behind a recorded boundary";
     "isolation-level" => "M7", "How code is sandboxed: wasm, gvisor, trusted or microvm";
     "snapshot" => "M6", "A consistent copy of materialized state at an LSN";
+    "engine" => "M6", "The runtime's identity; a new one needs kronik upgrade check";
     "segment" => "M1", "A log file; closed segments are immutable";
     "connections" => "M24", "WebSocket and SSE connections that the gateway holds for the actor that accepted them";
     "frame" => "M24", "One message on a connection: WebSocket text or binary, or an SSE event";
@@ -163,7 +165,7 @@ mod tests {
     use super::*;
 
     /// The concepts that `kronik explain` must cover.
-    const REQUIRED_CONCEPTS: [&str; 38] = [
+    const REQUIRED_CONCEPTS: [&str; 40] = [
         "actor",
         "kind",
         "message",
@@ -189,6 +191,7 @@ mod tests {
         "capability",
         "delivery-class",
         "secret-handle",
+        "linked-secret",
         "sql-state",
         "dead-letters",
         "orphaned-change",
@@ -198,6 +201,7 @@ mod tests {
         "foreign-actor",
         "isolation-level",
         "snapshot",
+        "engine",
         "segment",
         "connections",
         "frame",

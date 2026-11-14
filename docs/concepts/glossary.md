@@ -42,6 +42,7 @@ parts that come later with their own milestone, for example "(M3)". The
 | [`capability`](#capability) | Permission for an actor type to use an effect against a target | M2 |
 | [`delivery-class`](#delivery-class) | How a target tolerates retries | M2 |
 | [`secret-handle`](#secret-handle) | A secret referred to by name; the value never reaches the guest | M2 |
+| [`linked-secret`](#linked-secret) | A secret name bound to an external backend, read through a cache | M23 |
 | [`sql-state`](#sql-state) | A SQLite database per actor, owned by the host | M1 |
 | [`dead-letters`](#dead-letters) | Inputs whose turn failed, kept for inspection and resend | M1 |
 | [`orphaned-change`](#orphaned-change) | A callee's committed change whose caller then failed | M2 |
@@ -51,6 +52,7 @@ parts that come later with their own milestone, for example "(M3)". The
 | [`foreign-actor`](#foreign-actor) | A Linux binary in gVisor behind a recorded boundary | M7 |
 | [`isolation-level`](#isolation-level) | How code is sandboxed: wasm, gvisor, trusted or microvm | M7 |
 | [`snapshot`](#snapshot) | A consistent copy of materialized state at an LSN | M6 |
+| [`engine`](#engine) | The runtime's identity; a new one needs kronik upgrade check | M6 |
 | [`segment`](#segment) | A log file; closed segments are immutable | M1 |
 | [`connections`](#connections) | WebSocket and SSE connections that the gateway holds for the actor that accepted them | M24 |
 | [`frame`](#frame) | One message on a connection: WebSocket text or binary, or an SSE event | M24 |
@@ -294,6 +296,17 @@ A secret handle refers to a secret by its name. The guest names the secret in a 
 
 See also: [`capability`](#capability), [`effect`](#effect).
 
+## linked-secret
+
+A secret name bound to an external backend, read through a cache. Milestone M23.
+
+A linked secret is a secret name bound to an external backend (M23): OpenBao or Vault, AWS Secrets Manager, GCP Secret Manager or Azure Key Vault, configured in `[secrets.backends.<id>]`. `kronik secret link` records the binding as a log record, and guest code uses the name like any other secret handle: the value never enters guest memory or the log. The node reads values through an in-memory cache, refreshed every `[secrets] refresh`; an effect records the version it used, so `history` shows a rotation as a new version. While a backend is unavailable, a value that was authorized stays in use for up to `[secrets] max_stale`; after that, or after a definitive refusal, the effect fails with `SECRET_UNAVAILABLE`. A fork never fetches: it uses only a value the cache already holds for the fork point's link. A version the backend later destroys is still removed from what the views show, from an encrypted, scrub-only copy that never answers an effect.
+
+    kronik secret link stripe-key --backend vault --ref secret/stripe#api_key --reason "keep it in Vault"
+    kronik secret backends
+
+See also: [`secret-handle`](#secret-handle), [`SECRET_UNAVAILABLE`](../errors.md#secret_unavailable).
+
 ## sql-state
 
 A SQLite database per actor, owned by the host. Milestone M1.
@@ -379,6 +392,16 @@ A snapshot is a consistent copy of materialized state at a known LSN, made with 
 
 See also: [`segment`](#segment), [`branch`](#branch).
 
+## engine
+
+The runtime's identity; a new one needs kronik upgrade check. Milestone M6.
+
+The engine is the identity of the runtime that executes turns: `kronik-<version>+wasmtime-<version>`, which `kronik --version` prints and every turn record carries. Wasmtime and Kronik changes are not assumed to replay identically, so each release has its own engine, and a data directory written by another engine starts only after `kronik upgrade check` with the new binary passed on it: the check replays the last window of logical time with the new engine and compares the result. Without a passing check, `kronik serve` stops with `ENGINE_VERSION_MISMATCH` before it serves anything; a start after one records an `engine upgrade` in the log. Going back to an older binary needs that binary's own check, and works only while the log holds no record the older binary does not know.
+
+    kronik upgrade check --window 6h --config /etc/kronik/kronik.toml
+
+See also: [`snapshot`](#snapshot), [`ENGINE_VERSION_MISMATCH`](../errors.md#engine_version_mismatch), [`ENGINE_UPGRADE_DIVERGED`](../errors.md#engine_upgrade_diverged).
+
 ## segment
 
 A log file; closed segments are immutable. Milestone M1.
@@ -418,7 +441,7 @@ See also: [`connections`](#connections), [`send-now`](#send-now), [`message`](#m
 
 Sending a frame during a turn, as an effect with the delivery class unsafe. Milestone M24.
 
-`connections.send-now` sends a frame during the turn instead of after it commits (M24), for intermediate results such as the tokens of a streamed answer. It is an effect with the delivery class `unsafe`: it needs the capability `connection:send-now`, its turn's `TurnBegin` is durable before the frame goes out, and its result is recorded before the guest sees it. `ok` means the frame was handed to the connection in order, not that the client received it; `closed` means it was not sent. After a crash a re-run never sends it again: the guest gets `outcome-unknown`, and a turn that does not handle it fails with `EFFECT_OUTCOME_UNKNOWN`. A stream can reach the client before its turn fails: that is the price of streaming. Use `send` for final notices, such as "payment complete".
+`connections.send-now` sends a frame during the turn instead of after it commits (M24), for intermediate results such as the tokens of a streamed answer. It is an effect with the delivery class `unsafe`: it needs the capability `connection:send-now`, its turn's `TurnBegin` is durable before the frame goes out, and its result is recorded before the guest sees it. `ok` means the frame was handed to the connection in order, not that the client received it; `closed` means it was not sent: the connection is closed or closing, or its client read nothing within the kind's effect timeout, which also closes it as a slow consumer. After a crash a re-run never sends it again: the guest gets `outcome-unknown`, and a turn that does not handle it fails with `EFFECT_OUTCOME_UNKNOWN`. A stream can reach the client before its turn fails: that is the price of streaming. Use `send` for final notices, such as "payment complete".
 
     kronik grant chat connection:send-now --reason "stream the bot's answers"
 
