@@ -1547,6 +1547,7 @@ impl Api {
                 held_bytes: held.held_bytes,
                 since_ms: held.since_ms,
             }),
+            blobs_low_disk: self.node.blobs_below_reserve().is_some(),
         })
     }
 

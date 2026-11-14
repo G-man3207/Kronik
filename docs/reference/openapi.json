@@ -3557,7 +3557,9 @@
                   "APPROVAL_REQUIRED",
                   "AUDIT_RANGE_GONE",
                   "BAD_REQUEST",
+                  "BLOB_MISSING",
                   "BLOB_NOT_HELD",
+                  "BLOB_STORE_FULL",
                   "CAPABILITY_NOT_GRANTED",
                   "CERTIFICATE_INVALID",
                   "CONNECTION_LIMIT",
@@ -4813,6 +4815,10 @@
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          },
+          "blobs_low_disk": {
+            "description": "The blob store is below `[blobs] disk_reserve` (M25): uploads that\nwould become blobs are refused, and turns that write blobs wait.\nOmitted when false.",
+            "type": "boolean"
           },
           "branch": {
             "type": "string"

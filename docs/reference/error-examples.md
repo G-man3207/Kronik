@@ -51,6 +51,16 @@ Content-Length: 8
 {"text":
 ```
 
+## BLOB_MISSING
+
+A fixture data directory was restored without some of its blobs, and a turn
+reads one. Find the turn that failed, then restore the blob files from the
+same backup as the log; do not delete records to hide the error.
+
+```sh
+kronik history media/fixture --limit 5
+```
+
 ## BLOB_NOT_HELD
 
 A fixture `media` actor stored a blob's hash in state and, in a later turn,
@@ -60,6 +70,17 @@ its input carried, or to retain the blob (M26) in the turn that received it.
 
 ```sh
 kronik history media/fixture --limit 5
+```
+
+## BLOB_STORE_FULL
+
+An owned fixture's disk is filled until the blob store is below
+`[blobs] disk_reserve`; an upload that would become a blob is refused. The
+health check says so with `"blobs_low_disk": true`. Free space on the
+fixture's file system, then retry the upload.
+
+```http
+GET /v1/health
 ```
 
 ## CAPABILITY_NOT_GRANTED

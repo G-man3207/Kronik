@@ -349,6 +349,12 @@ pub fn set_scrape_gauges(node: &Node) {
         let low = node.disk_below_reserve().is_some();
         kronik_metrics::set("kronik_disk_below_reserve", &[], f64::from(u8::from(low)));
     }
+    let blobs_low = node.blobs_below_reserve().is_some();
+    kronik_metrics::set(
+        "kronik_blob_store_below_reserve",
+        &[],
+        f64::from(u8::from(blobs_low)),
+    );
 }
 
 fn answer(
@@ -376,6 +382,9 @@ fn answer(
                 // A field of its own: probes that compare the status keep working.
                 if node.disk_below_reserve().is_some() {
                     body["low_disk"] = serde_json::Value::Bool(true);
+                }
+                if node.blobs_below_reserve().is_some() {
+                    body["blobs_low_disk"] = serde_json::Value::Bool(true);
                 }
                 response(200, "application/json", body.to_string())
             }

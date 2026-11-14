@@ -908,6 +908,25 @@ impl<'a> StreamScrubber<'a> {
         Ok(())
     }
 
+    /// The same stream continued with another matcher, such as one with more
+    /// secrets once a turn has revealed another value. The bytes held back
+    /// for lookahead are matched again by the new matcher, so a value that
+    /// straddles the switch is still found; bytes already emitted stay as
+    /// they were. Returns the new stream and what it emits at once.
+    pub fn rematch<'b>(
+        mut self,
+        matcher: CompiledScrubber<'b>,
+    ) -> Result<(StreamScrubber<'b>, Vec<u8>), ScrubError> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        let mut next = StreamScrubber::from_compiled(matcher, self.limits, self.buffer_bytes)?;
+        next.produced = self.produced;
+        let held = std::mem::take(&mut self.pending);
+        let emitted = next.push(&held)?.to_vec();
+        Ok((next, emitted))
+    }
+
     /// Flush final lookahead. An earlier error remains a failure, never a partial success.
     pub fn finish(mut self) -> Result<Vec<u8>, ScrubError> {
         if let Some(error) = self.failed {
@@ -937,6 +956,40 @@ pub fn scrub_str<N: AsRef<str>, V: AsRef<[u8]>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rematched_stream_finds_a_value_that_straddles_the_switch() {
+        let before = [("one", b"aaaa".to_vec())];
+        let after = [("one", b"aaaa".to_vec()), ("two", b"xyz".to_vec())];
+        let limits = ScrubLimits {
+            output_bytes: 1 << 20,
+            pattern_bytes: 1 << 20,
+        };
+        // "xy" is held back by the first matcher (longest pattern 4), so the
+        // second one sees "xyz" whole.
+        let mut stream = StreamScrubber::new(&before, limits, 1 << 16).unwrap();
+        let mut out = stream.push(b"aaaa..xy").unwrap().to_vec();
+        let matcher = CompiledScrubber::new(&after, limits.pattern_bytes).unwrap();
+        let (mut stream, emitted) = stream.rematch(matcher).unwrap();
+        out.extend_from_slice(&emitted);
+        out.extend_from_slice(stream.push(b"z..xyz").unwrap());
+        out.extend(stream.finish().unwrap());
+        assert_eq!(out, b"[secret:one]..[secret:two]..[secret:two]");
+        // Without a straddling value the output is the whole input scrubbed
+        // by the new matcher, for every place of the switch.
+        let input = b"q aaaa w xyz e aaaaxyz r".to_vec();
+        let whole = scrub(&input, &after, limits).unwrap();
+        for cut in 0..=input.len() {
+            let mut stream = StreamScrubber::new(&after, limits, 1 << 16).unwrap();
+            let mut out = stream.push(&input[..cut]).unwrap().to_vec();
+            let matcher = CompiledScrubber::new(&after, limits.pattern_bytes).unwrap();
+            let (mut stream, emitted) = stream.rematch(matcher).unwrap();
+            out.extend_from_slice(&emitted);
+            out.extend_from_slice(stream.push(&input[cut..]).unwrap());
+            out.extend(stream.finish().unwrap());
+            assert_eq!(out, whole, "cut at {cut}");
+        }
+    }
 
     #[test]
     fn stream_matches_original_leftmost_longest_across_all_chunk_boundaries() {

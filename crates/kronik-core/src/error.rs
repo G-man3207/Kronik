@@ -110,9 +110,15 @@ codes! {
     BadRequest = "BAD_REQUEST", 400, "M1",
         "The request is malformed",
         "Fix the field or value named in the message and send the request again.";
+    BlobMissing = "BLOB_MISSING", 500, "M25",
+        "A committed blob reference's bytes are not in the blob store",
+        "Restore the blob store from the backup the data directory came from; never expected otherwise.";
     BlobNotHeld = "BLOB_NOT_HELD", 403, "M25",
         "The turn used a blob reference it neither holds nor received",
         "Use the reference the turn received in its input, from a fetch or a writer, or one the actor holds; a hash stored as data is not a reference.";
+    BlobStoreFull = "BLOB_STORE_FULL", 503, "M25",
+        "The blob store's disk is below its reserve",
+        "Free disk space on the data directory's file system, or lower [blobs] disk_reserve, then retry; turns that write blobs wait and run again.";
     CapabilityNotGranted = "CAPABILITY_NOT_GRANTED", 403, "M2",
         "The actor type lacks a capability for this effect",
         "Grant it with `kronik grant <kind> <capability> --reason '...'`.";

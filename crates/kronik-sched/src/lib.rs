@@ -17,6 +17,7 @@
 //! interval/shutdown and irreversible recovery continuations are separate host paths;
 //! audit metadata never chooses operation authority.
 
+mod blobs;
 pub mod connections;
 mod durable;
 pub mod effects;
@@ -143,6 +144,29 @@ pub struct NodeConfig {
     /// DST property C3 must catch it.
     #[doc(hidden)]
     pub mutation_deliver_before_fsync: bool,
+    /// The blob store (M25, M26); `None` runs without blobs, as every node
+    /// does until M26 is complete (docs/design/m25-streaming-bodies.md
+    /// §18.2): components that import `blobs` then get inline bodies, and
+    /// the `blobs` functions trap.
+    pub blobs: Option<BlobsConfig>,
+}
+
+/// `[blobs]` (docs/design/m25-streaming-bodies.md §12).
+#[derive(Debug, Clone)]
+pub struct BlobsConfig {
+    /// `[blobs] disk_reserve`, in bytes: below it no new blob is written.
+    pub disk_reserve: u64,
+    /// `[blobs] lease_ttl`.
+    pub lease_ttl: Duration,
+}
+
+impl Default for BlobsConfig {
+    fn default() -> Self {
+        BlobsConfig {
+            disk_reserve: 0,
+            lease_ttl: Duration::from_secs(300),
+        }
+    }
 }
 
 impl Default for NodeConfig {
@@ -171,6 +195,7 @@ impl Default for NodeConfig {
             test_max_record_bytes: None,
             connections: connections::ConnectionsConfig::default(),
             mutation_deliver_before_fsync: false,
+            blobs: None,
         }
     }
 }
@@ -299,6 +324,22 @@ pub async fn start_local_locked(
     let keys = data.join("keys");
     private_files(&keys, &["secrets.db", "keystore.db"])
         .map_err(|e| StartError::Log(kronik_log::LogError::Io(e)))?;
+    // `<data>/blobs` (ADR 0117 §1), before `data` names the secret data.
+    let blobs = match &config.blobs {
+        None => None,
+        Some(b) => Some(
+            kronik_blob::BlobStore::open(
+                env.clone(),
+                data,
+                kronik_blob::StoreConfig {
+                    reserve: b.disk_reserve,
+                    lease_ttl: b.lease_ttl,
+                },
+            )
+            .await
+            .map_err(|e| StartError::Corrupt(format!("opening the blob store: {e}")))?,
+        ),
+    };
     let data = kronik_privacy::SecretStore::owned_data(&ownership)
         .map_err(key_error)?
         .unwrap_or_else(|| secrets::SecretCacheData::new());
@@ -320,6 +361,7 @@ pub async fn start_local_locked(
         )),
         key_source: Some(source),
         ownership: Some(ownership),
+        blobs,
     })
     .await
 }

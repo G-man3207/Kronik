@@ -37,7 +37,9 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`APPROVAL_REQUIRED`](#approval_required) | 403 | M3 | The policy requires an approval first |
 | [`AUDIT_RANGE_GONE`](#audit_range_gone) | 410 | M28 | The requested log range is before the first retained record |
 | [`BAD_REQUEST`](#bad_request) | 400 | M1 | The request is malformed |
+| [`BLOB_MISSING`](#blob_missing) | 500 | M25 | A committed blob reference's bytes are not in the blob store |
 | [`BLOB_NOT_HELD`](#blob_not_held) | 403 | M25 | The turn used a blob reference it neither holds nor received |
+| [`BLOB_STORE_FULL`](#blob_store_full) | 503 | M25 | The blob store's disk is below its reserve |
 | [`CAPABILITY_NOT_GRANTED`](#capability_not_granted) | 403 | M2 | The actor type lacks a capability for this effect |
 | [`CERTIFICATE_INVALID`](#certificate_invalid) | 400 | M6 | The TLS certificate cannot be used |
 | [`CONNECTION_LIMIT`](#connection_limit) | 503 | M24 | The gateway holds as many connections as it may |
@@ -175,6 +177,24 @@ The request could not be understood: invalid JSON, a missing or mistyped field, 
 
 The message names the field or value that is wrong. Fix it and send the request again, or start the daemon again; the same input always gives the same error.
 
+## BLOB_MISSING
+
+HTTP status 500, milestone M25. A committed blob reference's bytes are not in the blob store.
+
+Default hint: Restore the blob store from the backup the data directory came from; never expected otherwise.
+
+A committed record refers to a blob whose bytes are not in the blob store.
+Kronik writes and syncs a blob before any record refers to it and keeps it
+while a record within retention refers to it, so this is never expected. It
+can follow a restore that was told to go on without some blobs
+(`--allow-missing-blobs`), or files removed from the data directory by hand.
+
+The turn that needed the blob is not recorded; an HTTP client gets `500
+BLOB_MISSING`. Nothing else is affected. Restore the blob store from the
+backup the data directory came from.
+
+See also: [`blob`](concepts/glossary.md#blob).
+
 ## BLOB_NOT_HELD
 
 HTTP status 403, milestone M25. The turn used a blob reference it neither holds nor received.
@@ -197,6 +217,28 @@ same in production and in replay.
 To keep a blob across turns, retain it (`blobs.retain`, M26) in the turn that
 received it, and send it to another actor in the message's `blobs`, never in
 its body.
+
+See also: [`blob`](concepts/glossary.md#blob).
+
+## BLOB_STORE_FULL
+
+HTTP status 503, milestone M25. The blob store's disk is below its reserve.
+
+Default hint: Free disk space on the data directory's file system, or lower [blobs] disk_reserve, then retry; turns that write blobs wait and run again.
+
+The blob store's file system has less free space than `[blobs]
+disk_reserve` (twice `[log] disk_reserve` by default), so no new blob is
+written: an upload or response that would become a blob is refused with
+`503 BLOB_STORE_FULL`. The reserve keeps room for the log, so a full disk
+never stops turns that write no blobs.
+
+A turn whose blob write meets the reserve is not recorded and does not fail:
+it runs again from the start, with backoff (from 100 ms up to 30 s), until
+there is room, and the metric `kronik_blob_turn_retries_total` counts the
+attempts. A turn that had already written its `TurnBegin` runs again as a
+re-run, with its recorded effects.
+
+Free disk space, or lower `[blobs] disk_reserve`.
 
 See also: [`blob`](concepts/glossary.md#blob).
 

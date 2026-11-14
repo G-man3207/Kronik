@@ -38,6 +38,12 @@ pub enum BlobHostError {
     /// The blob store is below its disk reserve or full: the turn attempt
     /// is abandoned without a record and runs again later (ADR 0117 §9).
     StoreFull(String),
+    /// The blob would pass its size limit, for instance once secrets are
+    /// scrubbed from it: `blob-error::quota-exceeded`.
+    TooLarge,
+    /// A committed reference's bytes are not in the store (`BLOB_MISSING`):
+    /// the turn is abandoned without a record.
+    Missing(String),
     /// A host failure (a missing or damaged blob, I/O): the turn is
     /// abandoned without a record.
     Host(String),
@@ -151,6 +157,13 @@ impl TurnHost {
                 self.fatal = Some(RunError::BlobStoreFull(message.clone()));
                 wasmtime::format_err!("BLOB_STORE_FULL: {message}")
             }
+            BlobHostError::Missing(message) => {
+                self.fatal = Some(RunError::BlobMissing(message.clone()));
+                wasmtime::format_err!("BLOB_MISSING: {message}")
+            }
+            BlobHostError::TooLarge => {
+                self.host_failure("a blob too large where nothing was written".into())
+            }
             BlobHostError::Host(message) => self.host_failure(message),
         }
     }
@@ -244,6 +257,7 @@ impl wit::HostWriter for TurnHost {
         match host.write(id, chunk).await {
             Ok(()) => Ok(Ok(())),
             Err(BlobHostError::Erased) => Ok(Err(wit::BlobError::Erased)),
+            Err(BlobHostError::TooLarge) => Ok(Err(wit::BlobError::QuotaExceeded)),
             Err(error) => Err(self.blob_failure(error)),
         }
     }
@@ -265,6 +279,7 @@ impl wit::HostWriter for TurnHost {
                 Ok(Ok(wit_ref))
             }
             Err(BlobHostError::Erased) => Ok(Err(wit::BlobError::Erased)),
+            Err(BlobHostError::TooLarge) => Ok(Err(wit::BlobError::QuotaExceeded)),
             Err(error) => Err(self.blob_failure(error)),
         }
     }

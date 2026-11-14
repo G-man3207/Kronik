@@ -636,6 +636,7 @@ impl World {
             sealer: None,
             key_source: None,
             ownership: None,
+            blobs: None,
         };
         let (parts, _store_guard) = match self.open_secrets(node_id, parts) {
             Ok(opened) => opened,

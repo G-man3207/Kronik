@@ -155,6 +155,7 @@ impl TestHost {
             sealer: None,
             key_source: None,
             ownership: Some(ownership),
+            blobs: None,
         })
         .await
         .map_err(|e| Error::new("starting the node", e))?;

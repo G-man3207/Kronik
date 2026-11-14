@@ -111,6 +111,8 @@ pub struct NodeParts {
     pub sealer: Option<Arc<Sealer>>,
     pub key_source: Option<Arc<kronik_privacy::key_source::KeySource>>,
     pub ownership: Option<kronik_privacy::key_source::DataOwnership>,
+    /// The blob store (M25), when the node runs with blobs.
+    pub blobs: Option<Arc<kronik_blob::BlobStore>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -426,6 +428,8 @@ pub struct Node {
     /// stays pending while a turn that may hold its subject's values runs.
     running_born: Mutex<HashMap<u64, Born>>,
     next_running: AtomicU64,
+    /// The blob store (M25), when the node runs with blobs.
+    pub(crate) blobs: Option<Arc<kronik_blob::BlobStore>>,
     /// The sandboxes behind `foreign://` (docs/design/m7-foreign.md).
     pub(crate) foreign: Option<Arc<dyn kronik_effects::foreign::ForeignHost>>,
     pub(crate) rates: RateLimiter,
@@ -669,6 +673,7 @@ impl Node {
             sealer,
             key_source,
             ownership,
+            blobs,
         } = parts;
         let publication = Arc::new(Mutex::new(()));
         let lifecycle = Arc::new(crate::native_execution::Lifecycle::new(ownership));
@@ -868,7 +873,14 @@ impl Node {
         }
 
         // The first reading before any work is admitted; then every second.
-        let measure = config.disk_reserve > 0 || config.storage.is_some();
+        let measure = config.disk_reserve > 0
+            || config.storage.is_some()
+            || config.blobs.as_ref().is_some_and(|b| b.disk_reserve > 0);
+        if let Some(store) = &blobs
+            && let Err(e) = store.refresh_free().await
+        {
+            tracing::warn!(error = %e, "reading the blob store's free disk space failed");
+        }
         let disk_free = if measure {
             env.fs
                 .available(space_dir.clone())
@@ -911,6 +923,7 @@ impl Node {
             erase_lock: Arc::new(tokio::sync::RwLock::new(())),
             running_born: Mutex::new(HashMap::new()),
             next_running: AtomicU64::new(0),
+            blobs,
             rates: RateLimiter::starting_full(env.clock.monotonic()),
             wheel: Mutex::new(Wheel::default()),
             wheel_notify: Arc::new(Notify::new()),
@@ -2274,12 +2287,31 @@ impl Node {
         };
         origin.check()?;
         self.probe.turns_run.fetch_add(1, Ordering::Relaxed);
+        // The turn's blob host (M25), when the node runs with blobs. It and
+        // its lease live until the turn's record is applied.
+        let turn_blobs = self.blobs.as_ref().map(|store| {
+            crate::blobs::TurnBlobs::new(
+                store.clone(),
+                if self.cfg.branch == "main" {
+                    kronik_blob::Space::Main
+                } else {
+                    kronik_blob::Space::Fork(self.cfg.branch.clone())
+                },
+                self.env.clone(),
+                self.sealer.clone(),
+                crate::blobs::TurnBlobs::secrets_of(fx.clone()),
+                kind_limits.blob_bytes_per_actor,
+            )
+        });
         let run = program
-            .run(
+            .run_with_blobs(
                 req,
                 state,
                 Some(Box::new(SqlHandle(sql.clone()))),
                 Some(Arc::new(Gate(fx.clone()))),
+                turn_blobs
+                    .clone()
+                    .map(|host| Arc::new(host) as Arc<dyn kronik_runtime::BlobHost>),
             )
             .await;
         drop(permit);
@@ -2325,6 +2357,16 @@ impl Node {
                         born,
                     )
                     .await;
+            }
+            // Not recorded: the worker runs the turn again once the blob
+            // store has room (ADR 0117 §9).
+            Err(kronik_runtime::RunError::BlobStoreFull(message)) => {
+                let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
+                return Err(ApiError::new(ErrorCode::BlobStoreFull, message));
+            }
+            Err(kronik_runtime::RunError::BlobMissing(message)) => {
+                let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
+                return Err(ApiError::new(ErrorCode::BlobMissing, message));
             }
             Err(e) => {
                 let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
@@ -2531,6 +2573,19 @@ impl Node {
         } else {
             origin
         };
+        // A record never precedes its blobs (ADR 0117 §4): the turn's
+        // blobs are named durably first. Without room the turn is not
+        // recorded and runs again.
+        if let Some(blobs) = &turn_blobs
+            && let Err(error) = blobs.ensure_durable().await
+        {
+            return Err(match error {
+                kronik_blob::BlobError::StoreFull { .. } => {
+                    ApiError::new(ErrorCode::BlobStoreFull, error.to_string())
+                }
+                other => internal(other),
+            });
+        }
         // An erasure that began while the turn ran: its values of the subject
         // become tombstones, in the record and in what it sends (§6.8): its
         // messages and compensations, the frames and closes the hub writes
@@ -2559,6 +2614,7 @@ impl Node {
         let lsn = self.commit_origin(record, completion).await;
         drop(fence);
         let lsn = lsn?;
+        drop(turn_blobs);
         if authorized {
             Self::observe_turn(&actor.kind, Some(&outcome));
         }
@@ -3265,6 +3321,12 @@ impl Node {
     pub fn disk_below_reserve(&self) -> Option<u64> {
         self.disk_free()
             .filter(|free| *free < self.cfg.disk_reserve)
+    }
+
+    /// The blob store's free bytes when it is below `[blobs]
+    /// disk_reserve` (M25): no new blobs are written.
+    pub fn blobs_below_reserve(&self) -> Option<u64> {
+        self.blobs.as_ref()?.below_reserve()
     }
 
     /// How often retention compacted the index rows (tests, R2-cost).
@@ -5258,6 +5320,7 @@ fn turn_limits(l: &KindLimits) -> TurnLimits {
 async fn disk_space_loop(node: Weak<Node>, dir: std::path::PathBuf) {
     const RETAIN_EVERY: Duration = Duration::from_secs(60);
     let mut low = false;
+    let mut blobs_low = false;
     let mut retained_at: Option<Duration> = None;
     loop {
         let Some(n) = node.upgrade() else { return };
@@ -5287,6 +5350,28 @@ async fn disk_space_loop(node: Weak<Node>, dir: std::path::PathBuf) {
             }
             Err(e) => {
                 tracing::warn!(dir = %dir.display(), error = %e, "reading free disk space failed")
+            }
+        }
+        if let Some(store) = &n.blobs {
+            match store.refresh_free().await {
+                Ok(free) => {
+                    let now_low = store.below_reserve().is_some();
+                    if now_low && !blobs_low {
+                        tracing::error!(
+                            free_mib = free >> 20,
+                            "the blob store is below [blobs] disk_reserve: no new blobs are \
+                             written, uploads that would be blobs are refused and turns that \
+                             write blobs wait"
+                        );
+                    } else if blobs_low && !now_low {
+                        tracing::info!(
+                            free_mib = free >> 20,
+                            "the blob store's free disk space is back above [blobs] disk_reserve"
+                        );
+                    }
+                    blobs_low = now_low;
+                }
+                Err(e) => tracing::warn!(error = %e, "reading the blob store's free space failed"),
             }
         }
         let sleep = n.env.clock.sleep(Duration::from_secs(1));

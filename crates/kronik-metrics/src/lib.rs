@@ -108,6 +108,26 @@ pub const METRICS: &[Def] = &[
         kind: Type::Counter,
     },
     Def {
+        name: "kronik_blob_written_bytes_total",
+        help: "Bytes of new blobs, by source (guest, upload, effect).",
+        kind: Type::Counter,
+    },
+    Def {
+        name: "kronik_blob_read_bytes_total",
+        help: "Blob bytes read, by reader (guest, gateway, ship, api).",
+        kind: Type::Counter,
+    },
+    Def {
+        name: "kronik_blob_store_below_reserve",
+        help: "1 while the blob store is below [blobs] disk_reserve: no new blobs are written.",
+        kind: Type::Gauge,
+    },
+    Def {
+        name: "kronik_blob_missing_total",
+        help: "Reads of a committed blob whose bytes are not in the blob store (BLOB_MISSING).",
+        kind: Type::Counter,
+    },
+    Def {
         name: "kronik_gateway_requests_total",
         help: "HTTP requests answered by the gateway, by status code.",
         kind: Type::Counter,

@@ -202,6 +202,10 @@ $ curl -s http://127.0.0.1:9464/healthz
 | `kronik_log_records_appended_total` | counter | Records written to the log. |
 | `kronik_log_fsync_duration_seconds` | histogram | Time to fsync a group commit of the log. |
 | `kronik_effects_total` | counter | Effect results recorded, by effect kind and status. |
+| `kronik_blob_written_bytes_total` | counter | Bytes of new blobs, by source (guest, upload, effect). |
+| `kronik_blob_read_bytes_total` | counter | Blob bytes read, by reader (guest, gateway, ship, api). |
+| `kronik_blob_store_below_reserve` | gauge | 1 while the blob store is below [blobs] disk_reserve: no new blobs are written. |
+| `kronik_blob_missing_total` | counter | Reads of a committed blob whose bytes are not in the blob store (BLOB_MISSING). |
 | `kronik_gateway_requests_total` | counter | HTTP requests answered by the gateway, by status code. |
 | `kronik_gateway_request_duration_seconds` | histogram | Time to answer an HTTP request at the gateway, by status code. |
 | `kronik_replay_runs_total` | counter | Replays run for forks and proposals, by mode. |

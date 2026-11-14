@@ -216,6 +216,15 @@ until the v1.0 compatibility promise takes effect.
   M25 and M26 lands, the functions trap with `NOT_IMPLEMENTED`. The Go
   bindings and TypeScript types are regenerated; components built for
   `0.1.0` link and run as before.
+- The daemon can run turns with a blob store (M25), still switched off:
+  a blob a turn writes is scrubbed of the secret values the turn used or
+  revealed, named durably before the turn's record is appended, and covered
+  by the turn's lease until the record is applied; a fetch whose body is a
+  reference the turn may not use is a recorded denial (`BLOB_NOT_HELD`).
+  New codes `BLOB_STORE_FULL` (503) and `BLOB_MISSING` (500), the health
+  field `blobs_low_disk`, and the metrics `kronik_blob_written_bytes_total`,
+  `kronik_blob_read_bytes_total`, `kronik_blob_store_below_reserve` and
+  `kronik_blob_missing_total`.
 - Three new per-kind limits (M25, M26): `blob_threshold_bytes` (bodies above
   it become blobs for code that imports `blobs`, 1 MiB, never above
   `message_bytes`), `upload_bytes` (the largest upload for such code,

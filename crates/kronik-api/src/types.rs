@@ -442,6 +442,11 @@ pub struct HealthResponse {
     /// would have deleted otherwise. Omitted when no turn kept any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_pin: Option<RetentionPinView>,
+    /// The blob store is below `[blobs] disk_reserve` (M25): uploads that
+    /// would become blobs are refused, and turns that write blobs wait.
+    /// Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blobs_low_disk: bool,
 }
 
 /// An open turn that keeps log segments from retention: its re-run reads its

@@ -63,6 +63,7 @@ pub struct Config {
     pub fleet: Option<Fleet>,
     pub events: Events,
     pub connections: Connections,
+    pub blobs: Blobs,
 }
 
 /// `[connections]` (M24, docs/design/m24-connections.md §5.11): admission
@@ -114,6 +115,30 @@ impl Default for Connections {
             sse_heartbeat: Dur(d.sse_heartbeat),
             close_timeout: Dur(d.close_timeout),
             shutdown_grace: Dur(d.shutdown_grace),
+        }
+    }
+}
+
+/// `[blobs]`: the blob store of M25 and M26
+/// (docs/design/m25-streaming-bodies.md §12). Undocumented, and off by
+/// default, until M26 is complete (§18.2).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Blobs {
+    pub enabled: bool,
+    /// Below this much free disk no new blob is written: a multiple of
+    /// `[log] disk_reserve` (`"2x"`) or a size.
+    pub disk_reserve: BlobReserve,
+    /// How long a lease lives without renewal.
+    pub lease_ttl: Dur,
+}
+
+impl Default for Blobs {
+    fn default() -> Self {
+        Blobs {
+            enabled: false,
+            disk_reserve: BlobReserve::Times(2),
+            lease_ttl: Dur::secs(300),
         }
     }
 }
@@ -184,6 +209,39 @@ impl std::str::FromStr for Rate {
             .filter(|n| *n > 0)
             .map(Rate)
             .ok_or_else(|| format!("invalid rate {s:?}: write it as \"50/s\""))
+    }
+}
+
+impl Blobs {
+    /// `disk_reserve` in bytes.
+    pub fn disk_reserve_bytes(&self, log_disk_reserve: u64) -> u64 {
+        match self.disk_reserve {
+            BlobReserve::Times(n) => log_disk_reserve.saturating_mul(n),
+            BlobReserve::Bytes(b) => b,
+        }
+    }
+}
+
+/// `[blobs] disk_reserve`: a multiple of `[log] disk_reserve` (`"2x"`) or a
+/// size (`"2GiB"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobReserve {
+    Times(u64),
+    Bytes(u64),
+}
+
+impl std::str::FromStr for BlobReserve {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<BlobReserve, String> {
+        match s.trim().strip_suffix('x') {
+            Some(n) => n.parse().map(BlobReserve::Times).map_err(|_| {
+                format!(
+                    "invalid [blobs] disk_reserve {s:?}: use a multiple such as \"2x\" or a size"
+                )
+            }),
+            None => s.parse::<Size>().map(|b| BlobReserve::Bytes(b.0)),
+        }
     }
 }
 
@@ -922,7 +980,7 @@ macro_rules! from_string {
     )*};
 }
 
-from_string!(Dur, Size, Percent, HoldRelease, Rate);
+from_string!(Dur, Size, Percent, HoldRelease, Rate, BlobReserve);
 
 /// A file that can't be used: where, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1543,6 +1601,25 @@ start_timeout = "30s"                 # how long a started sandbox may take to a
         assert_eq!(config.foreign.platform, Platform::Auto);
         // The documented file carries the default, so the round trip holds.
         assert_eq!(config.foreign.start_timeout.0, Duration::from_secs(30));
+    }
+
+    /// `[blobs]` is off by default and undocumented until M26 is complete
+    /// (docs/design/m25-streaming-bodies.md §18.2).
+    #[test]
+    fn blobs_are_off_by_default_and_their_reserve_follows_the_log() {
+        let empty = parse("").unwrap();
+        assert!(!empty.blobs.enabled);
+        assert_eq!(empty.blobs.disk_reserve_bytes(512 << 20), 1 << 30);
+        assert_eq!(empty.blobs.lease_ttl, Dur::secs(300));
+        let set =
+            parse("[blobs]\nenabled = true\ndisk_reserve = \"3x\"\nlease_ttl = \"1m\"\n").unwrap();
+        assert!(set.blobs.enabled);
+        assert_eq!(set.blobs.disk_reserve_bytes(100), 300);
+        assert_eq!(set.blobs.lease_ttl, Dur::secs(60));
+        let sized = parse("[blobs]\ndisk_reserve = \"2GiB\"\n").unwrap();
+        assert_eq!(sized.blobs.disk_reserve_bytes(1), 2 << 30);
+        assert!(parse("[blobs]\ndisk_reserve = \"zx\"\n").is_err());
+        assert!(parse("[blobs]\nunknown = 1\n").is_err());
     }
 
     #[test]

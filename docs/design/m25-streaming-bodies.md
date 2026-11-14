@@ -271,9 +271,11 @@ and new components.
   `min(len, size - offset)` bytes, an empty list at or past the end.
 - `writer`: the constructor records the default subject; `write` takes at
   most 1 MiB per call and fails with `quota-exceeded` when the bytes the turn
-  created would pass `blob_bytes_per_actor`; `finish` makes the blob durable
-  (ADR 0117 §4) and adds the reference to `T` as borrowed. A writer that is
-  dropped or still open when the turn ends is discarded.
+  created would pass `blob_bytes_per_actor`; `finish` installs the blob (its
+  bytes synced before its name exists, ADR 0117 §4) and adds the reference
+  to `T` as borrowed; the turn's commit names every blob it finished durably
+  before its record is appended (§4.3). A writer that is dropped or still
+  open when the turn ends is discarded.
 - Every function is denied in `describe` (it traps, like `state`).
 - Bytes moved by `get` and `write` count against the turn's blob budget,
   `fuel × 64` bytes; exceeding it traps with `FUEL_EXHAUSTED`.
@@ -812,7 +814,7 @@ M24's slices.
 | **B3** log format | `proto/kronik/log/v1/{common,turn,effects,config}.proto`, `kronik-proto` (`blobs::refs`, validation), fixtures, `docs/design/m1-core.md` note | decode fixtures; v0.4.1 fixtures unchanged | rebase on M24's proto edits (different fields) |
 | **B4** WIT 0.1.1 and `blobs` | `wit/kronik-actor.wit`, SDK WIT copies, `allowlist.rs` (+ its test), host stubs (`NOT_IMPLEMENTED`), `docs/reference/wit.md`, `wit-examples.md` | allowlist tests; a v0.4 component still runs; the doc-surface gate | **serialize** with M24's WIT slice: the first bumps to 0.1.1 |
 | **B5** runtime blob host | `kronik-runtime` (`BlobHost`, `reads_blobs`, bodies in and out, `FetchBody`, budget, trap codes) | runtime tests with an in-memory `BlobHost` | parallel (textual edits in `host.rs`) |
-| **B6** node wiring | `kronik-sched` (store in `Node`, `TurnBlobs`, leases, `ensure_durable` in commit, worker retry, limits in `Config`), `kronik-effects` (`KindLimits`), `kronik-store` (`blobs` and `blob_pins` sources 4, 6, 7), `kronik` (`[blobs]`, `limits set` flags), `kronik-api` (limits), error codes `BLOB_NOT_HELD`, `BLOB_STORE_FULL`, `BLOB_MISSING`, metrics | `kronik-sched/tests/blobs.rs`: a writer's blob in a response; a crash before commit leaves it loose; a record never precedes its blob; criterion 5 | parallel |
+| **B6** node wiring | `kronik-sched` (store in `Node`, `TurnBlobs`, leases, `ensure_durable` in commit, worker retry, limits in `Config`), `kronik-effects` (`KindLimits`), `kronik` (`[blobs]`, `limits set` flags), `kronik-api` (limits), error codes `BLOB_NOT_HELD`, `BLOB_STORE_FULL`, `BLOB_MISSING`, metrics; the `blobs` and `blob_pins` tables move to B11, which first reads them | `kronik-sched/tests/blobs.rs`: a writer's blob in a response; a crash before commit leaves it loose; a record never precedes its blob; criterion 5 | parallel |
 | **B7** effects | `kronik-core` (`http_stream_authorized`, real and default), `kronik-sim` (streaming `SimNet`), `kronik-effects` (`StreamScrubber`), `kronik-sched/src/effects.rs` (§7.2–§7.5), `ForeignHost` | property test; effects tests with a blob response and request in the simulator; re-run after a crash between blob and `EffectResult` | parallel |
 | **B8** gateway | `kronik-gateway` (`body.rs`, `server.rs`, body phase, response streaming, previews), `kronik-sched` (`ingress_peek`, version 4 hash, upload lease in `Job`), `kronik` (`body_idle_timeout`) | gateway tests; idempotent retry of an upload; criterion 1 at CI size | **coordinate** with M24's gateway slices (`body.rs` either order, agreed) |
 | **B9** `wasi:http` bodies | `kronik-runtime/src/host/wasi_http.rs` | the 100-run transcript test with 3 MiB bodies | parallel |

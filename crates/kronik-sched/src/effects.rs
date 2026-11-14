@@ -1399,11 +1399,22 @@ impl TurnFx {
                 value: Some(value),
             });
         }
-        // Blob request bodies arrive with M25 slice B7; before it no turn
-        // has a blob host that could send one.
+        // A body the turn may not use is a denied effect (M25 §7.2): its
+        // request is recorded without the reference, which no record may
+        // list as the turn's. Blob request bodies arrive with slice B7.
         let wire_body = match &req.body {
             FetchBody::Inline(bytes) => bytes.clone(),
-            FetchBody::Blob(_) | FetchBody::NotHeld { .. } => {
+            FetchBody::NotHeld { hash, size } => {
+                failure = Some((
+                    pb::EffectStatus::Denied,
+                    format!(
+                        "BLOB_NOT_HELD: the request body is the blob {hash} ({size} bytes), \
+                         which the turn neither holds nor received"
+                    ),
+                ));
+                Vec::new()
+            }
+            FetchBody::Blob(_) => {
                 return Err(GateError::Host(
                     "NOT_IMPLEMENTED: blob request bodies are not supported yet".into(),
                 ));

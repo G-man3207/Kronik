@@ -71,6 +71,10 @@ pub enum RunError {
     /// turn attempt is abandoned without a record and runs again later.
     #[error("BLOB_STORE_FULL: {0}")]
     BlobStoreFull(String),
+    /// A committed blob reference's bytes are not in the blob store
+    /// (`BLOB_MISSING`); never expected, as a record follows its blobs.
+    #[error("BLOB_MISSING: {0}")]
+    BlobMissing(String),
     /// A sealed value reached the turn unopened: its subject's key is not
     /// in this node's privacy keystore (`KEYSTORE_INCOMPLETE`).
     #[error(
