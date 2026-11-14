@@ -357,6 +357,15 @@ roots that keep a blob (`{"roots": [{"kind": "held", "actor": "media/alice"},
   Fixtures for both.
 - Pruning a snapshot drops its index with it. A fork's `blobs.roots` is the
   same query on the state the fork starts from, written at fork creation.
+  As built (M25 slice B11): `kronik fork create` writes it, with a
+  `fork_lsn <n>` header line, right after the fork's `proposal.json`. For a
+  fork of the applied state it is that state's roots; for an earlier fork
+  point, whose state the node does not keep, it is every blob of the index
+  first referenced at or before the point (a superset). A crash between the
+  two files leaves a fork without it, whose base the floor and the snapshot
+  indexes keep while the fork is in retention; a proposal or preview, whose
+  base is rebuilt from main's snapshots and log for each run, has none, and
+  its runs take a floor lease (`Node::blob_floor_lease`).
 
 ## 8. Shipping and restore
 

@@ -2155,6 +2155,10 @@ impl Proposals {
                 return Ok((meta, true));
             }
             this.save(&meta, None)?;
+            // The blobs its base state roots (ADR 0120 §4), after the fork
+            // exists: a crash in between leaves a fork whose base the floor
+            // and main's snapshot indexes keep while it is in retention.
+            this.node.write_fork_roots(&this.dir(&name), fork_lsn)?;
             entries.insert(
                 name,
                 Entry {

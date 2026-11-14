@@ -309,3 +309,53 @@ fn the_blobs_that_turns_wrote_and_did_not_keep_are_collected() {
     assert!(p.exists(&kept));
     assert_eq!(second.report.objects, 1);
 }
+
+/// A fork keeps the blobs of its base state (its `blobs.roots`, here the
+/// superset of a point before the head) and those of main's records after
+/// its point (the floor), after compaction has deleted those records from
+/// main's log; once the fork is deleted, both go.
+#[test]
+fn a_fork_keeps_its_base_and_the_records_after_its_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    let base = p.blob_turn(50_000, "");
+    let fork_lsn = p.node.applied_lsn();
+    let after = p.blob_turn(60_000, "");
+    let fork = dir.path().join("branches/f1");
+    std::fs::create_dir_all(&fork).unwrap();
+    p.node.write_fork_roots(&fork, fork_lsn).unwrap();
+    let roots = std::fs::read_to_string(fork.join("blobs.roots")).unwrap();
+    assert_eq!(
+        roots.lines().collect::<Vec<_>>(),
+        [format!("fork_lsn {fork_lsn}").as_str(), base.hash.as_str()]
+    );
+
+    p.traffic(80);
+    p.compact();
+    let storage = p.node.storage_config().unwrap().clone();
+    assert!(p.node.log_first(&storage).unwrap() > fork_lsn + 2);
+    assert_eq!(p.node.blob_floor().unwrap(), fork_lsn + 1);
+    assert!(dry(&p).is_empty());
+    p.gc(SweepOptions {
+        immediate: true,
+        ..Default::default()
+    });
+    assert!(p.exists(&base) && p.exists(&after));
+
+    std::fs::remove_dir_all(&fork).unwrap();
+    let mut unrooted: Vec<(String, UnrootedReason)> =
+        dry(&p).into_iter().map(|u| (u.hash, u.reason)).collect();
+    unrooted.sort();
+    let mut expected = vec![
+        (base.hash.clone(), UnrootedReason::OutOfRetention),
+        (after.hash.clone(), UnrootedReason::OutOfRetention),
+    ];
+    expected.sort();
+    assert_eq!(unrooted, expected);
+    let gone = p.gc(SweepOptions {
+        immediate: true,
+        ..Default::default()
+    });
+    assert_eq!(gone.report.deleted, 2, "{gone:?}");
+    assert!(!p.exists(&base) && !p.exists(&after));
+}

@@ -51,7 +51,7 @@ pub struct GcOutcome {
 }
 
 /// Why a blob file has no root (ADR 0120 §6). M26 adds `released`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnrootedReason {
     /// No committed record ever referenced it: a turn that failed or never
     /// returned or kept what it wrote, a crash before the commit.
@@ -146,23 +146,6 @@ fn read_roots_file(path: &Path) -> std::io::Result<BTreeSet<BlobId>> {
         .lines()
         .filter_map(|line| BlobId::parse(line.trim()).ok())
         .collect())
-}
-
-/// Writes `branches/<fork>/blobs.roots` for a fork whose state is in
-/// `fork_dir/state.db`: a `fork_lsn <n>` header and the identities that
-/// state roots. Called when the fork is created.
-pub fn write_fork_roots(fork_dir: &Path, fork_lsn: Lsn) -> Result<(), ApiError> {
-    let ids: Vec<String> = kronik_store::snapshot::state_blob_roots(&fork_dir.join("state.db"))
-        .map_err(store_error)?
-        .into_iter()
-        .map(|(hash, _)| hash)
-        .collect();
-    write_roots_file(
-        &fork_dir.join(FORK_ROOTS),
-        Some(&format!("fork_lsn {fork_lsn}")),
-        &ids,
-    )
-    .map_err(store_error)
 }
 
 /// A fork of `<data>/branches`: its fork LSN and the blobs its base state
@@ -389,6 +372,47 @@ impl Node {
             *lock(&self.blob_gc.last) = Some(outcome.clone());
         }
         Ok(Some(outcome))
+    }
+
+    /// Writes `branches/<fork>/blobs.roots` for a fork created at
+    /// `fork_lsn` (ADR 0120 §4): a `fork_lsn <n>` header, then the blobs
+    /// its base state roots. For a fork of the applied state that is the
+    /// state's roots now; for an earlier point, which this node does not
+    /// keep a state of, every blob of the index first referenced at or
+    /// before it, a superset. Main's collector keeps them, and the records
+    /// after the fork point, while the fork exists. Nothing when blobs are
+    /// off.
+    pub fn write_fork_roots(&self, fork_dir: &Path, fork_lsn: Lsn) -> Result<(), ApiError> {
+        if self.blobs.is_none() {
+            return Ok(());
+        }
+        let at_head = fork_lsn >= self.applied_lsn();
+        let ids = {
+            let db = self.store().db();
+            if at_head {
+                db.state_blob_roots()
+            } else {
+                db.blobs_referenced_through(fork_lsn)
+            }
+        }
+        .map_err(store_error)?;
+        write_roots_file(
+            &fork_dir.join(FORK_ROOTS),
+            Some(&format!("fork_lsn {fork_lsn}")),
+            &ids,
+        )
+        .map_err(store_error)
+    }
+
+    /// A floor lease at `lsn` (ADR 0120 §4): while it lives (its holder
+    /// renews it at least every 30 s), main's collector keeps every blob a
+    /// record at or after `lsn` references. For a replay, proposal,
+    /// catch-up, rebase or preview run, at its fork point. `None` when blobs
+    /// are off.
+    pub fn blob_floor_lease(&self, holder: &'static str, lsn: Lsn) -> Option<kronik_blob::Lease> {
+        self.blobs
+            .as_ref()
+            .map(|store| store.leases().floor(holder, lsn))
     }
 
     /// The last pass that deleted, for `kronik blobs status`.

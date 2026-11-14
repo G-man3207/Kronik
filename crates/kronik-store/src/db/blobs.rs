@@ -367,6 +367,17 @@ impl StateDb {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Every blob first referenced at or before `lsn`, not erased, sorted:
+    /// a superset of what the state at `lsn` roots, for a fork's
+    /// `blobs.roots` when that state is not at hand.
+    pub fn blobs_referenced_through(&self, lsn: Lsn) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT hash FROM blobs WHERE first_lsn <= ?1 AND erased = 0 ORDER BY hash",
+        )?;
+        let rows = statement.query_map([i(lsn)], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// The number of blobs in the index and their bytes (not erased).
     pub fn blob_totals(&self) -> Result<(u64, u64), StoreError> {
         Ok(self.conn.query_row(
