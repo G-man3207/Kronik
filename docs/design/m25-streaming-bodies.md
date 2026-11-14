@@ -700,9 +700,17 @@ effect results and the API's turn JSON show the reference, never the bytes.
 - **Request bodies.** A blob request body is recorded as its reference, as in
   production, so the fingerprints agree; a reference the turn may not use is
   matched to production's recorded denial, or denied in production's words.
-- **Keys.** A fork never changes the keystore: a subject's new blob in a fork
-  is named with the subject's existing key (`Sealer::existing_blob_keys`),
-  else with a fork-local test key, never sealed.
+- **Keys.** A fork's blob takes its key as the fork's record that names it
+  does (`Sealer::fork_blob_keys`, after `seal_record_keeping_erasures`):
+  with privacy on, the subject's existing key, else a new one when the
+  subject was never erased, and none for an erased subject without a newer
+  key, whose blob the fork refuses (`erased` to the guest, `SUBJECT_ERASED`
+  to a preview's upload: a fork never makes a key version for an erased
+  subject, M8 §6.8); with privacy off, the existing key, else a fork-local
+  test key, never sealed and never in the keystore. (As built: an earlier
+  rule, that a fork never creates a key, left a preview's blobs of a new
+  subject plain on disk while the preview's record created the subject's
+  key anyway; review P-1.)
 - **Prepared bodies.** The disclosure guards that check prepared inline
   bodies for secret values (`prepared_outcome_safe`,
   `disclose_neighbor`) treat `Body.blob` and `body_blob` as prepared when

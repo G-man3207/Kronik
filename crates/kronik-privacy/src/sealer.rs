@@ -483,8 +483,8 @@ impl Sealer {
     }
 
     /// [`Sealer::blob_keys`] without creating a key: `None` when the
-    /// subject has no live key (a fork, which must not change the keystore,
-    /// then names the blob otherwise). Without a keystore, the test key.
+    /// subject has no live key ([`Sealer::fork_blob_keys`] then decides).
+    /// Without a keystore, the test key.
     pub fn existing_blob_keys(&self, subject: &str) -> Result<Option<BlobKeys>, PrivacyError> {
         if !crate::keystore::valid_subject(subject) {
             return Err(PrivacyError::InvalidSubject(subject.to_owned()));
@@ -499,6 +499,35 @@ impl Sealer {
             identity: key.derive(BLOB_IDENTITY_LABEL),
             seal: (self.keystore.is_some() && self.is_on()).then(|| key.derive(BLOB_SEAL_LABEL)),
         }))
+    }
+
+    /// The keys of a subject's blob that a fork writes (a preview's upload,
+    /// a fork turn's writer), by the rule of the fork's own record sealing
+    /// ([`Sealer::seal_record_keeping_erasures`]). With the mode on: the
+    /// subject's key, created when it has none and was never erased, as the
+    /// fork's record that names the blob creates it; `None` when it was
+    /// erased and has no key newer than its erasure, as a fork never makes a
+    /// key version for an erased subject (M8 §6.8). With the mode off nothing
+    /// is sealed and the keystore is not written: the existing key, else the
+    /// fixed test key.
+    pub fn fork_blob_keys(
+        &self,
+        subject: &str,
+        fill: Fill<'_>,
+        wall_ms: u64,
+    ) -> Result<Option<BlobKeys>, PrivacyError> {
+        if let Some(keys) = self.existing_blob_keys(subject)? {
+            return Ok(Some(keys));
+        }
+        if self.keystore.is_none() || !self.is_on() {
+            return Sealer::plain()
+                .blob_keys(subject, &|bytes: &mut [u8]| bytes.fill(0), 0)
+                .map(Some);
+        }
+        if self.erasure_floor(subject)?.is_some() {
+            return Ok(None);
+        }
+        self.blob_keys(subject, fill, wall_ms).map(Some)
     }
 
     fn blob_identity_key(

@@ -44,9 +44,11 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// How a blob host treats keys and subjects' blobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostOptions {
-    /// Whether a subject's first blob may create its key. Production turns
-    /// may; forks must not change the keystore, so they use the subject's
-    /// existing key, else a fork-local test key.
+    /// Whether a subject's blob takes its key as production's do
+    /// (`Sealer::blob_keys`). A fork's take theirs by the rule of the fork's
+    /// record sealing (`Sealer::fork_blob_keys`): with privacy on, a new
+    /// subject's key is created, as the fork's record creates it, and an
+    /// erased subject's blob is refused.
     pub create_keys: bool,
     /// A `--no-pii` fork: a read of a subject's blob gives its pseudonym
     /// (M25 §9), never its bytes.
@@ -422,11 +424,23 @@ impl Inner {
                 .blob_keys(subject, &fill, self.env.clock.wall_ms())
                 .map_err(privacy);
         }
-        match self.sealer.existing_blob_keys(subject).map_err(privacy)? {
+        // A fork's blob is sealed as the fork's record that names it is
+        // (review P-1): never plain on disk with privacy on.
+        let entropy = self.env.entropy.clone();
+        let fill = move |bytes: &mut [u8]| entropy.fill(bytes);
+        match self
+            .sealer
+            .fork_blob_keys(subject, &fill, self.env.clock.wall_ms())
+            .map_err(privacy)?
+        {
             Some(keys) => Ok(keys),
-            None => Sealer::plain()
-                .blob_keys(subject, &|bytes: &mut [u8]| bytes.fill(0), 0)
-                .map_err(privacy),
+            None => {
+                // An erased subject: no new key version in a fork (M8 §6.8),
+                // and the turn cannot be checked against production's.
+                self.read_erased
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                Err(BlobHostError::Erased)
+            }
         }
     }
 

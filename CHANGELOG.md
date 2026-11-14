@@ -288,6 +288,13 @@ until the v1.0 compatibility promise takes effect.
   node from starting (found in review). Every record is also checked as the
   log's readers will decode it before it is appended: a turn whose record
   would not decode fails instead of being written.
+- With privacy on, a fork seals its blobs of a subject as its records (M25):
+  a preview's upload, or a preview turn's own blob, of a subject without a
+  key was stored plain in the preview's space, survived the subject's
+  erasure and was not counted by `privacy status`; it now takes the
+  subject's key, created when the subject was never erased, and a fork
+  refuses a blob of an erased subject (`SUBJECT_ERASED`, `erased`) (found
+  in review).
 - A preview reopened after a restart takes uploads as blobs again (M25): it
   read every request body inline, with the message size limit, until it was
   created again (found in review).

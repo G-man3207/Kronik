@@ -514,10 +514,10 @@ fn a_preview_takes_uploads_and_streams_blob_answers_in_its_space() {
     );
 }
 
-/// Review L-1 (erasure): a subject's upload to a preview created the
-/// subject's key in main's keystore, although forks never change it. A
-/// preview uses the subject's existing key, else a fork-local one; main's
-/// upload still creates it.
+/// Review L-1 (erasure), with privacy off: a subject's upload to a preview
+/// creates no key (nothing is sealed), main's upload creates it. With
+/// privacy on a preview's upload takes its key as the preview's record does
+/// (review P-1, below).
 #[test]
 fn a_preview_upload_creates_no_subject_key() {
     use kronik_gateway::subject::SubjectFrom;
@@ -917,4 +917,151 @@ fn a_preview_takes_uploads_as_blobs_after_a_restart() {
             r.status
         );
     }
+}
+
+/// Every file under `dir` that contains `needle`.
+fn files_with(dir: &std::path::Path, needle: &[u8]) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if std::fs::read(&path)
+                .is_ok_and(|bytes| bytes.windows(needle.len()).any(|w| w == needle))
+            {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Review P-1 (erasure): with privacy on, a preview's upload of a subject
+/// without a key, and a preview turn's own blob of one, were stored plain
+/// (a fork-local test key) although the preview's record sealing created
+/// the subject's key for the same request: the bytes survived the
+/// subject's erasure. A fork's blob now takes its key as the fork's record
+/// does: created for a subject never erased (and sealed), refused for an
+/// erased one.
+#[test]
+fn a_preview_seals_a_new_subjects_blobs_and_refuses_an_erased_ones() {
+    use kronik_gateway::subject::SubjectFrom;
+    use kronik_gateway::{Gateway, GatewayConfig, HttpRequest, PREVIEW_PREFIX};
+    const MARK: &[u8] = b"P1-PREVIEW-MARK-7f3a";
+    let dir = tempdir();
+    let p = blob_node(dir.path());
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "media".into(),
+            fuel: Some(2_000_000_000),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    p.rt.block_on(
+        p.node
+            .set_privacy_mode(pb::PrivacyState::On, audit(), false, p.owner()),
+    )
+    .unwrap();
+    ingress(&p, http("info", "", inline(b"x")));
+    p.settle();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    let (proposal, _) =
+        p.rt.block_on(props.propose(
+            kronik_fork::proposal::ProposeRequest {
+                wasm: vec![{
+                    let mut v2 = std::fs::read(guest("media")).unwrap();
+                    v2.extend_from_slice(&[0x00, 0x07, 0x04, b't', b'e', b's', b't', b'v', b'2']);
+                    v2
+                }],
+                names: Vec::new(),
+                window_ms: None,
+                at: None,
+                options: DiffOptions::default(),
+                workers: Some(2),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
+        .unwrap();
+    let (preview, _) =
+        p.rt.block_on(props.create_preview(&proposal.id, None, false, audit(), false, p.owner()))
+            .unwrap();
+    let gw = Gateway::new(
+        p.node.clone(),
+        GatewayConfig {
+            subject_from: SubjectFrom::parse("header:x-user-id"),
+            ..GatewayConfig::default()
+        },
+    )
+    .with_preview(props.clone());
+    let request = |op: &str, query: &str, user: &str, body: Vec<u8>| HttpRequest {
+        method: "POST".into(),
+        path: format!("{PREVIEW_PREFIX}{}/media/a/{op}", preview.id),
+        query: query.into(),
+        headers: vec![("x-user-id".into(), user.into())],
+        body,
+        peer: None,
+    };
+    // An upload of a subject that has no key yet: sealed under its new key.
+    let mut body = Vec::new();
+    while body.len() < 1_500_000 {
+        body.extend_from_slice(MARK);
+        body.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    }
+    let r =
+        p.rt.block_on(gw.handle(request("info", "", "user:9", body.clone())));
+    let answer = String::from_utf8_lossy(&r.body).to_string();
+    assert!(answer.starts_with("blob b3s:"), "{} {answer}", r.status);
+    assert!(
+        files_with(dir.path(), MARK).is_empty(),
+        "the upload is plain on disk"
+    );
+    let sealer = p.node.sealer();
+    let keystore = sealer.keystore().expect("privacy on has a keystore");
+    assert_eq!(keystore.newest_version("user:9").unwrap(), Some(1));
+    // A preview turn's own blob of another new subject: sealed too.
+    let r =
+        p.rt.block_on(gw.handle(request("write", "size=300000", "user:10", Vec::new())));
+    assert_eq!(r.status, 200);
+    let written: Vec<u8> = (0..4096u64).map(pattern).collect();
+    assert!(r.body.starts_with(&written));
+    assert!(
+        files_with(dir.path(), &written).is_empty(),
+        "the preview turn's blob is plain on disk"
+    );
+    assert_eq!(keystore.newest_version("user:10").unwrap(), Some(1));
+    // The erasure makes the upload unreadable, and the preview refuses a
+    // new body of the erased subject.
+    p.rt.block_on(p.node.erase_subject("user:9", audit(), false, p.owner()))
+        .unwrap();
+    let hash = answer.split_whitespace().nth(1).unwrap().to_owned();
+    let meta = kronik_blob::BlobMeta {
+        id: kronik_blob::BlobId::parse(&hash).unwrap(),
+        size: body.len() as u64,
+        subject: Some("user:9".into()),
+        key_version: 1,
+    };
+    let store = p.node.blob_store().unwrap().clone();
+    let read = p.rt.block_on(store.reader(
+        &kronik_blob::Space::Fork(preview.id.clone()),
+        &meta,
+        &sealer.blob_key_access(),
+    ));
+    assert!(
+        matches!(read, Err(kronik_blob::BlobError::Erased)),
+        "{:?}",
+        read.err()
+    );
+    let r =
+        p.rt.block_on(gw.handle(request("info", "", "user:9", body)));
+    assert_eq!(r.status, 410, "{}", String::from_utf8_lossy(&r.body));
+    assert!(String::from_utf8_lossy(&r.body).contains("SUBJECT_ERASED"));
+    assert!(files_with(dir.path(), MARK).is_empty());
 }

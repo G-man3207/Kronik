@@ -1279,9 +1279,11 @@ impl Gateway {
     }
 
     /// The keys of a subject's upload: main's creates the subject's key when
-    /// it has none, as a value of the subject's does; a preview (a fork)
-    /// never changes the keystore (M25 §9), so it uses the subject's
-    /// existing key, else a fork-local test key, never sealed.
+    /// it has none, as a value of the subject's does. A preview's (a fork's)
+    /// follow the fork's record sealing (`Sealer::fork_blob_keys`, review
+    /// P-1): with privacy on, the subject's key, created when it was never
+    /// erased, and SUBJECT_ERASED for an erased subject; with it off, the
+    /// existing key, else a test key, and nothing sealed.
     fn upload_keys(
         &self,
         subject: &str,
@@ -1297,11 +1299,18 @@ impl Gateway {
                 .blob_keys(subject, &fill, self.node.env().clock.wall_ms())
                 .map_err(internal);
         }
-        match sealer.existing_blob_keys(subject).map_err(internal)? {
+        let entropy = self.node.env().entropy.clone();
+        let fill = move |bytes: &mut [u8]| entropy.fill(bytes);
+        match sealer
+            .fork_blob_keys(subject, &fill, self.node.env().clock.wall_ms())
+            .map_err(internal)?
+        {
             Some(keys) => Ok(keys),
-            None => kronik_privacy::sealer::Sealer::plain()
-                .blob_keys(subject, &|bytes: &mut [u8]| bytes.fill(0), 0)
-                .map_err(internal),
+            None => Err(ApiError::new(
+                ErrorCode::SubjectErased,
+                "the request's subject was erased: a preview stores no body of an erased subject",
+            )
+            .with_hint("A fork never makes a key version for an erased subject; send it to main.")),
         }
     }
 
