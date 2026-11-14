@@ -879,3 +879,57 @@ fn promoting_code_without_the_connection_export_over_open_connections_warns() {
         ]
     );
 }
+
+const REVIEW_EVERY_CHANGE: &str = "[[rule]]\nname = \"any-change\"\nwhen = \"diff.summary.changed\"\naction = \"require_approval\"\n";
+
+/// The quickstart's step 7: a proposal evaluated under the default policy
+/// (allow), then a policy that requires an approval for any change, then
+/// `approve` and `promote`. The approval answers the policy in force when
+/// it was given, so it covers the promote. The other order keeps its
+/// guard: an approval given under the lenient policy does not cover a
+/// stricter one set after it.
+#[test]
+fn an_approval_answers_the_policy_in_force_when_it_was_given() {
+    for approve_first in [false, true] {
+        let dir = tempdir();
+        let p = Proc::start(dir.path());
+        for _ in 0..3 {
+            p.http("a", "increment", "");
+        }
+        let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+        let prop = propose(&p, &props, "counter-step2", DiffOptions::default());
+        assert_eq!(prop.policy["outcome"], "allow", "{}", prop.policy);
+        let set_policy = || {
+            p.rt.block_on(
+                p.node
+                    .set_policy(REVIEW_EVERY_CHANGE, audit(), false, p.owner()),
+            )
+            .unwrap();
+        };
+        let approve = || {
+            p.rt.block_on(props.approve(&prop.id, audit(), false, None, p.owner()))
+                .unwrap()
+                .0
+        };
+        if approve_first {
+            assert_eq!(approve().outcome, "allow");
+            set_policy();
+            let err =
+                p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
+                    .unwrap_err();
+            assert_eq!(err.code, ErrorCode::ApprovalRequired, "{}", err.message);
+        } else {
+            set_policy();
+            let approved = approve();
+            assert_eq!(approved.outcome, "require_approval");
+            assert_eq!(
+                props_get(&p, &props, &prop.id).policy["outcome"],
+                "require_approval"
+            );
+            let r =
+                p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
+                    .unwrap();
+            assert!(r.epoch > 0);
+        }
+    }
+}

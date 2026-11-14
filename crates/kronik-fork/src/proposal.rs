@@ -1555,21 +1555,29 @@ impl Proposals {
         if meta.plain_fork || meta.status == "promoted" {
             return Ok(());
         }
-        let db = self.node.store().db();
-        let promoted = db
-            .deployments()
-            .map_err(internal)?
-            .into_iter()
-            .find(|(_, d)| {
-                // A rollback via replay's switch carries cause Rollback
-                // (its StateRebase deployment), with the proposal's id.
-                let cause = if meta.rebase.is_some() {
-                    pb::DeploymentCause::Rollback
-                } else {
-                    pb::DeploymentCause::Promote
-                };
-                d.proposal_id == meta.id && d.cause == cause as i32
-            });
+        // What the log recorded about the proposal, read under state.db's
+        // guard, which goes before the policy is evaluated (the rules are
+        // read from state.db too).
+        let (deployments, approvals) = {
+            let db = self.node.store().db();
+            let deployments = db.deployments().map_err(internal)?;
+            let approvals = if meta.approved.is_none() {
+                db.approvals(&meta.id).map_err(internal)?
+            } else {
+                Vec::new()
+            };
+            (deployments, approvals)
+        };
+        let promoted = deployments.into_iter().find(|(_, d)| {
+            // A rollback via replay's switch carries cause Rollback
+            // (its StateRebase deployment), with the proposal's id.
+            let cause = if meta.rebase.is_some() {
+                pb::DeploymentCause::Rollback
+            } else {
+                pb::DeploymentCause::Promote
+            };
+            d.proposal_id == meta.id && d.cause == cause as i32
+        });
         let mut changed = false;
         if let Some((lsn, d)) = promoted {
             meta.status = "promoted".into();
@@ -1590,27 +1598,27 @@ impl Proposals {
             && let Ok(bytes) = std::fs::read(self.dir(&meta.id).join("diff.json"))
         {
             let hash = blake3::hash(&bytes).as_bytes().to_vec();
-            let approval = db
-                .approvals(&meta.id)
-                .map_err(internal)?
+            let approval = approvals
                 .into_iter()
                 .rev()
                 .find(|(_, a)| !a.request && a.diff_hash == hash);
             if let Some((lsn, _)) = approval {
                 let d: Value = serde_json::from_slice(&bytes).map_err(internal)?;
+                // As `approve` would have: under the policy in force.
+                let policy = self.evaluate(&bytes)?;
                 meta.approved = Some(Approved {
                     lsn,
                     diff_hash: meta.diff_hash.clone(),
-                    outcome: meta.policy["outcome"].as_str().unwrap_or("deny").to_owned(),
+                    outcome: policy["outcome"].as_str().unwrap_or("deny").to_owned(),
                     targets: targets_of_value(&d),
                 });
+                meta.policy = policy;
                 if meta.status == "evaluated" {
                     meta.status = "approved".into();
                 }
                 changed = true;
             }
         }
-        drop(db);
         if changed {
             self.save(meta, None)?;
         }
@@ -1723,10 +1731,15 @@ impl Proposals {
         let d: Value = serde_json::from_slice(&bytes).map_err(internal)?;
         let targets = targets_of_value(&d);
         let hash_bytes = blake3::hash(&bytes).as_bytes().to_vec();
+        // The bar this approval answers is the policy in force now, not the
+        // one the proposal was evaluated under: a policy set since then
+        // (stricter, say) is what `promote` evaluates, and what the
+        // approver saw (`kronik approve` after `kronik policy set`).
+        let policy = self.evaluate(&bytes)?;
         let mut approved = Approved {
             lsn: 0,
             diff_hash: meta.diff_hash.clone(),
-            outcome: meta.policy["outcome"].as_str().unwrap_or("deny").to_owned(),
+            outcome: policy["outcome"].as_str().unwrap_or("deny").to_owned(),
             targets,
         };
         if dry_run {
@@ -1749,6 +1762,7 @@ impl Proposals {
             .await?;
         approved.lsn = lsn;
         meta.approved = Some(approved.clone());
+        meta.policy = policy;
         if meta.status == "evaluated" {
             meta.status = "approved".into();
         }
