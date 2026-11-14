@@ -1,9 +1,12 @@
 //! Outgoing HTTP for tests: answers from stubs, every request recorded.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
-use kronik_core::env::{BoxFuture, HttpRequest, HttpResponse, Net, NetError};
+use kronik_core::env::{
+    BoxFuture, BytesSource, HttpBody, HttpRequest, HttpResponse, HttpStreamRequest,
+    HttpStreamResponse, Net, NetError,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::Body;
@@ -69,7 +72,9 @@ pub struct Recorded {
 /// that no stub matches fails as if the connection were refused.
 #[derive(Default)]
 pub struct StubNet {
-    state: Mutex<NetState>,
+    // Shared with a streamed request's future, which answers after it has
+    // read the body.
+    state: Arc<Mutex<NetState>>,
 }
 
 #[derive(Default)]
@@ -98,43 +103,66 @@ impl StubNet {
     }
 
     fn answer(&self, req: &HttpRequest) -> Result<HttpResponse, NetError> {
-        let mut st = self.state();
-        st.recorded.push(Recorded {
-            method: req.method.clone(),
-            url: req.url.clone(),
-            headers: req.headers.clone(),
-            body: Body::from_bytes(&req.body),
-        });
-        let Some(stub) = st.stubs.iter_mut().rev().find(|s| s.matches(req)) else {
-            return Err(NetError::Connect(format!(
-                "the test host has no stub for {} {}",
-                req.method, req.url
-            )));
-        };
-        if let Some(times) = &mut stub.times {
-            *times -= 1;
-        }
-        match stub.error {
-            Some(StubFailure::Connect) => {
-                Err(NetError::Connect(format!("stub: {} refused", stub.url)))
+        answer(&self.state, req)
+    }
+}
+
+/// Records `req` and answers it from the newest matching stub.
+fn answer(state: &Mutex<NetState>, req: &HttpRequest) -> Result<HttpResponse, NetError> {
+    let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
+    st.recorded.push(Recorded {
+        method: req.method.clone(),
+        url: req.url.clone(),
+        headers: req.headers.clone(),
+        body: Body::from_bytes(&req.body),
+    });
+    let Some(stub) = st.stubs.iter_mut().rev().find(|s| s.matches(req)) else {
+        return Err(NetError::Connect(format!(
+            "the test host has no stub for {} {}",
+            req.method, req.url
+        )));
+    };
+    if let Some(times) = &mut stub.times {
+        *times -= 1;
+    }
+    match stub.error {
+        Some(StubFailure::Connect) => Err(NetError::Connect(format!("stub: {} refused", stub.url))),
+        Some(StubFailure::Io) => Err(NetError::Io(format!("stub: {} broke off", stub.url))),
+        None => {
+            let body = stub
+                .body
+                .to_bytes()
+                .map_err(|e| NetError::Connect(format!("stub body: {e}")))?;
+            if body.len() as u64 > req.max_response_bytes {
+                return Err(NetError::TooLarge);
             }
-            Some(StubFailure::Io) => Err(NetError::Io(format!("stub: {} broke off", stub.url))),
-            None => {
-                let body = stub
-                    .body
-                    .to_bytes()
-                    .map_err(|e| NetError::Connect(format!("stub body: {e}")))?;
-                if body.len() as u64 > req.max_response_bytes {
-                    return Err(NetError::TooLarge);
-                }
-                Ok(HttpResponse {
-                    status: stub.status,
-                    headers: stub.headers.clone(),
-                    body: Bytes::from(body),
-                })
-            }
+            Ok(HttpResponse {
+                status: stub.status,
+                headers: stub.headers.clone(),
+                body: Bytes::from(body),
+            })
         }
     }
+}
+
+/// `answer` under the original authority's admission, as a live request.
+fn admitted(
+    state: &Mutex<NetState>,
+    req: &HttpRequest,
+    original: &kronik_core::authority::AuthLease,
+) -> Result<HttpResponse, NetError> {
+    let mut response = None;
+    original
+        .admit(&mut || {
+            response = Some(answer(state, req));
+            Ok(())
+        })
+        .map_err(|error| NetError::Connect(error.to_string()))?;
+    response.unwrap_or_else(|| {
+        Err(NetError::Connect(
+            "authority did not admit stub HTTP".into(),
+        ))
+    })
 }
 
 impl Net for StubNet {
@@ -143,23 +171,51 @@ impl Net for StubNet {
         req: HttpRequest,
         original: kronik_core::authority::AuthLease,
     ) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
-        let mut response = None;
-        let admitted = original.admit(&mut || {
-            response = Some(self.answer(&req));
-            Ok(())
-        });
-        let response = admitted
-            .map_err(|error| NetError::Connect(error.to_string()))
-            .and_then(|()| {
-                response.unwrap_or_else(|| {
-                    Err(NetError::Connect(
-                        "authority did not admit stub HTTP".into(),
-                    ))
-                })
-            });
+        let response = admitted(&self.state, &req, &original);
         Box::pin(async move {
             drop(original);
             response
+        })
+    }
+
+    /// A streamed request body (a blob, M25) is read whole first: a stub
+    /// answers a whole request, and the test sees what was sent.
+    fn http_stream_authorized(
+        &self,
+        req: HttpStreamRequest,
+        original: kronik_core::authority::AuthLease,
+    ) -> BoxFuture<'static, Result<HttpStreamResponse, NetError>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let body = match req.body {
+                HttpBody::Bytes(bytes) => bytes,
+                HttpBody::Stream { len, mut source } => {
+                    let mut all = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+                    while let Some(chunk) = source
+                        .next()
+                        .await
+                        .map_err(|e| NetError::Io(format!("reading the request body: {e}")))?
+                    {
+                        all.extend_from_slice(&chunk);
+                    }
+                    Bytes::from(all)
+                }
+            };
+            let whole = HttpRequest {
+                method: req.method,
+                url: req.url,
+                headers: req.headers,
+                body,
+                max_response_bytes: req.max_response_bytes,
+            };
+            let response = admitted(&state, &whole, &original);
+            drop(original);
+            let response = response?;
+            Ok(HttpStreamResponse {
+                status: response.status,
+                headers: response.headers,
+                body: Box::new(BytesSource::new(response.body)),
+            })
         })
     }
 
