@@ -1513,6 +1513,40 @@ mod tests {
     /// its subjects was erased holds that erasure's tombstone in place of the
     /// value, as the live answer of a turn that ran across the erasure does;
     /// another subject's value opens as usual.
+    /// A reseal's tombstone of a subject that never had a key (erased
+    /// through version 0) opens as erased, as one of a subject that had a
+    /// key does. A tombstone of a subject this keystore never erased stays
+    /// unreadable (it vouches for nothing), whatever version it names.
+    #[test]
+    fn a_tombstone_of_a_subject_that_never_had_a_key_opens_as_erased() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sealer(dir.path());
+        s.set_on(true);
+        assert_eq!(s.erase("user:8", 1).unwrap(), 0);
+        let mut v = val(Some("user:8"), b"a request written in mode off");
+        assert_eq!(
+            s.reseal_value(&mut v, Some(0), &counter_fill(), 2).unwrap(),
+            ResealOp::Tombstone
+        );
+        assert!(matches!(s.open(&v), Opened::Erased { .. }), "{v:?}");
+        // A subject that had a key: erased through version 1.
+        let mut had = val(Some("user:9"), b"x");
+        s.seal_value(&mut had, &counter_fill(), 3).unwrap();
+        assert_eq!(s.erase("user:9", 4).unwrap(), 1);
+        assert!(matches!(s.open(&had), Opened::Erased { .. }));
+        // Tombstones of a subject that was never erased.
+        for version in [0, 1] {
+            let forged = pb::Sealable {
+                subject: Some("user:10".into()),
+                value: Some(pb::sealable::Value::Sealed(tombstone(version))),
+            };
+            assert!(
+                matches!(s.open(&forged), Opened::Unreadable { .. }),
+                "{version}"
+            );
+        }
+    }
+
     #[test]
     fn a_saved_answer_holds_the_tombstone_of_an_erased_subject() {
         let dir = tempfile::tempdir().unwrap();

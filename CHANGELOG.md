@@ -21,6 +21,18 @@ until the v1.0 compatibility promise takes effect.
   data shows no `PII-masked` line any more; a `--no-pii` fork keeps it, and
   with erased data in the window it says the turns ran on pseudonyms or met
   erased data.
+- A node restarted after `kronik privacy reseal` could fail to certify its
+  secret inventory for good, so reads that remove secret values answered 503
+  `SECRET_UNAVAILABLE` ("the retained secret identity or value is
+  unavailable") until the log was cut. The cause was a reseal that turned a
+  value of an erased subject that never had a key (one written while the
+  privacy mode was off) into a tombstone. The keystore refused to look up
+  version 0, the version such a subject is erased through, so the coverage
+  scan read the tombstone as unreadable instead of erased. It happened when
+  the restart's scan reread the resealed segment, which depends on how far
+  the coverage watermark had got. The keystore now answers "erased" for every
+  version an erasure covers, 0 included; a tombstone of a subject it never
+  erased still fails closed. v0.4.1 had the same defect.
 - `isolation = "microvm"` runs a foreign actor in a Firecracker microVM of
   its own (M20; ADRs 0095 and 0096, accepted on 2026-11-14), an opt-in
   level beside gVisor, which stays the default. It needs a usable `/dev/kvm`

@@ -813,7 +813,6 @@ impl Keystore {
         subject: &str,
         version: u32,
     ) -> Result<(KeyRevision, KeyLookup), PrivacyError> {
-        let version = subject_key_version(version)?;
         let mut conn = self.checked_conn()?;
         let data_version = data_version(&conn)?;
         let tx = conn.transaction()?;
@@ -822,9 +821,14 @@ impl Keystore {
             revision: semantic_revision(&tx)?,
             data_version,
         };
+        // Erased through `version` first, so that version 0 answers too: a
+        // subject that never had a key is erased through 0, and a reseal's
+        // tombstones of its values name that version. 0 is no key's version
+        // otherwise.
         let key = if Self::erased_through(&tx, subject)?.is_some_and(|last| version <= last) {
             KeyLookup::Erased
         } else {
+            let version = subject_key_version(version)?;
             let row: Option<(Vec<u8>, Vec<u8>)> = tx
                 .query_row(
                     "SELECT nonce, wrapped FROM subject_keys WHERE subject = ?1 AND version = ?2",

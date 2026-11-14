@@ -969,3 +969,58 @@ fn a_reseal_whose_rename_is_not_durable_stops_the_node() {
         );
     });
 }
+
+/// A node restarted after a complete reseal certifies its secret inventory
+/// (log-integrity's report): the reseal made the request of `user:8`, a
+/// subject erased without ever having a key, a tombstone, which the coverage
+/// scan read as unreadable, so a restart whose scan read it again (from the
+/// first record: no coverage watermark past it) never certified. The
+/// watermark is removed here so that the scan always reads it.
+#[test]
+fn a_restart_after_a_complete_reseal_certifies_the_inventory() {
+    let data = tempfile::tempdir().unwrap();
+    run(async {
+        let node = plain_history(data.path()).await;
+        node.reseal(audit(), false, authority(&node)).await.unwrap();
+        assert_eq!(node.pending_erasures().await.unwrap(), 0);
+        quiesce(&node).await;
+    });
+    let _ = std::fs::remove_file(data.path().join("secret-coverage.json"));
+    run(async {
+        let node = crate::start_local(env(), data.path(), resealing_config(data.path()))
+            .await
+            .unwrap();
+        settle(&node).await;
+        quiesce(&node).await;
+        let found = node.scan_secret_use(1, node.applied_lsn()).await.unwrap();
+        assert!(found.erased >= 1, "{}", found.erased);
+    });
+}
+
+/// The scan reads the tombstone of a subject that never had a key as
+/// erased, as it reads one of a subject that had a key.
+#[test]
+fn a_tombstone_of_a_subject_erased_without_a_key_is_read_as_erased() {
+    run(async {
+        let data = tempfile::tempdir().unwrap();
+        let node = private_node(data.path(), env()).await;
+        // user:6 never had a key: erased through version 0.
+        erase(&node, "user:6").await;
+        finished(
+            &node,
+            1,
+            with_sealed(
+                fetch(Some("user:6"), None),
+                pb::Sealed {
+                    key_version: 0,
+                    nonce: vec![0; 24],
+                    ciphertext: Vec::new(),
+                },
+            ),
+        )
+        .await;
+        let found = node.scan_secret_use(1, node.applied_lsn()).await.unwrap();
+        assert_eq!(found.erased, 1);
+        assert!(found.references.is_empty());
+    });
+}
