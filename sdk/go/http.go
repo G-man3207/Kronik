@@ -281,7 +281,11 @@ func (m OutgoingMessage) wit() (types.Message, error) {
 	if m.ContentType != "" {
 		contentType = m.ContentType
 	}
-	blobs := make([]types.BlobRef, 0, len(m.Blobs))
+	// Without blobs the list stays nil. An empty slice from make may point
+	// anywhere (TinyGo gives zero-size allocations one shared address), and
+	// the canonical ABI traps on a list pointer that is not aligned to its
+	// elements, 8 bytes for blob-ref, even for an empty list.
+	var blobs []types.BlobRef
 	for _, b := range m.Blobs {
 		blobs = append(blobs, b.wit())
 	}

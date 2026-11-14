@@ -290,8 +290,11 @@ func TestMessagesCarryBlobs(t *testing.T) {
 	if string(w.Body.Slice()) != "img-1" || w.ContentType != "text/plain; charset=utf-8" {
 		t.Errorf("body %q %q", w.Body.Slice(), w.ContentType)
 	}
-	if none, _ := (OutgoingMessage{Name: "tick"}).wit(); len(none.Blobs.Slice()) != 0 {
-		t.Error("no blobs")
+	// No blobs: the zero list, whose nil pointer is aligned. An empty list
+	// with a pointer that is not (TinyGo's zero-size allocations) traps in
+	// the host: "list pointer is not aligned".
+	if none, _ := (OutgoingMessage{Name: "tick"}).wit(); none.Blobs.Len() != 0 || none.Blobs.Data() != nil {
+		t.Errorf("a message without blobs has the zero list, not %d at %p", none.Blobs.Len(), none.Blobs.Data())
 	}
 	m := newMessage(&w, nil)
 	if !reflect.DeepEqual(m.Blobs, []BlobRef{a, b}) {
