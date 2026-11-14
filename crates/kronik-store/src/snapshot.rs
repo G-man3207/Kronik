@@ -421,6 +421,25 @@ pub fn oldest_open_turn(snapshot: &Path) -> Result<Option<(Lsn, String)>, StoreE
     })
 }
 
+/// The blob identities the state in `state_db` roots (M26 §7: pinned, not
+/// erased; M26 adds holds), sorted, with their sizes, read without changing
+/// the file. A state from before blobs has no blob tables and roots none.
+pub fn state_blob_roots(state_db: &Path) -> Result<Vec<(String, u64)>, StoreError> {
+    let conn = rusqlite::Connection::open_with_flags(
+        state_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let has_tables: bool = conn.query_row(
+        "SELECT count(*) = 2 FROM sqlite_schema WHERE type = 'table' AND name IN ('blobs', 'blob_pins')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_tables {
+        return Ok(Vec::new());
+    }
+    crate::db::StateDb::roots_of(&conn)
+}
+
 /// The code hashes the snapshot's `deployments` table names, as `<64 hex>`
 /// strings (the name a `code/` object carries before `.wasm`), read without
 /// changing the snapshot. A restore downloads these and the ones the

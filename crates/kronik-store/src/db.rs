@@ -361,6 +361,9 @@ pub struct StateDb {
     allow_gaps: bool,
 }
 
+mod blobs;
+pub use blobs::{BlobPin, BlobRow, source as blob_source};
+
 fn corrupt(msg: impl Into<String>) -> StoreError {
     StoreError::Corrupt(msg.into())
 }
@@ -387,6 +390,7 @@ impl StateDb {
             "PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = OFF; PRAGMA secure_delete = ON;",
         )?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(blobs::SCHEMA)?;
         // M8: `kv.sealed` says whether `value` is an encoded `Sealed`
         // (privacy mode) or the plain bytes; older databases gain it.
         let has_sealed: bool = conn.query_row(
@@ -829,6 +833,14 @@ impl StateDb {
                     c.lsn
                 )));
             }
+            // The blob index (M26 §5.2): every reference, and the pins of
+            // open turns and saved responses.
+            let closed_here = match &c.record {
+                Record::TurnBegin(t) => closed.contains(t.execution_id.as_str()),
+                Record::EffectResult(e) => closed.contains(e.execution_id.as_str()),
+                _ => false,
+            };
+            blobs::apply(&tx, c.lsn, &c.record, closed_here)?;
             match &c.record {
                 Record::TurnRecord(t) => {
                     hwm = hwm.max(t.logical_time_ms);
@@ -3811,6 +3823,11 @@ impl CatchupRows {
             Record::TurnRecord(t) if simple_http(t) => {}
             Record::TurnBegin(_) => {}
             _ => return Ok(false),
+        }
+        // The rows keep no blob index: a record with a blob goes to the
+        // applier.
+        if blobs::references_blobs(&c.record) {
+            return Ok(false);
         }
         if c.lsn <= self.applied {
             return Ok(true);
