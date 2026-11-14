@@ -61,7 +61,16 @@ type Response struct {
 	Body    []byte
 	// Turn is the id of the turn that answered, such as "main:5".
 	Turn string
+	// Blob is the blob the body was, when the actor answered with one
+	// (M25); Body holds its bytes.
+	Blob *Blob
 	t    testing.TB
+}
+
+// Blob is a blob a response's body was: its hash and size.
+type Blob struct {
+	Hash string `json:"hash"`
+	Size uint64 `json:"size"`
 }
 
 // Header returns the first header called name, ignoring case.
@@ -284,9 +293,10 @@ func (h *TestHost) HTTP(method, path string, body any, headers ...Header) *Respo
 		Status  int      `json:"status"`
 		Headers []Header `json:"headers"`
 		Turn    *string  `json:"turn"`
+		Blob    *Blob    `json:"blob"`
 	}
 	h.call(request, &answer)
-	res := &Response{Status: answer.Status, Headers: answer.Headers, Body: answer.bytes(h.t), t: h.t}
+	res := &Response{Status: answer.Status, Headers: answer.Headers, Body: answer.bytes(h.t), Blob: answer.Blob, t: h.t}
 	if answer.Turn != nil {
 		res.Turn = *answer.Turn
 	}

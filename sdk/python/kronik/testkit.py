@@ -58,7 +58,9 @@ def _with_content_type(headers, is_json):
 
 @dataclass
 class TestResponse:
-    """A response through the gateway; `turn` is the id of the turn that answered, such as `main:5`."""
+    """A response through the gateway; `turn` is the id of the turn that answered,
+    such as `main:5`, and `blob` the blob the body was ({"hash", "size"}) when
+    the actor answered with one (M25), else None; `body` holds its bytes."""
 
     __test__ = False  # not a test case for test runners that collect Test* classes
 
@@ -66,6 +68,7 @@ class TestResponse:
     headers: list
     body: bytes
     turn: str | None
+    blob: dict | None = None
 
     def header(self, name):
         """The first header called `name`, ignoring case, or None."""
@@ -233,7 +236,7 @@ class TestHost:
         wire, is_json = _wire_body(body)
         hdrs = _with_content_type([[n, v] for n, v in (headers or {}).items()], is_json)
         answer = self._call({"op": "http", "method": method, "path": path, "headers": hdrs, **wire})
-        return TestResponse(answer["status"], answer["headers"], _bytes_of(answer), answer.get("turn"))
+        return TestResponse(answer["status"], answer["headers"], _bytes_of(answer), answer.get("turn"), answer.get("blob"))
 
     def open_connection(self, path, protocol="websocket", headers=None):
         """Opens a WebSocket (the default) or an event stream (`protocol="sse"`) at `path`

@@ -54,12 +54,21 @@ export class TestResponse {
   readonly body: Uint8Array;
   /** The id of the turn that answered, such as `main:5`. */
   readonly turn: string | undefined;
+  /** The blob the body was, when the actor answered with one (M25); `body` holds its bytes. */
+  readonly blob: { hash: string; size: number } | undefined;
 
-  constructor(status: number, headers: Array<[string, string]>, body: Uint8Array, turn: string | undefined) {
+  constructor(
+    status: number,
+    headers: Array<[string, string]>,
+    body: Uint8Array,
+    turn: string | undefined,
+    blob?: { hash: string; size: number },
+  ) {
     this.status = status;
     this.headers = headers;
     this.body = body;
     this.turn = turn;
+    this.blob = blob;
   }
 
   /** The first header called `name`, ignoring case. */
@@ -180,6 +189,7 @@ interface HttpAnswer extends WireBody {
   status: number;
   headers: Array<[string, string]>;
   turn: string | null;
+  blob?: { hash: string; size: number };
 }
 interface ApiAnswer {
   status: number;
@@ -308,7 +318,7 @@ export class TestHost {
     const headers = Object.entries(init.headers ?? {});
     if (json && !headers.some(([n]) => n.toLowerCase() === 'content-type')) headers.push(['content-type', 'application/json']);
     const answer = await this.#call<HttpAnswer>({ op: 'http', method, path, headers, ...body });
-    return new TestResponse(answer.status, answer.headers, bytesOf(answer), answer.turn ?? undefined);
+    return new TestResponse(answer.status, answer.headers, bytesOf(answer), answer.turn ?? undefined, answer.blob ?? undefined);
   }
 
   /**
