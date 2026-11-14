@@ -6,11 +6,13 @@
 //! - Virtual time only advances when no task is ready: it jumps to the
 //!   earliest timer. A run with hours of simulated latency takes milliseconds.
 //! - Tasks belong to a node. Killing a node drops all of its futures at once,
-//!   which is how a crash looks to the code: it just stops.
+//!   which is how a crash looks to the code: it just stops. A killed node
+//!   starts nothing new: a task its destructors spawn is dropped at once,
+//!   as a dead process runs no code (and must not write to the disk).
 //! - Internals sit behind a `Mutex` only because `Waker` must be
 //!   `Send + Sync`; there is never contention.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
@@ -42,6 +44,8 @@ struct Inner {
     next_task: u64,
     next_timer: u64,
     polls: u64,
+    /// Nodes that were killed: they never run a task again.
+    dead: BTreeSet<NodeId>,
 }
 
 /// Cloneable, `Send + Sync` handle used by wakers, sleeps and spawners.
@@ -78,6 +82,7 @@ impl Executor {
                 next_task: 1,
                 next_timer: 1,
                 polls: 0,
+                dead: BTreeSet::new(),
             }))),
         }
     }
@@ -173,6 +178,12 @@ impl Handle {
 
     pub fn spawn(&self, node: NodeId, name: &'static str, fut: BoxFuture<'static, ()>) {
         let mut g = self.lock();
+        if g.dead.contains(&node) {
+            // A destructor of a killed node's task: the process is gone.
+            drop(g);
+            drop(fut);
+            return;
+        }
         let id = g.next_task;
         g.next_task += 1;
         g.tasks.insert(
@@ -192,6 +203,7 @@ impl Handle {
     pub fn kill_node(&self, node: NodeId) -> usize {
         let dropped: Vec<Slot> = {
             let mut g = self.lock();
+            g.dead.insert(node);
             let ids: Vec<u64> = g
                 .tasks
                 .iter()
