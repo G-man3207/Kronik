@@ -728,6 +728,167 @@ mod tests {
         );
     }
 
+    /// ADR 0005 §6 in a fork. One production turn on behalf of `user:1`
+    /// wrote a row of its own and one that names `user:2`; each changeset
+    /// of its record is sealed under its own subject. A `--no-pii` replay
+    /// gives each row the pseudonyms of its own subject. Once `user:2` is
+    /// erased, its changeset stays sealed and its row is not in the fork,
+    /// with or without `--no-pii`, while `user:1`'s is. Filing both rows
+    /// under the turn's default subject would give `user:2`'s row
+    /// `user:1`'s pseudonyms and keep it after the erasure.
+    #[test]
+    fn a_replay_treats_each_row_of_a_turn_under_its_own_subject() {
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+
+        use kronik_log::{Committed, Position};
+        use kronik_privacy::MasterKey;
+        use kronik_privacy::keystore::{Keystore, Pseudonyms};
+        use kronik_proto::Record;
+        use kronik_store::sql::{Limits, MemOpener, SqlActor, TurnOpts};
+
+        const MINE: &str = "ROW-u1-3b7d";
+        const THEIRS: &str = "ROW-u2-8e05";
+        const SCHEMA: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
+             payload BLOB, _subject TEXT DEFAULT (kronik_subject()))";
+
+        let mut live = SqlActor::open(&MemOpener, "notes/n", Limits::default()).unwrap();
+        let opts = |seed: u8, subject: Option<&str>, migrate: bool| TurnOpts {
+            seed: [seed; 32],
+            time_ms: 1_000,
+            default_subject: subject.map(str::to_owned),
+            migrate,
+            sql_budget: 50_000_000,
+            max_bytes: 0,
+        };
+        live.begin_turn(&opts(1, None, true)).unwrap();
+        live.query(SCHEMA, &[]).unwrap();
+        let schema_turn = live.end_turn(true).unwrap();
+        live.apply(&schema_turn, 1, &BTreeSet::new()).unwrap();
+        live.begin_turn(&opts(2, Some("user:1"), false)).unwrap();
+        live.query(
+            &format!("INSERT INTO notes(body, payload) VALUES ('{MINE}', x'01')"),
+            &[],
+        )
+        .unwrap();
+        live.query(
+            &format!(
+                "INSERT INTO notes(body, payload, _subject) VALUES ('{THEIRS}', x'02', 'user:2')"
+            ),
+            &[],
+        )
+        .unwrap();
+        let dml = live.end_turn(true).unwrap();
+
+        let master = MasterKey::from_bytes([9; 32]).unwrap();
+        let sealer = Arc::new(
+            Sealer::new(Arc::new(Keystore::open_memory(&master).unwrap()))
+                .with_pseudonyms(Pseudonyms::new(&master).unwrap()),
+        );
+        sealer.set_on(true);
+        // As the node records them: each changeset sealed under its subject.
+        let sealed: Vec<pb::SqlChangeset> = dml
+            .changesets
+            .iter()
+            .map(|(subject, cs)| {
+                let mut value = pb::Sealable {
+                    subject: subject.clone(),
+                    value: Some(pb::sealable::Value::Plain(cs.clone())),
+                };
+                sealer
+                    .seal_value(&mut value, &|b: &mut [u8]| b.fill(3), 2)
+                    .unwrap();
+                pb::SqlChangeset {
+                    changeset: Some(value),
+                }
+            })
+            .collect();
+        let turn = |lsn: u64, ddl: &[String], sql_changes: Vec<pb::SqlChangeset>| Committed {
+            lsn,
+            pos: Position {
+                segment: 0,
+                offset: 0,
+            },
+            record: Record::TurnRecord(pb::TurnRecord {
+                actor: Some(pb::ActorRef {
+                    kind: "notes".into(),
+                    key: "n".into(),
+                }),
+                causal_key: Some(kronik_core::causal::root(format!("r{lsn}"))),
+                input: Some(pb::Input {
+                    kind: Some(pb::input::Kind::Http(pb::HttpInput::default())),
+                }),
+                outcome: Some(pb::Outcome {
+                    kind: pb::OutcomeKind::Committed as i32,
+                    ..Default::default()
+                }),
+                sql_schema: ddl
+                    .iter()
+                    .map(|statement| pb::SqlSchemaChange {
+                        statement: statement.clone(),
+                    })
+                    .collect(),
+                sql_changes,
+                ..Default::default()
+            }),
+        };
+        let replay = |no_pii: bool| {
+            let records = vec![
+                turn(1, &schema_turn.ddl, Vec::new()),
+                turn(2, &[], sealed.clone()),
+            ];
+            let mut index = crate::ProductionIndex::from_records(records, 0, 2);
+            index.reveal(&ForkPrivacy {
+                sealer: sealer.clone(),
+                no_pii,
+            });
+            let store = crate::replay::cursor(&index).unwrap();
+            crate::replay::advance(&store, &index, 2).unwrap();
+            store
+        };
+        let pseudonym = |subject: &str, value: &[u8]| sealer.pseudonym(subject, value).unwrap();
+        let mine = (
+            1,
+            pseudonym("user:1", MINE.as_bytes()),
+            pseudonym("user:1", &[1]).into_bytes(),
+            "user:1".to_owned(),
+        );
+
+        let masked = replay(true);
+        assert_eq!(
+            actor_rows(&masked),
+            [
+                mine.clone(),
+                (
+                    2,
+                    pseudonym("user:2", THEIRS.as_bytes()),
+                    pseudonym("user:2", &[2]).into_bytes(),
+                    "user:2".to_owned(),
+                ),
+            ],
+            "each row carries its own subject's pseudonyms"
+        );
+        let image = actor_image(&masked);
+        for needle in [MINE, THEIRS] {
+            assert!(
+                !image.windows(needle.len()).any(|w| w == needle.as_bytes()),
+                "the fork's actor database holds {needle}"
+            );
+        }
+
+        sealer.erase("user:2", 3).unwrap();
+        assert_eq!(
+            actor_rows(&replay(true)),
+            [mine],
+            "a --no-pii fork after the erasure"
+        );
+        assert_eq!(
+            actor_rows(&replay(false)),
+            [(1, MINE.to_owned(), vec![1], "user:1".to_owned())],
+            "an ordinary fork after the erasure"
+        );
+    }
+
     fn actor_image(store: &kronik_store::Store) -> Vec<u8> {
         let db = store.sql.get("notes/n").unwrap();
         let actor = db.lock().unwrap();

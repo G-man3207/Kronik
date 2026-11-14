@@ -493,6 +493,135 @@ fn subject_rows(a: &mut SqlActor) -> Vec<(i64, String, String)> {
         .collect()
 }
 
+/// (op, body, `_subject`) of each change in a changeset of [`SUBJECT_TABLE`];
+/// an UPDATE's `_subject` is its unchanged old one, absent from the record.
+fn subject_changes(cs: &[u8]) -> Vec<(ffi::Op, Option<String>, Option<String>)> {
+    let text = |v: Option<&Option<ffi::Val>>| match v {
+        Some(Some(ffi::Val::Text(t))) => Some(t.clone()),
+        _ => None,
+    };
+    ffi::changes(cs)
+        .unwrap()
+        .into_iter()
+        .map(|c| {
+            let image = if c.op == ffi::Op::Delete {
+                &c.old
+            } else {
+                &c.new
+            };
+            (c.op, text(image.get(1)), text(image.get(2)))
+        })
+        .collect()
+}
+
+/// `subjects/split` (ADR 0005 §6): one turn with the default subject
+/// `user:1` writes a row of its own and rows that name `user:2` and
+/// `user:3`. Each subject gets one changeset that holds its rows and no
+/// other's, and that applies on its own. Filing every row under the turn's
+/// default subject would put `user:2`'s and `user:3`'s rows in `user:1`'s
+/// changeset, which an erasure of `user:2` leaves readable.
+#[test]
+fn subjects_split_one_turn_into_a_changeset_per_row_subject() {
+    let mut live = subject_actor("split-live");
+    let (t, res) = commit(
+        &mut live,
+        &as_subject(2, "user:1"),
+        &[
+            "INSERT INTO notes(body) VALUES ('one')",
+            "INSERT INTO notes(body, _subject) VALUES ('two', 'user:2')",
+            "INSERT INTO notes(body, _subject) VALUES ('three', 'user:3')",
+        ],
+        2,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let subjects: Vec<Option<&str>> = t.changesets.iter().map(|(s, _)| s.as_deref()).collect();
+    assert_eq!(
+        subjects,
+        [Some("user:1"), Some("user:2"), Some("user:3")],
+        "one changeset per row subject"
+    );
+    for ((subject, cs), body) in t.changesets.iter().zip(["one", "two", "three"]) {
+        assert_eq!(
+            subject_changes(cs),
+            [(ffi::Op::Insert, Some(body.to_owned()), subject.clone())],
+            "the changeset of {subject:?} holds its row and no other"
+        );
+        // Applicable on its own, as a rebuild after another subject's
+        // erasure applies it.
+        let mut alone = subject_actor("split-alone");
+        alone
+            .apply(
+                &TurnSql {
+                    changesets: vec![(subject.clone(), cs.clone())],
+                    ..TurnSql::default()
+                },
+                2,
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        let rows = subject_rows(&mut alone);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            (rows[0].1.as_str(), Some(rows[0].2.as_str())),
+            (body, subject.as_deref())
+        );
+    }
+    assert_eq!(
+        subject_rows(&mut live),
+        [
+            (1, "one".to_owned(), "user:1".to_owned()),
+            (2, "two".to_owned(), "user:2".to_owned()),
+            (3, "three".to_owned(), "user:3".to_owned()),
+        ]
+    );
+}
+
+/// `subjects/row-subject-wins` (ADR 0005 §6): an UPDATE record carries only
+/// the changed columns, so the subject of an updated row is looked up by
+/// key; a DELETE carries the old row. A change to `user:2`'s row in a turn
+/// whose default subject is `user:3` goes to `user:2`'s changeset.
+#[test]
+fn subjects_row_subject_wins_over_the_turns_default_subject() {
+    let mut a = subject_actor("row-subject");
+    let (_, res) = commit(
+        &mut a,
+        &as_subject(2, "user:2"),
+        &["INSERT INTO notes(body) VALUES ('two')"],
+        2,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let (t, res) = commit(
+        &mut a,
+        &as_subject(3, "user:3"),
+        &["UPDATE notes SET body = 'two, edited' WHERE id = 1"],
+        3,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    assert_eq!(t.changesets.len(), 1, "{t:?}");
+    assert_eq!(t.changesets[0].0.as_deref(), Some("user:2"));
+    assert_eq!(
+        subject_changes(&t.changesets[0].1),
+        [(ffi::Op::Update, Some("two, edited".to_owned()), None)]
+    );
+    let (t, res) = commit(
+        &mut a,
+        &as_subject(4, "user:3"),
+        &["DELETE FROM notes WHERE id = 1"],
+        4,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    assert_eq!(t.changesets.len(), 1, "{t:?}");
+    assert_eq!(t.changesets[0].0.as_deref(), Some("user:2"));
+    assert_eq!(
+        subject_changes(&t.changesets[0].1),
+        [(
+            ffi::Op::Delete,
+            Some("two, edited".to_owned()),
+            Some("user:2".to_owned())
+        )]
+    );
+}
+
 /// `subjects/move-detected` (ADR 0005 §6): a row cannot move to another
 /// subject. An UPDATE of `_subject`, an upsert's too, is denied when the
 /// statement runs. A REPLACE, or a DELETE and an INSERT of the same key in

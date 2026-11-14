@@ -273,24 +273,38 @@ Limits:
   moved row's old values (one subject's data) would sit in the other
   subject's changeset. Deleting the row in one turn and inserting it in a
   later one moves it.
-- **Verified** (`subjects/split`, `subjects/row-subject-wins`): one turn
-  with default subject `user:1` wrote rows for `user:2` and `user:3`, each
-  in its own changeset, applicable on its own. An update of `user:2`'s row
-  in a turn whose default subject is `user:3` goes to `user:2`.
+- **Verified** by the tests in `crates/kronik-store/src/sql/tests.rs`:
+  `subjects_split_one_turn_into_a_changeset_per_row_subject` (one turn with
+  default subject `user:1` writes rows for `user:2` and `user:3`, each in
+  its own changeset that holds only its rows and applies on its own),
+  `subjects_row_subject_wins_over_the_turns_default_subject` (an update and
+  a delete of `user:2`'s row in a turn whose default subject is `user:3` go
+  to `user:2`) and `subjects_move_detected`. Each of them fails if every row
+  is filed under the turn's default subject.
 - **Erasure** is a recorded erasure operation in the log, not a changeset,
   because a changeset's old values would be the erased data. The host runs
   `DELETE FROM t WHERE _subject = ?` on every table that has a `_subject`
   column. On rebuild, the erased subject's changesets are unreadable and
   skipped, and the erasure operation is replayed. The result equals the
-  live database (`subjects/erasure`). Rows that already have a `_subject`
-  value are erased that way; this decision does not change that.
+  live database. Rows that already have a `_subject` value are erased that
+  way; this decision does not change that. Verified by
+  `crates/kronik-store/tests/sql_subjects.rs`: after one turn wrote rows of
+  two subjects and one subject is erased, the other's rows stay, live and
+  rebuilt from the log; the changeset that still opens holds nothing of
+  the erased subject; and a rebuild that stops before the erasure record
+  has no row of it either. In a fork,
+  `a_replay_treats_each_row_of_a_turn_under_its_own_subject`
+  (`crates/kronik-fork/src/privacy.rs`) checks that a `--no-pii` replay
+  pseudonymizes each row under its own subject and that the erased
+  subject's row is not in the fork.
 - **Tables without `_subject` (decided: option B).** A turn that has a
   default subject may only write tables that have a `_subject` column. A
   write to a table without that column fails the turn with
-  `subjects/table-without-subject` and names the table. Turns without a
-  subject may still write anywhere, so configuration tables stay possible.
-  `rows_without_subject_column` stays a no-op because new writes are
-  refused. Existing rows written before this decision are not rewritten.
+  `subjects/table-without-subject` and names the table
+  (`a_subject_turn_cannot_write_a_table_without_subject_column`). Turns
+  without a subject may still write anywhere, so configuration tables stay
+  possible. `rows_without_subject_column` stays a no-op because new writes
+  are refused. Existing rows written before this decision are not rewritten.
   Old rows in tables without `_subject`, or with a NULL `_subject`, belong
   to nobody and survive erasure. Option A, a host-side row-owner table, is
   not implemented.

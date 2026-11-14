@@ -105,6 +105,9 @@ CREATE TABLE orders (
   `subjects/move-detected`, for example an `INSERT OR REPLACE` of a row of
   another subject, or a `DELETE` and an `INSERT` of the same key in one
   turn. Delete the row in one turn and insert it in a later one.
+- The rows of one turn may belong to several subjects: each subject's
+  changes go into a changeset of their own, which privacy mode seals under
+  that subject's key, so erasing one subject leaves the others' rows.
 - Erasure deletes the subject's rows from every table that has `_subject`.
 - A turn that has a default subject may only write tables that have a
   `_subject` column. A write to a table without that column fails the turn
