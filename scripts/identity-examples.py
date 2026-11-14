@@ -92,20 +92,24 @@ class Example:
         self.check(f"{method} {path} answered {status}", status < 300, out)
         return out
 
-    def http(self, method, path, body=None, headers=None):
-        """A request through the gateway: (status, body as JSON or text, headers)."""
+    def http(self, method, path, body=None, headers=None, raw=False):
+        """A request through the gateway: (status, body as JSON or text, or
+        the bytes with `raw`, headers)."""
+        want_raw = raw
         data = body if isinstance(body, bytes) else None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
                                      headers=headers or {})
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
-                status, raw, hdrs = r.status, r.read(), r.headers
+                status, body_bytes, hdrs = r.status, r.read(), r.headers
         except urllib.error.HTTPError as e:
-            status, raw, hdrs = e.code, e.read(), e.headers
+            status, body_bytes, hdrs = e.code, e.read(), e.headers
+        if want_raw:
+            return status, body_bytes, {k.lower(): v for k, v in hdrs.items()}
         try:
-            out = json.loads(raw) if raw else None
+            out = json.loads(body_bytes) if body_bytes else None
         except ValueError:
-            out = raw.decode(errors="replace")
+            out = body_bytes.decode(errors="replace")
         return status, out, {k.lower(): v for k, v in hdrs.items()}
 
     def expect(self, method, path, status, body=None, headers=None):
@@ -483,6 +487,96 @@ def billing_traffic(ex):
     ex.dead_letter_resent("ledger/acme", "post", {"invoice": "inv-9"})
 
 
+# ------------------------------------------------------------------- media
+
+
+def picture(n, seed=7):
+    """Bytes that stand in for an image: byte i is (i * 31 + seed) % 251."""
+    period = bytes((i * 31 + seed) % 251 for i in range(251))
+    return (period * (n // 251 + 1))[:n]
+
+
+class ImageHost:
+    """Where media-ts imports from: /cat.png (small), /big.png (1.5 MiB, a
+    blob), /page (HTML, not an image)."""
+
+    def __init__(self):
+        files = {"/cat.png": ("image/png", picture(40_000, 3)), "/big.png": ("image/png", picture(1536 << 10, 5)),
+                 "/page": ("text/html", b"<html></html>")}
+        self.files = files
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                content_type, data = files.get(self.path, ("text/plain", b""))
+                self.send_response(200 if self.path in files else 404)
+                self.send_header("content-type", content_type)
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *_):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def media_setup(ex):
+    ex.grant("media", "http:127.0.0.1")
+
+
+def media_traffic(ex):
+    images = ImageHost()
+    ex.services.append(images.stop)
+    png = {"content-type": "image/png"}
+
+    def read(album, image):
+        got, data, headers = ex.http("GET", f"/media/{album}/images/{image}", raw=True)
+        return data if got == 200 else got
+
+    def ids(album):
+        return [i["id"] for i in ex.expect("GET", f"/media/{album}/images", 200)["images"]]
+
+    # Uploads: inline ones stored with put, one above the threshold a blob.
+    small, other, big = picture(20_000), picture(30_000, 9), picture(1536 << 10, 11)
+    first = ex.expect("POST", "/media/trip/images", 201, small, png)
+    ex.expect("POST", "/media/trip/images", 201, other, png)
+    ex.expect("POST", "/media/trip/images", 201, big, {"content-type": "image/jpeg"})
+    ex.check("the images read back as uploaded",
+             [read("trip", i) for i in ("img-1", "img-2", "img-3")] == [small, other, big])
+    # The same bytes again: one blob in two rows; the delete of one keeps the other.
+    ex.check("the same bytes are the same blob",
+             ex.expect("POST", "/media/trip/images", 201, small, png)["hash"] == first["hash"])
+    ex.expect("DELETE", "/media/trip/images/img-1", 204)
+    ex.check("the other row of the blob still reads", read("trip", "img-4") == small)
+    ex.expect("POST", "/media/trip/images", 415, small, {"content-type": "text/plain"})
+
+    # A share: the receiving album holds the blob too.
+    ex.expect("POST", "/media/trip/images/img-2/share/family", 202)
+    ex.wait_for("the shared image", lambda: ids("family") == ["img-1"])
+    ex.expect("DELETE", "/media/trip/images/img-2", 204)
+    ex.check("the receiver keeps its own hold", read("family", "img-1") == other)
+
+    # Imports through the granted host: small, a blob, and not an image.
+    for path, want in (("/cat.png", 201), ("/big.png", 201), ("/page", 502)):
+        ex.expect("POST", "/media/zoo/import", want, {"url": images.url + path})
+    ex.check("the imports read back", [read("zoo", "img-1"), read("zoo", "img-2")]
+             == [images.files["/cat.png"][1], images.files["/big.png"][1]])
+
+    # Expiries: timers that carry the blob, fired within seconds.
+    ex.expect("POST", "/media/zoo/images/img-1/expire?days=0.00002", 202)
+    ex.expect("POST", "/media/trip/images/img-3/expire?days=0.00002", 202)
+    ex.expect("DELETE", "/media/trip/images/img-3", 204)
+    ex.wait_for("the expiry", lambda: ids("zoo") == ["img-2"])
+    ex.wait_for("the expiry of a deleted image", lambda: ex.coverage()["inputs"].get("timer", 0) >= 2)
+    ex.check("the expired image is gone", read("zoo", "img-1") == 404)
+
+
 EXAMPLES = {
     "counter-rs": (["counter.wasm"], None, counter_traffic),
     "counter-ts": (["counter-ts.wasm"], None, counter_traffic),
@@ -499,7 +593,15 @@ EXAMPLES = {
     "uptime-ts": (["uptime-ts.wasm"], uptime_setup, uptime_traffic),
     "todo-ts": (["todo-ts.wasm"], None, todo_traffic),
     "chat-ts": (["chat-ts.wasm"], None, chat_traffic),
+    "media-ts": (["media-ts.wasm"], media_setup, media_traffic),
     "billing-ts": (["billing-ts.wasm", "billing-ts-ledger.wasm"], billing_setup, billing_traffic),
+}
+
+
+# The configuration an example needs beyond the defaults (a kronik.toml).
+CONFIG = {
+    # Blob storage is off until M26 is complete.
+    "media-ts": "[blobs]\nenabled = true\n",
 }
 
 
@@ -508,7 +610,13 @@ def run(args, name):
     ex = Example(args, name)
     started = time.time()
     try:
-        ex.daemon.start()
+        env = None
+        if name in CONFIG:
+            config = os.path.join(ex.dir, "kronik.toml")
+            with open(config, "w") as f:
+                f.write(CONFIG[name])
+            env = {"KRONIK_CONFIG": config}
+        ex.daemon.start(env)
         for c in components:
             with open(os.path.join(args.dist, c), "rb") as f:
                 ex.api("POST", "/v1/deployments", {"wasm_base64": base64.b64encode(f.read()).decode(), "reason": REASON})
