@@ -61,6 +61,9 @@ against both.
 | `kronik trace` | [`TraceResponse`](#traceresponse) (`GET /v1/turns/{id}/trace`) |
 | `kronik dead-letters list` | [`DeadLettersResponse`](#deadlettersresponse) (`GET /v1/dead-letters`) |
 | `kronik dead-letters resend` | [`TurnResponse`](#turnresponse) (`POST /v1/dead-letters/{id}/resend`) |
+| `kronik connections list` | [`ConnectionsResponse`](#connectionsresponse) (`GET /v1/connections`) |
+| `kronik connections inspect` | [`Connection`](#connection) (`GET /v1/connections/{id}`) |
+| `kronik connections close` | [`ConnectionCloseResponse`](#connectioncloseresponse) (`POST /v1/connections/{id}/close`) |
 | `kronik grant` | [`GrantResponse`](#grantresponse) (`POST /v1/grants`) |
 | `kronik revoke` | [`RevokeResponse`](#revokeresponse) (`POST /v1/grants/revoke`) |
 | `kronik grants list` | [`GrantsResponse`](#grantsresponse) (`GET /v1/grants`) |
@@ -626,6 +629,364 @@ against both.
   "required": [
     "message_id",
     "state"
+  ],
+  "type": "object"
+}
+```
+
+### Connection
+
+```json
+{
+  "description": "A long-lived WebSocket or SSE connection (M24,\ndocs/design/m24-connections.md §12).",
+  "properties": {
+    "actor": {
+      "description": "Its owner, as `kind/key`: the actor whose open turn accepted it.",
+      "type": "string"
+    },
+    "closed": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/ConnectionClosed"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Its close input, once recorded."
+    },
+    "frames": {
+      "$ref": "#/components/schemas/ConnectionFrames"
+    },
+    "id": {
+      "description": "`c-` and 32 lowercase hex characters.",
+      "type": "string"
+    },
+    "live": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/ConnectionLive"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "While this node holds it."
+    },
+    "opened": {
+      "$ref": "#/components/schemas/ConnectionOpened"
+    },
+    "protocol": {
+      "description": "`websocket` or `sse`.",
+      "type": "string"
+    },
+    "route": {
+      "description": "The route pattern that it opened on.",
+      "type": "string"
+    },
+    "state": {
+      "description": "`open`; `closing` (its owner, the host or the operator closed it, and\nits close input is not recorded yet); or `closed`.",
+      "type": "string"
+    },
+    "subject": {
+      "description": "The connection's subject; only with `pii:read`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "actor",
+    "protocol",
+    "route",
+    "state",
+    "opened",
+    "frames"
+  ],
+  "type": "object"
+}
+```
+
+### ConnectionCloseResponse
+
+```json
+{
+  "properties": {
+    "connection": {
+      "$ref": "#/components/schemas/Connection",
+      "description": "The connection: `closing` after a close, unchanged after a dry run."
+    },
+    "dry_run": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "dry_run",
+    "connection"
+  ],
+  "type": "object"
+}
+```
+
+### ConnectionClosed
+
+```json
+{
+  "properties": {
+    "cause": {
+      "description": "`client`, `actor`, `restart`, `ping-timeout`, `too-large`,\n`slow-consumer`, `protocol`, `operator`, `rebase`, `abandoned` or\n`unavailable`.",
+      "type": "string"
+    },
+    "code": {
+      "description": "The WebSocket close code received or sent.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "initiator": {
+      "description": "`client`, `actor` or `host`.",
+      "type": "string"
+    },
+    "turn_id": {
+      "description": "The close input's turn.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "turn_id",
+    "initiator",
+    "cause",
+    "code"
+  ],
+  "type": "object"
+}
+```
+
+### ConnectionFates
+
+```json
+{
+  "description": "How many frames of a send were written, are queued, were dropped (the\nconnection was gone, closing or not live) or have an unknown fate (a\nrestart hid it, or the connection's row is gone).",
+  "properties": {
+    "dropped": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "queued": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "unknown": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "written": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "written",
+    "queued",
+    "dropped",
+    "unknown"
+  ],
+  "type": "object"
+}
+```
+
+### ConnectionFrames
+
+```json
+{
+  "description": "Counts of a connection's frames. Outgoing frames are `written`,\n`queued`, `dropped` or `unknown` (docs/design/m24-connections.md §4.7):\nafter a restart nobody knows which of the frames before it were\nwritten.",
+  "properties": {
+    "dropped": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "in": {
+      "description": "Frames from the client, recorded as inputs.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "out": {
+      "description": "Frames to the client, recorded by its owner's turns.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "queued": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "unknown": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "written": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "in",
+    "out",
+    "written",
+    "queued",
+    "dropped",
+    "unknown"
+  ],
+  "type": "object"
+}
+```
+
+### ConnectionLive
+
+```json
+{
+  "properties": {
+    "queued_bytes": {
+      "description": "Outgoing bytes waiting for the client.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "queued_bytes"
+  ],
+  "type": "object"
+}
+```
+
+### ConnectionOpSummary
+
+```json
+{
+  "description": "A turn's `send`, `broadcast` or `close` of connections (M24,\ndocs/design/m24-connections.md §12), without the frame's data.",
+  "properties": {
+    "bytes": {
+      "description": "A send's frame size in bytes.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "code": {
+      "description": "A close's code.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "connections": {
+      "description": "The first 20 of them.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "fates": {
+      "anyOf": [
+        {
+          "$ref": "#/components/schemas/ConnectionFates"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "A send's frames by fate (§4.7), in an actor's history."
+    },
+    "kind": {
+      "description": "A send's frame kind: `text`, `binary` or `event`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "op": {
+      "description": "`send` (also a broadcast) or `close`.",
+      "type": "string"
+    },
+    "targets": {
+      "description": "How many connections it was for, those that were not live included.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "op",
+    "targets",
+    "connections"
+  ],
+  "type": "object"
+}
+```
+
+### ConnectionOpened
+
+```json
+{
+  "properties": {
+    "logical_time_ms": {
+      "description": "The open turn's logical time; null once retention removed it.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "turn_id": {
+      "description": "The open turn that accepted it.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "turn_id"
+  ],
+  "type": "object"
+}
+```
+
+### ConnectionsResponse
+
+```json
+{
+  "properties": {
+    "connections": {
+      "items": {
+        "$ref": "#/components/schemas/Connection"
+      },
+      "type": "array"
+    },
+    "next": {
+      "description": "Pass as `after` for the next page; null at the end.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "connections"
   ],
   "type": "object"
 }
@@ -3351,6 +3712,7 @@ against both.
             "CAPABILITY_NOT_GRANTED",
             "CERTIFICATE_INVALID",
             "CONNECTION_LIMIT",
+            "CONNECTION_NOT_FOUND",
             "CONNECTION_NOT_HELD",
             "DEAD_LETTER_ALREADY_RESENT",
             "DEAD_LETTER_NOT_FOUND",
@@ -8071,6 +8433,13 @@ against both.
   "properties": {
     "code_hash": {
       "type": "string"
+    },
+    "connection_ops": {
+      "description": "The turn's buffered connection operations, in call order (M24);\nabsent when it has none.",
+      "items": {
+        "$ref": "#/components/schemas/ConnectionOpSummary"
+      },
+      "type": "array"
     },
     "effects": {
       "default": [],

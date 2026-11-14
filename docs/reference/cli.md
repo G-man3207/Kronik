@@ -75,7 +75,7 @@ Every mutation (`deploy`, `send`, `dead-letters resend`, `grant`, `revoke`,
 `stubs set`, `privacy mode`, `privacy erase`, `privacy reseal`, `keys wrap`,
 `keys rewrap`, `token create`, `token revoke`, `snapshot create`,
 `export rewind`, `fleet enroll`, `fleet revoke`,
-`events webhooks replay`) requires `--reason`,
+`events webhooks replay`, `connections close`) requires `--reason`,
 which the history records with the change, and supports `--dry-run`, which
 checks the request and writes nothing (I12). `replay` writes only in its
 fork, and `send --fork` only in the fork; both require `--reason` and have
@@ -695,7 +695,7 @@ Next     kronik history counter/t
 
 ## kronik history
 
-`kronik history <KIND/KEY> [--limit <N>] [--before <LSN>]`
+`kronik history <KIND/KEY> [--limit <N>] [--before <LSN>] [--connection <ID>]`
 
 Shows an actor's turns, newest first, 100 per page by default: the input,
 the outcome, what the turn changed and the hash of the code that ran it
@@ -763,6 +763,25 @@ TURN    EFFECT      TARGET                           DELIVERY           STATUS  
 main:9  http.fetch  POST api.example.com/v1/charges  idempotency-keyed  ok      -      secret:stripe-key@v2 (3fa9c1d2)
 main:5  http.fetch  POST api.example.com/v1/charges  idempotency-keyed  ok      -      secret:stripe-key@v1 (8b705664)
 Next     kronik actors inspect billing/acme
+```
+
+A connection turn (M24) has the input type `connection`: `open`, `frame`
+or `close`, with the connection id shortened to its first 8 digits. What
+turns sent on connections follows in a table of its own: the operation
+(`send`, also for a broadcast, or `close`), its connections, the frame or
+the close code, and the fates of a send's frames: `written`, `queued`,
+`dropped` (the connection was closed or not live) or `unknown` (a restart
+hid whether they were written). `--connection <ID>` shows only one
+connection's turns: its inputs and the turns that sent to it or closed it.
+
+```text
+$ kronik history chat/lobby --connection c-3f9a0d1c4b2e4f6a8d7c5b1e0a9f8e7d --limit 1
+TURN     TYPE        INPUT                           OUTCOME    CHANGES       CODE
+main:17  connection  frame c-3f9a0d1c… #3 text 27 B  committed  1 SQL change  b3:0123456789ab
+
+TURN     CONNECTION OP  TO                                             FRAME      FATES
+main:17  send           c-3f9a0d1c4b2e4f6a8d7c5b1e0a9f8e7d and 1 more  text 96 B  1 written, 0 queued, 1 dropped, 0 unknown
+Next     kronik history chat/lobby --connection c-3f9a0d1c4b2e4f6a8d7c5b1e0a9f8e7d --before 17 --limit 1
 ```
 
 ## kronik history --operations
@@ -871,6 +890,66 @@ Resent main:6 as turn main:7, which failed
   Dead letter   main:7: fix the cause, then resend it
 Next     kronik explain TURN_FAILED
          kronik dead-letters list
+```
+
+## kronik connections list
+
+`kronik connections list [--actor <KIND/KEY> | --kind <KIND>] [--state open|closed|all] [--after <ID>] [--limit <N>]`
+
+Lists long-lived WebSocket and SSE connections (M24) in id order: the open
+ones by default (also those closing), `--state closed` the closed ones,
+until retention passes their close, or `all`. `FRAMES IN/OUT` counts the
+client's frames and the actor's.
+
+```text
+$ kronik connections list --state all --limit 2
+ID                                  ACTOR       PROTOCOL   ROUTE           STATE   OPENED   FRAMES IN/OUT  CLOSED
+c-3f9a0d1c4b2e4f6a8d7c5b1e0a9f8e7d  chat/lobby  websocket  /chat/{key}/ws  open    main:14  12/40          -
+c-7b1e0a9f8e7d3f9a0d1c4b2e4f6a8d7c  chat/lobby  websocket  /chat/{key}/ws  closed  main:31  3/9            client 1001 (client)
+Next     kronik connections inspect c-3f9a0d1c4b2e4f6a8d7c5b1e0a9f8e7d
+         kronik connections list --state all --limit 2 --after c-7b1e0a9f8e7d3f9a0d1c4b2e4f6a8d7c
+```
+
+## kronik connections inspect
+
+`kronik connections inspect <ID>`
+
+Shows a connection: its owner, its open turn and its close, and its frames
+by fate. An outgoing frame is `written`, `queued` while this node's writer
+has it, `dropped`, or `unknown` after a restart, which loses the count of
+frames written. `Queued` (the bytes waiting for the client) is there while
+this node holds the connection, and `Subject` only with `pii:read`.
+
+```text
+$ kronik connections inspect c-3f9a0d1c4b2e4f6a8d7c5b1e0a9f8e7d
+Connection c-3f9a0d1c4b2e4f6a8d7c5b1e0a9f8e7d
+  Actor      chat/lobby
+  Protocol   websocket /chat/{key}/ws
+  State      open
+  Opened     main:14 at 2026-01-01T00:00:01Z
+  Frames     12 in; 40 out: 39 written, 1 queued, 0 dropped, 0 unknown
+  Queued     212 bytes
+  Subject    user:ada
+Next     kronik history chat/lobby --connection c-3f9a0d1c4b2e4f6a8d7c5b1e0a9f8e7d
+         kronik connections close c-3f9a0d1c4b2e4f6a8d7c5b1e0a9f8e7d --reason "..."
+```
+
+## kronik connections close
+
+`kronik connections close <ID> [--code <N>] [--message <TEXT>] --reason <REASON> [--dry-run]`
+
+Closes an open connection that this node holds, as the operator. The
+client gets the close code (1000, 1001, 1003, 1007, 1008, 1009, 1011, or
+3000 to 4999; default 1008) and `--message` as the close frame's reason;
+an event stream ends. The actor's close handler runs with the initiator
+`host` and the reason `operator`, and the close input records the reason
+given here (I12). A closed or unknown connection answers
+`CONNECTION_NOT_FOUND`.
+
+```text
+$ kronik connections close c-3f9a0d1c4b2e4f6a8d7c5b1e0a9f8e7d --code 4001 --message "closed by the operator" --reason "an abusive client"
+Closing c-3f9a0d1c4b2e4f6a8d7c5b1e0a9f8e7d of chat/lobby with 4001: its close input records the reason
+Next     kronik connections inspect c-3f9a0d1c4b2e4f6a8d7c5b1e0a9f8e7d
 ```
 
 ## kronik grant

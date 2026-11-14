@@ -4,12 +4,13 @@
 use std::fmt::Write as _;
 
 use kronik_api::types::{
-    ActorsResponse, DeadLettersResponse, DeployResponse, DeploymentsResponse, EffectSecret,
-    EffectSummary, ForkTurnResponse, GrantResponse, GrantsResponse, HistoryResponse,
-    InspectResponse, LimitsListResponse, LimitsResponse, LimitsView, OrphansResponse, Outcome,
-    Payload, Reply, RevokeResponse, Route, SecretBackendsResponse, SecretDeleteResponse,
-    SecretHistoryResponse, SecretLinkResponse, SecretResponse, SecretVersionPhase, SecretsResponse,
-    TimersResponse, TraceNode, TraceResponse, TurnResponse, TurnSummary,
+    ActorsResponse, Connection, ConnectionCloseResponse, ConnectionsResponse, DeadLettersResponse,
+    DeployResponse, DeploymentsResponse, EffectSecret, EffectSummary, ForkTurnResponse,
+    GrantResponse, GrantsResponse, HistoryResponse, InspectResponse, LimitsListResponse,
+    LimitsResponse, LimitsView, OrphansResponse, Outcome, Payload, Reply, RevokeResponse, Route,
+    SecretBackendsResponse, SecretDeleteResponse, SecretHistoryResponse, SecretLinkResponse,
+    SecretResponse, SecretVersionPhase, SecretsResponse, TimersResponse, TraceNode, TraceResponse,
+    TurnResponse, TurnSummary,
 };
 use kronik_core::error::ApiError;
 use kronik_core::explain::{Topic, TopicKind};
@@ -307,7 +308,7 @@ pub fn history(actor: &str, r: &HistoryResponse, limit: Option<u32>) -> String {
             vec![
                 t.turn_id.clone(),
                 t.input.kind.clone(),
-                clip(&t.input.summary, 40),
+                clip(&short_connection_ids(&t.input.summary), 40),
                 clip(&outcome(&t.outcome), 60),
                 clip(&changes(t), 40),
                 t.code_hash.clone(),
@@ -353,6 +354,43 @@ pub fn history(actor: &str, r: &HistoryResponse, limit: Option<u32>) -> String {
             header.push("SECRETS");
         }
         out.push_str(&table(&header, effects));
+    }
+    // M24: what the turns sent on connections, and the frames' fates.
+    let ops: Vec<Vec<String>> = r
+        .turns
+        .iter()
+        .flat_map(|t| {
+            t.connection_ops.iter().map(move |op| {
+                let what = match (&op.kind, op.bytes, op.code) {
+                    (Some(kind), Some(bytes), _) => format!("{kind} {bytes} B"),
+                    (_, _, Some(code)) => code.to_string(),
+                    _ => "-".to_owned(),
+                };
+                let first = op.connections.first().map_or("-", String::as_str);
+                let targets = if op.targets > 1 {
+                    format!("{first} and {} more", op.targets - 1)
+                } else {
+                    first.to_owned()
+                };
+                let fates = op.fates.as_ref().map_or_else(
+                    || "-".to_owned(),
+                    |f| {
+                        format!(
+                            "{} written, {} queued, {} dropped, {} unknown",
+                            f.written, f.queued, f.dropped, f.unknown
+                        )
+                    },
+                );
+                vec![t.turn_id.clone(), op.op.clone(), targets, what, fates]
+            })
+        })
+        .collect();
+    if !ops.is_empty() {
+        out.push('\n');
+        out.push_str(&table(
+            &["TURN", "CONNECTION OP", "TO", "FRAME", "FATES"],
+            ops,
+        ));
     }
     // A denied effect's hint is the exact command that grants it.
     let mut cmds: Vec<String> = Vec::new();
@@ -614,6 +652,153 @@ pub fn dead_letters(r: &DeadLettersResponse, full: Option<Option<u32>>) -> Strin
         cmds.push(more);
     }
     out.push_str(&next(&cmds));
+    out
+}
+
+/// A summary with each connection id (`c-` and 32 hex digits) cut to its
+/// first 8 digits, as git shortens hashes, so that the 40 characters of the
+/// INPUT column keep what the input was: `frame c-3f9a0d1c… #3 text 27 B`.
+/// `--json` and `kronik connections list` have the whole id.
+fn short_connection_ids(summary: &str) -> String {
+    summary
+        .split(' ')
+        .map(|word| match word.strip_prefix("c-") {
+            Some(hex)
+                if hex.len() == 32
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+            {
+                format!("c-{}…", &hex[..8])
+            }
+            _ => word.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `kronik connections list`; `again` is the command with the same
+/// filters, for the next page.
+pub fn connections(r: &ConnectionsResponse, again: &str) -> String {
+    if r.connections.is_empty() {
+        return "No connections.\n".to_owned();
+    }
+    let rows = r
+        .connections
+        .iter()
+        .map(|c| {
+            vec![
+                c.id.clone(),
+                c.actor.clone(),
+                c.protocol.clone(),
+                clip(&c.route, 30),
+                c.state.clone(),
+                c.opened.turn_id.clone(),
+                format!("{}/{}", c.frames.incoming, c.frames.out),
+                c.closed.as_ref().map_or_else(
+                    || "-".to_owned(),
+                    |x| format!("{} {} ({})", x.initiator, x.code, x.cause),
+                ),
+            ]
+        })
+        .collect();
+    let mut out = table(
+        &[
+            "ID",
+            "ACTOR",
+            "PROTOCOL",
+            "ROUTE",
+            "STATE",
+            "OPENED",
+            "FRAMES IN/OUT",
+            "CLOSED",
+        ],
+        rows,
+    );
+    let mut cmds = Vec::new();
+    if let Some(c) = r.connections.first() {
+        cmds.push(format!("kronik connections inspect {}", c.id));
+    }
+    if let Some(after) = &r.next {
+        cmds.push(format!("{again} --after {after}"));
+    }
+    out.push_str(&next(&cmds));
+    out
+}
+
+/// `kronik connections inspect`.
+pub fn connection(c: &Connection) -> String {
+    let f = &c.frames;
+    let mut out = format!("Connection {}\n", c.id);
+    let mut line = |k: &str, v: String| {
+        let _ = writeln!(out, "  {k:<10} {v}");
+    };
+    line("Actor", c.actor.clone());
+    line("Protocol", format!("{} {}", c.protocol, c.route));
+    line("State", c.state.clone());
+    line(
+        "Opened",
+        match c.opened.logical_time_ms {
+            Some(ms) => format!("{} at {}", c.opened.turn_id, units::utc(ms)),
+            None => c.opened.turn_id.clone(),
+        },
+    );
+    if let Some(x) = &c.closed {
+        line(
+            "Closed",
+            format!(
+                "{} by the {}: {} ({})",
+                x.turn_id, x.initiator, x.code, x.cause
+            ),
+        );
+    }
+    line(
+        "Frames",
+        format!(
+            "{} in; {} out: {} written, {} queued, {} dropped, {} unknown",
+            f.incoming, f.out, f.written, f.queued, f.dropped, f.unknown
+        ),
+    );
+    if let Some(l) = &c.live {
+        line("Queued", units::size(l.queued_bytes));
+    }
+    if let Some(s) = &c.subject {
+        line("Subject", s.clone());
+    }
+    let mut cmds = vec![format!("kronik history {} --connection {}", c.actor, c.id)];
+    if c.state == "open" {
+        cmds.push(format!(
+            "kronik connections close {} --reason \"...\"",
+            c.id
+        ));
+    }
+    out.push_str(&next(&cmds));
+    out
+}
+
+/// `kronik connections close`.
+pub fn connection_close(r: &ConnectionCloseResponse, code: u16) -> String {
+    let c = &r.connection;
+    let mut out = if r.dry_run {
+        format!(
+            "Would close {} of {} with {code} (dry run)\n",
+            c.id, c.actor
+        )
+    } else {
+        format!(
+            "Closing {} of {} with {code}: its close input records the reason\n",
+            c.id, c.actor
+        )
+    };
+    let cmd = if r.dry_run {
+        format!(
+            "kronik connections close {} --code {code} --reason \"...\"",
+            c.id
+        )
+    } else {
+        format!("kronik connections inspect {}", c.id)
+    };
+    out.push_str(&next(&[cmd]));
     out
 }
 
@@ -1387,6 +1572,230 @@ fn table_rows(rows: Vec<Vec<String>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connection_view(id: &str, state: &str) -> Connection {
+        use kronik_api::types::{ConnectionFrames, ConnectionLive, ConnectionOpened};
+        Connection {
+            id: id.into(),
+            actor: "chat/lobby".into(),
+            protocol: "websocket".into(),
+            route: "/chat/{key}/ws".into(),
+            state: state.into(),
+            opened: ConnectionOpened {
+                turn_id: "main:14".into(),
+                logical_time_ms: Some(1_767_225_601_000),
+            },
+            closed: None,
+            frames: ConnectionFrames {
+                incoming: 12,
+                out: 40,
+                written: 39,
+                queued: 1,
+                dropped: 0,
+                unknown: 0,
+            },
+            live: Some(ConnectionLive { queued_bytes: 212 }),
+            subject: Some("user:ada".into()),
+        }
+    }
+
+    const ADA: &str = "c-3f9a0d1c4b2e4f6a8d7c5b1e0a9f8e7d";
+    const BOB: &str = "c-7b1e0a9f8e7d3f9a0d1c4b2e4f6a8d7c";
+
+    #[test]
+    fn connections_list_with_their_next_page() {
+        let mut bob = connection_view(BOB, "closed");
+        bob.closed = Some(kronik_api::types::ConnectionClosed {
+            turn_id: "main:31".into(),
+            initiator: "client".into(),
+            cause: "client".into(),
+            code: 1001,
+        });
+        bob.live = None;
+        let r = ConnectionsResponse {
+            connections: vec![connection_view(ADA, "open"), bob],
+            next: Some(BOB.into()),
+        };
+        let out = connections(&r, "kronik connections list --state all --limit 2");
+        println!("{out}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("ID "), "{out}");
+        assert!(
+            lines[1].starts_with(ADA) && lines[1].contains("  open  "),
+            "{out}"
+        );
+        assert!(
+            lines[1].contains("12/40") && lines[1].ends_with(" -"),
+            "{out}"
+        );
+        assert!(lines[2].ends_with("client 1001 (client)"), "{out}");
+        assert_eq!(
+            lines[3],
+            format!("Next     kronik connections inspect {ADA}")
+        );
+        assert_eq!(
+            lines[4],
+            format!("         kronik connections list --state all --limit 2 --after {BOB}")
+        );
+        assert_eq!(
+            connections(
+                &ConnectionsResponse {
+                    connections: vec![],
+                    next: None
+                },
+                ""
+            ),
+            "No connections.\n"
+        );
+    }
+
+    #[test]
+    fn a_connection_shows_its_counts_and_what_to_do_next() {
+        let out = connection(&connection_view(ADA, "open"));
+        println!("{out}");
+        assert!(
+            out.contains("  Opened     main:14 at 2026-01-01T00:00:01Z\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "  Frames     12 in; 40 out: 39 written, 1 queued, 0 dropped, 0 unknown\n"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("  Queued     212 bytes\n"), "{out}");
+        assert!(out.contains("  Subject    user:ada\n"), "{out}");
+        assert!(
+            out.contains(&format!("kronik history chat/lobby --connection {ADA}")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("kronik connections close {ADA} --reason")),
+            "{out}"
+        );
+        let mut closed = connection_view(ADA, "closed");
+        closed.closed = Some(kronik_api::types::ConnectionClosed {
+            turn_id: "main:40".into(),
+            initiator: "host".into(),
+            cause: "operator".into(),
+            code: 4001,
+        });
+        closed.live = None;
+        closed.subject = None;
+        let out = connection(&closed);
+        assert!(
+            out.contains("  Closed     main:40 by the host: 4001 (operator)\n"),
+            "{out}"
+        );
+        assert!(!out.contains("Queued") && !out.contains("Subject"), "{out}");
+        assert!(!out.contains("connections close"), "{out}");
+    }
+
+    #[test]
+    fn an_operator_close_says_what_it_did() {
+        let r = ConnectionCloseResponse {
+            dry_run: true,
+            connection: connection_view(ADA, "open"),
+        };
+        let out = connection_close(&r, 4001);
+        println!("{out}");
+        assert!(out.starts_with(&format!(
+            "Would close {ADA} of chat/lobby with 4001 (dry run)\n"
+        )));
+        assert!(out.contains(&format!(
+            "kronik connections close {ADA} --code 4001 --reason"
+        )));
+        let r = ConnectionCloseResponse {
+            dry_run: false,
+            connection: connection_view(ADA, "closing"),
+        };
+        let out = connection_close(&r, 4001);
+        println!("{out}");
+        assert!(out.starts_with(&format!("Closing {ADA} of chat/lobby with 4001")));
+        assert!(out.contains(&format!("Next     kronik connections inspect {ADA}")));
+    }
+
+    #[test]
+    fn history_lists_what_turns_sent_on_connections() {
+        use kronik_api::types::{ConnectionFates, ConnectionOpSummary, InputSummary};
+        let t = TurnSummary {
+            turn_id: "main:17".into(),
+            lsn: 17,
+            logical_time_ms: 0,
+            code_hash: "b3:0123456789ab".into(),
+            input: InputSummary {
+                kind: "connection".into(),
+                summary: format!("frame {ADA} #3 text 27 B"),
+            },
+            outcome: Outcome {
+                kind: "committed".into(),
+                error_code: None,
+                message: None,
+            },
+            writes: Vec::new(),
+            messages: Vec::new(),
+            sql_changes: 1,
+            fuel_used: 1,
+            effects: Vec::new(),
+            connection_ops: vec![
+                ConnectionOpSummary {
+                    op: "send".into(),
+                    targets: 2,
+                    connections: vec![ADA.into(), BOB.into()],
+                    kind: Some("text".into()),
+                    bytes: Some(96),
+                    code: None,
+                    fates: Some(ConnectionFates {
+                        written: 1,
+                        queued: 0,
+                        dropped: 1,
+                        unknown: 0,
+                    }),
+                },
+                ConnectionOpSummary {
+                    op: "close".into(),
+                    targets: 1,
+                    connections: vec![BOB.into()],
+                    kind: None,
+                    bytes: None,
+                    code: Some(1000),
+                    fates: None,
+                },
+            ],
+        };
+        let out = history(
+            "chat/lobby",
+            &HistoryResponse {
+                turns: vec![t],
+                next: None,
+            },
+            None,
+        );
+        println!("{out}");
+        assert!(out.contains("frame c-3f9a0d1c… #3 text 27 B"), "{out}");
+        assert!(out.contains("CONNECTION OP"), "{out}");
+        assert!(
+            out.contains(&format!("send           {ADA} and 1 more  text 96 B  1 written, 0 queued, 1 dropped, 0 unknown")),
+            "{out}"
+        );
+        assert!(out.contains(&format!("close          {BOB}")), "{out}");
+    }
+
+    #[test]
+    fn connection_ids_are_short_in_summaries() {
+        assert_eq!(
+            short_connection_ids(&format!("close {ADA} client 1000")),
+            "close c-3f9a0d1c… client 1000"
+        );
+        // Not a connection id: unchanged.
+        for s in [
+            "c-xyz",
+            "c-3F9A0D1C4B2E4F6A8D7C5B1E0A9F8E7D",
+            "message say from operator",
+        ] {
+            assert_eq!(short_connection_ids(s), s);
+        }
+    }
 
     #[test]
     fn quotes_only_what_the_shell_needs() {

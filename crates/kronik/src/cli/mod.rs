@@ -24,6 +24,7 @@ mod token;
 pub(crate) mod units;
 pub(crate) mod userns;
 
+use std::fmt::Write as _;
 use std::io::{self, BufRead as _, IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
@@ -32,7 +33,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use clap::{ArgGroup, Args, Subcommand};
 use kronik_api::types::{
-    ActorsResponse, DeadLettersResponse, DeployRequest, DeployResponse, DeploymentsResponse,
+    ActorsResponse, Connection, ConnectionCloseRequest, ConnectionCloseResponse,
+    ConnectionsResponse, DeadLettersResponse, DeployRequest, DeployResponse, DeploymentsResponse,
     ForkTurnResponse, GrantRequest, GrantResponse, GrantsResponse, HistoryResponse,
     InspectResponse, LimitsListResponse, LimitsRequest, LimitsResponse, OrphansResponse, Payload,
     ResendRequest, RevokeRequest, RevokeResponse, SecretBackendsResponse, SecretDeleteRequest,
@@ -124,6 +126,9 @@ pub enum Command {
     /// List failed inputs, or resend one as a new root input.
     #[command(subcommand)]
     DeadLetters(DeadLettersCommand),
+    /// List, inspect or close long-lived WebSocket and SSE connections.
+    #[command(subcommand)]
+    Connections(ConnectionsCommand),
     /// Grant an actor type a capability: permission for an effect against a
     /// target.
     Grant(GrantArgs),
@@ -298,6 +303,10 @@ pub struct HistoryArgs {
     /// Only turns before this LSN, for the next page.
     #[arg(long, value_name = "LSN")]
     before: Option<u64>,
+    /// Only this connection's inputs and the turns that sent to it or
+    /// closed it.
+    #[arg(long, value_name = "ID", conflicts_with_all = ["orphans", "operations"])]
+    connection: Option<String>,
     /// List the orphaned changes instead: changes that a called actor
     /// committed in a `call` whose caller then failed, until a compensation
     /// succeeds.
@@ -309,6 +318,58 @@ pub struct HistoryArgs {
     /// With --orphans: also the resolved ones.
     #[arg(long, requires = "orphans")]
     all: bool,
+}
+
+/// Which connections `kronik connections list` shows.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ConnectionStateArg {
+    /// Open or closing.
+    Open,
+    /// Closed, until retention passes their close.
+    Closed,
+    All,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConnectionsCommand {
+    /// List connections in id order: the open ones by default.
+    List {
+        /// Only the connections this actor (kind/key) accepted.
+        #[arg(long, value_name = "KIND/KEY", conflicts_with = "kind")]
+        actor: Option<String>,
+        /// Only the connections of actors of this kind.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Open (also closing), closed or all [default: open].
+        #[arg(long, value_enum)]
+        state: Option<ConnectionStateArg>,
+        /// Start after this connection id, for the next page.
+        #[arg(long, value_name = "ID")]
+        after: Option<String>,
+        /// At most this many connections (1-1000) [default: 100].
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: Option<u32>,
+    },
+    /// Show a connection: its owner, open turn, close and frame counts.
+    Inspect {
+        /// The connection id, c- and 32 hex characters.
+        id: String,
+    },
+    /// Close an open connection as the operator.
+    Close {
+        /// The connection id.
+        id: String,
+        /// The close code: 1000, 1001, 1003, 1007, 1008, 1009, 1011, or
+        /// 3000-4999 [default: 1008].
+        #[arg(long)]
+        code: Option<u16>,
+        /// The close frame's reason, which the client gets (at most 123
+        /// bytes).
+        #[arg(long)]
+        message: Option<String>,
+        #[command(flatten)]
+        mutation: Mutation,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -588,6 +649,20 @@ pub fn run(command: Command, global: &Global) -> ExitCode {
         Command::DeadLetters(DeadLettersCommand::List { after, limit }) => {
             dead_letters(&ctx, after, limit)
         }
+        Command::Connections(ConnectionsCommand::List {
+            actor,
+            kind,
+            state,
+            after,
+            limit,
+        }) => connections_list(&ctx, actor, kind, state, after, limit),
+        Command::Connections(ConnectionsCommand::Inspect { id }) => connection_inspect(&ctx, &id),
+        Command::Connections(ConnectionsCommand::Close {
+            id,
+            code,
+            message,
+            mutation,
+        }) => connection_close(&ctx, &id, code, message, mutation),
         Command::DeadLetters(DeadLettersCommand::Resend { id, mutation }) => {
             resend(&ctx, &id, mutation)
         }
@@ -1289,6 +1364,7 @@ fn history(ctx: &Ctx, a: HistoryArgs) -> Result<ExitCode, Error> {
         actor_path(&actor),
         query(&[
             ("before", a.before.map(|b| b.to_string())),
+            ("connection", a.connection.clone()),
             ("limit", a.limit.map(|l| l.to_string())),
         ])
     ))?;
@@ -1297,7 +1373,93 @@ fn history(ctx: &Ctx, a: HistoryArgs) -> Result<ExitCode, Error> {
         return Ok(ExitCode::SUCCESS);
     }
     let r: HistoryResponse = ctx.decode(&body)?;
-    ctx.print(&render::history(&actor.to_string(), &r, a.limit));
+    let mut listed = actor.to_string();
+    if let Some(c) = &a.connection {
+        let _ = write!(listed, " --connection {c}");
+    }
+    ctx.print(&render::history(&listed, &r, a.limit));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn connections_list(
+    ctx: &Ctx,
+    actor: Option<String>,
+    kind: Option<String>,
+    state: Option<ConnectionStateArg>,
+    after: Option<String>,
+    limit: Option<u32>,
+) -> Result<ExitCode, Error> {
+    let state = state.map(|s| {
+        match s {
+            ConnectionStateArg::Open => "open",
+            ConnectionStateArg::Closed => "closed",
+            ConnectionStateArg::All => "all",
+        }
+        .to_owned()
+    });
+    let body = ctx.get(&format!(
+        "/v1/connections{}",
+        query(&[
+            ("actor", actor.clone()),
+            ("kind", kind.clone()),
+            ("state", state.clone()),
+            ("after", after),
+            ("limit", limit.map(|l| l.to_string())),
+        ])
+    ))?;
+    if ctx.json {
+        ctx.print_raw(&body);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let r: ConnectionsResponse = ctx.decode(&body)?;
+    // The same filters for the next page.
+    let mut again = String::from("kronik connections list");
+    for (flag, value) in [("--actor", &actor), ("--kind", &kind), ("--state", &state)] {
+        if let Some(v) = value {
+            let _ = write!(again, " {flag} {}", shell_quote(v));
+        }
+    }
+    if let Some(l) = limit {
+        let _ = write!(again, " --limit {l}");
+    }
+    ctx.print(&render::connections(&r, &again));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn connection_inspect(ctx: &Ctx, id: &str) -> Result<ExitCode, Error> {
+    let body = ctx.get(&format!("/v1/connections/{}", http::encode(id)))?;
+    if ctx.json {
+        ctx.print_raw(&body);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let c: Connection = ctx.decode(&body)?;
+    ctx.print(&render::connection(&c));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn connection_close(
+    ctx: &Ctx,
+    id: &str,
+    code: Option<u16>,
+    message: Option<String>,
+    mutation: Mutation,
+) -> Result<ExitCode, Error> {
+    let reason = reason(&mutation)?;
+    let raw = ctx.post(
+        &format!("/v1/connections/{}/close", http::encode(id)),
+        &ConnectionCloseRequest {
+            code,
+            message: message.unwrap_or_default(),
+            reason: reason.to_owned(),
+            dry_run: mutation.dry_run,
+        },
+    )?;
+    if ctx.json {
+        ctx.print_raw(&raw);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let r: ConnectionCloseResponse = ctx.decode(&raw)?;
+    ctx.print(&render::connection_close(&r, code.unwrap_or(1008)));
     Ok(ExitCode::SUCCESS)
 }
 

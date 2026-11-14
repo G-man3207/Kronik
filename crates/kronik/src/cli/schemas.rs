@@ -83,6 +83,18 @@ const COMMANDS: &[(&str, Output)] = &[
         "dead-letters resend",
         Output::Api(&[("", "POST", "/v1/dead-letters/{id}/resend")]),
     ),
+    (
+        "connections list",
+        Output::Api(&[("", "GET", "/v1/connections")]),
+    ),
+    (
+        "connections inspect",
+        Output::Api(&[("", "GET", "/v1/connections/{id}")]),
+    ),
+    (
+        "connections close",
+        Output::Api(&[("", "POST", "/v1/connections/{id}/close")]),
+    ),
     ("grant", Output::Api(&[("", "POST", "/v1/grants")])),
     ("revoke", Output::Api(&[("", "POST", "/v1/grants/revoke")])),
     ("grants list", Output::Api(&[("", "GET", "/v1/grants")])),
