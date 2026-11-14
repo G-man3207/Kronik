@@ -1721,6 +1721,22 @@ pub fn deny_io_uring() -> io::Result<()> {
     ))
 }
 
+/// The controllers a VM's cgroup gets, from those its parent has
+/// (`cgroup.controllers`): cpu, memory and pids always (a missing one fails
+/// the write, and the start), and io where the parent has it. With io and
+/// memory both on, the kernel throttles the VMM's buffered writes to its data
+/// drive by the VM's own memory (cgroup writeback): without io, the dirty
+/// pages of those writes count against `memory.max` and nothing slows the
+/// writer, and a guest that fills its drive got its VMM killed by the OOM
+/// killer on the first KVM proof.
+pub(crate) fn vm_controllers(available: &str) -> &'static str {
+    if available.split_whitespace().any(|c| c == "io") {
+        "+cpu +memory +pids +io"
+    } else {
+        "+cpu +memory +pids"
+    }
+}
+
 /// Installs the VMM's fixed jail in its single-threaded launcher process.
 /// Every resource write is mandatory: delegation errors never remove limits.
 pub fn jail_microvm(jail: &MicrovmJail<'_>) -> io::Result<()> {
@@ -1746,7 +1762,10 @@ pub fn jail_microvm(jail: &MicrovmJail<'_>) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("microVM launcher is outside the daemon cgroup leaf"))?;
     validate_child_cgroup(delegated, jail.cgroup)?;
     let parent = cgroup_dir(delegated);
-    fs::write(parent.join("cgroup.subtree_control"), "+cpu +memory +pids")?;
+    fs::write(
+        parent.join("cgroup.subtree_control"),
+        vm_controllers(&fs::read_to_string(parent.join("cgroup.controllers"))?),
+    )?;
     let group = cgroup_dir(jail.cgroup);
     fs::create_dir(&group)?;
     fs::write(
@@ -2781,6 +2800,20 @@ mod tests {
             assert_eq!(field(set), ["0000000000000000"], "{set}");
         }
         assert_eq!(field("NoNewPrivs:"), ["1"]);
+    }
+
+    #[test]
+    fn a_vms_cgroup_gets_io_where_its_parent_has_it() {
+        assert_eq!(
+            vm_controllers("cpuset cpu io memory hugetlb pids rdma misc\n"),
+            "+cpu +memory +pids +io"
+        );
+        assert_eq!(vm_controllers("cpu memory pids\n"), "+cpu +memory +pids");
+        // A name that merely contains `io` is not the io controller.
+        assert_eq!(
+            vm_controllers("cpu memory pids iox\n"),
+            "+cpu +memory +pids"
+        );
     }
 
     #[test]
