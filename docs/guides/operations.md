@@ -1775,6 +1775,235 @@ unfinished turn` lines; each names an actor and an execution id. For each,
 `kronik dead-letters list` shows outcome-unknown dead letters from that
 start.
 
+## Blobs
+
+Large bodies travel as blobs. Examples are an upload of hundreds of
+megabytes, a fetched document, or an image an actor renders. A blob is a
+file of the node's blob store, `<data_dir>/blobs`, kept apart from the log.
+A log record names it by its identity, `b3:<hex>` (BLAKE3 of the content),
+or `b3s:<hex>` for a subject's blob (keyed per subject; see
+[the privacy guide](privacy.md)), together with its size. The bytes are
+written once and never change; the daemon's memory stays flat whatever
+their size.
+
+### Which bodies become blobs
+
+Only kinds whose code imports `kronik:actor/blobs` (the SDKs' blob API)
+get blobs. Every other kind works as before. For those kinds, the kind's
+limits (`kronik limits set <kind> ...`) decide:
+
+| Flag | Default | What |
+| --- | --- | --- |
+| `--blob-threshold` | 1 MiB | An HTTP request body or a `fetch` response above this becomes a blob; never above the message size |
+| `--upload-size` | 64 MiB | The largest request body. Above it the gateway answers 413 `PAYLOAD_TOO_LARGE`, at once when `Content-Length` says so |
+| `--effect-response-size` | as before | The largest `fetch` response, blob or not |
+| `--blob-size-per-actor` | 1 GiB | What one actor may keep alive, and what one turn may write ([below](#holds-and-the-quota)) |
+
+An upload streams into the store as it arrives. It may pause at most 30
+seconds between bytes, and once `[gateway] upload_rate_grace` (30 s) has
+passed it must average `upload_min_rate` (8 KiB/s) over `upload_rate_window`
+(30 s), else it ends with `408 UPLOAD_TOO_SLOW`; there is no limit on the
+whole body's time. A retry with the same `Idempotency-Key` of a request that
+is running or answered is only hashed: its bytes are not stored again. A
+preview's uploads, and the blobs its turns write, go to the preview fork's
+space, `<data_dir>/branches/<fork>/blobs`, up to `[fork] preview_blob_bytes`
+(256 MiB; past it `409 PREVIEW_FULL`), and are deleted with it.
+
+### Holds and the quota
+
+A turn can use a blob in three cases:
+- it received a reference: the upload, a `fetch` response, a message's
+  `blobs`, a timer's, a call's reply;
+- it created the blob;
+- its actor holds the blob.
+
+A hash learned some other way, as text in a message or a value in state,
+is not a reference: using it fails with `BLOB_NOT_HELD`. An actor takes a
+hold with `blobs.retain` (or `blobs.put`, which stores bytes and holds
+them) and lets it go with `blobs.release`. Holds change only when the turn
+commits.
+
+`--blob-size-per-actor` bounds the bytes one actor keeps alive: the
+distinct blobs it holds, and those of its timers, of the messages and
+compensations it sent while they wait, and of the dead letters of its
+messages and timers, each blob once. A blob that two actors keep counts for
+each. `kronik actors inspect <kind/key>` shows the count and bytes
+(`blobs`), and `kronik blobs list --actor <kind/key>` lists what it holds.
+A `retain` or `put` that would pass the quota answers `quota-exceeded` to
+the guest. The SDKs
+raise `BLOB_QUOTA_EXCEEDED`, and the turn goes on without the hold. The
+same number bounds what one turn writes into blobs. Raise it for a kind
+that keeps originals:
+
+```sh
+kronik limits set media --blob-size-per-actor 4GiB --reason "media keeps originals"
+```
+
+### What keeps a blob
+
+A blob's file stays as long as something keeps it:
+- a hold;
+- a queued message, a scheduled timer, a dead letter not yet resent;
+- a saved idempotent response, until its key expires (`[gateway]
+  idempotency_ttl`);
+- a call's saved outcome;
+- a turn that is running, and the effects it has recorded;
+- a log record within retention (`[retention] history`);
+- a snapshot;
+- a fork;
+- a lease.
+
+Leases are what the daemon is using right now: uploads, streamed answers,
+running turns and replays. A replay leases everything from its fork point
+on. A lease ends after `[blobs] lease_ttl` (5 minutes) unless it is
+renewed; the daemon renews the leases it holds while it uses them. Nothing
+else keeps a blob, and no actor or operator deletes one directly, except
+that erasing a subject deletes its blobs' files whatever keeps them (see
+[the privacy guide](privacy.md#blobs)).
+
+`kronik blobs inspect <hash>` lists what keeps one blob (MCP `inspect_blob`
+answers the same). `kronik blobs status` shows the store as a whole:
+- how many blobs records and state reference, and their bytes;
+- the floor: records at or after it keep their blobs;
+- the leases;
+- free disk and the reserve;
+- the collector's last pass.
+
+```sh
+kronik blobs status
+kronik blobs inspect b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9
+kronik blobs get b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9 -o report.pdf
+```
+
+`kronik blobs get` needs `pii:read` for a subject's blob. Its bytes pass
+through the secret output matcher like every answer of the daemon.
+
+### Collection
+
+The collector deletes the files that nothing keeps. It runs after every
+retention pass and every `[blobs] gc_interval` (an hour; `"0s"` leaves only
+the retention passes and `kronik blobs gc`). A pass deletes a file only if
+the previous pass also found it without a root, so a file goes within two
+passes after its last root does. A blob's bytes therefore last about
+`[retention] history`, plus the time until a snapshot lets compaction drop
+its records, plus up to two collector intervals.
+
+```sh
+kronik blobs gc --dry-run                                  # what has no root now, and why
+kronik blobs gc --reason "free the disk after the import"  # a pass now
+kronik blobs gc --reason "..." --immediate                 # delete everything without a root at once
+```
+
+The dry run names a reason for each file:
+- `loose`: no record ever referenced it. Examples are a turn that failed or
+  did not keep what it wrote, an upload whose turn never ran, and a crash
+  before a commit.
+- `released`: its last holder released it, and the record that did is
+  below the floor now.
+- `out-of-retention`: its last record is below the floor, and nothing in
+  the state keeps it.
+- `erased`: its subject was erased.
+
+`--immediate` skips the second pass's grace. It stays safe, because leases
+and running turns keep what they use. Each pass records an `AuditEvent`
+`blobs.gc`.
+
+The metrics:
+- `kronik_blob_objects` and `kronik_blob_bytes`: what the store holds;
+- `kronik_blob_gc_candidates`: what the next pass deletes;
+- `kronik_blob_gc_deleted_total`, `kronik_blob_gc_freed_bytes_total` and
+  `kronik_blob_gc_runs_total`;
+- `kronik_blob_gc_duration_seconds`;
+- `kronik_blob_leases`;
+- `kronik_blob_written_bytes_total{source}` (`guest`, `upload`, `effect`)
+  and `kronik_blob_read_bytes_total{reader}`: the traffic.
+
+To reclaim space sooner:
+- shorten `[retention] history` and `[retention] snapshots_kept`;
+- delete forks that are no longer needed;
+- release what actors no longer need;
+- then run a pass.
+
+### Disk space
+
+Size the volume for the sum of these:
+- what actors hold;
+- the blobs of the records within retention: the upload and fetch traffic
+  of `[retention] history`, which `kronik_blob_written_bytes_total` shows;
+- what snapshots, forks and saved responses keep beyond that;
+- up to two collector intervals of deleted traffic;
+- the reserve.
+
+On disk, a file is its content, plus a 512-byte header, plus 4 bytes per
+64 KiB frame, or 16 bytes per frame when sealed.
+
+`[blobs] disk_reserve` keeps free space for the rest of the node. It
+defaults to twice `[log] disk_reserve` (`"2x"`, or a size). The daemon reads
+free space every second and subtracts each frame it writes in between.
+Below the reserve:
+- uploads that would become blobs get 503 `BLOB_STORE_FULL`;
+- a turn that writes a blob is not recorded and runs again later, backing
+  off from 100 ms to 30 s (`kronik_blob_turn_retries_total`);
+- a turn that by itself fills the store past the reserve stops with
+  `BLOB_STORE_FULL` after five attempts in a row that each began with room
+  above the reserve and still met it. Nothing of it is recorded: a message
+  stays queued, and an open turn runs again at the next start.
+
+`kronik_blob_store_below_reserve` is 1 meanwhile, and `/v1/health` says
+`blobs_low_disk`. Turns without blobs are not affected.
+
+Memory does not grow with a blob's size. In the M25 acceptance a 300 MB
+upload, a 40 MB fetch and a 1 GB response each raised the release build's
+peak RSS by less than 2 MiB
+([performance](../perf.md#streaming-bodies-and-blobs-m25)).
+
+### Failures
+
+- **An I/O failure of the blob store** (a failed write, sync or rename)
+  stops the daemon, as a log failure does. The restart runs the open turns
+  again.
+- **`BLOB_MISSING`** means a record or the state references a blob whose
+  file is gone, which should never happen. Its causes are a file removed
+  by hand, a disk that lost it, or a restore with `--allow-missing-blobs`.
+  `kronik_blob_missing_total` counts it, and shipping goes on without it
+  (below). `kronik blobs inspect <hash> --verify` checks a file whole.
+
+### Shipping and restoring blobs
+
+With [shipping](#shipping-to-object-storage) on, blobs go to the bucket
+too, as `<prefix>/blobs/<2 hex>/<name>`. Each object holds the file's bytes
+as stored: sealed blobs stay sealed, and the shipper does not compress
+them. Files above 8 MiB go up as multipart uploads, read from disk part by
+part.
+
+A round uploads every blob a segment or snapshot references before that
+segment or snapshot, so the bucket never holds a record whose blob the node
+has and did not upload. A blob whose file the node has lost (above) does
+not stop the round: its reference ships without it, as the node holds it,
+and the shipper records it in `ship-blobs.db` and in
+`kronik_blob_missing_total`, logs it once, and uploads it if a later round
+finds the file again ([ADR 0122](../adr/0122-shipping-and-restoring-blobs.md),
+amended). A blob of an erased subject is never uploaded. A blob's object is
+deleted only after its local file has been collected, at the end of a
+round, after the segments and snapshots that referenced it have left the
+bucket.
+
+`<data_dir>/ship-blobs.db` records what was uploaded. If it is lost, the
+next rounds ask the bucket before uploading again, and take an object
+already there only when its header's digest matches the file. A blob that `kronik
+privacy reseal` sealed in place replaces its plain object in the next
+round. `kronik_blob_ship_pending` counts the blobs not yet uploaded.
+
+`kronik restore` downloads the blobs of the snapshot's state and of the
+restored log, and checks each one (header, size, body digest, frames,
+identity; a subject's blob with its key) before anything is installed.
+Blobs of erased subjects are not downloaded. A blob missing from the
+bucket, or one that fails its check, fails the restore with `BLOB_MISSING`,
+and nothing is installed. `--allow-missing-blobs` installs anyway and lists
+them; the node then answers `BLOB_MISSING` for them. The report says how
+many blobs were restored, their bytes, and how many were of erased
+subjects.
+
 ## Upgrading to a new release
 
 Each release has its own engine version, `kronik-<version>+wasmtime-<version>`
