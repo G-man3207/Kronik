@@ -1,7 +1,13 @@
-//! `isolation = "microvm"` against a real `kronik serve` on a host without
-//! KVM (M20): the add is refused with `KVM_UNAVAILABLE` and the gVisor
-//! suggestion, and nothing is declared or recorded. It needs neither root,
-//! `runsc` nor an image: the admission check comes before all of them.
+//! `isolation = "microvm"` against a real `kronik serve` without KVM (M20):
+//! the add is refused with `KVM_UNAVAILABLE` and the gVisor suggestion, and
+//! nothing is declared or recorded. It needs neither root, `runsc` nor an
+//! image: the admission check comes before all of them.
+//!
+//! It runs on every host. The daemon, a debug build like this test, checks
+//! the KVM device that `KRONIK_TEST_KVM_DEVICE` names, a path that does not
+//! exist, so a host's own `/dev/kvm` (GitHub's runners have one) does not
+//! turn the test into a skip. A release build ignores the variable, so there
+//! the test runs only on a host without `/dev/kvm`.
 
 // Test harness code: unwraps and std threads are fine here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
@@ -62,6 +68,9 @@ impl Daemon {
         .unwrap();
         let log = std::fs::File::create(dir.path().join("serve.log")).unwrap();
         let child = command()
+            // Hide the host's KVM from the daemon's admission (a debug build
+            // reads it; see the module's documentation).
+            .env("KRONIK_TEST_KVM_DEVICE", dir.path().join("no-kvm"))
             .arg("serve")
             .arg("--config")
             .arg(&config)
@@ -113,11 +122,12 @@ impl Drop for Daemon {
 
 #[test]
 fn microvm_without_kvm_is_a_503_with_the_gvisor_suggestion_and_declares_nothing() {
-    if Path::new("/dev/kvm").exists() {
-        eprintln!("skipped: this host has /dev/kvm");
+    if Path::new("/dev/kvm").exists() && !cfg!(debug_assertions) {
+        eprintln!("skipped: a release daemon sees this host's /dev/kvm");
         return;
     }
     let d = Daemon::start();
+    assert!(!d.path().join("no-kvm").exists());
     let head_before = d.cli(&["--json", "foreign", "list"]);
     assert!(head_before.status.success(), "{head_before:?}");
     let out = d.cli(&[

@@ -77,7 +77,14 @@ root daemon, the probe tries the host's TCP, UDP, Unix and abstract-socket
 listeners, its files, processes and devices, writes into its directories and a
 neighbouring sandbox, and must fail at all of it while its own controls work
 (about ten seconds). The full proof, under the installed nonroot service with
-SysV, demo and microVM checks, is the manual `isolation` workflow. The `action` step
+SysV, demo and microVM checks, is the manual `isolation` workflow. The
+microVM level's refusal without KVM (`KVM_UNAVAILABLE` with the gVisor hint)
+is tested on every host, including CI's runners, which have `/dev/kvm`, by
+`crates/kronik/tests/microvm_admission.rs`: a debug build of the daemon
+checks the device that `KRONIK_TEST_KVM_DEVICE` names instead of
+`/dev/kvm`, and the test names one that does not exist. A release build
+ignores the variable, and only the admission check reads it: the VMM's jail
+binds `/dev/kvm` itself. The `action` step
 installs checksum-verified actionlint 1.7.12 into `target/tools/` and lints
 the actual workflows and composite action; a download or lint failure
 fails the step. Its YAML structure checks of the workflows need PyYAML

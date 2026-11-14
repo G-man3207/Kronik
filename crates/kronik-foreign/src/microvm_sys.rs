@@ -7,14 +7,37 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// The environment variable that points a debug build's microVM admission at
+/// another KVM device (see [`kvm_device`]).
+pub(crate) const TEST_KVM_DEVICE: &str = "KRONIK_TEST_KVM_DEVICE";
+
+/// The device the microVM admission checks: `/dev/kvm`. A debug build takes
+/// the path from [`TEST_KVM_DEVICE`] when it is set, so that a test can hide
+/// KVM from a real daemon on a host that has it (CI's runners do) and prove
+/// the refusal without KVM there; a release build never reads the variable.
+/// Only the admission check reads this path: the VMM's jail binds
+/// `/dev/kvm` itself, so the variable cannot hand a VM another device.
+fn kvm_device() -> PathBuf {
+    let test_device = if cfg!(debug_assertions) {
+        std::env::var_os(TEST_KVM_DEVICE)
+    } else {
+        None
+    };
+    test_device.map_or_else(|| PathBuf::from("/dev/kvm"), PathBuf::from)
+}
 
 /// Check the real KVM interface, not merely the presence of a path. A temporary
 /// empty VM is closed immediately; no image, runtime state or log is written.
 pub(crate) fn kvm() -> io::Result<()> {
-    let device = OpenOptions::new().read(true).write(true).open("/dev/kvm")?;
+    let path = kvm_device();
+    let device = OpenOptions::new().read(true).write(true).open(&path)?;
     if !device.metadata()?.file_type().is_char_device() {
-        return Err(io::Error::other("/dev/kvm is not a character device"));
+        return Err(io::Error::other(format!(
+            "{} is not a character device",
+            path.display()
+        )));
     }
     // SAFETY: these KVM ioctls have integer arguments and device is owned here.
     let version = unsafe { libc::ioctl(device.as_raw_fd(), 0xae00 as _, 0) };
