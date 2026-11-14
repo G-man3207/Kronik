@@ -523,19 +523,23 @@ when the mode is `on`, plain otherwise.
 ### 9.3 Erasure
 
 `Node::erase_subject` is unchanged up to the record. Applying `Erasure`
-marks the subject's index rows erased (§5.2). Then, in the node's
-`after_erasure` hook next to the snapshot it takes today, the store deletes
-every file of an erased row, in main's store and in every fork space, and
-writes nothing else. The shipper deletes the remote objects in its next
-round (ADR 0122 §3, step 6).
+marks the subject's index rows erased (§5.2): those keyed with the erased
+version or an older one, live, on rebuild, and in a fork's or rebase
+shadow's store at the erasure's place. Then, once the record is applied,
+the node deletes every file of an erased row, in main's store and in every
+fork space, under each shard's claim lock, and writes nothing else; it does
+so again at every start, for files a stop in between left. The rows stay
+until the collector forgets them, which it does only once the shipper no
+longer holds their objects. The shipper deletes the remote objects in its
+next round (ADR 0122 §3, step 6).
 
 - A guest read returns `erased`; the API answers `SUBJECT_ERASED`; a replay
   marks the turn unverifiable (ADR 0109); holds, pins and log references
   remain and point at an erased blob.
 - `POST /v1/privacy/erase` answers also `blobs` (the files deleted) and
   `pending_blob_objects` (remote objects not yet deleted).
-- `privacy status` reports an erasure as pending while any of its blob
-  objects is still in the bucket.
+- `privacy status` reports an erasure as pending while any of its blobs
+  still has a file on the node or an object in the bucket.
 - Rebuilding `state.db` from the log applies the same record: the rows are
   marked again, and the deletion finds nothing left.
 
@@ -545,8 +549,14 @@ round (ADR 0122 §3, step 6).
 `blobs` row with a subject, not erased, whose file is plain, it writes the
 file sealed under the row's key version (ADR 0117 §2) as a part file, fsyncs
 it, renames it over the plain one, syncs the directory and writes a
-`blobs/reupload/<name>` marker. Progress: `reseal.blobs_sealed` and
-`reseal.pending_blobs` in `GET /v1/privacy`.
+`blobs/reupload/<name>` marker. The marker is written just before the
+rename, under the shard's claim lock, so a sealed file never replaces a
+plain one without it; the shipper uploads a marked sealed file over the
+plain object and removes the marker (a still-plain file keeps it). A blob
+whose subject was erased meanwhile is left to the erasure's deletion, and
+fork spaces are not resealed (a fork's blobs go with the fork). Progress:
+`reseal.blobs_sealed` and `reseal.pending_blobs` in `GET /v1/privacy`, and
+`blobs` in the reseal's answer.
 
 ### 9.5 Forks without PII and redaction
 
