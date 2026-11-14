@@ -32,6 +32,10 @@
 //!   writer refuses and answers how many bytes it took and the error.
 //! - `touch` (`count=`): reads the body's first MiB `count` times without
 //!   looking at it, and answers the bytes read (the blob I/O budget).
+//! - `many-writers` (`n=`, `size=`): opens `n` writers at once, writes
+//!   `size` bytes into each and keeps them all open; answers `opened <n>`.
+//! - `write-discard` (`size=`): writes a blob of `size` bytes as `write`
+//!   does, finishes it, and answers `discarded` without it.
 //! - `open-writer`: writes into a writer it never finishes.
 //! - `fail-after-write` writes a blob, then fails the turn.
 
@@ -340,6 +344,24 @@ fn run(op: &str, query: &str, body: HttpBody) -> Result<Output, HandlerError> {
                     .len() as u64;
             }
             text(format!("{read}"))
+        }
+        "many-writers" => {
+            let n = query_u64(query, "n", 1);
+            let size = query_u64(query, "size", 0);
+            let chunk = vec![7u8; size as usize];
+            let mut open = Vec::new();
+            for _ in 0..n {
+                let writer = Writer::new();
+                if size > 0 {
+                    writer.write(&chunk).map_err(|e| failed("write", &e))?;
+                }
+                open.push(writer);
+            }
+            text(format!("opened {}", open.len()))
+        }
+        "write-discard" => {
+            write_pattern(query_u64(query, "size", 0), MIB).map_err(|e| failed("write", &e))?;
+            text("discarded".into())
         }
         "open-writer" => {
             let writer = Writer::new();

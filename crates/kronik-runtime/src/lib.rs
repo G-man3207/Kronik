@@ -11,7 +11,10 @@ pub mod host;
 pub mod turn;
 
 pub use engine::{CodeError, CodeStore, PoolSize, build_engine};
-pub use host::blobs::{BLOB_BYTES_PER_FUEL, BlobHost, BlobHostError, MAX_BLOB_CALL_BYTES};
+pub use host::blobs::{
+    BLOB_BYTES_PER_FUEL, BLOB_FRAME_BYTES, BlobHost, BlobHostError, MAX_BLOB_CALL_BYTES,
+    MAX_OPEN_WRITERS, read_charge,
+};
 pub use host::{
     CallOutcome, ConnectionView, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchBody,
     FetchHeader, FetchOutcome, FetchRequest, FetchResponse, FetchResponseBody, GateError, LogEvent,

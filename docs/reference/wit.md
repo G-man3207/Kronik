@@ -596,12 +596,16 @@ with `NOT_IMPLEMENTED`.
   that does not import it keeps getting inline bodies and their limits.
 - **`get`** returns up to `len` bytes (at most 1 MiB) from `offset`, fewer
   only at the end of the blob and none at or past it. Its result depends only
-  on the blob and the arguments; the host reads only the frames the range
-  touches.
+  on the blob and the arguments; the host reads only the 64 KiB frames the
+  range touches, and charges the turn's blob budget (64 bytes per unit of the
+  fuel limit) for each of them whole, so many tiny reads cost what they
+  make the host read.
 - **`writer`** writes a blob of any size in chunks of at most 1 MiB, with the
   turn's default subject at construction. `finish` returns a reference the
   turn may use: retain it, send it, or return it as a body. A writer that is
-  dropped, or still open when the turn ends, is discarded.
+  dropped, or still open when the turn ends, is discarded. A turn holds at
+  most 64 writers open at once: constructing another traps (finished and
+  dropped writers do not count).
 - **`put`, `retain` and `release`** (M26) store and hold blobs: `put` and
   `retain` make the actor hold the blob once the turn commits, and `release`
   ends the actor's own hold at commit. Holds are recorded in the turn record
@@ -650,6 +654,8 @@ host either records it or derives it from what it recorded (I1, I2):
 | Effect response (M2) | 10 MiB | `too-large` |
 | Everything one turn records: its input, effects and their results, state writes, messages, timers, SQL changes and output | 128 MiB, one log record; not a setting | A new effect that no longer fits does not happen and the turn fails with `TURN_TOO_LARGE`; a response larger than what is left is `too-large`; a turn whose writes, messages, SQL changes or output do not fit fails with `TURN_TOO_LARGE` |
 | Table elements | 1,000,000 | `table.grow` returns -1 |
+| Blob bytes a turn reads and writes (M25), reads counted in whole 64 KiB frames | 64 per unit of the fuel limit | The turn fails with `FUEL_EXHAUSTED` |
+| Blob writers open at once in one turn (M25) | 64 | Constructing another traps |
 
 Fuel, memory, message and state value size, SQL size per actor, effect
 timeout and effect response size can be set per kind from M2

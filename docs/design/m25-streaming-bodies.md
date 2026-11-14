@@ -242,6 +242,13 @@ left. The worker loop (`Node::worker`) gains the retry: on the internal error
 `BLOB_STORE_FULL` it sleeps with backoff (100 ms doubling to 30 s) and runs
 the job again, as a re-run from its `TurnBegin` and `open_effects` when it
 wrote one, else unchanged, while `kronik_blob_turn_retries_total` counts.
+The store's free space is read every second, and every frame written in
+between is subtracted from the reading, so concurrent writers stop at the
+reserve rather than one reading later. A turn whose own writes take the
+store below the reserve cannot finish by waiting: after five attempts in a
+row that began with room and met the reserve anyway, its caller gets
+`BLOB_STORE_FULL` and the worker moves on; nothing is recorded, so an open
+turn is re-run at the next start and a message stays in the mailbox.
 
 ## 5. The WIT and the turn host
 
@@ -278,7 +285,13 @@ and new components.
   open when the turn ends is discarded.
 - Every function is denied in `describe` (it traps, like `state`).
 - Bytes moved by `get` and `write` count against the turn's blob budget,
-  `fuel × 64` bytes; exceeding it traps with `FUEL_EXHAUSTED`.
+  `fuel × 64` bytes; exceeding it traps with `FUEL_EXHAUSTED`. A `get` is
+  charged for every 64 KiB frame it touches, whole, since the store reads and
+  checks whole frames (`kronik_runtime::read_charge`).
+- A turn holds at most 64 writers open at once (`MAX_OPEN_WRITERS`); the
+  constructor cannot return an error, so another traps. A writer creates its
+  part file with its first full frame and writes every frame when it is
+  complete, so it holds one frame of data at most.
 - A writer's bytes are scrubbed of the secret values the turn has revealed so
   far, with the stream scrubber of §7.4; a value revealed later cannot be in
   bytes written before the guest had it. A turn that revealed nothing pays

@@ -233,6 +233,17 @@ until the v1.0 compatibility promise takes effect.
   as it arrives, scrubbed of the turn's secrets and named durably before
   its result is recorded, and a blob request body is streamed from the store
   with its length. The effect's record holds only the references.
+- Blob limits found in review (M25): a turn holds at most 64 blob writers
+  open at once (constructing another traps); a writer creates its part file
+  with its first full frame and holds at most one frame; a blob read is
+  charged for every 64 KiB frame it touches; written bytes count against
+  the blob store's free space between two disk readings, so the blob reserve
+  holds under concurrent writers; a turn that fills the store past the
+  reserve by itself stops waiting after five attempts with
+  `BLOB_STORE_FULL`. An erased subject's blob reads as erased also when it
+  was written unsealed, and a sealed write replaces a plain file of the
+  same blob. A turn's blob host no longer keeps the turn's effect state
+  alive, so its lease (renewed while it runs) ends with the turn.
 - Forks replay turns with blobs (M25): a fork's turns read production's
   blobs and write new ones to the fork's own space, recorded blob responses
   and blob request bodies replay as production recorded them, and `kronik

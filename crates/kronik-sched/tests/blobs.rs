@@ -575,3 +575,115 @@ fn walk(root: &Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+/// Review B-H1 (ci-green's repro): a turn may hold 64 writers open at
+/// once; constructing more traps, so one turn can never hold thousands of
+/// files. Within the cap, each writer holds at most a frame of its data.
+#[test]
+fn a_turn_holds_a_bounded_number_of_open_writers() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path(), Some(BlobsConfig::default()));
+    let tmp = dir.path().join("blobs/tmp");
+    let parts = || std::fs::read_dir(&tmp).map(|d| d.count()).unwrap_or(0);
+    let within = p.ingress(http("many-writers", "n=64&size=1000000", inline(b"")));
+    assert_eq!(answer(&within), "opened 64");
+    let over = p.ingress(http("many-writers", "n=3000&size=0", inline(b"")));
+    assert!(!over.committed());
+    assert_eq!(over.outcome.kind, pb::OutcomeKind::Trap as i32);
+    assert!(
+        over.outcome.message.contains("too many open blob writers"),
+        "{:?}",
+        over.outcome
+    );
+    // Discarded writers leave no part files behind (deleted in the
+    // background).
+    for _ in 0..100 {
+        if parts() == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(parts(), 0);
+}
+
+/// A turn's lease ends with the turn (found in review: the turn's effect
+/// state and its blob host held each other, so neither was freed, nor the
+/// turn's lease, nor the secret values the turn used).
+#[test]
+fn a_turns_lease_ends_with_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path(), Some(BlobsConfig::default()));
+    let store = p.node.blob_store().unwrap().clone();
+    for _ in 0..3 {
+        let r = p.ingress(http("write", "size=100000", inline(b"")));
+        let blob = blob_answer(&r);
+        let id = kronik_blob::BlobId::parse(&blob.hash).unwrap();
+        let mut gone = false;
+        for _ in 0..100 {
+            if !store.leases().holders().contains(&"turn") && !store.leases().is_leased(&id) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(gone, "holders: {:?}", store.leases().holders());
+    }
+}
+
+/// Review B-M2: a turn that fills the store past its reserve by itself
+/// cannot finish by waiting. After five attempts that began with room, the
+/// caller gets BLOB_STORE_FULL, nothing is recorded, and the actor's next
+/// input runs.
+#[allow(clippy::disallowed_methods)]
+#[test]
+fn a_turn_that_fills_the_store_itself_stops_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path(), Some(BlobsConfig::default()));
+    let store = p.node.blob_store().unwrap().clone();
+    let reserve = 1u64 << 30;
+    store.set_reserve(reserve);
+    // A disk reading every 20 ms, with less room above the reserve than
+    // one frame: the turn's first frame takes the store below it, and only
+    // a reading between a frame's write and the next frame's check (a few
+    // microseconds) could let a frame more through.
+    let room = reserve + 100;
+    store.set_free(room);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reading = {
+        let (stop, store) = (stop.clone(), store.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                store.set_free(room);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        })
+    };
+    let started = std::time::Instant::now();
+    let result = p.rt.block_on(async {
+        match p
+            .node
+            .ingress(
+                ActorRef::parse("media/a").unwrap(),
+                http("write", "size=1000000", inline(b"")),
+                None,
+            )
+            .unwrap()
+        {
+            Ingress::Started(w) | Ingress::Joined(w) => w.wait().await,
+            Ingress::Done(r) => Ok(*r),
+        }
+    });
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    reading.join().unwrap();
+    let error = result.expect_err("the turn cannot finish");
+    assert_eq!(error.code, kronik_core::error::ErrorCode::BlobStoreFull);
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+    store.set_reserve(0);
+    store.set_free(u64::MAX - 1);
+    let next = p.ingress(http("info", "", inline(b"x")));
+    assert_eq!(answer(&next), "inline 1");
+    // Nothing of the abandoned turn was recorded: the next turn is the
+    // actor's first record.
+    let record = p.record(&next);
+    assert!(record.effects.is_empty());
+}

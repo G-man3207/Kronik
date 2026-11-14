@@ -25,6 +25,12 @@ use crate::effects::{FxState, secret_patterns};
 /// The most one push of a writer's scrubber may emit: a 1 MiB chunk whose
 /// secrets turn into longer markers.
 const SCRUB_BUFFER_BYTES: usize = 16 << 20;
+/// Readers a turn keeps open; reading another blob closes the oldest. The
+/// results do not depend on it, only how often a header is read again.
+const OPEN_READERS: usize = 32;
+/// How often a running turn renews its lease (ADR 0120 §4), at most a
+/// quarter of the lease's lifetime.
+const RENEW_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The secret values a turn has used or revealed, by name.
 pub type SecretValues = Vec<(String, Arc<zeroize::Zeroizing<Vec<u8>>>)>;
@@ -52,7 +58,8 @@ struct Inner {
     limit: u64,
     next: AtomicU64,
     writers: Mutex<HashMap<u64, Slot>>,
-    readers: Mutex<HashMap<String, Arc<BlobReader>>>,
+    /// Open readers, oldest first ([`OPEN_READERS`] at most).
+    readers: Mutex<Vec<(String, Arc<BlobReader>)>>,
     /// Blobs the turn finished, to make durable before its record.
     created: Mutex<Vec<BlobId>>,
 }
@@ -77,7 +84,7 @@ impl TurnBlobs {
         limit: u64,
     ) -> TurnBlobs {
         let lease = store.leases().take("turn");
-        TurnBlobs(Arc::new(Inner {
+        let inner = Arc::new(Inner {
             store,
             space,
             env,
@@ -87,16 +94,38 @@ impl TurnBlobs {
             limit,
             next: AtomicU64::new(0),
             writers: Mutex::new(HashMap::new()),
-            readers: Mutex::new(HashMap::new()),
+            readers: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
-        }))
+        });
+        // The lease lives as long as the host, renewed while the turn runs,
+        // however long it waits (ADR 0120 §4); the loop ends with the host.
+        let weak = Arc::downgrade(&inner);
+        let every = RENEW_EVERY.min(inner.store.lease_ttl() / 4);
+        let clock = inner.env.clock.clone();
+        drop(inner.env.spawn("blob lease renewal", async move {
+            loop {
+                clock.sleep(every).await;
+                match weak.upgrade() {
+                    Some(inner) => inner.lease.renew(),
+                    None => return,
+                }
+            }
+        }));
+        TurnBlobs(inner)
     }
 
-    /// The secret values of a turn's effect state, for its blob host.
+    /// The secret values of a turn's effect state, for its blob host. It
+    /// holds the turn's effects weakly: the gate holds the host, and a
+    /// strong reference here would keep both, the turn's secrets and its
+    /// lease, alive for good.
     pub(crate) fn secrets_of(state: Arc<crate::effects::TurnFx>) -> SecretSource {
-        Arc::new(move || {
-            let s: std::sync::MutexGuard<'_, FxState> = lock(&state.state);
-            s.secrets.clone()
+        let state = Arc::downgrade(&state);
+        Arc::new(move || match state.upgrade() {
+            Some(state) => {
+                let s: std::sync::MutexGuard<'_, FxState> = lock(&state.state);
+                s.secrets.clone()
+            }
+            None => Vec::new(),
         })
     }
 
@@ -322,7 +351,7 @@ impl Inner {
     }
 
     async fn reader(&self, blob: &pb::BlobRef) -> Result<Arc<BlobReader>, BlobHostError> {
-        if let Some(reader) = lock(&self.readers).get(&blob.hash) {
+        if let Some((_, reader)) = lock(&self.readers).iter().find(|(h, _)| *h == blob.hash) {
             return Ok(reader.clone());
         }
         let meta = BlobMeta::from_pb(blob).map_err(host_error)?;
@@ -333,7 +362,11 @@ impl Inner {
                 .await
                 .map_err(host_error)?,
         );
-        lock(&self.readers).insert(blob.hash.clone(), reader.clone());
+        let mut readers = lock(&self.readers);
+        if readers.len() >= OPEN_READERS {
+            readers.remove(0);
+        }
+        readers.push((blob.hash.clone(), reader.clone()));
         Ok(reader)
     }
 }

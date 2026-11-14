@@ -1441,8 +1441,13 @@ impl Node {
     ) -> Result<TurnResult, ApiError> {
         const FIRST: Duration = Duration::from_millis(100);
         const MAX: Duration = Duration::from_secs(30);
+        // Attempts in a row that began with room above the reserve and met
+        // it anyway: the turn fills the store itself, and waiting cannot
+        // help it. The caller then gets BLOB_STORE_FULL; nothing is recorded.
+        const OWN_FULL_ATTEMPTS: u32 = 5;
         let mut delay = FIRST;
         let mut attempts = 0u32;
+        let mut own_full = 0u32;
         while matches!(&result, Err(e) if e.code == ErrorCode::BlobStoreFull) {
             if self.fatal().is_some() {
                 break;
@@ -1458,6 +1463,7 @@ impl Node {
             kronik_metrics::inc("kronik_blob_turn_retries_total", &[]);
             self.env.clock.sleep(delay).await;
             delay = delay.saturating_mul(2).min(MAX);
+            let room = self.blobs_below_reserve().is_none();
             let begun = lock(&self.blob_waits).remove(actor);
             result = match begun {
                 Some((begin, last_result_lsn)) => {
@@ -1505,6 +1511,25 @@ impl Node {
                     .await
                 }
             };
+            if room && matches!(&result, Err(e) if e.code == ErrorCode::BlobStoreFull) {
+                own_full += 1;
+                if own_full >= OWN_FULL_ATTEMPTS {
+                    tracing::error!(
+                        actor = %actor,
+                        attempts,
+                        "a turn needs more room in the blob store than there is above \
+                         [blobs] disk_reserve: it is not run again until the node restarts"
+                    );
+                    lock(&self.blob_waits).remove(actor);
+                    return Err(ApiError::new(
+                        ErrorCode::BlobStoreFull,
+                        "the turn needs more room in the blob store than there is above \
+                         [blobs] disk_reserve; it was not recorded",
+                    ));
+                }
+            } else {
+                own_full = 0;
+            }
         }
         result
     }

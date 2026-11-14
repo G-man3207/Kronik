@@ -663,3 +663,131 @@ async fn one_directory_sync_covers_every_name_before_it() {
         .unwrap();
     assert_eq!(fs.syncs.lock().unwrap().last(), Some(&shard_of(&d)));
 }
+
+/// Review B-H1: a writer holds no file until its first frame is complete,
+/// and buffers one frame at most, whatever it is given.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writer_holds_no_file_until_a_frame_and_buffers_one_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path()).await;
+    let tmp = dir.path().join("blobs/tmp");
+    let parts = || std::fs::read_dir(&tmp).unwrap().count();
+    let mut writers = Vec::new();
+    for _ in 0..200 {
+        let mut w = store
+            .writer(Space::Main, None, u64::MAX, store.leases().take("t"))
+            .await
+            .unwrap();
+        w.write(&[1; 1000]).await.unwrap();
+        writers.push(w);
+    }
+    assert_eq!(parts(), 0, "200 writers of less than a frame hold no file");
+    // A write of many frames leaves at most one frame buffered: the file
+    // grows with every complete frame.
+    let mut w = store
+        .writer(Space::Main, None, u64::MAX, store.leases().take("t"))
+        .await
+        .unwrap();
+    let data = content(9, 10 * FRAME_SIZE + 5);
+    w.write(&data).await.unwrap();
+    assert_eq!(parts(), 1);
+    let part = std::fs::read_dir(&tmp)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let on_disk = std::fs::metadata(&part).unwrap().len();
+    assert!(
+        on_disk >= (HEADER_LEN + 10 * FRAME_SIZE) as u64,
+        "{on_disk} bytes on disk after 10 frames"
+    );
+    let meta = w.finish().await.unwrap();
+    assert_eq!(meta.size, data.len() as u64);
+    drop(writers);
+    // An empty plain blob still gets its file at finish.
+    let empty = put(&store, None, &[], 1).await;
+    let r = store.reader(&Space::Main, &empty, &NoKeys).await.unwrap();
+    assert!(r.read_at(0, 0).await.unwrap().is_empty());
+}
+
+/// Review B-H2: written bytes count against the last free-space reading,
+/// so writers between two readings stop at the reserve.
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_count_against_the_reserve_between_readings() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = BlobStore::open(
+        Env::real(tokio::runtime::Handle::current()),
+        dir.path(),
+        StoreConfig {
+            reserve: 1 << 20,
+            ..StoreConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    // Four frames above the reserve.
+    store.set_free((1 << 20) + 4 * FRAME_SIZE as u64);
+    let mut w = store
+        .writer(Space::Main, None, u64::MAX, store.leases().take("t"))
+        .await
+        .unwrap();
+    let mut written = 0;
+    let error = loop {
+        match w.write(&[7; FRAME_SIZE]).await {
+            Ok(()) => written += 1,
+            Err(e) => break e,
+        }
+        assert!(written < 100, "the reserve never stopped the writer");
+    };
+    assert!(matches!(error, BlobError::StoreFull { .. }), "{error}");
+    assert!((4..=6).contains(&written), "{written} frames written");
+    assert!(store.below_reserve().is_some());
+    // A new reading replaces the estimate.
+    store.set_free(u64::MAX - 1);
+    assert!(store.below_reserve().is_none());
+}
+
+/// Review B-M4: a sealed write does not claim a plain file of the same
+/// identity (privacy mode was turned on since); it replaces it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sealed_write_replaces_a_plain_file_of_the_same_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path()).await;
+    let keys = TestKeys::default();
+    let data = content(4, FRAME_SIZE + 10);
+    let plain = put(&store, Some(keys.keys("user:5", 1, false)), &data, 5000).await;
+    let bytes = std::fs::read(object(dir.path(), &plain)).unwrap();
+    assert!(bytes.windows(64).any(|w| w == &data[100..164]));
+    let sealed = put(&store, Some(keys.keys("user:5", 1, true)), &data, 5000).await;
+    assert_eq!(sealed, plain);
+    let bytes = std::fs::read(object(dir.path(), &sealed)).unwrap();
+    assert!(!bytes.windows(64).any(|w| w == &data[100..164]));
+    let r = store.reader(&Space::Main, &sealed, &keys).await.unwrap();
+    assert!(r.is_sealed());
+}
+
+/// Review B-M3: an erased subject's blob is gone, plain or sealed
+/// (ADR 0118 §4).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_erased_subjects_plain_blob_reads_as_erased() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path()).await;
+    let keys = TestKeys::default();
+    let plain = put(
+        &store,
+        Some(keys.keys("user:6", 1, false)),
+        &content(5, 500),
+        100,
+    )
+    .await;
+    store.reader(&Space::Main, &plain, &keys).await.unwrap();
+    keys.erased.lock().unwrap().push("user:6".into());
+    assert!(matches!(
+        store.reader(&Space::Main, &plain, &keys).await,
+        Err(BlobError::Erased)
+    ));
+    // A blob without a subject never asks for keys.
+    let shared = put(&store, None, &content(6, 500), 100).await;
+    store.reader(&Space::Main, &shared, &keys).await.unwrap();
+}

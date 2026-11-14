@@ -26,6 +26,24 @@ pub const MAX_BLOB_CALL_BYTES: usize = 1 << 20;
 /// Blob bytes a turn may move per unit of its fuel limit (ADR 0121 §4): host
 /// calls are not metered by Wasm fuel, so this bounds a turn's disk I/O.
 pub const BLOB_BYTES_PER_FUEL: u64 = 64;
+/// The frame size of the blob format (`kronik_blob::format::FRAME_SIZE`):
+/// a read is charged for every frame it touches, as the store reads and
+/// checks whole frames.
+pub const BLOB_FRAME_BYTES: u64 = 65_536;
+/// The writers one turn may hold open at once: each holds a part file and
+/// up to a frame of data. Constructing another traps; finished and dropped
+/// writers do not count.
+pub const MAX_OPEN_WRITERS: usize = 64;
+
+/// The bytes a read of `blob_size` bytes at `offset`, `len` bytes long,
+/// is charged: every frame it touches, whole.
+pub fn read_charge(blob_size: u64, offset: u64, len: u32) -> u64 {
+    let end = blob_size.min(offset.saturating_add(u64::from(len)));
+    if end <= offset {
+        return 0;
+    }
+    ((end - 1) / BLOB_FRAME_BYTES - offset / BLOB_FRAME_BYTES + 1) * BLOB_FRAME_BYTES
+}
 
 /// Why the blob host could not do what the turn asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,8 +211,7 @@ impl wit::Host for TurnHost {
         let Some(full) = self.blob_state.complete(&blob) else {
             return Ok(Err(wit::BlobError::NotHeld));
         };
-        let end = full.size.min(offset.saturating_add(u64::from(len)));
-        self.charge_blob_bytes(end.saturating_sub(offset))?;
+        self.charge_blob_bytes(read_charge(full.size, offset, len))?;
         if offset >= full.size {
             return Ok(Ok(Vec::new()));
         }
@@ -224,6 +241,12 @@ impl wit::Host for TurnHost {
 impl wit::HostWriter for TurnHost {
     async fn new(&mut self) -> wasmtime::Result<Resource<GuestWriter>> {
         let host = self.blob_host("blobs.writer")?;
+        if self.blob_state.open.len() >= MAX_OPEN_WRITERS {
+            bail!(
+                "too many open blob writers: a turn holds at most {MAX_OPEN_WRITERS} at once \
+                 (finish or drop one first)"
+            );
+        }
         let id = match host.create(self.subject.clone()).await {
             Ok(id) => id,
             Err(error) => return Err(self.blob_failure(error)),

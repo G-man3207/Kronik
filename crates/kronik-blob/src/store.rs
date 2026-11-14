@@ -15,9 +15,6 @@ use crate::format::{self, FRAME_SIZE, FrameKey, HEADER_LEN, Header};
 use crate::id::hex;
 use crate::{BlobError, BlobId, BlobMeta, Lease, Leases};
 
-/// Encoded frames are written in batches of about this many bytes.
-const WRITE_BATCH: usize = 1 << 20;
-
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -122,6 +119,7 @@ pub struct BlobStore {
     data_dir: PathBuf,
     /// `[blobs] disk_reserve`; a test can change it ([`BlobStore::set_reserve`]).
     reserve: AtomicU64,
+    lease_ttl: Duration,
     leases: Arc<Leases>,
     /// The last free-space reading of `<data>/blobs`; `u64::MAX`: none yet.
     free: AtomicU64,
@@ -148,6 +146,7 @@ impl BlobStore {
             env,
             data_dir: data_dir.to_path_buf(),
             reserve: AtomicU64::new(cfg.reserve),
+            lease_ttl: cfg.lease_ttl,
             leases,
             free: AtomicU64::new(u64::MAX),
             prepared: tokio::sync::Mutex::new(BTreeSet::new()),
@@ -163,6 +162,11 @@ impl BlobStore {
 
     pub fn leases(&self) -> &Arc<Leases> {
         &self.leases
+    }
+
+    /// `[blobs] lease_ttl`: how long a lease lives without renewal.
+    pub fn lease_ttl(&self) -> Duration {
+        self.lease_ttl
     }
 
     /// The root directory of a space.
@@ -267,6 +271,17 @@ impl BlobStore {
         self.free.store(bytes, Ordering::Relaxed);
     }
 
+    /// Counts `bytes` just written against the last free-space reading, so
+    /// that writes between two readings cannot pass the reserve unseen; the
+    /// next reading replaces the estimate.
+    fn charge(&self, bytes: u64) {
+        let _ = self
+            .free
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |free| {
+                (free != u64::MAX).then(|| free.saturating_sub(bytes))
+            });
+    }
+
     /// The free bytes when below `[blobs] disk_reserve`, else None.
     pub fn below_reserve(&self) -> Option<u64> {
         let free = self.free.load(Ordering::Relaxed);
@@ -303,16 +318,12 @@ impl BlobStore {
             ));
         }
         self.prepare(&space).await?;
-        let root = self.root(&space);
-        let part = root
+        // The part file is created with the first frame: a writer that has
+        // written less than a frame holds no file.
+        let planned = self
+            .root(&space)
             .join("tmp")
             .join(format!("{}.part", hex(&self.env.random_bytes::<8>())));
-        let file = self
-            .env
-            .fs
-            .open(part.clone(), OpenMode::ReadWriteCreate)
-            .await
-            .map_err(|e| BlobError::io("creating a blob part file", e))?;
         let sealed = keys.as_ref().is_some_and(|k| k.seal.is_some());
         let nonce_prefix = if sealed {
             self.env.random_bytes::<16>()
@@ -326,13 +337,14 @@ impl BlobStore {
         Ok(BlobWriter {
             store: self.clone(),
             space,
-            part: Some(part),
-            file,
+            planned,
+            part: None,
+            file: None,
             keys,
             nonce_prefix,
             identity,
             body: blake3::Hasher::new(),
-            pending: Vec::with_capacity(FRAME_SIZE),
+            pending: Vec::new(),
             out: Vec::new(),
             next_frame: 0,
             file_pos: HEADER_LEN as u64,
@@ -350,6 +362,7 @@ impl BlobStore {
         space: &Space,
         part: &Path,
         meta: &BlobMeta,
+        sealed: bool,
         lease: &Lease,
     ) -> Result<(), BlobError> {
         let object = self.object_path(space, &meta.id);
@@ -361,7 +374,7 @@ impl BlobStore {
         let fs = &self.env.fs;
         let _claim = dir.claim.lock().await;
         let claimable = match fs.open(object.clone(), OpenMode::Read).await {
-            Ok(file) => existing_matches(&*file, meta).await,
+            Ok(file) => existing_matches(&*file, meta, sealed).await,
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(BlobError::io("opening a blob", e)),
         };
@@ -462,8 +475,10 @@ impl BlobStore {
 
 /// Whether an existing object is the same blob as `meta` (its header
 /// structure, identity and size), so a writer may claim it instead of
-/// replacing it. A damaged header is not claimed: the new file replaces it.
-async fn existing_matches(file: &dyn File, meta: &BlobMeta) -> bool {
+/// replacing it. A damaged header is not claimed, nor a plain file when the
+/// new one is sealed (privacy mode was turned on since): the new file
+/// replaces it. A sealed file serves a plain writer as well.
+async fn existing_matches(file: &dyn File, meta: &BlobMeta, sealed: bool) -> bool {
     let Ok(bytes) = file.read_at(0, HEADER_LEN).await else {
         return false;
     };
@@ -474,6 +489,7 @@ async fn existing_matches(file: &dyn File, meta: &BlobMeta) -> bool {
         return false;
     };
     h.identity == *meta.id.digest()
+        && (h.sealed || !sealed)
         && h.size == meta.size
         && h.subject == meta.subject
         && h.key_version == meta.key_version
@@ -484,16 +500,19 @@ async fn existing_matches(file: &dyn File, meta: &BlobMeta) -> bool {
 pub struct BlobWriter {
     store: Arc<BlobStore>,
     space: Space,
-    /// The part file, until the blob is named or discarded.
+    /// The part file's name, created with the first frame.
+    planned: PathBuf,
+    /// The part file once created, until the blob is named or discarded.
     part: Option<PathBuf>,
-    file: Arc<dyn File>,
+    file: Option<Arc<dyn File>>,
     keys: Option<BlobKeys>,
     nonce_prefix: [u8; 16],
     identity: blake3::Hasher,
     body: blake3::Hasher,
     /// Plaintext of the frame being filled, at most one frame.
     pending: Vec<u8>,
-    /// Encoded frames not written yet.
+    /// The encoded frame not written yet: one at most, as every frame is
+    /// written when it is complete.
     out: Vec<u8>,
     next_frame: u64,
     file_pos: u64,
@@ -540,17 +559,38 @@ impl BlobWriter {
         Ok(())
     }
 
+    /// The part file, created on first use.
+    async fn file(&mut self) -> Result<Arc<dyn File>, BlobError> {
+        if let Some(file) = &self.file {
+            return Ok(file.clone());
+        }
+        let file = self
+            .store
+            .env
+            .fs
+            .open(self.planned.clone(), OpenMode::ReadWriteCreate)
+            .await
+            .map_err(|e| BlobError::io("creating a blob part file", e))?;
+        self.part = Some(self.planned.clone());
+        self.file = Some(file.clone());
+        Ok(file)
+    }
+
+    /// Writes the encoded frame, below the store's reserve only, and counts
+    /// it against the store's free space.
     async fn flush(&mut self) -> Result<(), BlobError> {
         if self.out.is_empty() {
             return Ok(());
         }
+        self.store.check_reserve()?;
+        let file = self.file().await?;
         let bytes = Bytes::from(std::mem::take(&mut self.out));
         self.body.update(&bytes);
         let len = bytes.len() as u64;
-        self.file
-            .write_at(self.file_pos, bytes)
+        file.write_at(self.file_pos, bytes)
             .await
             .map_err(|e| BlobError::io("writing a blob", e))?;
+        self.store.charge(len);
         self.file_pos += len;
         Ok(())
     }
@@ -566,15 +606,14 @@ impl BlobWriter {
         self.written += data.len() as u64;
         while !data.is_empty() {
             if self.pending.len() == FRAME_SIZE {
-                // More data follows, so this frame is not the last.
+                // More data follows, so this frame is not the last; it is
+                // written now, so a writer buffers one frame at most.
                 self.encode_frame(false)?;
+                self.flush().await?;
             }
             let take = (FRAME_SIZE - self.pending.len()).min(data.len());
             self.pending.extend_from_slice(&data[..take]);
             data = &data[take..];
-            if self.out.len() >= WRITE_BATCH {
-                self.flush().await?;
-            }
         }
         Ok(())
     }
@@ -606,12 +645,12 @@ impl BlobWriter {
         if let Some(key) = self.keys.as_ref().and_then(|k| k.seal.as_deref()) {
             header.seal(key).map_err(BlobError::Io)?;
         }
-        self.file
-            .write_at(0, Bytes::copy_from_slice(&header.encode()))
+        // An empty plain blob has no frame: its file is created here.
+        let file = self.file().await?;
+        file.write_at(0, Bytes::copy_from_slice(&header.encode()))
             .await
             .map_err(|e| BlobError::io("writing a blob header", e))?;
-        self.file
-            .sync_data()
+        file.sync_data()
             .await
             .map_err(|e| BlobError::io("syncing a blob", e))?;
         let meta = BlobMeta {
@@ -625,7 +664,7 @@ impl BlobWriter {
             .clone()
             .ok_or_else(|| BlobError::Invalid("a finished writer".into()))?;
         self.store
-            .install(&self.space, &part, &meta, &self.lease)
+            .install(&self.space, &part, &meta, sealed, &self.lease)
             .await?;
         self.part = None;
         Ok(meta)
@@ -670,12 +709,14 @@ impl BlobReader {
             .await
             .map_err(|e| BlobError::io("reading a blob header", e))?;
         let header = Header::decode(&bytes).map_err(corrupt)?;
+        // Keys are looked up with the reference's subject and version, never
+        // the header's: nothing in a header is trusted before its tag.
         let key = if header.sealed {
-            let subject = header
+            let subject = meta
                 .subject
                 .clone()
-                .ok_or_else(|| corrupt("a sealed blob without a subject".into()))?;
-            let key = match keys.seal_key(&subject, header.key_version) {
+                .ok_or_else(|| corrupt("a sealed file for a blob without a subject".into()))?;
+            let key = match keys.seal_key(&subject, meta.key_version) {
                 KeyAnswer::Found(key) => key,
                 KeyAnswer::Erased => return Err(BlobError::Erased),
                 KeyAnswer::Missing => return Err(BlobError::KeyMissing(subject)),
@@ -683,10 +724,19 @@ impl BlobReader {
                     return Err(BlobError::Io(format!("reading a blob key: {why}")));
                 }
             };
-            // Nothing in a sealed header is trusted before its tag.
             header.verify(&key).map_err(corrupt)?;
             Some(key)
         } else {
+            // ADR 0118 §4: an erased subject's blob is gone, plain or sealed.
+            if let Some(subject) = &meta.subject {
+                match keys.identity_key(subject, meta.key_version) {
+                    KeyAnswer::Erased => return Err(BlobError::Erased),
+                    KeyAnswer::Unavailable(why) => {
+                        return Err(BlobError::Io(format!("reading a blob key: {why}")));
+                    }
+                    KeyAnswer::Found(_) | KeyAnswer::Missing => {}
+                }
+            }
             None
         };
         if header.identity != *meta.id.digest()

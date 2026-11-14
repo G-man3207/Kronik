@@ -547,3 +547,17 @@ async fn a_blob_turn_is_deterministic() {
         }
     }
 }
+
+/// Review B-M1: a read is charged for every frame it touches, whole, so
+/// tiny reads cannot make the store read far more than the budget says.
+#[test]
+fn reads_are_charged_by_the_frames_they_touch() {
+    use kronik_runtime::{BLOB_FRAME_BYTES as F, read_charge};
+    assert_eq!(read_charge(10 * F, 0, 1), F);
+    assert_eq!(read_charge(10 * F, F - 1, 2), 2 * F);
+    assert_eq!(read_charge(10 * F, 3 * F, F as u32), F);
+    assert_eq!(read_charge(10 * F, 0, 1 << 20), 10 * F);
+    assert_eq!(read_charge(100, 0, 1 << 20), F);
+    assert_eq!(read_charge(100, 100, 5), 0);
+    assert_eq!(read_charge(100, 7, 0), 0);
+}
