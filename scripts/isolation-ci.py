@@ -290,12 +290,17 @@ def run(args, log=None, env=None, timeout=None, check=True):
     return result
 
 
-def test_executables(names, profile_args=("--release",)):
-    """The paths of the explicit driver targets, built by name (they are never run by cargo test)."""
+def test_executables(names, profile_args=("--release",), log=None):
+    """The paths of the explicit driver targets, built by name (they are never run by cargo test).
+    Cargo's JSON messages are on its stdout, read alone; its progress goes to `log`."""
     args = ["cargo", "test", *profile_args, "--locked", "-p", "kronik", "--no-run", "--message-format=json"]
     for name in names:
         args += ["--test", name]
-    result = run(args)
+    print("+ " + " ".join(args), flush=True)
+    with open(log or os.devnull, "a") as errors:
+        result = subprocess.run(args, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=errors)
+    if result.returncode != 0:
+        raise Refused(f"cargo exited {result.returncode} building {names}" + (f"; see {log}" if log else ""))
     return executables_from(result.stdout, names)
 
 
@@ -320,7 +325,7 @@ def build(out, examples):
     out.mkdir(parents=True, exist_ok=True)
     log = out / "build.log"
     run(["cargo", "build", "--release", "--locked", "-p", "kronik"], log=log)
-    drivers = test_executables(["isolation_fixture", "rootless_boundary"])
+    drivers = test_executables(["isolation_fixture", "rootless_boundary"], log=log)
     layouts = {}
     for key, name in [("probe", "foreign-probe"), ("pg", "foreign-pg"), ("payments", "fake-payments")]:
         run(["scripts/build-foreign-examples.sh", "--only", name], log=log)
