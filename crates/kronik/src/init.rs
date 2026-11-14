@@ -411,6 +411,20 @@ idempotency_ttl = "24h"
 trusted_proxies = []                 # a reverse proxy here has no per-client connection cap
 # preview_domain = "example-preview.com"   # previews only at https://<id>.<domain>/; acme needs dns01_hook
 
+# [connections]                      # WebSocket and SSE connections (M24)
+# max_open = 4096                    # live connections in total (the open-file limit may lower it)
+# max_per_actor = 2048               # per owner
+# max_per_client = 256               # per client address; trusted_proxies are exempt
+# max_frame_bytes = 65536            # largest incoming message
+# inflight_frames = 16               # incoming frames per connection admitted and not finished
+# inbound_rate = "50/s"              # reads per connection are paced to this
+# outbound_queue_bytes = 1048576     # queued outgoing bytes before a slow-consumer close
+# ping_interval = "30s"
+# ping_timeout = "30s"
+# sse_heartbeat = "15s"
+# close_timeout = "5s"
+# shutdown_grace = "2s"
+
 [log]
 group_commit_ms = 2
 segment_max_mb = 64

@@ -62,6 +62,118 @@ pub struct Config {
     pub oidc: Option<kronik_api::oidc::Config>,
     pub fleet: Option<Fleet>,
     pub events: Events,
+    pub connections: Connections,
+}
+
+/// `[connections]` (M24, docs/design/m24-connections.md §5.11): admission
+/// and transport settings of WebSocket and SSE connections. Replay never
+/// reads them; it reads the recorded inputs.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Connections {
+    /// Live connections in total, besides [gateway]'s HTTP connections.
+    pub max_open: usize,
+    /// Live connections per owner.
+    pub max_per_actor: usize,
+    /// Live connections per client address; trusted proxies are exempt.
+    pub max_per_client: usize,
+    /// The largest incoming message (never above the kind's message limit).
+    pub max_frame_bytes: usize,
+    /// Incoming frames per connection admitted and not yet finished.
+    pub inflight_frames: usize,
+    /// Reads per connection are paced to this, as `"50/s"`.
+    pub inbound_rate: Rate,
+    /// Queued outgoing bytes per connection before a slow-consumer close.
+    pub outbound_queue_bytes: usize,
+    pub ping_interval: Dur,
+    pub ping_timeout: Dur,
+    pub sse_heartbeat: Dur,
+    pub close_timeout: Dur,
+    pub shutdown_grace: Dur,
+}
+
+impl Default for Connections {
+    fn default() -> Self {
+        let d = kronik_sched::connections::ConnectionsConfig::default();
+        Connections {
+            max_open: d.max_open,
+            max_per_actor: d.max_per_actor,
+            max_per_client: d.max_per_client,
+            max_frame_bytes: d.max_frame_bytes,
+            inflight_frames: d.inflight_frames,
+            inbound_rate: Rate(d.inbound_rate),
+            outbound_queue_bytes: d.outbound_queue_bytes,
+            ping_interval: Dur(d.ping_interval),
+            ping_timeout: Dur(d.ping_timeout),
+            sse_heartbeat: Dur(d.sse_heartbeat),
+            close_timeout: Dur(d.close_timeout),
+            shutdown_grace: Dur(d.shutdown_grace),
+        }
+    }
+}
+
+impl Connections {
+    /// The hub's settings, with `max_open` at most `cap` (what the
+    /// open-file limit leaves, [`crate::serve`]).
+    pub fn hub(&self, cap: usize) -> kronik_sched::connections::ConnectionsConfig {
+        kronik_sched::connections::ConnectionsConfig {
+            max_open: self.max_open.min(cap),
+            max_per_actor: self.max_per_actor,
+            max_per_client: self.max_per_client,
+            max_frame_bytes: self.max_frame_bytes,
+            inflight_frames: self.inflight_frames,
+            inbound_rate: self.inbound_rate.0,
+            outbound_queue_bytes: self.outbound_queue_bytes,
+            ping_interval: self.ping_interval.0,
+            ping_timeout: self.ping_timeout.0,
+            sse_heartbeat: self.sse_heartbeat.0,
+            close_timeout: self.close_timeout.0,
+            shutdown_grace: self.shutdown_grace.0,
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("max_open", self.max_open),
+            ("max_per_actor", self.max_per_actor),
+            ("max_per_client", self.max_per_client),
+            ("max_frame_bytes", self.max_frame_bytes),
+            ("inflight_frames", self.inflight_frames),
+            ("outbound_queue_bytes", self.outbound_queue_bytes),
+        ] {
+            if value == 0 {
+                return Err(format!("[connections] {name} must be at least 1"));
+            }
+        }
+        for (name, value) in [
+            ("ping_interval", self.ping_interval),
+            ("ping_timeout", self.ping_timeout),
+            ("sse_heartbeat", self.sse_heartbeat),
+            ("close_timeout", self.close_timeout),
+        ] {
+            if value.0.is_zero() {
+                return Err(format!("[connections] {name} must be more than zero"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A rate per second: `"50/s"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rate(pub u32);
+
+impl std::str::FromStr for Rate {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Rate, String> {
+        s.trim()
+            .strip_suffix("/s")
+            .and_then(|n| n.trim().parse::<u32>().ok())
+            .filter(|n| *n > 0)
+            .map(Rate)
+            .ok_or_else(|| format!("invalid rate {s:?}: write it as \"50/s\""))
+    }
 }
 
 /// Outbound fleet enrollment: only local configuration chooses identity and scopes.
@@ -799,7 +911,7 @@ macro_rules! from_string {
     )*};
 }
 
-from_string!(Dur, Size, Percent, HoldRelease);
+from_string!(Dur, Size, Percent, HoldRelease, Rate);
 
 /// A file that can't be used: where, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1014,6 +1126,7 @@ impl Config {
         if self.ship.enabled && self.ship.url.as_deref().unwrap_or("").is_empty() {
             return Err("[ship] enabled = true needs url, such as \"s3://bucket/kronik\"".into());
         }
+        self.connections.check()?;
         if self.gateway.idempotency_header.trim().is_empty() {
             return Err(
                 "BAD_REQUEST: [gateway] idempotency_header is empty; name the header clients send"
@@ -1300,6 +1413,39 @@ mod tests {
 
     /// The operator configuration file documented in the build brief,
     /// "Operator configuration and policy".
+    /// `[connections]` (M24 §5.11): the defaults, every key, and refused
+    /// values.
+    #[test]
+    fn connections_section() {
+        let c = parse("").unwrap();
+        assert_eq!(c.connections, Connections::default());
+        assert_eq!(c.connections.inbound_rate, Rate(50));
+        let c = parse(
+            "[connections]\nmax_open = 10\nmax_per_actor = 5\nmax_per_client = 2\n\
+             max_frame_bytes = 1024\ninflight_frames = 4\ninbound_rate = \"10/s\"\n\
+             outbound_queue_bytes = 4096\nping_interval = \"10s\"\nping_timeout = \"5s\"\n\
+             sse_heartbeat = \"1s\"\nclose_timeout = \"2s\"\nshutdown_grace = \"1s\"\n",
+        )
+        .unwrap();
+        let hub = c.connections.hub(7);
+        assert_eq!(
+            (hub.max_open, hub.max_per_actor, hub.max_per_client),
+            (7, 5, 2)
+        );
+        assert_eq!((hub.inbound_rate, hub.inflight_frames), (10, 4));
+        assert_eq!(hub.ping_timeout, Duration::from_secs(5));
+        for bad in [
+            "max_open = 0",
+            "inflight_frames = 0",
+            "inbound_rate = \"50\"",
+            "inbound_rate = \"0/s\"",
+            "ping_timeout = \"0s\"",
+            "unknown = 1",
+        ] {
+            assert!(parse(&format!("[connections]\n{bad}\n")).is_err(), "{bad}");
+        }
+    }
+
     const DOCUMENTED_CONFIG: &str = r#"[server]
 data_dir = "/var/lib/kronik"
 api_socket = "/run/kronik/api.sock"

@@ -573,6 +573,15 @@ fn connection_caps(open_files: usize) -> (usize, usize) {
     ((spare * 3).clamp(16, 1024), spare.clamp(4, 256))
 }
 
+/// How many long-lived connections (M24) the open-file limit leaves after
+/// the node's reserve and the gateway's and TCP API's caps
+/// ([`connection_caps`]): `[connections] max_open` is capped to it.
+pub(crate) fn connection_budget(open_files: usize) -> usize {
+    let reserved = (open_files / 2).min(1024);
+    let (gateway, api) = connection_caps(open_files);
+    open_files.saturating_sub(reserved + gateway + api)
+}
+
 async fn serve(args: ServeArgs, config: Config, early: Early) -> anyhow::Result<()> {
     // No core dumps or ptrace by other users: the process holds the master
     // key, secrets and plain subject data (PR_SET_DUMPABLE 0).
@@ -583,6 +592,16 @@ async fn serve(args: ServeArgs, config: Config, early: Early) -> anyhow::Result<
     }
     let open_files = raise_open_files();
     let (gateway_connections, api_connections) = connection_caps(open_files);
+    let connections_cap = connection_budget(open_files);
+    if connections_cap < config.connections.max_open {
+        tracing::warn!(
+            max_open = config.connections.max_open,
+            cap = connections_cap,
+            open_files,
+            "the open-file limit leaves fewer connections than [connections] max_open; \
+             raise LimitNOFILE"
+        );
+    }
     let api_listen = preflight(&config)?;
     let env = Env::real(tokio::runtime::Handle::current());
     let data_dir = config.server.data_dir.clone();
@@ -602,6 +621,7 @@ async fn serve(args: ServeArgs, config: Config, early: Early) -> anyhow::Result<
     }
     let foreign = kronik_foreign::Foreign::new(env.clone(), foreign_config);
     let node_config = NodeConfig {
+        connections: config.connections.hub(connections_cap),
         foreign: kronik_effects::foreign::ForeignSlot(Some(Arc::new(kronik_foreign::Host(
             foreign.clone(),
         )))),
@@ -997,6 +1017,14 @@ async fn serve(args: ServeArgs, config: Config, early: Early) -> anyhow::Result<
             Ok(())
         }
     };
+    // M24 §5.9: a graceful stop closes every WebSocket with 1012 and
+    // `kronik: restart` and ends every SSE stream, and gives the writers
+    // the grace to finish; the close inputs come from the next start.
+    if stopping {
+        node.hub()
+            .shutdown(config.connections.shutdown_grace.0)
+            .await;
+    }
     // A controlled shutdown leaves a snapshot when something happened since
     // the newest one (the listeners are closed: their futures were dropped
     // with the select).
@@ -1346,5 +1374,9 @@ mod tests {
         assert_eq!(super::connection_caps(1024), (384, 128));
         assert_eq!(super::connection_caps(256), (96, 32));
         assert_eq!(super::connection_caps(32), (16, 4));
+        // M24 §5.11: the shipped unit's LimitNOFILE=65536 leaves about
+        // 63,000 long-lived connections.
+        assert_eq!(super::connection_budget(65_536), 63_232);
+        assert_eq!(super::connection_budget(1024), 0);
     }
 }

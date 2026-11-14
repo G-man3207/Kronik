@@ -5,7 +5,16 @@
 //! [`PreviewRouter`] (M11), the host `<id>.<preview_domain>`, or
 //! `/__preview/<id>/...` when no preview domain is set, goes to preview
 //! forks instead of main.
+//!
+//! Long-lived connections (M24, docs/design/m24-connections.md §5): a
+//! WebSocket upgrade, or a GET that an `SSE` route answers, is classified
+//! before any body is read ([`Gateway::classify`]), and
+//! [`Gateway::open_connection`] admits its open, waits for the owner's open
+//! turn and answers the handshake; the caller attaches the connection's
+//! transport to the node's hub.
 
+#[cfg(feature = "server")]
+pub mod connections;
 #[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "server")]
@@ -215,12 +224,40 @@ fn to_routes(entries: Vec<RouteEntry>) -> Vec<Route> {
         .collect()
 }
 
+/// The methods a request with `method` can match: a GET also matches `SSE`
+/// routes, which cannot overlap a GET route's pattern (M24 §2.5), so the
+/// most specific of either decides.
+fn methods_for(method: &str) -> &'static [&'static str] {
+    match method {
+        "GET" => &["GET", "SSE"],
+        "HEAD" => &["HEAD"],
+        "POST" => &["POST"],
+        "PUT" => &["PUT"],
+        "PATCH" => &["PATCH"],
+        "DELETE" => &["DELETE"],
+        "OPTIONS" => &["OPTIONS"],
+        _ => &[],
+    }
+}
+
 /// The most specific route for `method` and `path`: fewest parameters,
-/// literals first.
+/// literals first. A GET also matches `SSE` routes ([`methods_for`]).
 fn find(routes: &[Route], method: &str, path: &str) -> Result<Matched, ApiError> {
+    find_in(routes, methods_for(method), method, path)
+}
+
+fn find_in(
+    routes: &[Route],
+    methods: &[&str],
+    method: &str,
+    path: &str,
+) -> Result<Matched, ApiError> {
     let segs: Vec<&str> = path.split('/').skip(1).collect();
     let mut best: Option<(Vec<bool>, &Route)> = None;
-    for r in routes.iter().filter(|r| r.method == method) {
+    for r in routes
+        .iter()
+        .filter(|r| methods.contains(&r.method.as_str()))
+    {
         if r.segs.len() != segs.len() {
             continue;
         }
@@ -253,6 +290,7 @@ fn find(routes: &[Route], method: &str, path: &str) -> Result<Matched, ApiError>
     }
     Ok(Matched {
         kind: r.kind.clone(),
+        method: r.method.clone(),
         pattern: r.pattern.clone(),
         params,
     })
@@ -314,12 +352,73 @@ fn sandboxed(mut resp: HttpResponse) -> HttpResponse {
     resp
 }
 
-/// A route match: kind, actor key, pattern and parameters in order.
+/// A route match: kind, the route's method, pattern and parameters in
+/// order.
 struct Matched {
     kind: String,
+    method: String,
     pattern: String,
     params: Vec<(String, String)>,
 }
+
+/// What a request is (M24 §5.1), decided before any body is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestKind {
+    Http,
+    /// A WebSocket upgrade.
+    WebSocket,
+    /// A GET that an `SSE` route answers.
+    Sse,
+}
+
+/// The values of every header named `name`, in order.
+fn header_values<'a>(req: &'a HttpRequest, name: &'a str) -> impl Iterator<Item = &'a str> {
+    req.headers
+        .iter()
+        .filter(move |(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// Whether a header of `name` lists `token` (comma-separated, any case).
+fn header_has_token(req: &HttpRequest, name: &str, token: &str) -> bool {
+    header_values(req, name)
+        .flat_map(|v| v.split(','))
+        .any(|t| t.trim().eq_ignore_ascii_case(token))
+}
+
+/// A WebSocket upgrade: a GET whose `Upgrade` lists `websocket` and whose
+/// `Connection` lists `upgrade` (RFC 6455 §4.2.1).
+pub fn is_websocket_upgrade(req: &HttpRequest) -> bool {
+    req.method == "GET"
+        && header_has_token(req, "upgrade", "websocket")
+        && header_has_token(req, "connection", "upgrade")
+}
+
+/// The subprotocols a WebSocket client offered: its `Sec-WebSocket-Protocol`
+/// headers in order, split at commas and trimmed, as the runtime derives
+/// them from the recorded request.
+fn offered_subprotocols(req: &HttpRequest) -> Vec<String> {
+    header_values(req, "sec-websocket-protocol")
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// What [`Gateway::open_connection`] answers: the response for the client,
+/// and the connection's id when its owner accepted it. The caller then
+/// attaches the connection's transport to the hub, or abandons it
+/// (`Hub::abandon`) when it cannot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAnswer {
+    pub response: HttpResponse,
+    pub connection: Option<String>,
+    pub protocol: Option<pb::ConnectionProtocol>,
+}
+
+/// How long a client waits before it reconnects after `CONNECTION_LIMIT`.
+const CONNECTION_LIMIT_RETRY_SECS: &str = "5";
 
 fn percent_decode(s: &str) -> Option<String> {
     let b = s.as_bytes();
@@ -620,7 +719,19 @@ impl Gateway {
         {
             return self.serve_preview(router.clone(), id, path, req).await;
         }
+        if is_websocket_upgrade(&req) {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "a WebSocket upgrade needs the gateway's connection path (open_connection)",
+            ));
+        }
         let m = self.matched(&req.method, &req.path)?;
+        if m.method == "SSE" {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "an SSE route needs the gateway's connection path (open_connection)",
+            ));
+        }
         let (actor, http, subject) = self.input(req, m)?;
         let (waiter, joined) = match self.node.ingress(actor, http, subject)? {
             Ingress::Done(r) => return Ok(turn_response(&r)),
@@ -640,6 +751,224 @@ impl Gateway {
             )),
             Err(_) => Err(self.timed_out()),
         }
+    }
+
+    /// What a request is (M24 §5.1): a WebSocket upgrade, a GET that an
+    /// `SSE` route of main answers (the most specific match of the GET and
+    /// SSE routes), or HTTP. A preview's requests are HTTP here; its own
+    /// path refuses connections.
+    pub fn classify(&self, req: &HttpRequest) -> RequestKind {
+        if self.preview.is_some()
+            && preview_target(req, self.cfg.preview_domain.as_deref()).is_some()
+        {
+            return RequestKind::Http;
+        }
+        if is_websocket_upgrade(req) {
+            return RequestKind::WebSocket;
+        }
+        match self.matched(&req.method, &req.path) {
+            Ok(m) if m.method == "SSE" => RequestKind::Sse,
+            _ => RequestKind::Http,
+        }
+    }
+
+    /// Opens a long-lived connection (M24 §5.3 and §5.4, steps 1 to 5,
+    /// without the socket): checks the handshake, matches the route, admits
+    /// the open as a root input of the route's actor within the hub's caps,
+    /// waits for the open turn (at most the gateway timeout; after it the
+    /// hub closes an eventual accept as `abandoned`) and answers. An accept
+    /// answers `101 Switching Protocols` (WebSocket) or the `200` event
+    /// stream's headers (SSE) with the actor's headers and the turn id; a
+    /// refusal or a failure answers like an HTTP turn.
+    pub async fn open_connection(&self, req: HttpRequest) -> OpenAnswer {
+        match self.open(req).await {
+            Ok(answer) => answer,
+            Err(e) => {
+                let mut response = error(&e);
+                if e.code == ErrorCode::ConnectionLimit {
+                    response
+                        .headers
+                        .push(("retry-after".into(), CONNECTION_LIMIT_RETRY_SECS.into()));
+                }
+                OpenAnswer {
+                    response,
+                    connection: None,
+                    protocol: None,
+                }
+            }
+        }
+    }
+
+    async fn open(&self, req: HttpRequest) -> Result<OpenAnswer, ApiError> {
+        if self.preview.is_some()
+            && preview_target(&req, self.cfg.preview_domain.as_deref()).is_some()
+        {
+            return Err(ApiError::new(
+                ErrorCode::NotImplemented,
+                "previews do not take WebSocket or SSE connections",
+            ));
+        }
+        let has_body = !req.body.is_empty()
+            || header_values(&req, "content-length").any(|v| v.trim() != "0")
+            || header_values(&req, "transfer-encoding").next().is_some();
+        if has_body {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "a WebSocket upgrade or an SSE request has no body",
+            ));
+        }
+        let websocket = is_websocket_upgrade(&req);
+        let (protocol, m, key) = if websocket {
+            if !header_values(&req, "sec-websocket-version").any(|v| v.trim() == "13") {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    "a WebSocket upgrade needs Sec-WebSocket-Version: 13",
+                ));
+            }
+            let key = header_values(&req, "sec-websocket-key")
+                .next()
+                .map(|k| k.trim().to_owned())
+                .filter(|k| {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(k)
+                        .is_ok_and(|b| b.len() == 16)
+                })
+                .ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::BadRequest,
+                        "a WebSocket upgrade needs a Sec-WebSocket-Key of 16 base64 bytes",
+                    )
+                })?;
+            let m = {
+                let (epoch, entries) = self.node.routes();
+                let mut cache = self.routes.lock().unwrap_or_else(|e| e.into_inner());
+                if cache.0 != Some(epoch) {
+                    cache.1 = to_routes(entries);
+                    cache.0 = Some(epoch);
+                }
+                find_in(&cache.1, &["WEBSOCKET"], "WEBSOCKET", &req.path)?
+            };
+            (pb::ConnectionProtocol::Websocket, m, Some(key))
+        } else {
+            let m = self.matched(&req.method, &req.path)?;
+            if m.method != "SSE" {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "{} {} is not a WebSocket upgrade or an SSE request",
+                        req.method, req.path
+                    ),
+                ));
+            }
+            (pb::ConnectionProtocol::Sse, m, None)
+        };
+        let offered = offered_subprotocols(&req);
+        let peer = req.peer;
+        let exempt = peer.is_some_and(|ip| self.cfg.trusted_proxies.iter().any(|n| n.contains(ip)));
+        let (actor, http, subject) = self.input(req, m)?;
+        let (conn, waiter) = self
+            .node
+            .connection_open(actor, http, protocol, subject, peer, exempt)?;
+        let r = match self
+            .node
+            .env()
+            .timeout(self.cfg.timeout, waiter.wait())
+            .await
+        {
+            Ok(r) => r?,
+            Err(_) => {
+                self.node.hub().abandon(&conn);
+                return Err(self.timed_out());
+            }
+        };
+        let accept = match (&r.outcome.output, r.committed()) {
+            (Some(pb::outcome::Output::Accept(a)), true) => a,
+            _ => {
+                return Ok(OpenAnswer {
+                    response: turn_response(&r),
+                    connection: None,
+                    protocol: None,
+                });
+            }
+        };
+        let mut headers: Vec<(String, String)> = Vec::new();
+        let status = match key {
+            Some(key) => {
+                headers.push(("upgrade".into(), "websocket".into()));
+                headers.push(("connection".into(), "Upgrade".into()));
+                headers.push((
+                    "sec-websocket-accept".into(),
+                    tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes()),
+                ));
+                // The value at the recorded position of the live request's
+                // offered list (the record keeps no copy, §6.1).
+                if let Some(p) = accept
+                    .subprotocol_index
+                    .and_then(|i| offered.get(usize::try_from(i).ok()?))
+                {
+                    headers.push(("sec-websocket-protocol".into(), p.clone()));
+                }
+                101
+            }
+            None => {
+                headers.push(("content-type".into(), "text/event-stream".into()));
+                headers.push(("cache-control".into(), "no-store".into()));
+                headers.push(("x-accel-buffering".into(), "no".into()));
+                200
+            }
+        };
+        // The actor's headers, without what belongs to the handshake, the
+        // stream or Kronik.
+        headers.extend(
+            accept
+                .headers
+                .iter()
+                .filter(|h| {
+                    let name = h.name.to_ascii_lowercase();
+                    !kronik_core::http::hop_by_hop(&name)
+                        && name != TURN_ID_HEADER
+                        && !name.starts_with("sec-websocket-")
+                        && !matches!(name.as_str(), "content-type" | "cache-control")
+                })
+                .map(|h| {
+                    (
+                        h.name.clone(),
+                        String::from_utf8_lossy(&sealable_bytes(h.value.as_ref())).into_owned(),
+                    )
+                })
+                .filter(|(name, value)| {
+                    !name.eq_ignore_ascii_case("set-cookie") || !reserved_admin_cookie(value)
+                }),
+        );
+        headers.push((TURN_ID_HEADER.into(), r.turn_id.to_string()));
+        Ok(OpenAnswer {
+            response: HttpResponse {
+                status,
+                headers,
+                body: Vec::new(),
+            },
+            connection: Some(conn),
+            protocol: Some(protocol),
+        })
+    }
+
+    /// The largest frame a connection's owner kind takes: its
+    /// `message_bytes` under the current configuration.
+    pub fn message_bytes_for_connection(&self, conn: &str) -> usize {
+        let kind = self
+            .node
+            .store()
+            .db()
+            .connection(conn)
+            .ok()
+            .flatten()
+            .map(|row| row.actor.kind);
+        let limits = match kind {
+            Some(kind) => self.node.config_now().limits(&kind),
+            None => kronik_effects::KindLimits::default(),
+        };
+        usize::try_from(limits.message_bytes).unwrap_or(usize::MAX)
     }
 
     fn timed_out(&self) -> ApiError {
@@ -670,7 +999,20 @@ impl Gateway {
         let authority = self.node.local_operator_authority()?;
         let routes = to_routes(router.routes(&id).await?);
         req.path = path;
+        // M24 §5.12: previews take no WebSocket or SSE connections yet.
+        let previews_take_none = || {
+            ApiError::new(
+                ErrorCode::NotImplemented,
+                "previews do not take WebSocket or SSE connections",
+            )
+        };
+        if is_websocket_upgrade(&req) {
+            return Err(previews_take_none());
+        }
         let m = find(&routes, &req.method, &req.path)?;
+        if m.method == "SSE" {
+            return Err(previews_take_none());
+        }
         let (actor, mut http, subject) = self.input(req, m)?;
         http.idempotency_key.clear();
         http.request_hash.clear();

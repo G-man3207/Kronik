@@ -64,6 +64,8 @@ libc = { workspace = true }
 prost = { workspace = true }
 rcgen = { workspace = true }
 sha2 = { workspace = true }
+# connections.rs: a real WebSocket client (tungstenite's synchronous one).
+tokio-tungstenite = { workspace = true }
 
 [lints]
 workspace = true

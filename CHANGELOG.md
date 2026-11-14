@@ -20,6 +20,20 @@ until the v1.0 compatibility promise takes effect.
   earlier release get their copy at the first start while the backend still
   serves them. **External secret values are now at rest, encrypted, in the
   data directory, its snapshots and the bucket.**
+- The gateway serves WebSocket routes (M24): an upgrade to a `WEBSOCKET`
+  route opens a connection whose owner's open turn accepts it, and the
+  client gets `101 Switching Protocols` (with the selected subprotocol and
+  the actor's headers) only after that turn's record is durable; a
+  refusal or a failure answers like an HTTP turn. Incoming messages become
+  frame inputs of the owner, paced by an in-flight window and a rate;
+  idle connections get pings; a message over the limit, a protocol error,
+  a client that stops reading or answering, and a graceful stop close the
+  connection with their WebSocket codes (1009, 1002, 1008, 1001, 1012).
+  New `[connections]` settings in `kronik.toml` (caps per node, owner and
+  client address, frame and queue sizes, timeouts); over a cap an open
+  gets `503 CONNECTION_LIMIT` with `retry-after`. `kronik doctor` warns
+  when the open-file limit leaves fewer connections than `max_open`. SSE
+  routes answer `501` until their part lands.
 - Actors can hold connections (M24, in progress): a connection input runs
   the component's `connection-handler`, whose open turn accepts (with a
   subprotocol, headers and the connection's subject) or refuses with an

@@ -524,7 +524,7 @@ against both.
       "type": "string"
     },
     "name": {
-      "description": "Stable: config, kernel, runsc, kvm, cgroup, root, runc, netns,\nrun_dir, caps, sandbox, disk, clock, tls, dns01_hook, wildcard, ship,\nexport, key_source, secrets; with `--rootless` also userns, uid_view,\nsubid, pin and delegate, and service_identity when a root invocation\nbecomes the service user; microvm where a microVM tool bundle is\ninstalled and the root service runs.",
+      "description": "Stable: config, kernel, runsc, kvm, cgroup, root, runc, netns,\nrun_dir, caps, sandbox, disk, clock, tls, dns01_hook, wildcard, ship,\nexport, key_source, secrets; with `--rootless` also userns, uid_view,\nsubid, pin and delegate, and service_identity when a root invocation\nbecomes the service user; microvm where a microVM tool bundle is\ninstalled and the root service runs; retention, connections.",
       "type": "string"
     },
     "status": {

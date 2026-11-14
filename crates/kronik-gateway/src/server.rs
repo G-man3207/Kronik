@@ -21,7 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::tls::ACME_TLS_ALPN;
-use crate::{Gateway, HttpRequest, HttpResponse, IpNet};
+use crate::{Gateway, HttpRequest, HttpResponse, IpNet, RequestKind};
 
 /// How long a client may take to send a request head, then its body.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -96,17 +96,73 @@ fn to_hyper(r: HttpResponse) -> hyper::Response<Full<Bytes>> {
     })
 }
 
-/// Serves HTTP/1.1 on one connection.
+/// A request on the connection path (M24 §5.3): the open is admitted and
+/// answered; an accepted WebSocket's upgrade then runs on a task that
+/// drives the connection, and one that does not complete in
+/// [`crate::connections::UPGRADE_TIMEOUT`] is abandoned. SSE streams take
+/// a response body of their own, which comes with their slice: until then
+/// they answer 501 before any turn runs.
+async fn open_connection(
+    gw: &Arc<Gateway>,
+    req: HttpRequest,
+    kind: RequestKind,
+    upgrade: Option<hyper::upgrade::OnUpgrade>,
+) -> HttpResponse {
+    if kind == RequestKind::Sse {
+        return error(
+            501,
+            kronik_core::error::ErrorCode::NotImplemented,
+            "SSE streams are not served yet".into(),
+        );
+    }
+    let answer = gw.open_connection(req).await;
+    let (Some(conn), Some(upgrade)) = (answer.connection.clone(), upgrade) else {
+        if let Some(conn) = &answer.connection {
+            gw.node.hub().abandon(conn);
+        }
+        return answer.response;
+    };
+    let hub = gw.node.hub().clone();
+    let cfg = hub.config().clone();
+    let owner_limit = gw.message_bytes_for_connection(&conn);
+    let limits = crate::connections::Limits {
+        max_message: cfg.max_frame_bytes.min(owner_limit).max(1),
+        outbound_queue_bytes: cfg.outbound_queue_bytes,
+        ping_interval: cfg.ping_interval,
+        ping_timeout: cfg.ping_timeout,
+        close_timeout: cfg.close_timeout,
+    };
+    tokio::spawn(async move {
+        match tokio::time::timeout(crate::connections::UPGRADE_TIMEOUT, upgrade).await {
+            Ok(Ok(upgraded)) => crate::connections::drive(hub, conn, upgraded, limits).await,
+            _ => {
+                tracing::debug!(connection = %conn, "the upgrade did not complete; abandoned");
+                hub.abandon(&conn);
+            }
+        }
+    });
+    answer.response
+}
+
+/// Serves HTTP/1.1 on one connection, with upgrades for WebSockets (M24).
 async fn serve_connection<I>(io: I, gw: Arc<Gateway>, peer: std::net::IpAddr)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let svc = service_fn(move |req| {
+    let svc = service_fn(move |mut req: hyper::Request<Incoming>| {
         let gw = gw.clone();
         async move {
             let started = std::time::Instant::now();
+            // Taken before the request is consumed; only an upgrade uses it.
+            let upgrade = req
+                .headers()
+                .contains_key(hyper::header::UPGRADE)
+                .then(|| hyper::upgrade::on(&mut req));
             let resp = match to_request(req, gw.cfg.max_body, peer).await {
-                Ok(r) => gw.handle(r).await,
+                Ok(r) => match gw.classify(&r) {
+                    RequestKind::Http => gw.handle(r).await,
+                    kind => open_connection(&gw, r, kind, upgrade).await,
+                },
                 Err(resp) => resp,
             };
             let status = resp.status.to_string();
@@ -123,7 +179,11 @@ where
     builder
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(HEADER_TIMEOUT);
-    if let Err(e) = builder.serve_connection(TokioIo::new(io), svc).await {
+    if let Err(e) = builder
+        .serve_connection(TokioIo::new(io), svc)
+        .with_upgrades()
+        .await
+    {
         tracing::debug!(error = %e, "gateway connection ended");
     }
 }
