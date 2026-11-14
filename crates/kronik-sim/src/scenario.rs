@@ -600,6 +600,9 @@ impl World {
                 apply_batch: 64,
                 bulk_replay_min: self.cfg.bulk_replay_min,
                 startup_apply_batch: self.cfg.startup_apply_batch,
+                // A run is a function of its seed, not of the host's cores:
+                // 4, what the hosted CI runners' cores gave.
+                startup_decode_width: Some(4),
                 // Production nodes always have a storage root; the simulated
                 // node's virtual /data backs the coverage watermark (and its
                 // cold-start scan frontier) the same way, across restarts.

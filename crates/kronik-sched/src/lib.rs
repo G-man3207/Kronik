@@ -124,6 +124,10 @@ pub struct NodeConfig {
     /// are not simple turns (default 131 072). The live applier keeps
     /// `apply_batch`, so a crash there does not redo a huge batch.
     pub startup_apply_batch: usize,
+    /// Segments a startup replay decodes ahead of the one it applies: by
+    /// default the machine's cores, 2 to 6. DST fixes it, so a run is a
+    /// function of its seed and not of the host's number of cores.
+    pub startup_decode_width: Option<usize>,
     /// Test hook: a log record limit below `kronik_log::MAX_RECORD` for
     /// `start_local`, so a test reaches the turn record budget
     /// (`record_budget`) without 128 MiB turns.
@@ -162,6 +166,7 @@ impl Default for NodeConfig {
             disk_reserve: 0,
             bulk_replay_min: 8_192,
             startup_apply_batch: 131_072,
+            startup_decode_width: None,
             test_max_record_bytes: None,
             connections: connections::ConnectionsConfig::default(),
             mutation_deliver_before_fsync: false,

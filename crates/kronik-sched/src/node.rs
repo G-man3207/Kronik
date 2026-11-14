@@ -447,12 +447,18 @@ pub struct Node {
 }
 
 /// Segments in flight: decoding a segment (and preparing its catch-up rows)
-/// costs more than applying it, so every core decodes.
-fn decode_ahead() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .clamp(2, 6)
+/// costs more than applying it, so every core decodes, unless the
+/// configuration fixes the number ([`NodeConfig::startup_decode_width`]).
+fn decode_ahead(config: &NodeConfig) -> usize {
+    config.startup_decode_width.map_or_else(
+        || {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .clamp(2, 6)
+        },
+        |width| width.max(1),
+    )
 }
 
 /// One segment, ready to apply.
@@ -486,7 +492,18 @@ async fn replay_unapplied(
     } else {
         config.apply_batch
     };
-    let result = replay_segments(env, rebase, store, applied + 1, upto, bulk, batch_cap).await;
+    let width = decode_ahead(config);
+    let result = replay_segments(
+        env,
+        rebase,
+        store,
+        applied + 1,
+        upto,
+        bulk,
+        batch_cap,
+        width,
+    )
+    .await;
     match result {
         // Journaling was off: the file may hold part of a failed batch. Its
         // marker stays, so the next start rebuilds it.
@@ -510,6 +527,7 @@ async fn replay_segments(
     upto: Lsn,
     bulk: bool,
     batch_cap: usize,
+    width: usize,
 ) -> Result<(), StartError> {
     let reader = &rebase.reader;
     let starts = reader.starts().await?;
@@ -527,7 +545,6 @@ async fn replay_segments(
     // database that is behind.
     let applied = store.applied.get();
     let branch = reader.branch().to_owned();
-    let width = decode_ahead();
     let mut inflight = VecDeque::new();
     let mut next = 0usize;
     let spawn = |idx: usize| {
