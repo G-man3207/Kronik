@@ -864,7 +864,8 @@ hour. The heap (`RssAnon`, MiB) every 10 minutes: 261, 307, 314, 331, 336,
 338 and 339, growing 0.1 MiB per minute at the end. It levels off about
 31 MiB above where the warm-up left it, which fits the room actors' SQLite
 page caches (50 rooms of at most 512 KiB, 25 MiB) and the allocator's own
-share.
+share. The run was on the test machine, confined to two CPUs, not on the
+test VPS itself.
 
 ## The release build against glibc and v0.4.1
 
