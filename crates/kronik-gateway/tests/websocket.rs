@@ -156,14 +156,32 @@ async fn text(ws: &mut Client) -> String {
     }
 }
 
-async fn until(what: &str, f: impl AsyncFn() -> bool) {
-    for _ in 0..500 {
+/// Polls `f` every 10 ms until it is true, and fails at the wall-clock
+/// deadline otherwise: a budget in time, not in sleeps, so that a slow
+/// runner cannot decide whether the daemon met its timers. Returns when
+/// the predicate was first seen true.
+async fn until(what: &str, budget: Duration, f: impl AsyncFn() -> bool) -> tokio::time::Instant {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
         if f().await {
-            return;
+            return tokio::time::Instant::now();
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for {what}");
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("timed out waiting for {what}");
+}
+
+/// The close input of `conn` has been applied: `closed_lsn` is written by
+/// the close turn's apply, never by the host's decision (§4.8).
+fn is_closed(s: &Server, conn: &str) -> bool {
+    s.node
+        .store()
+        .db()
+        .connection_any(conn)
+        .unwrap()
+        .is_some_and(|r| r.closed_lsn.is_some())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -236,7 +254,7 @@ async fn websocket_connections_end_to_end() {
     }))
     .await
     .unwrap();
-    until("three closes", async || {
+    until("three closes", Duration::from_secs(10), async || {
         s.closes().await.lines().count() == 3
     })
     .await;
@@ -256,9 +274,18 @@ async fn websocket_connections_end_to_end() {
 /// `ping-timeout` (1001).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keepalive_pings_and_the_ping_timeout() {
+    // §5.7's decision is due ping_interval + ping_timeout after the last
+    // inbound frame; the recorded close input only exists once the close
+    // frame has had its close_timeout grace and the close turn applied.
+    // Give that grace a short, explicit value: the 5 s default would make
+    // the test measure bookkeeping, not the 300 ms decision it is about.
+    let ping_interval = Duration::from_millis(200);
+    let ping_timeout = Duration::from_millis(300);
+    let close_timeout = Duration::from_millis(100);
     let s = server(ConnectionsConfig {
-        ping_interval: Duration::from_millis(200),
-        ping_timeout: Duration::from_millis(300),
+        ping_interval,
+        ping_timeout,
+        close_timeout,
         ..ConnectionsConfig::default()
     })
     .await;
@@ -276,22 +303,26 @@ async fn keepalive_pings_and_the_ping_timeout() {
         }
     }
     assert!(pings >= 2, "{pings} pings");
+    // Nothing reads ada's socket from here on, so nothing answers the pings.
+    // The server cannot have heard the sent frame before t0.
+    let t0 = tokio::time::Instant::now();
     ada.send(Message::text("echo still here")).await.unwrap();
     assert_eq!(text(&mut ada).await, "still here");
     let conn = s.node.store().db().open_connections().unwrap()[0]
         .id
         .clone();
 
-    // Now nothing reads ada's socket, so nothing answers the pings.
-    until("the ping timeout", async || {
-        s.node
-            .store()
-            .db()
-            .connection_any(&conn)
-            .unwrap()
-            .is_some_and(|r| r.closed_lsn.is_some())
-    })
-    .await;
+    // Two-sided: a silent client is closed by the ping timeout, and not
+    // before it. The predicate is polled from t0, so the first observation
+    // bounds the close input's appearance from below; the budget allows the
+    // close frame's grace and the close turn on top of the decision.
+    let budget = ping_interval + ping_timeout + close_timeout + Duration::from_secs(2);
+    let closed_at = until("the ping timeout", budget, async || is_closed(&s, &conn)).await;
+    assert!(
+        closed_at >= t0 + ping_interval + ping_timeout,
+        "the close input appeared {:?} after the last frame, before ping_interval + ping_timeout",
+        closed_at - t0
+    );
     let row = s.node.store().db().connection_any(&conn).unwrap().unwrap();
     assert_eq!(row.cause, Some(pb::CloseCause::PingTimeout as i32));
     assert_eq!(row.code, Some(1001));
