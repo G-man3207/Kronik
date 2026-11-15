@@ -86,6 +86,18 @@ turn's gate:
 Effect kinds (`EffectRecord.kind`): `http.fetch`, `actor.call`,
 `crypto.hmac-sha256`, `crypto.sign-ed25519`, `secret.reveal`.
 
+**The ordinal is identity, not a position hint.** The counter starts at 0,
+and one counter per turn is shared by `send`, `call`, `timers.schedule` and
+every external effect (m1-core §3). It is part of the HTTP idempotency key,
+a sent message's id, a timer's id and a called turn's causal key. A re-run
+returns recorded results in ordinal order (§4); a fork grades an external
+effect against production's effect at the same `(causal key, ordinal)` and
+never pairs it with another ordinal ([m3-fork](m3-fork.md) §3.5,
+[ADR 0147](../adr/0147-effect-matching-by-operation-ordinal.md)). Inserting
+or removing an operation before later external effects shifts those
+ordinals, and with them the grades and the diff's pairs. Buffered connection
+frames take no ordinal (ADR 0115).
+
 **Legacy fingerprint (HTTP, version 0).** `blake3` over: method, scheme, lowercase host, port
 (when not the default), path, query parameters sorted by name then value,
 `blake3(body)`, and the headers sorted by lowercase name, without
