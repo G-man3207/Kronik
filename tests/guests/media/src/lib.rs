@@ -30,12 +30,13 @@
 //! - `post` (`url=`): POSTs the body (a blob stays a blob) and answers the
 //!   status, or the fetch error.
 //! - `remember`: stores the body's reference in state (`ref` = `<hash>
-//!   <size>`), as bytes. `forged-get`, `forged-echo` and `forged-post`
-//!   (`url=`) use that stored reference in a later turn: get answers the
-//!   error, echo fails the turn, post answers the fetch error.
+//!   <size>`), as bytes. `forged-get` (`len=`, default 1), `forged-echo` and
+//!   `forged-post` (`url=`) use that stored reference in a later turn: get
+//!   answers the result, echo fails the turn, post answers the fetch error.
 //! - `limits`: tries `get` of 0 and of 1 MiB + 1 bytes and `write` of 1 MiB
-//!   + 1 bytes; answers the three errors. `quota` (`size=`) writes until the
-//!   writer refuses and answers how many bytes it took and the error.
+//!   + 1 bytes; answers the empty read and the two errors. `quota` (`size=`)
+//!   writes until the writer refuses and answers how many bytes it took and
+//!   the error.
 //! - `touch` (`count=`): reads the body's first MiB `count` times without
 //!   looking at it, and answers the bytes read (the blob I/O budget).
 //! - `many-writers` (`n=`, `size=`): opens `n` writers at once, writes
@@ -396,7 +397,10 @@ fn run(op: &str, query: &str, body: HttpBody) -> Result<Output, HandlerError> {
         }
         "forged-get" => {
             let blob = forged()?;
-            text(match blobs::get(&blob, 0, 1) {
+            let len = query_value(query, "len")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            text(match blobs::get(&blob, 0, len) {
                 Ok(bytes) => format!("read {}", bytes.len()),
                 Err(e) => error_name(&e),
             })

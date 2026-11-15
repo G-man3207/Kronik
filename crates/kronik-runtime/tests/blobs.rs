@@ -369,6 +369,51 @@ async fn an_uploaded_blob_is_read_in_ranges_and_returned_complete() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zero_length_get_reads_nothing_and_still_checks_the_reference() {
+    let w = world();
+    let upload = w.blobs.store(vec![5u8; 2_500_000]);
+    let reads = w.blobs.reads.load(Ordering::Relaxed);
+
+    // Inside the limits, and empty at either end of the blob.
+    let out = w
+        .run(http(
+            "ranges",
+            "at=0:0,1:0,2500000:0",
+            pb::body::Value::Blob(upload.clone()),
+        ))
+        .await;
+    assert_eq!(
+        answer(&out),
+        format!(
+            "0:0=0 {}\n1:0=0 {}\n2500000:0=0 {}\n",
+            fnv(&[]),
+            fnv(&[]),
+            fnv(&[])
+        )
+    );
+    assert_eq!(
+        w.blobs.reads.load(Ordering::Relaxed),
+        reads,
+        "nothing was read"
+    );
+
+    // The reference check still comes first: a stored reference the turn
+    // did not receive is `not-held`, whatever the length.
+    let first = w
+        .run(http("remember", "", pb::body::Value::Blob(upload)))
+        .await;
+    assert_eq!(answer(&first), "remembered");
+    w.apply(&first);
+    let forged = w.run(http("forged-get", "len=0", inline(b""))).await;
+    assert_eq!(answer(&forged), "not-held");
+    assert_eq!(
+        w.blobs.reads.load(Ordering::Relaxed),
+        reads,
+        "nothing was read"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_written_blob_is_a_response_and_an_open_writer_is_discarded() {
     let w = world();
     let out = w
@@ -473,8 +518,11 @@ async fn the_limits_of_a_call_a_turns_writes_and_its_reads_hold() {
     let body = pb::body::Value::Blob(upload);
     let limits = w.run(http("limits", "", body.clone())).await;
     let lines: Vec<String> = answer(&limits).lines().map(str::to_owned).collect();
-    assert!(lines[0].starts_with("invalid(get reads 1 to"), "{lines:?}");
-    assert!(lines[1].starts_with("invalid(get reads 1 to"), "{lines:?}");
+    assert_eq!(lines[0], "ok 0");
+    assert!(
+        lines[1].starts_with("invalid(get reads at most"),
+        "{lines:?}"
+    );
     assert!(
         lines[2].starts_with("invalid(write takes at most"),
         "{lines:?}"
