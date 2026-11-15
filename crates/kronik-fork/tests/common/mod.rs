@@ -8,11 +8,11 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use kronik_core::authority::AuthLease;
-use kronik_core::env::{EntropySource, Env};
+use kronik_core::env::{BoxFuture, Clock, EntropySource, Env};
 use kronik_core::ids::{ActorRef, Lsn};
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Ingress, Node, NodeConfig, TurnResult, start_local};
@@ -71,6 +71,49 @@ impl EntropySource for ProposalSaveFault {
     fn sign_rs256(&self, pkcs8: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
         self.source.sign_rs256(pkcs8, message)
     }
+}
+
+/// A real clock with a movable wall offset, so a test can let logical time
+/// pass without sleeping. Sleeps and monotonic time stay real.
+struct ShiftedClock {
+    inner: Arc<dyn Clock>,
+    offset_ms: Arc<AtomicU64>,
+}
+
+impl Clock for ShiftedClock {
+    fn wall_ms(&self) -> u64 {
+        self.inner
+            .wall_ms()
+            .saturating_add(self.offset_ms.load(Ordering::SeqCst))
+    }
+
+    fn monotonic(&self) -> Duration {
+        self.inner.monotonic()
+    }
+
+    fn sleep(&self, d: Duration) -> BoxFuture<'static, ()> {
+        self.inner.sleep(d)
+    }
+}
+
+/// `Proc::start`, with the wall clock offset by the returned counter.
+pub fn start_shifted(dir: &Path) -> (Proc, Arc<AtomicU64>) {
+    let offset = Arc::new(AtomicU64::new(0));
+    let at_start = offset.clone();
+    let p = Proc::start_env(
+        dir,
+        NodeConfig {
+            concurrency: 8,
+            ..NodeConfig::default()
+        },
+        move |env| {
+            env.clock = Arc::new(ShiftedClock {
+                inner: env.clock.clone(),
+                offset_ms: at_start,
+            });
+        },
+    );
+    (p, offset)
 }
 
 pub struct Proc {

@@ -352,7 +352,9 @@ isolated mode. Strata: (actor kind, input) as in §5.2. In each stratum the
 root inputs are ordered by `blake3(proposal_id + root id)` and the first
 `ceil(p × n)` are taken (at least one per stratum). The same proposal always
 samples the same inputs; `summary.sample` shows the coverage. Continuous
-replay always covers all root inputs.
+replay always covers all root inputs. Sampling selects within the window
+§8 defines; it does not move the window's anchor (the newest root input, or
+HEAD when there is none) or either end.
 
 ## 7. Policy interface (self-contained)
 
@@ -431,15 +433,17 @@ This section is the contract for `kronik-policy`.
 ## 8. Proposals, approval, promote, rollback
 
 - **`propose`** (`wasm` per kind, `window` default 1 h of logical time
-  back from HEAD or `at <lsn>`, `mode` default `both`, `sample` default
-  100 %, noise filters, stub rules; components whose code main already runs
-  are skipped, M9): creates the fork `p-<12 hex>` at the
-  fork point, writes a `Deployment` (cause `DEPLOY`) with the new code in
-  the fork's log, runs replay over `(fork_lsn, HEAD]`, writes the diff and
-  evaluates the policy. Its state lives in the fork (BranchCreated with
-  `proposal_id`, diff file) and in main's `state.db` table `proposals (id,
-  fork, status, verified_through_lsn, diff_hash, policy, created_lsn)`
-  rebuilt from the fork directories at startup.
+  back from the newest root input (HEAD when there are none; the window
+  always contains that input), or `at <lsn>` for an explicit fork point,
+  `mode` default `both`, `sample` default 100 %, noise filters, stub
+  rules; components whose code main already runs are skipped, M9):
+  creates the fork `p-<12 hex>` at the fork point, writes a `Deployment`
+  (cause `DEPLOY`) with the new code in the fork's log, runs replay over
+  `(fork_lsn, HEAD]`, writes the diff and evaluates the policy. Its state
+  lives in the fork (BranchCreated with `proposal_id`, diff file) and in
+  main's `state.db` table `proposals (id, fork, status,
+  verified_through_lsn, diff_hash, policy, created_lsn)` rebuilt from the
+  fork directories at startup.
 - **`approve`** writes `Approval {proposal_id, diff_hash,
   verified_through_lsn, audit}` in main's log. An approval holds for the
   diff (hash) it was given for.

@@ -48,6 +48,36 @@ fn last_deployment(p: &Proc) -> (u64, pb::Deployment) {
     p.node.store().db().deployments().unwrap().pop().unwrap()
 }
 
+/// Issue #90: the default window is one hour of logical time back from the
+/// newest root input, not from HEAD. Two quiet hours (a deployment advances
+/// HEAD but is not a root input) must not make the default proposal empty.
+#[test]
+fn a_default_window_still_covers_the_newest_root_after_an_idle_stretch() {
+    let dir = tempdir();
+    let (p, offset) = start_shifted(dir.path());
+    p.http("a", "increment", "");
+    let root_head = p.settle();
+
+    offset.store(2 * 3_600_000, Ordering::SeqCst);
+    p.deploy("notes");
+    let head = p.settle();
+    assert!(head > root_head, "the deployment did not advance HEAD");
+
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    let prop = propose(&p, &props, "counter-step2", DiffOptions::default());
+    assert_eq!(
+        prop.summary["root_inputs"].as_u64(),
+        Some(1),
+        "the default window did not reach the newest root: {}",
+        prop.summary
+    );
+    assert!(
+        prop.fork_lsn < head,
+        "the default window starts at HEAD ({}) instead of before the newest root ({root_head})",
+        prop.fork_lsn
+    );
+}
+
 #[test]
 fn promote_runs_catch_up_switches_code_and_rollback_restores_it() {
     let dir = tempdir();
