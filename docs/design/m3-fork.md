@@ -614,9 +614,11 @@ differs from it:
   in order for an effect without a recording, count as synthetic, and are
   recorded in the diff's `options.stubs`.
 - **`[fork] live_allowlist`** (kronik.toml): an effect without a
-  recording that is a `GET` without secret headers to a listed host goes
-  out live from the fork (grounding `live`, a fourth count next to exact,
-  approximate and synthetic in `summary` and `grounding`; `confidence =
+  recording that is a `GET` without secret headers to a listed host, and
+  whose grant's effective delivery class is `replay-safe` (`unsafe` and
+  `idempotency-keyed` grants never do), goes out live from the fork
+  (grounding `live`, a fourth count next to exact, approximate and
+  synthetic in `summary` and `grounding`; `confidence =
   exact / (exact + approximate + synthetic + live)`). Anything else, POSTs
   and `foreign://` included, never leaves (stub or `FailClosed`). The hosts
   in force are recorded in `options.live_allowlist`.

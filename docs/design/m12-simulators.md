@@ -77,8 +77,8 @@ order; the first that answers wins:
 3. **Stub rules of the replay request** (`stubs` in a replay or proposal,
    as in M3): label `stub`.
 4. **Stub rules of the target** (`SimulatorConfig.stubs`): label `stub`.
-5. **Live** (`[fork] live_allowlist`: a GET without secret headers to a
-   listed host): grounding `live`, not synthetic.
+5. **Live** (`[fork] live_allowlist`: a replay-safe GET without secret
+   headers to a listed host): grounding `live`, not synthetic.
 6. **ContractFake** (target has a contract): label `contract`.
 7. **RecordedNeighbor** (target has `neighbor`): label `neighbor`.
 8. **ModelSimulator** (target has `model` and the server has

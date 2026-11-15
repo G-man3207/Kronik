@@ -165,11 +165,15 @@ impl Proc {
     }
 
     pub fn grant(&self, cap: &str) {
+        self.grant_with_delivery(cap, None);
+    }
+
+    pub fn grant_with_delivery(&self, cap: &str, delivery: Option<kronik_effects::Delivery>) {
         self.rt
             .block_on(self.node.grant(
                 "counter",
                 cap,
-                None,
+                delivery,
                 None,
                 kronik_effects::InForks::Recorded,
                 audit(),

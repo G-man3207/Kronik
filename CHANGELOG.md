@@ -6,6 +6,11 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- A fork's live allowlist admits an unrecorded GET only when the matching
+  grant's effective delivery class is `replay-safe`: `unsafe` and
+  `idempotency-keyed` targets stay in the fork (denied, `replay: no
+  recording`) instead of sending the request for real during a replay, a
+  proposal or a preview. A live effect's record carries that class.
 - `kronik history`, `kronik trace` and the MCP history tools show a turn's
   blob references (M25, M26): each is the hash and size an operator passes to
   `kronik blobs inspect` or the MCP `inspect_blob`. The text shows the first

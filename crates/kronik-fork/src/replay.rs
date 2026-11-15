@@ -16,7 +16,7 @@ use kronik_effects::http::{
     CompiledScrubber, fingerprint, fingerprint_v2, parse_request_url, prepared_target,
     prepared_version, target_of, under_rules_of,
 };
-use kronik_effects::{Config, ConfigHistory};
+use kronik_effects::{Config, ConfigHistory, Delivery};
 use kronik_log::{Committed, Position};
 use kronik_privacy::SecretStore;
 use kronik_proto::Record;
@@ -95,8 +95,9 @@ pub struct ReplaySetup {
     pub held_secrets: Option<Arc<dyn HeldKeys>>,
     /// Canned answers for effects without a recording (synthetic).
     pub stubs: Vec<crate::stubs::StubRule>,
-    /// `[fork] live_allowlist`: hosts whose unrecorded GETs without secret
-    /// headers may go out live (I7: nothing else ever leaves a fork).
+    /// `[fork] live_allowlist`: hosts whose unrecorded replay-safe GETs
+    /// without secret headers may go out live (I7: nothing else ever leaves
+    /// a fork).
     pub live: Option<LiveAccess>,
     /// What the fork sees of production's user data (M8).
     pub privacy: crate::privacy::ForkPrivacy,
@@ -2878,7 +2879,15 @@ impl ReplayGate {
             self.push(rec)?;
             return out;
         }
-        // Live: an allowlisted host, a GET, no secret headers.
+        // Live: an allowlisted host, a replay-safe GET, no secret headers.
+        // The grant's class can make even a GET unsafe (m3-fork §11, I7),
+        // and an idempotency-keyed GET needs production's key, which this
+        // path does not send.
+        let delivery = self
+            .config()
+            .http_grant(&self.actor.kind, &t.host)
+            .and_then(|g| g.delivery)
+            .unwrap_or_else(|| Delivery::default_for(&req.method));
         let secretless = req
             .headers
             .iter()
@@ -2886,12 +2895,13 @@ impl ReplayGate {
         if let Some(live) = &setup.live
             && t.scheme != "foreign"
             && req.method.eq_ignore_ascii_case("GET")
+            && delivery == Delivery::ReplaySafe
             && secretless
             && live.hosts.contains(&t.host)
         {
             let env = live.env.clone();
             return self
-                .fetch_live(ordinal, cap, fp, encoded, req, env, &matcher)
+                .fetch_live(ordinal, cap, fp, encoded, req, delivery, env, &matcher)
                 .await;
         }
         if let Some(s) = sims {
@@ -3137,6 +3147,7 @@ impl ReplayGate {
     }
 
     /// A live GET from a fork (`[fork] live_allowlist`), grounding `live`.
+    /// `delivery` is the grant's effective class, `replay-safe` by admission.
     // One live fetch's admission: ordinal, capability, body and scrubber.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_live(
@@ -3146,6 +3157,7 @@ impl ReplayGate {
         fp: Vec<u8>,
         encoded: Option<pb::Sealable>,
         req: FetchRequest,
+        delivery: Delivery,
         env: Env,
         matcher: &CompiledScrubber<'_>,
     ) -> Result<FetchOutcome, GateError> {
@@ -3165,7 +3177,7 @@ impl ReplayGate {
             target: cap,
             fingerprint: fp,
             request: encoded,
-            delivery: "replay-safe".into(),
+            delivery: delivery.as_str().into(),
             grounding: pb::Grounding::Live as i32,
             ..Default::default()
         };

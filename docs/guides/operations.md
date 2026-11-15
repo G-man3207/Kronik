@@ -539,7 +539,7 @@ the script for the real clouds, are described in the design's §9.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `live_allowlist` | `[]` | Hosts that forks may call live: an effect with no recording that is a `GET` without secret headers to a listed host goes out for real. Anything else never leaves a fork |
+| `live_allowlist` | `[]` | Hosts that forks may call live: an effect with no recording that is a `GET` without secret headers to a listed host, whose grant's effective delivery class is `replay-safe`, goes out for real. Anything else never leaves a fork |
 | `preview_ttl` | `"24h"` | How long a preview fork lives unless `kronik preview create --ttl` says otherwise; see [previews](#previews) |
 | `preview_blob_bytes` | `"256MiB"` | What a preview's blob space holds: its uploads and the blobs its turns write, which no collector sweeps while it lives (the space is deleted with the preview). Past it an upload is `409 PREVIEW_FULL` and a turn's write answers `quota-exceeded`. `"0B"`: no cap |
 
@@ -2585,8 +2585,9 @@ a preview one way or the other, never both:
 
 An unknown or expired id answers `404 PREVIEW_NOT_FOUND`. A preview makes
 no live effects but one: a fetch without a stub is denied, except a `GET`
-without secret headers to a `[fork] live_allowlist` host, which goes out
-live. Its `crypto.*` calls answer `no recording` (it gets no production
+without secret headers to a `[fork] live_allowlist` host whose grant's
+effective delivery class is `replay-safe`, which goes out live. Its
+`crypto.*` calls answer `no recording` (it gets no production
 key), and `secrets.reveal` the placeholder. Its requests are not
 deduplicated by `Idempotency-Key`. Timers its requests set never fire, and
 neither do the timers pending at its fork point. The URL is reachable by
