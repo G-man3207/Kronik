@@ -1400,7 +1400,10 @@ impl Proposals {
         let mut unchanged = Vec::new();
         let mut seen: Vec<(String, usize)> = Vec::new();
         for (i, bytes) in req.wasm.iter().enumerate() {
-            let (hash, _, manifest) = self.node.prepare_code(bytes, authority.clone()).await?;
+            let (hash, _, manifest) = self
+                .node
+                .prepare_code(bytes, !req.dry_run, authority.clone())
+                .await?;
             if let Some((_, first)) = seen.iter().find(|(k, _)| *k == manifest.kind) {
                 let name = |n: usize| {
                     req.names
@@ -2241,7 +2244,10 @@ impl Proposals {
         dry_run: bool,
         authority: AuthLease,
     ) -> Result<pb::KindVersion, ApiError> {
-        let (hash, _, manifest) = self.node.prepare_code(wasm, authority.clone()).await?;
+        let (hash, _, manifest) = self
+            .node
+            .prepare_code(wasm, !dry_run, authority.clone())
+            .await?;
         let version = pb::KindVersion {
             kind: manifest.kind.clone(),
             code_hash: hash.0.to_vec(),

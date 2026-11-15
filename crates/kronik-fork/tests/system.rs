@@ -630,7 +630,7 @@ fn rolling_back_a_set_that_added_a_kind_is_refused() {
 fn kind_version(p: &Proc, name: &str) -> pb::KindVersion {
     let bytes = std::fs::read(guest(name)).unwrap();
     let (hash, _, manifest) =
-        p.rt.block_on(p.node.prepare_code(&bytes, p.owner()))
+        p.rt.block_on(p.node.prepare_code(&bytes, true, p.owner()))
             .unwrap();
     pb::KindVersion {
         kind: manifest.kind.clone(),

@@ -471,7 +471,7 @@ fn upgrade_replays_recorded_code_across_a_same_kind_deployment() {
             .unwrap();
         assert!(first.committed());
         let bytes = guest("counter-step2");
-        let (hash, _, manifest) = node.prepare_code(&bytes, owner(&node)).await.unwrap();
+        let (hash, _, manifest) = node.prepare_code(&bytes, true, owner(&node)).await.unwrap();
         assert_ne!(node.deployed("counter").unwrap().code_hash, hash.0);
         node.switch_code(
             kronik_sched::CodeSwitch {
