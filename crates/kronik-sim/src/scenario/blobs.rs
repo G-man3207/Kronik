@@ -1650,24 +1650,29 @@ impl World {
         }
     }
 
-    /// The end of the run (B6): after two passes, every blob file is one a
-    /// record references, no part file is left, and every body the service
-    /// received is the blob the guest wrote.
+    /// The two collector passes B6's end checks wait for. A pass that stops
+    /// the node on an injected I/O error is an expected stop, not a lost
+    /// invariant: the caller restarts the node and runs them again.
+    pub(super) async fn blob_end_passes(&self, node: &Node) -> Result<(), String> {
+        if self.blobs().is_none() {
+            return Ok(());
+        }
+        for _ in 0..2 {
+            node.blob_gc(SweepOptions::default())
+                .await
+                .map_err(|e| format!("{} {}", e.code, e.message))?;
+        }
+        Ok(())
+    }
+
+    /// The end of the run (B6), after [`World::blob_end_passes`] ran the two
+    /// passes: every blob file is one a record references, no part file is
+    /// left, and every body the service received is the blob the guest wrote.
     pub(super) async fn check_blobs_end(&self, node: &Node) {
         if self.blobs().is_none() {
             return;
         }
         self.check_blob_refs(node, "the end").await;
-        for _ in 0..2 {
-            if let Err(e) = node.blob_gc(SweepOptions::default()).await {
-                return self.violation(format!(
-                    "the last passes: {} {} (fatal: {:?})",
-                    e.code,
-                    e.message,
-                    node.fatal()
-                ));
-            }
-        }
         self.check_erased_files(node, "the end").await;
         let newest = node
             .store()
