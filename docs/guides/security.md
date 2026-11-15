@@ -46,10 +46,16 @@ repository root says how to report a vulnerability.
   grant nothing. Grants are records in the log, apply per kind (so new code
   of a kind keeps them), carry a delivery class and an optional rate, and
   are checked against the configuration of the turn's epoch.
-- **Host code.** `unsafe` Rust is denied in the whole workspace except two
-  allowlisted modules: loading precompiled code in `kronik-runtime` and the
-  SQLite bindings in `kronik-store`. Precompiled code is read only from
-  Kronik's own data directory, never from user input.
+- **Host code.** `unsafe_code` is denied in the workspace. The modules that
+  opt out are listed, each with its reason, in `scripts/unsafe-allowlist.txt`,
+  and the hygiene step enforces the list (a module with `unsafe` that the file
+  omits fails, and so does an entry whose module no longer has any). They
+  include loading precompiled code in `kronik-runtime`, the SQLite bindings in
+  `kronik-store`, and the isolation boundary: the namespace, id-map and
+  capability code and the microVM jail in `crates/kronik-foreign/src/sys.rs`,
+  the KVM ioctls in `crates/kronik-foreign/src/microvm_sys.rs`, and the
+  guest's PID 1 in `crates/kronik-guest-init/src/sys.rs`. Precompiled code is
+  read only from Kronik's own data directory, never from user input.
 
 Known gaps: SQLite has no memory limit per statement, so the VM step budget
 bounds sorts and recursive queries only indirectly (ADR 0005 leaves this for

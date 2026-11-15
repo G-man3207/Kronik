@@ -155,6 +155,15 @@ for path in allowed:
 for manifest in sorted(pathlib.Path("crates").glob("*/Cargo.toml")):
     if not re.search(r"^\[lints\]\s*\nworkspace\s*=\s*true", manifest.read_text(), re.M):
         bad.append(f"{manifest}: no [lints] workspace = true, so unwrap/expect are not denied")
+# The Security model must name the enforced list, not repeat a count that
+# drifts: a reader sizes the daemon's unsafe surface from this bullet.
+security = pathlib.Path("docs/guides/security.md").read_text()
+host = re.search(r"^- \*\*Host code\.\*\*(.*?)(?:\n[ \t]*\n|\Z)", security, re.M | re.S)
+if not host:
+    bad.append("docs/guides/security.md: no 'Host code' bullet in the security model")
+elif "scripts/unsafe-allowlist.txt" not in host.group(1):
+    bad.append("docs/guides/security.md: the 'Host code' bullet must name "
+               "scripts/unsafe-allowlist.txt as the authority")
 for b in bad:
     print("error: " + b, file=sys.stderr)
 sys.exit(1 if bad else 0)
