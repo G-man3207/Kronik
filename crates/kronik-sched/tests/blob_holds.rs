@@ -41,6 +41,12 @@ fn audit() -> pb::Audit {
 /// A node with blobs, no history window and no collector loop of its own;
 /// `media` deployed unless `deploy` is false (a restart).
 fn start(dir: &Path, deploy: bool) -> Proc {
+    start_holding(dir, deploy, false)
+}
+
+/// [`start`]; with `hold_after_call`, a caller's turn stops for good after
+/// its call has its answer, before it records it (a crash there).
+fn start_holding(dir: &Path, deploy: bool, hold_after_call: bool) -> Proc {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -60,6 +66,7 @@ fn start(dir: &Path, deploy: bool) -> Proc {
                 gc_interval: Duration::ZERO,
                 ..BlobsConfig::default()
             }),
+            test_hold_after_call: hold_after_call,
             ..NodeConfig::default()
         };
         start_local(env, dir, config).await.unwrap()
@@ -94,6 +101,91 @@ fn blob_of(answer: &str) -> pb::BlobRef {
         subject: None,
         key_version: 0,
     }
+}
+
+/// The blob of the `call` operation's answer `reply blob <hash> <size>
+/// retained`.
+fn retained_reply(answer: &str) -> pb::BlobRef {
+    blob_of(
+        answer
+            .strip_prefix("reply ")
+            .and_then(|rest| rest.strip_suffix(" retained"))
+            .unwrap_or_else(|| panic!("{answer}")),
+    )
+}
+
+/// The text answer of a committed turn.
+fn text_of(r: &TurnResult) -> String {
+    match &r.outcome.output {
+        Some(pb::outcome::Output::Http(h)) => {
+            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
+                Some(pb::body::Value::Inline(s)) => match &s.value {
+                    Some(pb::sealable::Value::Plain(b)) => String::from_utf8_lossy(b).into_owned(),
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// An operator's message named `name`, with an empty body.
+fn message(name: &str) -> pb::Message {
+    pb::Message {
+        name: name.into(),
+        content_type: "text/plain".into(),
+        body: Some(pb::Sealable {
+            subject: None,
+            value: Some(pb::sealable::Value::Plain(Vec::new())),
+        }),
+        ..Default::default()
+    }
+}
+
+/// The recorded `actor.call` effects of `media/<key>`'s committed turns.
+fn calls_of(records: &[Record], key: &str) -> Vec<pb::EffectRecord> {
+    records
+        .iter()
+        .filter_map(Record::turn)
+        .filter(|t| t.actor.as_ref().is_some_and(|a| a.key == key))
+        .filter(|t| {
+            t.outcome
+                .as_ref()
+                .is_some_and(|o| o.kind == pb::OutcomeKind::Committed as i32)
+        })
+        .flat_map(|t| t.effects.iter().cloned())
+        .filter(|e| e.kind == "actor.call")
+        .collect()
+}
+
+/// The reply a recorded call effect gave its caller.
+fn recorded_reply(call: &pb::EffectRecord) -> pb::Message {
+    let Some(pb::sealable::Value::Plain(bytes)) =
+        call.response.as_ref().and_then(|r| r.value.as_ref())
+    else {
+        panic!("{call:?}")
+    };
+    use prost::Message as _;
+    pb::CallEffectResponse::decode(bytes.as_slice())
+        .unwrap()
+        .reply
+        .unwrap_or_else(|| panic!("{call:?}"))
+}
+
+/// What a caller gets for a callee's HTTP answer whose body is `blob`: the
+/// reply `http 200` with an empty body, and the blob as its one blob.
+fn assert_blob_reply(call: &pb::EffectRecord, blob: &pb::BlobRef) {
+    let reply = recorded_reply(call);
+    assert_eq!(reply.name, "http 200", "{reply:?}");
+    assert_eq!(reply.content_type, "", "{reply:?}");
+    assert_eq!(
+        reply.body.as_ref().and_then(|b| b.value.clone()),
+        Some(pb::sealable::Value::Plain(Vec::new())),
+        "{reply:?}"
+    );
+    assert_eq!(reply.blobs, std::slice::from_ref(blob), "{reply:?}");
+    assert!(call.blobs.contains(blob), "the call lists it: {call:?}");
 }
 
 impl Proc {
@@ -165,20 +257,57 @@ impl Proc {
     fn ok(&self, key: &str, op: &str, query: &str) -> String {
         let r = self.run(key, op, query, b"");
         assert!(r.committed(), "{op}?{query}: {r:?}");
-        match &r.outcome.output {
-            Some(pb::outcome::Output::Http(h)) => {
-                match h.body.as_ref().and_then(|b| b.value.as_ref()) {
-                    Some(pb::body::Value::Inline(s)) => match &s.value {
-                        Some(pb::sealable::Value::Plain(b)) => {
-                            String::from_utf8_lossy(b).into_owned()
-                        }
-                        other => panic!("{other:?}"),
-                    },
-                    other => panic!("{other:?}"),
-                }
+        text_of(&r)
+    }
+
+    /// An operator's message `name` (`op?query`) to `media/<key>`, as
+    /// `kronik send` sends it: a message turn; its result.
+    fn send(&self, key: &str, name: &str) -> TurnResult {
+        let actor = ActorRef::parse(&format!("media/{key}")).unwrap();
+        let owner = self.node.local_operator_authority().unwrap();
+        self.rt
+            .block_on(self.node.send(actor, message(name), audit(), false, owner))
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .unwrap()
+    }
+
+    /// [`Proc::send`] without waiting: the turn may not end in this process.
+    fn send_detached(&self, key: &str, name: &str) {
+        let node = self.node.clone();
+        let actor = ActorRef::parse(&format!("media/{key}")).unwrap();
+        let name = name.to_owned();
+        self.rt.spawn(async move {
+            let owner = node.local_operator_authority().unwrap();
+            let _ = node
+                .send(actor, message(&name), audit(), false, owner)
+                .await;
+        });
+    }
+
+    /// Waits up to 20 s for `f`.
+    fn wait_until(&self, what: &str, f: impl Fn(&Proc) -> bool) {
+        for _ in 0..2000 {
+            if f(self) {
+                return;
             }
-            other => panic!("{other:?}"),
+            std::thread::sleep(Duration::from_millis(10));
         }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// How many turns `media/<key>` committed or failed.
+    fn turns(&self, key: &str) -> u64 {
+        self.node
+            .store()
+            .db()
+            .actor("media", key)
+            .unwrap()
+            .map_or(0, |a| a.turns)
+    }
+
+    /// Whether a turn is open: begun, and not ended by a record.
+    fn open_turns(&self) -> usize {
+        self.node.store().db().open_turns().unwrap().len()
     }
 
     /// Waits until no message to `media/<key>` waits in the mailbox: its
@@ -450,6 +579,78 @@ fn a_call_and_its_reply_carry_blobs() {
         .map(|e| e.blobs.iter().map(|b| b.hash.clone()).collect())
         .collect();
     assert_eq!(calls, [vec![mine.hash.clone()], vec![theirs.hash.clone()]]);
+}
+
+/// A callee that answers a call with an HTTP response whose body is a blob
+/// it wrote (`write` always makes one) gives the caller that blob: the
+/// reply `http 200` with an empty body and the blob as its one blob, which
+/// the caller reads and retains, and which its call effect lists. The callee
+/// holds nothing. Found by the v0.5.0 release rehearsal: the caller failed
+/// with 503 UNAVAILABLE, a missing prerequisite, and its turn stayed open.
+#[test]
+fn a_callee_answering_with_a_blob_it_wrote_replies_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path(), true);
+    for (callee, size) in [("b", 1000u64), ("c", 100_000)] {
+        let answer = p.ok(
+            "a",
+            "call",
+            &format!("to={callee}&op=write?size={size}&keep=1"),
+        );
+        let blob = retained_reply(&answer);
+        assert_eq!(blob.size, size);
+        assert!(p.held("a", &blob));
+        assert!(!p.held(callee, &blob), "the callee only wrote it");
+        // Retained, it reads in a later turn.
+        assert_eq!(p.ok("a", "held-sum", ""), pattern_sum(size));
+        let calls = calls_of(&p.records(), "a");
+        assert_blob_reply(calls.last().unwrap(), &blob);
+    }
+    assert_eq!(p.open_turns(), 0);
+}
+
+/// The same answer to a caller that is a message turn (here an operator's
+/// message, as `kronik send` sends it): its turn commits and ends, so no
+/// turn is left open to run again, and the actor goes on with its next
+/// input.
+#[test]
+fn a_message_turn_calling_a_blob_writer_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path(), true);
+    let r = p.send("m", "call?to=w&op=write?size=1000&keep=1");
+    assert!(r.committed(), "{r:?}");
+    let blob = retained_reply(&text_of(&r));
+    assert_eq!(blob.size, 1000);
+    assert!(p.held("m", &blob));
+    assert_eq!(p.open_turns(), 0);
+    assert_blob_reply(&calls_of(&p.records(), "m")[0], &blob);
+    // The next message runs and reads the blob it retained.
+    assert_eq!(text_of(&p.send("m", "held-sum")), pattern_sum(1000));
+}
+
+/// A message turn that stopped after its call had its answer, a blob the
+/// callee wrote, and before it recorded it (a crash), runs again at the
+/// next start, takes the callee's saved answer and commits, instead of
+/// staying open to fail at every start (as it did when that answer was
+/// refused as a missing prerequisite: then every run of the turn stopped
+/// there). The callee ran once.
+#[test]
+fn a_rerun_message_turn_takes_the_saved_blob_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start_holding(dir.path(), true, true);
+    p.send_detached("m", "call?to=w&op=write?size=1000&keep=1");
+    p.wait_until("the callee's turn", |p| p.turns("w") == 1);
+    drop(p);
+    let p = start(dir.path(), false);
+    p.wait_until("the caller's turn", |p| p.turns("m") == 1);
+    assert_eq!(p.open_turns(), 0);
+    let calls = calls_of(&p.records(), "m");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let blob = recorded_reply(&calls[0]).blobs[0].clone();
+    assert_blob_reply(&calls[0], &blob);
+    assert!(p.held("m", &blob));
+    assert_eq!(p.turns("w"), 1, "the callee ran once");
+    assert_eq!(text_of(&p.send("m", "held-sum")), pattern_sum(1000));
 }
 
 /// The state rebuilt from the log equals the live one, holds and pins

@@ -6,6 +6,12 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- An answer that is a blob reaches whoever asked for it (M25, M26). A
+  `call` whose callee answered with a blob body, such as a blob it wrote,
+  failed the caller with 503 `UNAVAILABLE` and left the caller's turn open,
+  to fail the same way at every start; the caller now gets a reply named
+  `http <status>` with an empty body and the blob in its `blobs`, which it
+  may read and retain.
 - `kronik upgrade check`, and the start of a daemon whose engine changed,
   replay blob turns (M25, M26): they replayed without the blob store, so a
   turn with a recorded blob response failed the check, and a node with one

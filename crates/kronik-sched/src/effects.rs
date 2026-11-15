@@ -2955,16 +2955,39 @@ pub fn map_call_outcome(outcome: pb::Outcome) -> Result<CallOutcome, GateError> 
                 validate_call_reply(Some(&message))?;
                 Some(message)
             }
+            // An HTTP answer is the reply `http <status>` with its body.
             Some(pb::outcome::Output::Http(response)) => {
-                let Some(pb::body::Value::Inline(body)) = response.body.and_then(|body| body.value)
-                else {
-                    return Err(GateError::Prerequisite(ErrorCode::Unavailable));
-                };
-                let message = pb::Message {
-                    name: format!("http {}", response.status),
-                    content_type: String::new(),
-                    body: Some(body),
-                    ..Default::default()
+                let name = format!("http {}", response.status);
+                let message = match response.body.and_then(|body| body.value) {
+                    Some(pb::body::Value::Inline(body)) => pb::Message {
+                        name,
+                        content_type: String::new(),
+                        body: Some(body),
+                        ..Default::default()
+                    },
+                    // A blob body (M25), such as a blob the callee wrote, is
+                    // the reply's one blob, with an empty body (M26 §2, §4):
+                    // the reply is the edge that gives it to the caller,
+                    // which may read and retain it, and the callee's saved
+                    // outcome pins it. Refusing it as a missing prerequisite
+                    // left the caller's turn open, to fail the same way at
+                    // every run.
+                    Some(pb::body::Value::Blob(blob)) => pb::Message {
+                        name,
+                        content_type: String::new(),
+                        body: Some(pb::Sealable {
+                            subject: None,
+                            value: Some(pb::sealable::Value::Plain(Vec::new())),
+                        }),
+                        blobs: vec![blob],
+                        ..Default::default()
+                    },
+                    // A committed record always has one (Record::validate).
+                    None => {
+                        return Err(GateError::Host(
+                            "The committed callee's HTTP answer has no body".into(),
+                        ));
+                    }
                 };
                 validate_call_reply(Some(&message))?;
                 Some(message)
