@@ -286,9 +286,14 @@ its ingress key belong to the re-run (an HTTP retry with the same
   request to the network), across crashes and restarts: the windows are not
   persisted, but every window starts full at process start, as if N sends
   had just happened, so the first rate-limited call after a restart waits
-  one period (up to an hour for `N/h`). Arrivals at the target are not
-  bounded: network delay can bunch two windows' worth of sends into one
-  period. Waiting uses `Env::clock`; logical time and forks are unaffected.
+  one period (up to an hour for `N/h`). A grant that changes the rate for a
+  (kind, capability, host) starts that window over at the new rate's pace:
+  the superseded grant's floor and send history do not carry, so raising
+  `1/h` to `60/s` no longer waits out the hour, while a lowered rate starts
+  full and waits one new pace before its first send. Arrivals at the target
+  are not bounded: network delay can bunch two windows' worth of sends into
+  one period. Waiting uses `Env::clock`; logical time and forks are
+  unaffected.
 - **Limits** per kind: fuel, memory, message and state value size, SQL size
   per actor, effect timeout, effect response size. A turn uses the limits
   of its epoch.

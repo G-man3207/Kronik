@@ -1768,7 +1768,10 @@ impl TurnFx {
         self.begin().await?;
         if let Some(rate) = grant.rate {
             let key = format!("{}|{}|{}", grant.kind, grant.capability, target.host);
-            self.node.rates.acquire(&self.node.env, &key, rate).await;
+            self.node
+                .rates
+                .acquire(self.node.env.clock.as_ref(), &key, rate)
+                .await;
         }
         // The values of secrets taken from the recording are needed on the
         // wire again (replay-safe or idempotency-keyed re-execution).
