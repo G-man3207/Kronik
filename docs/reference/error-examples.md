@@ -63,13 +63,14 @@ kronik history media/fixture --limit 5
 
 ## BLOB_NOT_FOUND
 
-An operator asks about a blob by a hash copied from another node's history.
-This node knows no such blob: no record within retention or row of its state
+An operator asks about a blob by a hash copied from another node. This node
+knows no such blob: no record within retention or row of its state
 references it, and no file of that identity is in its store. Check the hash
-against this node's history; a blob nothing kept any more may have been
-collected.
+against the blobs this node's actors hold; a blob nothing kept any more may
+have been collected.
 
 ```sh
+kronik blobs list --actor media/fixture
 kronik blobs gc --dry-run
 ```
 

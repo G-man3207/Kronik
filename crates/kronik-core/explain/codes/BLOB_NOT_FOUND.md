@@ -7,6 +7,8 @@ collector deleted it (`kronik blobs gc --dry-run` lists what the next pass
 deletes, and why). `get` serves only blobs a record or the state
 references; a loose file has no metadata to serve it with.
 
-Nothing changed. Check the hash: `kronik history` shows the blobs of turns.
+Nothing changed. Check the hash: `kronik blobs list --actor <kind/key>`
+lists the blobs an actor holds, and `kronik blobs inspect` one blob's
+state. History does not show a turn's blobs.
 
-See also: `blob`.
+See also: `blob`, `collector`.

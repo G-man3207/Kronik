@@ -203,7 +203,7 @@ See also: [`blob`](concepts/glossary.md#blob).
 
 HTTP status 404, milestone M25. This node knows no such blob.
 
-Default hint: Check the hash: `kronik history` shows the blobs of turns, and `kronik blobs gc --dry-run` the files nothing keeps; a blob nothing kept may have been collected.
+Default hint: Check the hash: `kronik blobs list --actor <kind/key>` lists the blobs an actor holds, and `kronik blobs gc --dry-run` the files nothing keeps; a blob nothing kept may have been collected.
 
 The API was asked about a blob (`kronik blobs inspect`, `kronik blobs get`,
 `GET /v1/blobs/{hash}`) that this node does not know: no record within
@@ -214,9 +214,11 @@ collector deleted it (`kronik blobs gc --dry-run` lists what the next pass
 deletes, and why). `get` serves only blobs a record or the state
 references; a loose file has no metadata to serve it with.
 
-Nothing changed. Check the hash: `kronik history` shows the blobs of turns.
+Nothing changed. Check the hash: `kronik blobs list --actor <kind/key>`
+lists the blobs an actor holds, and `kronik blobs inspect` one blob's
+state. History does not show a turn's blobs.
 
-See also: [`blob`](concepts/glossary.md#blob).
+See also: [`blob`](concepts/glossary.md#blob), [`collector`](concepts/glossary.md#collector).
 
 ## BLOB_NOT_HELD
 
@@ -851,6 +853,10 @@ Default hint: Send less data; messages are limited to 1 MiB by default.
 
 The request body or the message is larger than the limit, so it was rejected before any turn ran. Messages and state values are limited to 1 MiB each by default, and the limits can be set per actor type; the gateway and the API also limit the size of requests. This code exists, rather than `BAD_REQUEST`, because the request is otherwise valid: only its size is the problem.
 
+For an actor type whose code imports `kronik:actor/blobs` (M25, the SDKs' blob API), an HTTP request body may be larger than a message: a body above the type's blob threshold becomes a blob, up to the type's upload size (64 MiB by default). A larger body gets this code, at once when its `Content-Length` says so, and the hint names the limit:
+
+    kronik limits set media --upload-size 1Gi --reason "albums take camera originals"
+
 To fix it, send less data, or raise the actor type's limits with `kronik limits set` (M2) if larger messages are expected.
 
 ## POLICY_DENIED
@@ -1229,7 +1235,7 @@ HTTP status 410, milestone M8. The subject's data was erased.
 
 Default hint: The subject was erased; its data cannot be read.
 
-The data belongs to a subject that was erased with `kronik privacy erase`. Erasure deletes the subject's key, so its sealed values are unreadable everywhere: in the log, state, snapshots and shipped copies. Diffs and history show such values as `[erased]`.
+The data belongs to a subject that was erased with `kronik privacy erase`. Erasure deletes the subject's key, so its sealed values are unreadable everywhere: in the log, state, snapshots and shipped copies. Diffs and history show such values as `[erased]`. The subject's blobs go the same way (M26): their files are deleted at once, `kronik blobs get` answers this code, and in a turn the blob functions answer `erased`, which the SDKs raise as this code.
 
 This is permanent by design. Do not retry: the data cannot be recovered, and code that needs it must handle its absence.
 
