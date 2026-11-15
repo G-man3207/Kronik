@@ -1812,7 +1812,8 @@ Proposal p-3c1f0e8a9b27   counter   b3:d440473283f4 -> b3:9ae922b13c24   (evalua
 
 Approves a proposal's diff when the policy requires an approval. The
 approval holds for that diff: if catch-up at promote changes the diff to a
-stricter outcome or to new changed targets, promote asks for a new one.
+stricter outcome, to new changed targets, or no longer replays every root
+input the approved diff sampled, promote asks for a new one.
 
 ```text
 $ kronik promote p-d8e829aa6c7a --reason "ship it"

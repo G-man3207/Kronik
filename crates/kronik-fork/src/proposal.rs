@@ -76,6 +76,12 @@ pub struct Approved {
     /// Targets with approximate or synthetic effects, or changed effects,
     /// when approved.
     pub targets: Vec<String>,
+    /// Root inputs the approved diff replayed in isolation (§6), sorted.
+    /// A later catch-up diff may use this approval only if it replays all of
+    /// them: evidence may not get narrower. `None` (an approval written
+    /// before this field) cannot be checked and fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled: Option<BTreeSet<Lsn>>,
 }
 
 /// A promotion as the proposal remembers it.
@@ -102,6 +108,10 @@ pub struct Proposal {
     pub policy: Value,
     /// The diff's summary (§5.1).
     pub summary: Value,
+    /// Root inputs the saved diff replayed in isolation (§6), sorted; `None`
+    /// while running and for a proposal saved before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled: Option<BTreeSet<Lsn>>,
     pub options: DiffOptions,
     /// The proposed code, as `pb::KindVersion` (base64 protobuf).
     pub kinds: Vec<String>,
@@ -268,6 +278,13 @@ struct Entry {
     live: Option<Live>,
 }
 
+impl Live {
+    /// The isolated roots the current diff replayed (§6), sorted.
+    fn sampled(&self) -> BTreeSet<Lsn> {
+        self.trees.iter().map(|t| t.root_lsn).collect()
+    }
+}
+
 /// Every proposal of the node.
 pub struct Proposals {
     node: Arc<Node>,
@@ -398,6 +415,25 @@ fn outcome_rank(o: &str) -> u8 {
         "require_approval" => 1,
         _ => 2,
     }
+}
+
+/// Whether an approval still answers the diff just built: that exact diff, or
+/// a later diff after catch-up that is no stricter, changes only approved
+/// targets, and replays every root input the approved diff sampled (§6, §11).
+/// An approval that cannot be shown to cover the sample fails closed.
+fn approval_holds(
+    a: &Approved,
+    outcome: &str,
+    hash: &str,
+    sampled: &BTreeSet<Lsn>,
+    changed: &BTreeSet<String>,
+) -> bool {
+    a.diff_hash == hash
+        || (outcome_rank(outcome) <= outcome_rank(&a.outcome)
+            && a.sampled
+                .as_ref()
+                .is_some_and(|approved| approved.is_subset(sampled))
+            && changed.iter().all(|t| a.targets.contains(t)))
 }
 
 impl Proposals {
@@ -1212,6 +1248,7 @@ impl Proposals {
             diff_hash: String::new(),
             policy: Value::Null,
             summary: Value::Null,
+            sampled: None,
             options: p.options.clone(),
             kinds: p.kinds.iter().map(encode_kind).collect(),
             reason: p.reason.clone(),
@@ -1509,6 +1546,7 @@ impl Proposals {
             diff_hash: hash,
             policy,
             summary: serde_json::to_value(&d.summary).map_err(internal)?,
+            sampled: Some(live.sampled()),
             options: p.options.clone(),
             kinds: p.kinds.iter().map(encode_kind).collect(),
             reason: p.reason.clone(),
@@ -1622,6 +1660,9 @@ impl Proposals {
                     diff_hash: meta.diff_hash.clone(),
                     outcome: policy["outcome"].as_str().unwrap_or("deny").to_owned(),
                     targets: targets_of_value(&d),
+                    // The approval's record in the log names the diff, and
+                    // diff.json is the diff this metadata describes.
+                    sampled: meta.sampled.clone(),
                 });
                 meta.policy = policy;
                 if meta.status == "evaluated" {
@@ -1752,6 +1793,7 @@ impl Proposals {
             diff_hash: meta.diff_hash.clone(),
             outcome: policy["outcome"].as_str().unwrap_or("deny").to_owned(),
             targets,
+            sampled: meta.sampled.clone(),
         };
         if dry_run {
             return Ok((approved, meta.verified_through_lsn));
@@ -1940,10 +1982,12 @@ impl Proposals {
         } else {
             &mut entry.meta
         };
+        let sampled = live.sampled();
         meta.verified_through_lsn = live.index.to_lsn;
         meta.diff_hash = hash.clone();
         meta.policy = policy.clone();
         meta.summary = serde_json::to_value(&d.summary).map_err(internal)?;
+        meta.sampled = Some(sampled.clone());
         if outcome == "deny" {
             if !dry_run {
                 meta.status = "rejected".into();
@@ -1958,9 +2002,7 @@ impl Proposals {
         }
         if outcome == "require_approval" {
             let ok = meta.approved.as_ref().is_some_and(|a| {
-                a.diff_hash == hash
-                    || (outcome_rank(&outcome) <= outcome_rank(&a.outcome)
-                        && changed_targets(&d).iter().all(|t| a.targets.contains(t)))
+                approval_holds(a, &outcome, &hash, &sampled, &changed_targets(&d))
             });
             if !ok {
                 if !dry_run {
@@ -2076,7 +2118,6 @@ impl Proposals {
         dry_run: bool,
         authority: AuthLease,
     ) -> Result<(), ApiError> {
-        let old_to = live.index.to_lsn;
         let index = live
             .index
             .extended(self.node.reader(), head, &self.privacy(options.no_pii))
@@ -2095,17 +2136,31 @@ impl Proposals {
             authority,
         )?;
         if options.mode.isolated() {
-            let fresh: Vec<_> = index
-                .roots
+            // §6 samples the window, not each round's new roots: the trees
+            // that stay are the ones a replay of `(fork_lsn, head]` takes
+            // (m3-fork §11), so a later promote after a restart compares the
+            // same inputs the policy and the approval saw.
+            let roots = sample::sample(&index.roots, id, options.sample);
+            let wanted: BTreeSet<Lsn> = roots.iter().map(|r| r.lsn).collect();
+            let have: BTreeSet<Lsn> = live
+                .trees
                 .iter()
-                .filter(|r| r.lsn > old_to)
-                .cloned()
+                .map(|t| t.root_lsn)
+                .filter(|lsn| wanted.contains(lsn))
                 .collect();
-            let roots = sample::sample(&fresh, id, options.sample);
-            let trees = replay::isolated(self.node.env(), setup.clone(), roots, self.workers)
-                .await
-                .map_err(replay_error)?;
-            live.trees.extend(trees);
+            let missing: Vec<_> = roots
+                .into_iter()
+                .filter(|r| !have.contains(&r.lsn))
+                .collect();
+            let mut trees = Vec::new();
+            if !missing.is_empty() {
+                trees = replay::isolated(self.node.env(), setup.clone(), missing, self.workers)
+                    .await
+                    .map_err(replay_error)?;
+            }
+            live.trees.retain(|t| wanted.contains(&t.root_lsn));
+            live.trees.append(&mut trees);
+            live.trees.sort_by_key(|t| t.root_lsn);
         }
         if let Some(c) = live.continuous.as_mut() {
             c.extend(setup.clone()).await.map_err(replay_error)?;
@@ -2183,6 +2238,7 @@ impl Proposals {
                 diff_hash: String::new(),
                 policy: Value::Null,
                 summary: Value::Null,
+                sampled: None,
                 options: DiffOptions {
                     no_pii,
                     ..DiffOptions::default()
@@ -2329,6 +2385,7 @@ impl Proposals {
                 entry.meta.verified_through_lsn = d.summary.verified_through_lsn;
                 entry.meta.diff_hash = hash;
                 entry.meta.summary = serde_json::to_value(&d.summary).map_err(internal)?;
+                entry.meta.sampled = Some(live.sampled());
                 entry.meta.options = options;
                 this.save(&entry.meta, Some(&bytes))?;
                 this.save_samples(&name, &live, &d)?;
@@ -2828,6 +2885,63 @@ pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn approval(sampled: Option<&[Lsn]>) -> Approved {
+        Approved {
+            lsn: 7,
+            diff_hash: "b3:approved".into(),
+            outcome: "require_approval".into(),
+            targets: vec!["counter POST /counter/{key}/{op}".into()],
+            sampled: sampled.map(|roots| roots.iter().copied().collect()),
+        }
+    }
+
+    /// Evidence may grow across catch-up, never shrink: a later diff may
+    /// use an approval only if it sampled every root the approved diff did.
+    /// An approval written before roots were recorded cannot prove that.
+    #[test]
+    fn an_approval_covers_a_later_diff_only_with_its_sampled_roots() {
+        let a = approval(Some(&[1, 2]));
+        let changed: BTreeSet<String> = a.targets.iter().cloned().collect();
+        let covered: BTreeSet<Lsn> = [1, 2, 3].into_iter().collect();
+        let narrower: BTreeSet<Lsn> = [1, 3].into_iter().collect();
+        assert!(!approval_holds(
+            &a,
+            "require_approval",
+            "b3:new",
+            &narrower,
+            &changed
+        ));
+        assert!(approval_holds(
+            &a,
+            "require_approval",
+            "b3:approved",
+            &BTreeSet::new(),
+            &BTreeSet::new()
+        ));
+        assert!(approval_holds(
+            &a,
+            "require_approval",
+            "b3:new",
+            &covered,
+            &changed
+        ));
+        assert!(!approval_holds(
+            &approval(None),
+            "require_approval",
+            "b3:new",
+            &covered,
+            &changed
+        ));
+        assert!(!approval_holds(
+            &a,
+            "require_approval",
+            "b3:new",
+            &covered,
+            &BTreeSet::from(["other".into()])
+        ));
+        assert!(!approval_holds(&a, "deny", "b3:new", &covered, &changed));
+    }
 
     /// A replay that found the instance pool full could not run: the
     /// answer is `UNAVAILABLE`, which a client may retry, never a diff.
