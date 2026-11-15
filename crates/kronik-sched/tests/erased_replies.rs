@@ -5,6 +5,10 @@
 //! whichever path the answer took, and the caller's turn ends as its guest
 //! decides. Nothing is left open to run again at every start.
 //!
+//! The callee committed, so a caller that fails after the call still owes
+//! that change: the call is an orphan and its compensation is delivered
+//! exactly once (ADR 0124).
+//!
 //! A callee whose turn runs across an erasure answers its caller with the
 //! erasure's tombstone in place of the subject's values, and its record,
 //! which the store keeps as the call's saved outcome, holds the tombstone
@@ -366,9 +370,9 @@ impl Proc {
     }
 }
 
-/// The caller's recorded `actor.call`: a call error with the code, and no
-/// response.
-fn assert_erased_call(caller: &pb::TurnRecord) {
+/// The caller's recorded `actor.call`: a call error with the code, no
+/// response, and the callee's committed source (ADR 0124).
+fn erased_call(caller: &pb::TurnRecord) -> &pb::EffectRecord {
     let calls: Vec<&pb::EffectRecord> = caller
         .effects
         .iter()
@@ -379,6 +383,14 @@ fn assert_erased_call(caller: &pb::TurnRecord) {
     assert_eq!(call.status, pb::EffectStatus::Failed as i32, "{call:?}");
     assert_eq!(call.error, ERASED_ERROR);
     assert!(call.response.is_none(), "{call:?}");
+    assert!(call.callee_source.is_some(), "{call:?}");
+    assert!(call.successful_call(), "{call:?}");
+    call
+}
+
+/// The caller's turn committed after it chose to handle the call error.
+fn assert_erased_call(caller: &pb::TurnRecord) {
+    erased_call(caller);
     assert_eq!(
         caller.outcome.as_ref().map(|o| o.kind),
         Some(pb::OutcomeKind::Committed as i32),
@@ -447,6 +459,112 @@ fn an_answer_an_erasure_tombstoned_is_a_subject_erased_call_error() {
         let next = p.send("counter/a", msg("get", ""));
         assert!(next.committed(), "{mode:?}: {next:?}");
         assert_eq!(p.turns("a"), 2, "{mode:?}");
+    }
+}
+
+/// The same erased answer, but the caller's turn fails after the call and
+/// carries a compensation. The callee's write stands; the caller's failed
+/// turn must name it an orphan and deliver the compensation exactly once
+/// (ADR 0124), as it does for a readable answer. Before, the erased answer
+/// was recorded as a plain failed call and both were silently lost.
+#[test]
+fn a_failed_caller_orphans_an_erased_answer_and_delivers_its_compensation() {
+    for mode in MODES {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::start();
+        let p = start(dir.path(), false);
+        p.setup(COUNTER, mode);
+        let blocker = p.block(&server, "blk");
+        server.wait_for("/hang", 1);
+        let caller = p.send_detached("counter/a", msg("call-fail", "counter/w subject increment"));
+        p.erase_while_waiting(&server, 3);
+        let r = p.rt.block_on(caller).unwrap().unwrap().unwrap();
+        assert!(!r.committed(), "{mode:?}: {r:?}");
+        assert!(
+            r.outcome.message.contains(ERASED_ERROR),
+            "{mode:?}: the guest did not see the erased call error: {r:?}"
+        );
+        assert!(
+            p.rt.block_on(blocker)
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .committed()
+        );
+
+        // The compensation ran once, as an ordinary compensation message.
+        p.wait_until("the compensation's turn", |p| {
+            p.turns("a") == 1 && p.turns("w") == 2
+        });
+        let w = p.turn_records("w");
+        assert_eq!(w.len(), 2, "{mode:?}: {w:?}");
+        let compensation = message_input(&w[1]).expect("the second turn is a message");
+        assert_eq!(
+            compensation.source,
+            pb::MessageSource::Compensation as i32,
+            "{mode:?}: {compensation:?}"
+        );
+        assert_eq!(
+            compensation.sender.as_ref().map(|a| a.key.as_str()),
+            Some("a"),
+            "{mode:?}: {compensation:?}"
+        );
+        assert_eq!(
+            compensation.msg.as_ref().map(|m| m.name.as_str()),
+            Some("increment"),
+            "{mode:?}: {compensation:?}"
+        );
+
+        let a = p.turn_records("a");
+        assert_eq!(a.len(), 1, "{mode:?}: {a:?}");
+        let call = erased_call(&a[0]);
+        assert_eq!(
+            call.observed_callee_status,
+            Some(pb::EffectStatus::Ok as i32),
+            "{mode:?}: {call:?}"
+        );
+        assert_eq!(
+            a[0].outcome.as_ref().map(|o| o.kind),
+            Some(pb::OutcomeKind::Failed as i32),
+            "{mode:?}: {a:?}"
+        );
+        let source = call.callee_source.as_ref().unwrap();
+        assert_eq!(source.branch, "main", "{mode:?}");
+        assert!(source.lsn > 0, "{mode:?}");
+
+        // Exactly one orphan, naming the callee's committed turn, the call
+        // and the compensation, and resolved by the compensation's turn.
+        let orphans = p.node.store().db().orphans(true).unwrap();
+        assert_eq!(orphans.len(), 1, "{mode:?}: {orphans:?}");
+        let orphan = &orphans[0];
+        assert_eq!(orphan.callee.to_string(), "counter/w", "{mode:?}");
+        assert_eq!(orphan.caller.to_string(), "counter/a", "{mode:?}");
+        assert_eq!(
+            orphan.compensation_id.as_deref(),
+            Some(compensation.message_id.as_str()),
+            "{mode:?}"
+        );
+        assert_eq!(
+            orphan.callee_turn,
+            format!("{}:{}", source.branch, source.lsn),
+            "{mode:?}"
+        );
+        assert!(orphan.resolved_lsn.is_some(), "{mode:?}: {orphan:?}");
+        assert_eq!(p.open_turns(), 0, "{mode:?}");
+
+        // Nothing is left to run again at the next start.
+        drop(p);
+        let p = start(dir.path(), false);
+        assert_eq!(p.open_turns(), 0, "{mode:?}");
+        assert_eq!(p.turns("a"), 1, "{mode:?}");
+        assert_eq!(p.turns("w"), 2, "{mode:?}");
+    }
+}
+
+fn message_input(turn: &pb::TurnRecord) -> Option<&pb::MessageInput> {
+    match turn.input.as_ref()?.kind.as_ref()? {
+        pb::input::Kind::Message(m) => Some(m),
+        _ => None,
     }
 }
 

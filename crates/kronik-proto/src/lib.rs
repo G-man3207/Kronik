@@ -821,15 +821,38 @@ fn input(value: Option<&pb::Input>, what: &'static str) -> Result<(), DecodeErro
     }
 }
 
+/// The guest-visible call error of a callee that committed but whose answer
+/// belonged to an erased subject (ADR 0123, ADR 0124).
+pub const ERASED_CALL_ERROR: &str =
+    "SUBJECT_ERASED: the call's response belonged to an erased subject";
+
+/// The words of [`ERASED_CALL_ERROR`] without its stable code, as a record
+/// from before the code was prefixed may carry them.
+pub const ERASED_CALL_MESSAGE: &str = "the call's response belonged to an erased subject";
+
+fn erased_call_error(error: &str) -> bool {
+    error == ERASED_CALL_ERROR || error == ERASED_CALL_MESSAGE
+}
+
 impl pb::EffectRecord {
     /// Whether a validated call observed a successful callee, even when the
-    /// host subsequently failed to redact its result. Source alone is not success.
+    /// host subsequently failed to redact its result, or could not hand the
+    /// callee's committed answer over at all (an erasure's tombstone, ADR
+    /// 0123/0124). Source alone is not success.
     pub fn successful_call(&self) -> bool {
         self.kind == "actor.call"
             && (self.status == pb::EffectStatus::Ok as i32
                 || (self.status == pb::EffectStatus::HostRedactionFailure as i32
                     && self.callee_source.is_some()
-                    && self.observed_callee_status == Some(pb::EffectStatus::Ok as i32)))
+                    && self.observed_callee_status == Some(pb::EffectStatus::Ok as i32))
+                // Records from v0.5.0 carry the committed fact only in the
+                // error: the host wrote this exact text for a tombstoned
+                // answer, never for a failed callee turn.
+                || (self.status == pb::EffectStatus::Failed as i32
+                    && self.callee_source.is_some()
+                    && erased_call_error(&self.error)
+                    && (self.observed_callee_status.is_none()
+                        || self.observed_callee_status == Some(pb::EffectStatus::Ok as i32))))
     }
 
     /// Whether a call timed out: its callee's turn was queued and may still
@@ -871,10 +894,19 @@ fn effect(value: Option<&pb::EffectRecord>, what: &'static str) -> Result<(), De
                         | pb::EffectStatus::Rejected
                         | pb::EffectStatus::Failed)
                 ) => {}
+        // A failed call whose answer the erasure tombstoned still observed a
+        // committed callee (ADR 0123, ADR 0124). The error text is the host's,
+        // and the source proves where the commit is.
+        Some(status)
+            if e.kind == "actor.call"
+                && e.status == pb::EffectStatus::Failed as i32
+                && e.callee_source.is_some()
+                && erased_call_error(&e.error)
+                && status == pb::EffectStatus::Ok as i32 => {}
         Some(_) => {
             return Err(invalid(
                 "EffectRecord.observed_callee_status",
-                "requires a withheld committed callee outcome",
+                "requires a withheld or erased committed callee outcome",
             ));
         }
         None if e.status == pb::EffectStatus::HostRedactionFailure as i32
@@ -1337,6 +1369,53 @@ mod successful_call_consumer_tests {
         effect.observed_callee_status = Some(pb::EffectStatus::Ok as i32);
         effect.kind = "http.fetch".into();
         assert!(!effect.successful_call());
+        assert!(roundtrip(&effect).is_err());
+    }
+
+    /// ADR 0124: a call whose callee committed but whose answer an erasure
+    /// tombstoned is a standing call. A v0.5.0 record says so only in the
+    /// error text (no new field); this release also records the observed
+    /// `Ok`, and validation accepts exactly that pair.
+    #[test]
+    fn an_erased_committed_answer_is_a_successful_call() {
+        let source = pb::ActorSource {
+            shard: None,
+            lsn: 11,
+            branch: "main".into(),
+        };
+        let mut effect = pb::EffectRecord {
+            kind: "actor.call".into(),
+            status: pb::EffectStatus::Failed as i32,
+            error: ERASED_CALL_ERROR.into(),
+            callee_source: Some(source.clone()),
+            grounding: pb::Grounding::Live as i32,
+            ..Default::default()
+        };
+        // The v0.5.0 shape: committed, but the fact is only in the error.
+        assert!(effect.successful_call());
+        assert!(roundtrip(&effect).is_ok(), "{:?}", roundtrip(&effect));
+        // The current shape records the observation too.
+        effect.observed_callee_status = Some(pb::EffectStatus::Ok as i32);
+        assert!(effect.successful_call());
+        assert!(roundtrip(&effect).is_ok());
+        // A failed callee, or a failure with another error, is not standing.
+        effect.observed_callee_status = Some(pb::EffectStatus::Failed as i32);
+        assert!(!effect.successful_call());
+        assert!(roundtrip(&effect).is_err());
+        effect.observed_callee_status = Some(pb::EffectStatus::Ok as i32);
+        effect.error = "deliberate failure".into();
+        assert!(!effect.successful_call());
+        assert!(roundtrip(&effect).is_err());
+        effect.error = ERASED_CALL_MESSAGE.into();
+        assert!(effect.successful_call());
+        assert!(roundtrip(&effect).is_ok());
+        // The source is the evidence: no source, no standing call.
+        effect.callee_source = None;
+        assert!(!effect.successful_call());
+        assert!(roundtrip(&effect).is_err());
+        effect.callee_source = Some(source);
+        effect.status = pb::EffectStatus::Ok as i32;
+        assert!(effect.successful_call());
         assert!(roundtrip(&effect).is_err());
     }
 }

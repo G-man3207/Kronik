@@ -3419,7 +3419,7 @@ impl ReplayGate {
                         .is_some_and(|body| body.subject.is_some()) =>
                 {
                     rec.grounding = pb::Grounding::Exact as i32;
-                    CallOutcome::Failed(error)
+                    CallOutcome::Erased(error)
                 }
                 (outcome, _) => outcome,
             };
