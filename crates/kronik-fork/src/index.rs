@@ -270,13 +270,10 @@ impl ProductionIndex {
             let Some(key) = &t.causal_key else { continue };
             turns.insert(causal::encode(key), c.lsn);
             trees.entry(key.root.clone()).or_default().push(c.lsn);
-            if c.lsn <= fork_lsn || !key.path.is_empty() {
+            if c.lsn <= fork_lsn || !causal::is_root_input(t) {
                 continue;
             }
             let input = t.input.clone().unwrap_or_default();
-            if matches!(input.kind, Some(pb::input::Kind::Migrate(_)) | None) {
-                continue;
-            }
             let Some(actor) = t.actor.as_ref().map(ActorRef::from_pb) else {
                 continue;
             };

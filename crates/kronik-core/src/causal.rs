@@ -50,6 +50,22 @@ pub fn compensation(
     child(&child(key, caller, ordinal), callee, COMPENSATION_ORDINAL)
 }
 
+/// Whether `turn` is a root input of a window: a turn whose causal key has
+/// no path (no producing actor and ordinal above it), made by an actor, and
+/// not the migration that runs before an input. A fork's
+/// `unverified_inputs` and its replay window both count exactly these.
+pub fn is_root_input(turn: &pb::TurnRecord) -> bool {
+    turn.actor.is_some()
+        && turn
+            .causal_key
+            .as_ref()
+            .is_some_and(|key| key.path.is_empty())
+        && !matches!(
+            turn.input.as_ref().and_then(|input| input.kind.as_ref()),
+            None | Some(pb::input::Kind::Migrate(_))
+        )
+}
+
 /// Canonical byte encoding: `"kronik.causal.v1\0" + root + for each step:
 /// kind + "\0" + key + "\0" + u32_le(ordinal)`.
 pub fn encode(key: &pb::CausalKey) -> Vec<u8> {
@@ -95,6 +111,40 @@ pub fn idempotency_key(key: &pb::CausalKey, ordinal: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_inputs_are_actor_turns_without_a_path() {
+        let actor = ActorRef::parse("counter/a").unwrap().to_pb();
+        let message = pb::Input {
+            kind: Some(pb::input::Kind::Message(pb::MessageInput::default())),
+        };
+        let turn = |key: pb::CausalKey, input: Option<pb::Input>| pb::TurnRecord {
+            actor: Some(actor.clone()),
+            causal_key: Some(key),
+            input,
+            ..Default::default()
+        };
+        assert!(is_root_input(&turn(
+            root("r".into()),
+            Some(message.clone())
+        )));
+        assert!(!is_root_input(&turn(
+            child(&root("r".into()), &ActorRef::from_pb(&actor), 0),
+            Some(message.clone())
+        )));
+        // The migration's own turn is not a root input of the window.
+        assert!(!is_root_input(&turn(
+            root("r".into()),
+            Some(pb::Input {
+                kind: Some(pb::input::Kind::Migrate(Default::default())),
+            })
+        )));
+        assert!(!is_root_input(&pb::TurnRecord {
+            causal_key: Some(root("r".into())),
+            input: Some(message),
+            ..Default::default()
+        }));
+    }
 
     #[test]
     fn derived_ids_are_stable_and_distinct() {

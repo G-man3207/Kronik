@@ -632,14 +632,13 @@ fn a_promote_or_approval_cut_short_is_recorded_on_the_proposal() {
 
     // The switch is committed, the proposal's metadata is not.
     let kinds = prop.kind_versions().unwrap();
-    let (epoch, lsn) =
+    let (epoch, lsn, _) =
         p.rt.block_on(p.node.switch_code(
             kronik_sched::CodeSwitch {
                 kinds,
                 pinned: vec![],
                 cause: pb::DeploymentCause::Promote,
                 verified_through_lsn: prop.verified_through_lsn,
-                unverified_inputs: 0,
                 proposal_id: prop.id.clone(),
                 rollback_of_epoch: 0,
             },

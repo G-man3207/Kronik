@@ -459,7 +459,11 @@ This section is the contract for `kronik-policy`.
      effective_lsn: 0 (= its own LSN), verified_through_lsn,
      unverified_inputs: root inputs in (verified_through_lsn,
      effective_lsn), cause: PROMOTE, proposal_id, audit}`. Turns that start
-     after it run the new code; running turns finish with the old. Under
+     after it run the new code; running turns finish with the old. The node
+     counts the root inputs itself, with the switch gate held and
+     immediately before it appends the Deployment; it does not use a count
+     taken before the gate, so roots that commit while the switch waits for
+     the gate are in the gap. Under
      the deploy lock, each kind the proposal changes must still run on main
      the code main ran for it when the proposal was made (`created_lsn`,
      fixed: not the fork point, which a window often places before a

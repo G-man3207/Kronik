@@ -6,6 +6,13 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- A promote's `Deployment.unverified_inputs` counts the root inputs the
+  switch actually made unverified: the node now takes the count under the
+  switch gate, over main's log through the switch, instead of using the
+  proposal's earlier read. Root inputs that committed while promote waited
+  to switch (and ran the old code) are no longer missing from the gap.
+  `kronik promote --dry-run` reports the same projection and still stores
+  nothing.
 - A fork's live allowlist admits an unrecorded GET only when the matching
   grant's effective delivery class is `replay-safe`: `unsafe` and
   `idempotency-keyed` targets stay in the fork (denied, `replay: no

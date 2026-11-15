@@ -65,13 +65,12 @@ async fn version(node: &Node, name: &str) -> pb::KindVersion {
     }
 }
 
-fn promote(v: pb::KindVersion) -> CodeSwitch {
+fn promote(node: &Node, v: pb::KindVersion) -> CodeSwitch {
     CodeSwitch {
         kinds: vec![v],
         pinned: vec![],
         cause: pb::DeploymentCause::Promote,
-        verified_through_lsn: 0,
-        unverified_inputs: 0,
+        verified_through_lsn: node.applied_lsn(),
         proposal_id: "p-test".into(),
         rollback_of_epoch: 0,
     }
@@ -81,7 +80,7 @@ fn promote(v: pb::KindVersion) -> CodeSwitch {
 async fn promote_now(node: &Node, hold: &SwitchHold, name: &str) -> u64 {
     let v = version(node, name).await;
     hold.release.add_permits(1);
-    node.switch_code(promote(v), audit(), false, owner(node))
+    node.switch_code(promote(node, v), audit(), false, owner(node))
         .await
         .unwrap()
         .0
@@ -139,7 +138,7 @@ async fn a_cancelled_set_switch_still_installs_its_code() {
         let node = node.clone();
         let v = v.clone();
         tokio::spawn(async move {
-            node.switch_code(promote(v), audit(), false, owner(&node))
+            node.switch_code(promote(&node, v), audit(), false, owner(&node))
                 .await
         })
     };

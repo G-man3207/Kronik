@@ -485,7 +485,6 @@ fn upgrade_replays_recorded_code_across_a_same_kind_deployment() {
                 pinned: vec![node.deployed("counter").unwrap()],
                 cause: pb::DeploymentCause::Promote,
                 verified_through_lsn: node.applied_lsn(),
-                unverified_inputs: 0,
                 proposal_id: "checked-code-transition".into(),
                 rollback_of_epoch: 0,
             },

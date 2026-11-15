@@ -618,7 +618,6 @@ async fn admitted_code_switch_retains_live_config_after_request_revoke() {
         pinned: vec![version],
         cause: pb::DeploymentCause::Rollback,
         verified_through_lsn: 0,
-        unverified_inputs: 0,
         proposal_id: String::new(),
         rollback_of_epoch: node.epoch(),
     };
@@ -638,10 +637,79 @@ async fn admitted_code_switch_retains_live_config_after_request_revoke() {
     .unwrap();
     authority.revoke();
     hold.release.add_permits(1);
-    let (epoch, lsn) = request.await.unwrap().unwrap();
+    let (epoch, lsn, _) = request.await.unwrap().unwrap();
     assert_eq!(node.epoch(), epoch);
     assert_eq!(node.config_now().epoch, epoch);
     assert!(node.applied_lsn() >= lsn);
+}
+
+/// Issue #85: a promote's `unverified_inputs` is the root inputs of
+/// `(verified_through_lsn, lsn]`, so it must be counted after the switch
+/// waited for the deploy lock, not before. Two sends commit while the
+/// switch waits here; both ran the old code and both are in its gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_promote_counts_the_root_inputs_that_committed_while_it_waited() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, hold) = node(dir.path()).await;
+    let verified = node.applied_lsn();
+    let version = node.deployed("counter").unwrap();
+    let held = node.deploy_lock.clone().lock_owned().await;
+    let promote = {
+        let node = node.clone();
+        tokio::spawn(async move {
+            node.switch_code(
+                crate::CodeSwitch {
+                    kinds: vec![version],
+                    pinned: Vec::new(),
+                    cause: pb::DeploymentCause::Promote,
+                    verified_through_lsn: verified,
+                    proposal_id: "p-issue-85".into(),
+                    rollback_of_epoch: 0,
+                },
+                audit(),
+                false,
+                common::lease(),
+            )
+            .await
+        })
+    };
+    for key in ["a", "b"] {
+        node.send(
+            ActorRef::parse(&format!("counter/{key}")).unwrap(),
+            pb::Message {
+                name: "increment".into(),
+                ..Default::default()
+            },
+            audit(),
+            false,
+            common::lease(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    drop(held);
+    hold.release.add_permits(1);
+    let (epoch, lsn, unverified) = promote.await.unwrap().unwrap();
+    assert_eq!(node.epoch(), epoch);
+    let (deployed, deployment) = node.store().db().deployments().unwrap().pop().unwrap();
+    assert_eq!(deployed, lsn);
+    assert_eq!(deployment.unverified_inputs, unverified);
+    assert_eq!(unverified, 2, "the sends committed while the switch waited");
+    // The number is the log's: every root input in the gap, no other turn.
+    let mut roots = 0u64;
+    node.reader()
+        .read(verified + 1, lsn, |c| {
+            if let kronik_proto::Record::TurnRecord(t) = &c.record
+                && kronik_core::causal::is_root_input(t)
+            {
+                roots += 1;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(roots, unverified);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -654,12 +722,11 @@ async fn fixed_watch_switch_rejects_arbitrary_ordinary_metadata() {
         pinned: vec![version],
         cause: pb::DeploymentCause::Rollback,
         verified_through_lsn: 0,
-        unverified_inputs: 0,
         proposal_id: String::new(),
         rollback_of_epoch: node.epoch(),
     };
     let before = node.applied_lsn();
-    for case in 0..8 {
+    for case in 0..7 {
         let mut switch = valid.clone();
         match case {
             0 => switch.cause = pb::DeploymentCause::Deploy,
@@ -668,8 +735,7 @@ async fn fixed_watch_switch_rejects_arbitrary_ordinary_metadata() {
             3 => switch.pinned.push(switch.pinned[0].clone()),
             4 => switch.pinned[0].kind = "other".into(),
             5 => switch.proposal_id = "operator".into(),
-            6 => switch.verified_through_lsn = 1,
-            _ => switch.unverified_inputs = 1,
+            _ => switch.verified_through_lsn = 1,
         }
         let mut metadata = audit();
         metadata.reason = "watch fixed: guard `error-rate` fired".into();
