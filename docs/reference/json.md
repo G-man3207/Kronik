@@ -7632,6 +7632,15 @@ against both.
         "null"
       ]
     },
+    "log_last_lsn": {
+      "description": "The last LSN in the restored log. A snapshot newer than this was not\ninstalled, since its records are not in the bucket yet.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
     "segments": {
       "format": "uint64",
       "minimum": 0,
@@ -7655,6 +7664,15 @@ against both.
         "null"
       ]
     },
+    "snapshots_skipped": {
+      "description": "Snapshots newer than `log_last_lsn` that were skipped, in LSN order.\nEmpty when the newest snapshot was restored.",
+      "items": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "type": "array"
+    },
     "state_hash": {
       "type": [
         "string",
@@ -7667,6 +7685,7 @@ against both.
     "from",
     "data_dir",
     "branch",
+    "snapshots_skipped",
     "keys_missing"
   ],
   "type": "object"

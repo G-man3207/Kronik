@@ -934,6 +934,10 @@ fn restore_from_a_file_bucket_lands_in_the_named_directory() {
     assert_eq!(v["state_hash"], hash, "{v}");
     assert_eq!(v["data_dir"], dest.path().display().to_string());
     assert!(
+        v["log_last_lsn"].as_u64().unwrap() >= lsn,
+        "restore did not report the restored log's last LSN: {v}"
+    );
+    assert!(
         dest.path().join("branches/main/state.db").is_file(),
         "restore wrote state outside the named directory"
     );

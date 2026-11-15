@@ -262,17 +262,26 @@ before anything moves into place.
 DIR]` (offline: the daemon must not run on `DIR`; an existing `state.db`
 is refused unless `--force`):
 
-1. List `<prefix>/main/snapshots/`, take the newest manifest; download and
-   decompress its files into `DIR/snapshots/main/<L>/` and check sizes and
-   BLAKE3 against the manifest.
+1. List `<prefix>/main/snapshots/`, take the newest manifest the branch's
+   log reaches (step 2, [ADR 0146](../adr/0146-restore-installs-the-newest-snapshot-its-log-reaches.md));
+   download and decompress its files into
+   `DIR/snapshots/main/<L>/` and check sizes and BLAKE3 against the
+   manifest. A bucket can hold a snapshot newer than its newest segment
+   (the shipper reads the segments, then applies and uploads a snapshot
+   taken after that read, and loses the source in between); such a
+   manifest is skipped, named in the restore report's
+   `snapshots_skipped`, and not downloaded. When no manifest is reached,
+   restore fails, naming the log's last LSN and the oldest snapshot.
 2. Download every remote segment of the branch (the remote keeps the
    retention window, so history within it comes back) into
    `DIR/branches/main/log/`; segments must be contiguous and reach past `L`.
 3. Download every component the snapshot's deployments and the segments'
    deployments name into `DIR/code/`.
 4. Install the snapshot (§3: `state.db`, `sql/`, `keys/secrets.db`).
-5. Print the snapshot LSN, the last LSN in the restored log and the state
-   hash at `L`; `kronik serve` then applies the log from `L + 1`.
+5. Print the snapshot LSN, the first and last LSN in the restored log, the
+   skipped snapshots (if any) and the state hash at `L`; `kronik serve`
+   then applies the log from `L + 1`. The last LSN and the skipped
+   snapshots are `log_last_lsn` and `snapshots_skipped` in the JSON.
 
 `kronik restore` needs the master key file in place (or `--master-key-file`)
 only for the secrets to be usable; restore itself does not decrypt.

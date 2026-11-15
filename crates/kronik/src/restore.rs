@@ -88,6 +88,13 @@ struct RestoreOutput {
     segments: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     log_first_lsn: Option<u64>,
+    /// The last LSN in the restored log. A snapshot newer than this was not
+    /// installed, since its records are not in the bucket yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_last_lsn: Option<u64>,
+    /// Snapshots newer than `log_last_lsn` that were skipped, in LSN order.
+    /// Empty when the newest snapshot was restored.
+    snapshots_skipped: Vec<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     components: Option<u64>,
     /// The privacy keystore backup: `installed`, `none_in_bucket`, or
@@ -250,6 +257,11 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
         state_hash: report.as_ref().map(|r| r.state_hash.clone()),
         segments: report.as_ref().map(|r| r.segments as u64),
         log_first_lsn: report.as_ref().map(|r| r.log_first_lsn),
+        log_last_lsn: report.as_ref().map(|r| r.log_last_lsn),
+        snapshots_skipped: report
+            .as_ref()
+            .map(|r| r.snapshots_skipped.clone())
+            .unwrap_or_default(),
         components: report.as_ref().map(|r| r.components as u64),
         keystore: report.as_ref().map(|r| r.keystore.to_owned()),
         keys_missing: report
@@ -588,6 +600,27 @@ fn render(
         &[o.log_first_lsn.unwrap_or(0).to_string()],
         "",
     );
+    field(
+        &mut out,
+        "Log last LSN",
+        &[o.log_last_lsn.unwrap_or(0).to_string()],
+        "",
+    );
+    if !o.snapshots_skipped.is_empty() {
+        field(
+            &mut out,
+            "Skipped",
+            &[format!(
+                "snapshots {} (newer than the log; their records are not in the bucket)",
+                o.snapshots_skipped
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )],
+            "",
+        );
+    }
     field(
         &mut out,
         "Components",
