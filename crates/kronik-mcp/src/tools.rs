@@ -164,12 +164,14 @@ const TOOLS: &[Spec] = &[
         name: "inspect_blob",
         title: "Inspect a blob",
         scope: "read",
-        description: "A blob of the blob store by its hash (`b3:` or `b3s:`, as a history \
-            shows it): its state (live, erased, missing, or loose: in the store and never \
-            referenced), size, the first and last LSN that referenced it, whether its file is \
-            sealed, and what keeps it (`roots`). Its subject is null without pii:read. With \
-            `verify`, the whole file is read and checked. Never its bytes: `kronik blobs get` \
-            downloads them.",
+        description: "A blob of the blob store by its hash (`b3:` or `b3s:`, as the API's \
+            turn JSON and `kronik blobs list --actor` show it; history does not show blobs): \
+            its state (live, erased, missing, or loose: in the store and never referenced), \
+            size, the first and last LSN that referenced it, whether its file is sealed, and \
+            what keeps it (`roots`: a `log` record within retention, `held` by an actor, a \
+            `pin` of a row that carries it, a `snapshot`, a `fork` or a `lease` of the \
+            daemon). Its subject is null without pii:read. With `verify`, the whole file is \
+            read and checked. Never its bytes: `kronik blobs get` downloads them.",
         mutates: false,
         dry_run: false,
         destructive: false,
@@ -191,7 +193,7 @@ const TOOLS: &[Spec] = &[
                 "first_ref_lsn": {"type": ["integer", "null"]},
                 "last_ref_lsn": {"type": ["integer", "null"]},
                 "sealed": {"type": ["boolean", "null"]},
-                "roots": {"type": "array", "items": {"type": "object", "description": "What keeps the blob: {kind (log, pin, snapshot, fork or lease), lsn, floor, source (a pin's row: message, timer, dead-letter, saved-response, saved-call, open-turn or open-effect), owner, fork}; empty for a blob the collector deletes"}},
+                "roots": {"type": "array", "items": {"type": "object", "description": "What keeps the blob: {kind (log, held, pin, snapshot, fork or lease), actor (held: the holder, kind/key), lsn, floor, source (a pin's row: message, timer, dead-letter, saved-response, saved-call, open-turn or open-effect), owner, fork}; empty for a blob the collector deletes"}},
                 "verified": {"type": ["boolean", "null"], "description": "With verify: whether the whole file checked out."},
                 "verify_error": {"type": ["string", "null"]}
             }))
