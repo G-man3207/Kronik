@@ -106,6 +106,8 @@
 - [ADR 0082: What telemetry and audit export may carry off the node](adr/0082-what-leaves-the-node.md)
 - [ADR 0083: The audit export: the log is the audit trail](adr/0083-audit-export.md)
 - [ADR 0084: Export cursors, and the audit export holds retention](adr/0084-export-cursors-and-retention.md)
+- [ADR 0090: Secret backends and versions in the log](adr/0090-secret-backends-and-versions-in-the-log.md)
+- [ADR 0091: Secret cache, outages and complete retained-value coverage](adr/0091-secret-cache-outages-and-timeouts.md)
 - [ADR 0092: The master seed wrapped by a KMS](adr/0092-master-key-wrapped-by-a-kms.md)
 - [ADR 0093: PKCS#11 through an optional helper process](adr/0093-pkcs11-through-a-helper-process.md)
 - [ADR 0094: Key providers without SDKs](adr/0094-secret-providers-without-sdks.md)
