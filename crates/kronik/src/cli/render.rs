@@ -205,10 +205,27 @@ fn verb(kind: &str) -> &str {
 /// `CODE: message` of a failed outcome.
 fn failure(o: &Outcome) -> String {
     match (&o.error_code, &o.message) {
-        (Some(code), Some(m)) => format!("{code}: {m}"),
+        (Some(code), Some(m)) => coded(code, m),
         (Some(code), None) => code.clone(),
         (None, Some(m)) => m.clone(),
         (None, None) => verb(&o.kind).to_owned(),
+    }
+}
+
+/// `CODE: message`, with the code once: the message of an error the host
+/// raised already starts with its code (`BLOB_NOT_HELD: the turn neither
+/// holds nor received the blob …`), and the log keeps it so.
+fn coded(code: &str, message: &str) -> String {
+    if message.is_empty() || message == code {
+        code.to_owned()
+    } else if code.is_empty()
+        || message
+            .strip_prefix(code)
+            .is_some_and(|rest| rest.starts_with(": "))
+    {
+        message.to_owned()
+    } else {
+        format!("{code}: {message}")
     }
 }
 
@@ -643,7 +660,7 @@ pub fn dead_letters(r: &DeadLettersResponse, full: Option<Option<u32>>) -> Strin
                 d.id.clone(),
                 d.actor.clone(),
                 clip(&format!("{} {}", d.input.kind, d.input.summary), 40),
-                clip(&format!("{}: {}", d.error_code, d.message), 60),
+                clip(&coded(&d.error_code, &d.message), 60),
                 d.resent_as.clone().unwrap_or_else(|| "-".to_owned()),
             ]
         })
@@ -2200,6 +2217,177 @@ mod tests {
             connection_ops: Vec::new(),
         };
         assert_eq!(changes(&t), "set s [erased], set t");
+    }
+
+    /// A host error's message starts with its code, as the log keeps it:
+    /// history, a send and the dead letters show the code once, and every
+    /// other outcome as before.
+    #[test]
+    fn an_outcome_shows_its_code_once() {
+        let o = |kind: &str, code: Option<&str>, message: Option<&str>| Outcome {
+            kind: kind.into(),
+            error_code: code.map(str::to_owned),
+            message: message.map(str::to_owned),
+        };
+        let not_held = "BLOB_NOT_HELD: the turn neither holds nor received the blob \
+                        b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9 (10 bytes)";
+        for (given, want) in [
+            (
+                o("trap", Some("BLOB_NOT_HELD"), Some(not_held)),
+                format!("trapped ({not_held})"),
+            ),
+            (
+                o(
+                    "trap",
+                    Some("NOT_IMPLEMENTED"),
+                    Some("NOT_IMPLEMENTED: blob bodies are not available in this turn"),
+                ),
+                "trapped (NOT_IMPLEMENTED: blob bodies are not available in this turn)".into(),
+            ),
+            (
+                o(
+                    "trap",
+                    Some("TURN_FAILED"),
+                    Some("wasm trap: wasm `unreachable` instruction executed"),
+                ),
+                "trapped (TURN_FAILED: wasm trap: wasm `unreachable` instruction executed)".into(),
+            ),
+            (
+                o("trap", Some("HOST_REDACTION_FAILURE"), None),
+                "trapped (HOST_REDACTION_FAILURE)".into(),
+            ),
+            (
+                o("failed", Some("TURN_FAILED"), Some("deliberate failure")),
+                "failed (TURN_FAILED: deliberate failure)".into(),
+            ),
+            (
+                o("rejected", Some("TURN_FAILED"), Some("unknown op x")),
+                "was rejected (TURN_FAILED: unknown op x)".into(),
+            ),
+            (
+                o(
+                    "fuel_exhausted",
+                    Some("FUEL_EXHAUSTED"),
+                    Some("the turn ran out of fuel"),
+                ),
+                "ran out of fuel (FUEL_EXHAUSTED: the turn ran out of fuel)".into(),
+            ),
+            (
+                o(
+                    "memory_limit",
+                    Some("TURN_FAILED"),
+                    Some("memory limit reached, then: BLOB_NOT_HELD: no"),
+                ),
+                "hit the memory limit (TURN_FAILED: memory limit reached, then: BLOB_NOT_HELD: no)"
+                    .into(),
+            ),
+            // Another code before the message's: both stay.
+            (
+                o(
+                    "effect_outcome_unknown",
+                    Some("EFFECT_OUTCOME_UNKNOWN"),
+                    Some(not_held),
+                ),
+                format!("has an uncertain effect outcome (EFFECT_OUTCOME_UNKNOWN: {not_held})"),
+            ),
+            // A code that only begins the message's first word is another one.
+            (
+                o("trap", Some("BLOB"), Some("BLOB_NOT_HELD: no")),
+                "trapped (BLOB: BLOB_NOT_HELD: no)".into(),
+            ),
+            (
+                o("trap", Some("TURN_FAILED"), Some("TURN_FAILED")),
+                "trapped (TURN_FAILED)".into(),
+            ),
+            (o("trap", None, Some("no code")), "trapped (no code)".into()),
+            (o("committed", None, None), "committed".into()),
+        ] {
+            assert_eq!(outcome(&given), want);
+        }
+
+        // In history's OUTCOME column, clipped to 60 characters.
+        let trapped = TurnSummary {
+            turn_id: "main:12".into(),
+            lsn: 12,
+            logical_time_ms: 0,
+            code_hash: "b3:0123456789ab".into(),
+            input: kronik_api::types::InputSummary {
+                kind: "http".into(),
+                summary: "POST /media/a/forged-echo".into(),
+            },
+            outcome: o("trap", Some("BLOB_NOT_HELD"), Some(not_held)),
+            writes: Vec::new(),
+            messages: Vec::new(),
+            sql_changes: 0,
+            fuel_used: 1,
+            effects: Vec::new(),
+            connection_ops: Vec::new(),
+        };
+        let shown = history(
+            "media/a",
+            &HistoryResponse {
+                turns: vec![trapped],
+                next: None,
+            },
+            None,
+        );
+        assert!(
+            words(&shown).contains(
+                &"main:12 http POST /media/a/forged-echo trapped (BLOB_NOT_HELD: the turn \
+                  neither holds nor received… - b3:0123456789ab"
+                    .to_owned()
+            ),
+            "{shown}"
+        );
+
+        // The error of a send, and a dead letter's.
+        let shown = turn(
+            &TurnResponse {
+                dry_run: false,
+                turn_id: Some("main:12".into()),
+                outcome: Some(o("trap", Some("BLOB_NOT_HELD"), Some(not_held))),
+                reply: None,
+            },
+            &TurnContext::Send {
+                actor: "media/a".into(),
+                rerun: String::new(),
+            },
+        );
+        assert!(
+            shown.contains(&format!("  Error         {not_held}\n")),
+            "{shown}"
+        );
+        assert!(shown.contains("kronik explain BLOB_NOT_HELD\n"), "{shown}");
+        let dead = |code: &str, message: &str| kronik_api::types::DeadLetter {
+            id: "main:12".into(),
+            actor: "media/a".into(),
+            input: kronik_api::types::InputSummary {
+                kind: "message".into(),
+                summary: "forged-echo from operator".into(),
+            },
+            error_code: code.into(),
+            message: message.into(),
+            resent_as: None,
+        };
+        let shown = dead_letters(
+            &DeadLettersResponse {
+                dead_letters: vec![
+                    dead("BLOB_NOT_HELD", not_held),
+                    dead("TURN_FAILED", "deliberate failure"),
+                    dead("HOST_REDACTION_FAILURE", ""),
+                ],
+            },
+            None,
+        );
+        let lines = words(&shown);
+        for want in [
+            "main:12 media/a message forged-echo from operator BLOB_NOT_HELD: the turn neither \
+             holds nor received the blob… -",
+            "main:12 media/a message forged-echo from operator TURN_FAILED: deliberate failure -",
+            "main:12 media/a message forged-echo from operator HOST_REDACTION_FAILURE -",
+        ] {
+            assert!(lines.iter().any(|l| l == want), "{want}: {shown}");
+        }
     }
 
     #[test]
