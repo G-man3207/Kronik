@@ -6,6 +6,9 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- Changing a grant's rate takes effect on the next call: the target's limiter
+  starts its window over at the new rate instead of spending the superseded
+  grant's pace. Raising `1/h` to `60/s` no longer waits out the hour.
 - A zero-length `blobs.get` is an empty read, not `invalid`; like every other
   length it checks the reference first, so one the turn does not hold is
   `not-held`.
