@@ -421,6 +421,7 @@ impl Proposals {
             diff_hash: String::new(),
             policy: Value::Null,
             summary: Value::Null,
+            sampled: None,
             options,
             kinds: kinds.iter().map(encode_kind).collect(),
             reason: audit.reason.clone(),
@@ -540,6 +541,7 @@ impl Proposals {
         meta.verified_through_lsn = d.summary.verified_through_lsn;
         meta.diff_hash = hash;
         meta.summary = serde_json::to_value(&d.summary).map_err(internal)?;
+        meta.sampled = Some(live.sampled());
         self.save(meta, Some(&bytes))?;
         live.diffed_to = live.logged_to;
         Ok(())

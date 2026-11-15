@@ -583,7 +583,10 @@ differs from it:
   tree and the continuous fork) is in memory only, so the first promote
   after a restart replays `(fork_lsn, verified_through_lsn]` again before
   catching up. Replay is deterministic, so this gives the same trees and
-  diff as before the restart; it costs one replay of the window.
+  diff as before the restart; it costs one replay of the window. Each
+  catch-up round re-samples the whole window, `(fork_lsn, head]`, and
+  reconciles the isolated trees with that sample: the trees are the one
+  take §6 defines, not the union of each round's fresh roots.
 - **Lists in the diff are capped** at 200 items (responses, effects, state
   entries, cumulative), 20 per sample category and error kind, 5 samples
   per cause; the counts always cover everything. Body diff operations come
@@ -598,8 +601,11 @@ differs from it:
   whose final state differs.
 - **Approvals across catch-up**: an approval holds for the diff it was
   given for, and also for a later diff (after catch-up) whose outcome is
-  not stricter and whose changed targets (approximate or synthetic
-  grounding rows, changed effects) were all changed when approved.
+  not stricter, whose changed targets (approximate or synthetic grounding
+  rows, changed effects) were all changed when approved, and which replays
+  every root input the approved diff sampled in isolation. A later diff
+  that drops one of those roots needs a new approval, even if its changed
+  targets are a subset: the approval does not cover evidence it never saw.
 - **Both modes**: continuous replay runs on its own task next to the
   isolated workers (one fewer isolated worker).
 - **Stub rules** come with a replay or proposal (`stubs` in the request:

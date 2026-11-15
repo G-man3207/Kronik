@@ -215,6 +215,7 @@ impl Proposals {
                 diff_hash: hash,
                 policy,
                 summary: serde_json::to_value(&d.summary).map_err(internal)?,
+                sampled: Some(live.sampled()),
                 options,
                 kinds: kinds
                     .iter()
@@ -514,10 +515,12 @@ impl Proposals {
         let (d, bytes, hash) = self.build(id, live, &options)?;
         let policy = self.evaluate(&bytes)?;
         let outcome = policy["outcome"].as_str().unwrap_or("deny").to_owned();
+        let sampled = live.sampled();
         meta.verified_through_lsn = live.index.to_lsn;
         meta.diff_hash = hash.clone();
         meta.policy = policy.clone();
         meta.summary = serde_json::to_value(&d.summary).map_err(internal)?;
+        meta.sampled = Some(sampled.clone());
         let irreversible = d.irreversible.as_ref().map_or(0, |i| i.count);
         if outcome == "deny" {
             if !dry_run {
@@ -531,11 +534,10 @@ impl Proposals {
             ));
         }
         // 2. The switch always needs an approval for this diff.
-        let approved = meta.approved.as_ref().is_some_and(|a| {
-            a.diff_hash == hash
-                || (outcome_rank(&outcome) <= outcome_rank(&a.outcome)
-                    && changed_targets(&d).iter().all(|t| a.targets.contains(t)))
-        });
+        let approved = meta
+            .approved
+            .as_ref()
+            .is_some_and(|a| approval_holds(a, &outcome, &hash, &sampled, &changed_targets(&d)));
         if !approved {
             if !dry_run {
                 self.save(meta, Some(&bytes))?;
@@ -688,6 +690,7 @@ impl Proposals {
         meta.verified_through_lsn = verified;
         meta.diff_hash = hash;
         meta.summary = serde_json::to_value(&d.summary).map_err(internal)?;
+        meta.sampled = Some(live.sampled());
         meta.status = "promoted".into();
         meta.promoted = Some(Promoted { epoch, lsn });
         meta.rebase = Some(RebaseInfo {

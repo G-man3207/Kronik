@@ -263,6 +263,87 @@ fn approximate_effects_need_an_approval_for_promote() {
     assert_eq!(hits.load(Ordering::SeqCst), 3);
 }
 
+/// Issue #81: sampling is a property of the whole window (M3 §6), so a
+/// promote that catches up and a promote after a restart must take the same
+/// trees. Catch-up used to sample each round's fresh roots separately, and
+/// the restart then re-sampled the window once, dropping the round's trees.
+#[test]
+fn a_promote_after_a_restart_replays_the_same_sample() {
+    let (addr, _) = server();
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    p.grant("http:127.0.0.1");
+    let fetch = |i: usize| {
+        p.http(
+            "pay",
+            "fetch-ok",
+            &format!("POST http://{addr}/v1/charges/{i}\n\namount=10"),
+        );
+    };
+    for i in 0..3 {
+        fetch(i);
+    }
+    let sampled = DiffOptions {
+        sample: 0.1,
+        ..DiffOptions::default()
+    };
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    let prop = propose(&p, &props, "counter-body-v2", sampled);
+    assert_eq!(
+        prop.policy["outcome"], "require_approval",
+        "{}",
+        prop.policy
+    );
+    assert_eq!(
+        prop.summary["replayed"].as_u64(),
+        Some(1),
+        "{}",
+        prop.summary
+    );
+    assert_eq!(prop.sampled.as_ref().map(|s| s.len()), Some(1), "{prop:?}");
+
+    // Traffic after the proposal: catch-up must land on the one tree the
+    // whole (fork_lsn, head] window samples, not add a second round's tree.
+    for i in 3..6 {
+        fetch(i);
+    }
+    let err =
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
+            .unwrap_err();
+    assert_eq!(err.code, ErrorCode::ApprovalRequired, "{}", err.message);
+    let before = props_get(&p, &props, &prop.id);
+    assert_eq!(
+        before.summary["replayed"].as_u64(),
+        Some(1),
+        "{}",
+        before.summary
+    );
+    let before_diff = p.rt.block_on(props.diff(&prop.id, false, false)).unwrap();
+
+    // The daemon restarts; its catch-up state is gone and no root input
+    // arrived since. Replaying the window must give the same diff.
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    let err =
+        p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
+            .unwrap_err();
+    assert_eq!(err.code, ErrorCode::ApprovalRequired, "{}", err.message);
+    let after = props_get(&p, &props, &prop.id);
+    assert_eq!(after.verified_through_lsn, before.verified_through_lsn);
+    assert_eq!(after.summary["replayed"], before.summary["replayed"]);
+    assert_eq!(after.sampled, before.sampled);
+    assert_eq!(after.diff_hash, before.diff_hash);
+    assert_eq!(
+        p.rt.block_on(props.diff(&prop.id, false, false)).unwrap(),
+        before_diff
+    );
+    // The approval remembers the roots its diff replayed, so a later diff
+    // can only use it if it covers them too.
+    let (approved, _) =
+        p.rt.block_on(props.approve(&prop.id, audit(), false, None, p.owner()))
+            .unwrap();
+    assert_eq!(approved.sampled, after.sampled);
+}
+
 #[test]
 fn payments_full_coverage_stops_promote_under_a_sample() {
     let dir = tempdir();

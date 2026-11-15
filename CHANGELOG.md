@@ -6,6 +6,11 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- A sampled proposal's promote re-samples the whole window on every catch-up
+  round instead of appending a fresh sample of that round's roots. A promote
+  after a restart therefore returns the same isolated trees, summary and
+  diff hash as the promote before it, and an existing approval is reused only
+  if the later diff replays every root the approved diff sampled.
 - A call whose callee committed but whose answer an erasure tombstoned is a
   standing call: if the caller then fails, the change is listed as an orphan
   and the call's compensation is delivered exactly once, instead of being

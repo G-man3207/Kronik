@@ -3,7 +3,7 @@ The policy outcome for the proposal is `require_approval`, and no approval cover
 Typical causes:
 
 - A rule such as `payments-must-be-exact` matched, for example because payment effects changed.
-- The proposal was approved, but catch-up at promote made the outcome stricter or changed new targets. An approval applies only to the diff it was given for, so a new approval is required.
+- The proposal was approved, but catch-up at promote made the outcome stricter, changed new targets, or stopped replaying a root input the approved diff sampled. An approval applies only to the diff it was given for, so a new approval is required.
 
 To fix it, a human reads the diff and approves the proposal (from M5 this needs the `approve` scope), and then it is promoted:
 
