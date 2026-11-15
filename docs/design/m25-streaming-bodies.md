@@ -826,6 +826,12 @@ uploads, and `SUBJECT_ERASED` (410) erased blobs. A concept page
 | `POST /v1/limits` / `kronik limits set` | `operate` | The three new fields and flags |
 | MCP `inspect_blob` | `read` | As `GET /v1/blobs/{hash}` |
 
+As built for v0.5.0 (2026-11-14): `GET /v1/turns/{id}` renders a blob body
+as above, and a message's blobs as `blobs`. `kronik history` and `kronik
+trace` do not show a turn's blobs yet: their summaries are unchanged, and
+`kronik blobs list --actor`, `kronik blobs inspect` and the turn JSON are
+where a hash shows.
+
 Every command has `--json`; the CLI, JSON and OpenAPI references and their
 examples are regenerated in the slice that adds the route (the
 documentation-surface gate checks it).

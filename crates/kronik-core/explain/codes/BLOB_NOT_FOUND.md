@@ -9,6 +9,7 @@ references; a loose file has no metadata to serve it with.
 
 Nothing changed. Check the hash: `kronik blobs list --actor <kind/key>`
 lists the blobs an actor holds, and `kronik blobs inspect` one blob's
-state. History does not show a turn's blobs.
+state. History does not show a turn's blobs; the API's turn JSON
+(`GET /v1/turns/{id}`) shows a blob body's reference.
 
 See also: `blob`, `collector`.

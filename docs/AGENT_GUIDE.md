@@ -76,8 +76,9 @@ personal data unless your token has `pii:read`.
   were written.
 - A body larger than its kind's blob threshold (an upload, a large `fetch`
   response, a blob an actor wrote) is a blob, outside the log. History does
-  not show a turn's blobs; "Large bodies and blobs" below says where their
-  hashes show and what you must know about them.
+  not show a turn's blobs (the API's turn JSON does); "Large bodies and
+  blobs" below says where their hashes show and what you must know about
+  them.
 
 ### 3. Make the change
 
@@ -264,7 +265,9 @@ no blobs. When you write or review such code:
 
 History shows a turn's input, writes and effects, not its blobs. A hash
 shows in an app's own answers and state (`inspect_actor`, which also counts
-the blobs an actor holds), in a diff's bodies, and in `blob_gc_plan`.
+the blobs an actor holds), in a diff's bodies, in `blob_gc_plan`, and in the
+API's turn JSON (`GET /v1/turns/{id}`: a blob body as its reference, its
+subject only with `pii:read`).
 `inspect_blob` with a hash gives the blob's state, size and what keeps it:
 `held` by an actor, a `pin` (a queued message, a timer, a dead letter, a
 saved response, a running turn), a `log` record within retention, a
