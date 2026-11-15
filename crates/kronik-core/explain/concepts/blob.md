@@ -19,4 +19,4 @@ A component gets blob bodies only if it imports `kronik:actor/blobs`; it
 reads them in ranges with `blobs.get` and writes them with a `writer`.
 Replay reads the same blobs lazily, only the bytes the guest reads.
 
-See also: `BLOB_NOT_HELD`, `message`, `subject`, `sealed-value`.
+See also: `blob-threshold`, `hold`, `collector`, `BLOB_NOT_HELD`, `message`, `subject`, `sealed-value`.

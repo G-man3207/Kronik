@@ -21,6 +21,9 @@ parts that come later with their own milestone, for example "(M3)". The
 | [`kind`](#kind) | An actor type: the code for one sort of actor | M1 |
 | [`message`](#message) | Data sent to an actor: name, content type and body | M1 |
 | [`blob`](#blob) | A large body or object stored outside the log, named by its hash | M25 |
+| [`blob-threshold`](#blob-threshold) | The size above which a body becomes a blob | M25 |
+| [`hold`](#hold) | An actor's own reference to a blob, which keeps it for later turns | M26 |
+| [`collector`](#collector) | The daemon's sweep that deletes the blob files nothing keeps any more | M26 |
 | [`effect`](#effect) | A call from guest code to the outside world, via the host | M2 |
 | [`hash`](#hash) | The BLAKE3 hash of a component: the identity of its code | M1 |
 | [`fork`](#fork) | A branch of the system's history from an LSN | M3 |
@@ -121,7 +124,86 @@ A component gets blob bodies only if it imports `kronik:actor/blobs`; it
 reads them in ranges with `blobs.get` and writes them with a `writer`.
 Replay reads the same blobs lazily, only the bytes the guest reads.
 
-See also: [`BLOB_NOT_HELD`](../errors.md#blob_not_held), [`message`](#message), [`subject`](#subject), [`sealed-value`](#sealed-value).
+See also: [`blob-threshold`](#blob-threshold), [`hold`](#hold), [`collector`](#collector), [`BLOB_NOT_HELD`](../errors.md#blob_not_held), [`message`](#message), [`subject`](#subject), [`sealed-value`](#sealed-value).
+
+## blob-threshold
+
+The size above which a body becomes a blob. Milestone M25.
+
+The blob threshold is the size above which a body is stored as a blob
+instead of in the log (M25). It is a limit of each actor type, 1 MiB by
+default, and never above the type's message size. It applies to a kind whose
+code imports `kronik:actor/blobs` (the SDKs' blob API): an HTTP request
+body or a `fetch` response (standard `fetch` too) above it reaches the turn
+as a blob, streamed into the blob store as it arrives, and the record holds
+only its hash and size. A body at or below it stays inline, in the record.
+A kind whose code does not import blobs gets no blobs and works as before.
+
+The largest request body of a kind that reads blobs is its upload size,
+64 MiB by default; above it the gateway answers `413 PAYLOAD_TOO_LARGE`. A
+response is a blob only when the guest writes one (`blobs.put` or a writer)
+and answers with it. Both limits are set in the log, like every limit, so
+every node and every replay decides the same way:
+
+    kronik limits set media --blob-threshold 256Ki --upload-size 1Gi --reason "smaller records, camera originals"
+
+See also: [`blob`](#blob), [`hold`](#hold), [`EFFECT_BYTES_EXCEEDED`](../errors.md#effect_bytes_exceeded).
+
+## hold
+
+An actor's own reference to a blob, which keeps it for later turns. Milestone M26.
+
+A hold is an actor's own reference to a blob (M26). A turn may use the blobs
+its actor holds, the ones its input carries (an upload, a message's or a
+timer's `blobs`) and the ones it got during the turn (a `fetch` response, a
+call's reply, a blob it wrote); only the held ones last beyond the turn, and
+the others are borrowed, readable until the turn ends. `blobs.retain` holds
+a blob the turn may use, `blobs.put` stores bytes and holds the new blob,
+and `blobs.release` ends the actor's own hold and no one else's. Like state,
+holds change only when the turn commits, recorded as `RETAIN` and `RELEASE`
+in the turn record: a turn that fails holds nothing new and releases
+nothing.
+
+A reference is a hash and a size, an identity and not a permission. A hash
+kept in state, SQL or a message body is data: it keeps nothing alive and
+grants nothing, and using it without a hold gives `BLOB_NOT_HELD`. To give a
+blob to another actor, send it in the message's `blobs`; the receiving turn
+may read it, and holds it only if it retains it. An actor's holds count
+against its kind's blob quota (1 GiB by default), with the blobs of its
+timers, of the messages it sent that still wait, and of the dead letters of
+its messages and timers.
+
+    kronik blobs list --actor media/trip
+    kronik limits set media --blob-size-per-actor 4Gi --reason "media keeps originals"
+
+See also: [`blob`](#blob), [`collector`](#collector), [`BLOB_NOT_HELD`](../errors.md#blob_not_held), [`BLOB_QUOTA_EXCEEDED`](../errors.md#blob_quota_exceeded).
+
+## collector
+
+The daemon's sweep that deletes the blob files nothing keeps any more. Milestone M26.
+
+The collector deletes the blob files that nothing keeps any more (M26). No
+actor or operator deletes a blob directly, except that erasing a subject
+deletes its blobs at once. What keeps a blob is a root: a hold; a queued
+message, a timer or a dead letter that carries it; a saved idempotent
+response or `call` outcome; a running turn and its effects; a record within
+retention; a snapshot; a fork; or a lease, which the daemon takes in memory
+on what it is using right now (an upload, a streamed answer, a turn, a
+replay) and renews while it does. A hash stored as data is no root.
+
+A pass runs after every retention pass and every `[blobs] gc_interval` (an
+hour), and deletes a file only if the previous pass also found it without a
+root, so a file goes within two passes after its last root does.
+`kronik blobs gc --dry-run` (MCP `blob_gc_plan`) lists the files without a
+root and why: `loose` (no record ever referenced it), `released` (its last
+holder let it go), `out-of-retention` or `erased`. `kronik blobs inspect`
+lists one blob's roots, and `kronik blobs gc --reason "..."` runs a pass
+now.
+
+    kronik blobs gc --dry-run
+    kronik blobs inspect b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9
+
+See also: [`blob`](#blob), [`hold`](#hold), [`snapshot`](#snapshot), [`fork`](#fork).
 
 ## effect
 

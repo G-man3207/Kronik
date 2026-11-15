@@ -104,6 +104,9 @@ concepts! {
     "kind" => "M1", "An actor type: the code for one sort of actor";
     "message" => "M1", "Data sent to an actor: name, content type and body";
     "blob" => "M25", "A large body or object stored outside the log, named by its hash";
+    "blob-threshold" => "M25", "The size above which a body becomes a blob";
+    "hold" => "M26", "An actor's own reference to a blob, which keeps it for later turns";
+    "collector" => "M26", "The daemon's sweep that deletes the blob files nothing keeps any more";
     "effect" => "M2", "A call from guest code to the outside world, via the host";
     "hash" => "M1", "The BLAKE3 hash of a component: the identity of its code";
     "fork" => "M3", "A branch of the system's history from an LSN";
@@ -166,11 +169,14 @@ mod tests {
     use super::*;
 
     /// The concepts that `kronik explain` must cover.
-    const REQUIRED_CONCEPTS: [&str; 41] = [
+    const REQUIRED_CONCEPTS: [&str; 44] = [
         "actor",
         "kind",
         "message",
         "blob",
+        "blob-threshold",
+        "hold",
+        "collector",
         "effect",
         "hash",
         "fork",
