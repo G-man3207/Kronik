@@ -67,13 +67,15 @@ What the code does today, on one node:
   tested against Pebble, not a public Let's Encrypt host. `kronik doctor`
   and `/metrics` exist. There is no cluster.
 - **Foreign actors (M7, M20, M21).** Linux programs from OCI images run in
-  gVisor. With `isolation = "microvm"` they run in a Firecracker VM on a host
-  with KVM; that level is experimental: implemented, but it has not yet
-  booted a VM on a KVM host. `kronik serve --init` installs the root service
-  as before, and `--init --rootless` the nonroot service (M21), an opt-in
-  whose design is accepted (ADRs 0060–0065) but whose installed proofs have
-  not passed yet, also not on Ubuntu 24.04 with AppArmor's restriction on
-  user namespaces; the root service stays the default.
+  gVisor. With `isolation = "microvm"` (M20, opt-in) they run in a
+  Firecracker VM of their own on a host with KVM; its proofs passed on
+  GitHub-hosted Ubuntu 24.04 runners, virtual machines with nested KVM on
+  AMD and Intel hosts, and have not run on bare metal or aarch64. gVisor
+  stays the default. `kronik serve --init` installs the root service as
+  before, and `--init --rootless` the nonroot service (M21, opt-in), whose
+  installed proofs passed on the same kind of runner with AppArmor's
+  restriction on user namespaces active and with it lifted; it has not run
+  on other distributions, and the root service stays the default.
 - **Privacy (M8).** Values with a subject can be sealed. `erase` deletes a
   subject's keys and SQL rows that have a `_subject` value. A turn with a
   subject cannot write a table without a `_subject` column. Old rows in
@@ -99,6 +101,20 @@ What the code does today, on one node:
   turns of that actor, and the frames it sends are recorded with the turn
   and go out after the turn commits. A restart closes every open connection
   with a dedicated reason, and clients reconnect.
+- **Streaming bodies and blobs (M25, M26).** A request body or a `fetch`
+  response above its kind's blob threshold (1 MiB by default) streams into
+  a content-addressed blob store as it arrives and reaches the turn as a
+  blob, a reference of hash and size; the log keeps only the reference, and
+  memory stays flat whatever the size. A reference is not a permission: a
+  turn may use only the blobs its actor holds and the ones it received or
+  wrote. Actors hold blobs (`put`, `retain`, `release`), send them on
+  messages, timers, calls and replies within a per-actor quota, and a
+  collector deletes the files nothing keeps. A subject's blobs are sealed
+  with its key, erased and resealed with it; forks and previews read
+  production's blobs; shipping and restore carry them. The constant-memory
+  runs at the brief's sizes passed on a test machine confined to two CPUs,
+  not on the 2-vCPU test VPS itself, and blob shipping is tested against
+  directory buckets and a local S3 server, not a cloud store.
 - **Observability (M28).** OpenTelemetry traces built from the turn records,
   metrics for Prometheus and over OTLP, and an audit export that `kronik
   audit verify` checks against the log.

@@ -58,7 +58,21 @@ since `v0.4.1`. On `main` today:
   owner actor accepts, sends and closes in recorded turns, with the
   `kronik:actor@0.1.1` WIT that keeps `0.1.0` components running; `send-now`,
   the replay and diff of connections, their API, CLI and MCP surface, and
-  support in the four SDKs.
+  support in the four SDKs. The 1,000-client run of `chat-ts` passed on the
+  test machine confined to two CPUs, standing in for the 2-vCPU test VPS.
+- **Streaming bodies and blobs (M25, M26):** request bodies and `fetch`
+  responses above a kind's blob threshold (1 MiB by default) stream into a
+  content-addressed blob store and reach the actor as blobs, also through
+  `wasi:http`; actors hold blobs, send them on messages, timers, calls and
+  replies within a per-actor quota, and a collector deletes what nothing
+  keeps. Blobs are sealed, erased and resealed with their subject, shipped
+  and restored with the log, read by forks and previews, supported by the
+  four SDKs and shown by the `media-ts` example; they are always on. The
+  constant-memory runs at the brief's sizes (a 300 MB upload, a 40 MB fetch,
+  a 1 GB response) passed on the development machine and on the test
+  machine confined to two CPUs and 4 GiB, not on the test VPS itself, and
+  blob shipping ran against directory buckets and a local S3 server, not a
+  cloud store.
 - **The nonroot daemon (M21, opt-in):** the nonroot service of `kronik serve
   --init --rootless` passed its installed proofs (ADR 0064) on 2026-11-14 on
   GitHub-hosted Ubuntu 24.04 runners (virtual machines on AMD and Intel
@@ -73,8 +87,7 @@ since `v0.4.1`. On `main` today:
   metal. Its decisions, ADRs 0095 and 0096, were accepted on 2026-11-14.
 
 The manual `isolation` workflow runs those proofs on disposable hosted runners
-and keeps their evidence. Streaming bodies and blob storage (M25–M26) are on a
-branch and have not landed. Absent or partial: the cluster (M16–M19), the WASI
+and keeps their evidence. Absent or partial: the cluster (M16–M19), the WASI
 0.3 remainder (M22), and the UI, fleet and hardening tracks (M27 and M29–M34).
 See the [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
 for the state of each milestone, the open questions and the known gaps, and the
@@ -114,6 +127,12 @@ for how the brief maps to the tree.
   actor that accepts a connection owns it, its frames are recorded with the
   turns that send them and go out after those commit, and a restart closes
   every open connection with a dedicated reason so that clients reconnect.
+- **Large bodies as blobs.** Uploads and `fetch` responses above a kind's
+  blob threshold stream through a content-addressed blob store with
+  constant memory, and the log keeps only their hash and size. An actor
+  holds the blobs it keeps and passes them on messages, timers and calls; a
+  hash alone grants nothing. A collector deletes what nothing keeps, and a
+  subject's blobs are sealed with its key and erased with it.
 - **Privacy mode.** Values with a subject can be sealed, erased and resealed,
   and forks replay without personal data unless a token carries `pii:read`.
 - **Foreign actors.** Linux programs from OCI images run in gVisor behind the
@@ -185,7 +204,8 @@ Foreign actors need gVisor's `runsc`, which `install.sh` offers.
 
 [The quickstart](docs/guides/quickstart.md) walks the full path from an empty
 machine to a verified deploy, rollback and restore, including what to do
-without a public DNS name or an object store.
+without a public DNS name or an object store, and then live updates over
+SSE and WebSocket and large files as blobs.
 [Installing](docs/guides/install.md) covers the release contents and the SDK
 toolchains.
 
