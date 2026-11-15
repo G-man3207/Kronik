@@ -151,20 +151,67 @@ impl CodeStore {
     /// Checks imports, stores the bytes durably (write, fsync, rename, fsync
     /// dir) and loads the program. Idempotent.
     pub fn add(&self, bytes: &[u8]) -> Result<(CodeHash, Arc<Program>), CodeError> {
+        self.add_inner(bytes, true)
+    }
+
+    /// Checks imports and loads the program without writing to the code
+    /// directory. A loaded program stays in memory, so a dry run's replay can
+    /// run it; nothing here survives a restart.
+    pub fn check(&self, bytes: &[u8]) -> Result<(CodeHash, Arc<Program>), CodeError> {
+        self.add_inner(bytes, false)
+    }
+
+    fn add_inner(
+        &self,
+        bytes: &[u8],
+        persist: bool,
+    ) -> Result<(CodeHash, Arc<Program>), CodeError> {
         let bad = crate::allowlist::disallowed_imports(bytes)
             .map_err(|e| CodeError::Invalid(e.to_string()))?;
         if !bad.is_empty() {
             return Err(CodeError::ImportNotAllowed(bad));
         }
         let hash = CodeHash::of(bytes);
-        if let Some(path) = self.wasm_path(&hash)
-            && !path.exists()
-        {
-            write_durable(&path, bytes)?;
+        if persist {
+            if let Some(path) = self.wasm_path(&hash)
+                && !path.exists()
+            {
+                write_durable(&path, bytes)?;
+            }
+            self.precompile(&hash, bytes)?;
         }
+        let program = if !persist {
+            // `load_bytes` would write the .cwasm cache through `component`;
+            // a dry run must leave the code directory as it is.
+            if let Some(p) = lock(&self.programs).get(&hash) {
+                p.clone()
+            } else {
+                let component = Component::new(&self.engine, bytes).map_err(wt)?;
+                let program = Arc::new(Program::new(&self.engine, &component, hash).map_err(wt)?);
+                lock(&self.programs).insert(hash, program.clone());
+                program
+            }
+        } else {
+            // A dry run may already have loaded this program; make sure the
+            // files a later restart reads are there even then.
+            self.load_bytes(hash, bytes)?
+        };
         lock(&self.bytes).insert(hash, Arc::new(bytes.to_vec()));
-        let program = self.load_bytes(hash, bytes)?;
         Ok((hash, program))
+    }
+
+    /// Writes the precompiled cache for `hash` if it is not there. `component`
+    /// would, but it is skipped for a program a dry run already loaded.
+    fn precompile(&self, hash: &CodeHash, bytes: &[u8]) -> Result<(), CodeError> {
+        let Some(path) = self.cwasm_path(hash) else {
+            return Ok(());
+        };
+        if path.exists() {
+            return Ok(());
+        }
+        let artifact = self.engine.precompile_component(bytes).map_err(wt)?;
+        write_durable(&path, &artifact)?;
+        Ok(())
     }
 
     /// The program for `hash`, loading it from disk on first use.
@@ -254,4 +301,52 @@ fn write_durable(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::File::open(dir)?.sync_all()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COUNTER: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/guests/counter.wasm"
+    ));
+
+    fn store(dir: &std::path::Path) -> CodeStore {
+        CodeStore::new(
+            build_engine(PoolSize { concurrency: 1 }).unwrap(),
+            Some(dir.to_path_buf()),
+        )
+        .unwrap()
+    }
+
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn check_writes_nothing_and_add_stores_the_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = store(dir.path());
+
+        let (hash, _) = code.check(COUNTER).unwrap();
+        assert_eq!(hash, CodeHash::of(COUNTER));
+        assert!(code.get(&hash).is_ok(), "a dry run can run what it checked");
+        assert_eq!(names(dir.path()), Vec::<String>::new());
+
+        code.add(COUNTER).unwrap();
+        let files = names(dir.path());
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(files[0].ends_with(".cwasm"), "{files:?}");
+        assert!(files[1].ends_with(".wasm"), "{files:?}");
+        assert!(
+            files.iter().all(|n| n.starts_with(&hash.hex())),
+            "{files:?}"
+        );
+    }
 }

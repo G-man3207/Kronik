@@ -4423,7 +4423,9 @@ impl Node {
         authority.check()?;
         self.check_running()?;
         let guard = self.lock_deploy_authorized(&authority).await?;
-        let (hash, program, manifest) = self.prepare_code(bytes, authority.clone()).await?;
+        let (hash, program, manifest) = self
+            .prepare_code(bytes, !dry_run, authority.clone())
+            .await?;
         let kind = manifest.kind.clone();
         let current = self.kind(&kind);
         let epoch = self.epoch.load(Ordering::Acquire);
@@ -4520,17 +4522,24 @@ impl Node {
     }
 
     /// Compiles, checks and describes a component without deploying it
-    /// (deploy and proposals).
+    /// (deploy and proposals). With `persist` false—a dry run—the component
+    /// is only kept in memory, so a proposal replay can still run it.
     pub async fn prepare_code(
         &self,
         bytes: &[u8],
+        persist: bool,
         authority: AuthLease,
     ) -> Result<(CodeHash, Arc<Program>, pb::Manifest), ApiError> {
         authority.check()?;
         let code = self.code.clone();
         let bytes = bytes.to_vec();
         self.authorized_effect(authority, move || async move {
-            let (hash, program) = code.add(&bytes).map_err(|e| match e {
+            let loaded = if persist {
+                code.add(&bytes)
+            } else {
+                code.check(&bytes)
+            };
+            let (hash, program) = loaded.map_err(|e| match e {
                 CodeError::ImportNotAllowed(bad) => ApiError::new(
                     ErrorCode::ImportNotAllowed,
                     format!("the component imports {}", bad.join(", ")),

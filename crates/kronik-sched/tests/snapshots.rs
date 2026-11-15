@@ -1241,7 +1241,7 @@ fn below_the_disk_reserve_incident_actions_and_retention_still_work() {
     assert!(keyed_increment(&p, "k1").unwrap().committed());
     let bytes = guest("counter-step2");
     let (hash, _, manifest) =
-        p.rt.block_on(p.node.prepare_code(&bytes, p.owner()))
+        p.rt.block_on(p.node.prepare_code(&bytes, true, p.owner()))
             .unwrap();
     let rollback = kronik_sched::CodeSwitch {
         kinds: vec![pb::KindVersion {

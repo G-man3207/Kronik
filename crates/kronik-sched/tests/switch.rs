@@ -55,7 +55,7 @@ async fn node(dir: &std::path::Path) -> (Arc<Node>, Arc<SwitchHold>) {
 
 async fn version(node: &Node, name: &str) -> pb::KindVersion {
     let bytes = guest(name);
-    let (hash, _, manifest) = node.prepare_code(&bytes, owner(node)).await.unwrap();
+    let (hash, _, manifest) = node.prepare_code(&bytes, true, owner(node)).await.unwrap();
     pb::KindVersion {
         kind: manifest.kind.clone(),
         code_hash: hash.0.to_vec(),

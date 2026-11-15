@@ -6,6 +6,11 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- A dry-run deploy, fork deploy or propose compiles and describes the
+  candidate without storing it (I12): the component and its precompiled
+  cache no longer appear in `<data_dir>/code/` for a component no committed
+  deployment names, and are no longer uploaded by the shipper or left
+  unreachable by a restore of the bucket.
 - A test daemon is given a minute, not ten seconds, to answer its health
   check in the M1 acceptance, the M1 perf run and the privacy bench, and
   those scripts print the tail of its log when it does not; the acceptance

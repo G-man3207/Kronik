@@ -659,6 +659,7 @@ async fn every_mutation_requires_a_reason_and_a_dry_run_writes_nothing() {
 
     for case in &cases {
         let before = applied(&api).await;
+        let files = tree_snapshot(dir.path());
         let (status, body) = mutation_call(
             &api,
             &browser,
@@ -671,6 +672,24 @@ async fn every_mutation_requires_a_reason_and_a_dry_run_writes_nothing() {
             applied(&api).await,
             before,
             "dry_run wrote {} {} (HTTP {status}): {body}",
+            case.method,
+            case.path
+        );
+        let after = tree_snapshot(dir.path());
+        let changed: Vec<_> = after
+            .iter()
+            .filter(|(p, b)| !files.contains(&(p.clone(), b.clone())))
+            .map(|(p, _)| p)
+            .chain(
+                files
+                    .iter()
+                    .filter(|(p, b)| !after.contains(&(p.clone(), b.clone())))
+                    .map(|(p, _)| p),
+            )
+            .collect();
+        assert!(
+            changed.is_empty(),
+            "dry_run wrote {changed:?} for {} {} (HTTP {status}): {body}",
             case.method,
             case.path
         );
@@ -694,20 +713,142 @@ async fn every_mutation_requires_a_reason_and_a_dry_run_writes_nothing() {
     }
 }
 
-/// The file names and bytes under `dir`, so a rejected call can be proven
-/// to have written nothing.
-fn tree_snapshot(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-    let mut out: Vec<_> = std::fs::read_dir(dir)
+/// A dry-run deploy compiles and describes the candidate without storing it
+/// (I12, m1-core §4). The real deploy of the same bytes afterwards still
+/// stores both the component and its precompiled cache, as a restart needs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dry_run_deploy_writes_nothing_and_the_real_one_still_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start_local(
+        Env::real(tokio::runtime::Handle::current()),
+        dir.path(),
+        NodeConfig::default(),
+    )
+    .await
+    .unwrap();
+    let api = Arc::new(Api::new(node));
+    let b64 = |p: &str| base64::engine::general_purpose::STANDARD.encode(std::fs::read(p).unwrap());
+    let v2 = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/guests/counter-body-v2.wasm"
+    );
+
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/deployments",
+        json!({"wasm_base64": b64(COUNTER), "reason": "fixture"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+
+    let before = tree_snapshot(dir.path());
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/deployments",
+        json!({"wasm_base64": b64(v2), "reason": "validate", "dry_run": true}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["dry_run"], true, "{v}");
+    assert_eq!(tree_snapshot(dir.path()), before, "the dry run wrote files");
+
+    let bad = base64::engine::general_purpose::STANDARD.encode(b"not a component");
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/deployments",
+        json!({"wasm_base64": bad, "reason": "validate", "dry_run": true}),
+    )
+    .await;
+    assert_eq!(s, 400, "{v}");
+    assert_eq!(
+        tree_snapshot(dir.path()),
+        before,
+        "the refused dry run wrote files"
+    );
+
+    // Compiles, then is refused because a connection route lacks the export.
+    let room_bare = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/guests/room-bare.wasm"
+    );
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/deployments",
+        json!({"wasm_base64": b64(room_bare), "reason": "validate", "dry_run": true}),
+    )
+    .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (400, Some("BAD_REQUEST")),
+        "{v}"
+    );
+    assert_eq!(
+        tree_snapshot(dir.path()),
+        before,
+        "the compiled, refused dry run wrote files"
+    );
+
+    let (s, v) = call(
+        &api,
+        "POST",
+        "/v1/deployments",
+        json!({"wasm_base64": b64(v2), "reason": "deploy"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let hash = v["deployment"]["code_hash"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("b3:");
+    let code: Vec<String> = std::fs::read_dir(dir.path().join("code"))
         .unwrap()
         .flatten()
-        .filter_map(|e| {
-            let p = e.path();
-            p.is_file()
-                .then(|| Some((p.clone(), std::fs::read(&p).ok()?)))
-                .flatten()
-                .map(|(p, b)| (p.file_name().unwrap().into(), b))
-        })
+        .map(|e| e.file_name().into_string().unwrap())
         .collect();
+    assert!(
+        code.iter()
+            .any(|n| n.starts_with(hash) && n.ends_with(".wasm")),
+        "the real deploy stored the component: {code:?}"
+    );
+    assert!(
+        code.iter()
+            .any(|n| n.starts_with(hash) && n.ends_with(".cwasm")),
+        "the real deploy stored the precompiled cache: {code:?}"
+    );
+}
+
+/// The relative paths and bytes under `dir`, recursively, so a rejected or
+/// dry-run call can be proven to have written nothing.
+fn tree_snapshot(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+    ) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else if p.is_file() {
+                // SQLite's read marks in the -shm index move when a reader
+                // checks the WAL; that is not a write to the directory.
+                let name = p.file_name().unwrap().to_string_lossy();
+                if name.ends_with("-shm") {
+                    continue;
+                }
+                out.push((
+                    p.strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(&p).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
     out.sort();
     out
 }
