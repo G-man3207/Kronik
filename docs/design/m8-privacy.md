@@ -542,10 +542,14 @@ Where the code differs from the sections above:
   dead letter that of its message or timer body; a saved call response that
   of the reply. The `Erasure` record deletes the subject's `ingress_keys`
   rows (a repeated `Idempotency-Key` runs anew) and dead letters. A saved
-  call response becomes a tombstone outcome (`SUBJECT_ERASED`, no output)
-  and the row stays, so the message stays delivered and a repeated call
-  gets that failure instead of a second run. The bodies of its pending
-  timers and undelivered messages become tombstones (§6.3). Dead letters a
+  call response keeps its committed outcome; every value of the subject in
+  it becomes the erasure's tombstone ([ADR
+  0124](../adr/0124-an-erased-answer-keeps-the-callees-commit.md)). The row
+  stays, so the message stays delivered and a repeated
+  call gets `SUBJECT_ERASED` instead of a second run - and a caller that
+  fails after that call still owes its orphan and its compensation. The
+  bodies of its pending timers and undelivered messages become tombstones
+  (§6.3). Dead letters a
   subject's turns produce after its erasure stay (their input is sealed
   under the erased key); resending one fails with `SUBJECT_ERASED`.
 - **Nothing left in the files (v0.1 fix).** `state.db`, every actor

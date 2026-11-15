@@ -236,12 +236,22 @@ its ingress key belong to the re-run (an HTTP retry with the same
   key `child(callee turn key, callee, COMPENSATION_ORDINAL = 2^32 - 2)`,
   message id = its `causal-id`, `compensates` = the call's message id.
 - **Orphans.** When the caller's turn fails, every successful call (status
-  OK, or `HOST_REDACTION_FAILURE` that observed OK) adds an `orphans` row:
-  callee, callee turn, caller turn, call message id, compensation message id
-  (if any). A committed turn whose input has `compensates = m` resolves the
-  orphan for `m`. A failed compensation is a dead letter; its resend keeps
-  `compensates`, so a successful resend resolves the orphan. `history
-  --orphans` lists unresolved rows.
+  OK, `HOST_REDACTION_FAILURE` that observed OK, or a call error whose
+  `FAILED` record observed the callee's committed outcome, ADR 0124) adds an
+  `orphans` row: callee, callee turn, caller turn, call message id,
+  compensation message id (if any). A committed turn whose input has
+  `compensates = m` resolves the orphan for `m`. A failed compensation is a
+  dead letter; its resend keeps `compensates`, so a successful resend
+  resolves the orphan. `history --orphans` lists unresolved rows.
+- **An erased answer** is such a successful call. The callee's turn ran
+  across the subject's erasure and committed; its answer is the erasure's
+  tombstone, so the caller gets `call-error::failed("SUBJECT_ERASED: ...")`
+  as any other call error. The effect record keeps `FAILED` and that text,
+  names the callee in `callee_source`, and records the observed commit in
+  `observed_callee_status = OK` (a v0.5.0 record carries only the text and
+  source). The compensation is remembered and delivered once, and the
+  orphan names the callee's own turn. The guest-visible call error does not
+  change (ADR 0123 §5, ADR 0124).
 - **A call that timed out** (#30) is such a call once its callee's turn
   commits, which can happen before the caller's failed record or after it.
   Its compensation, if any, is in `TurnRecord.compensations` too. The
