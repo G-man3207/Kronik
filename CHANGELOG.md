@@ -6,6 +6,13 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- `kronik restore` installs the newest snapshot the bucket's log reaches,
+  not the newest manifest: a shipping round can upload a snapshot ahead of
+  the segments that hold its records, and installing it made a directory
+  `kronik serve` refused with `STORAGE_CORRUPT`. A newer snapshot is named
+  in the report (`snapshots_skipped`), the log's end is reported
+  (`log_last_lsn`), and a bucket with no reached snapshot is refused before
+  anything is installed.
 - A fork seals with the provenance of what it writes: a value copied from a
   production turn before its subject's erasure is the erasure's tombstone in
   the fork log, its samples and the turns a rebase stages into main's log,

@@ -247,6 +247,8 @@ fn same(a: &RestoreReport, b: &RestoreReport) {
     assert_eq!(a.state_hash, b.state_hash);
     assert_eq!(a.segments, b.segments);
     assert_eq!(a.log_first_lsn, b.log_first_lsn);
+    assert_eq!(a.log_last_lsn, b.log_last_lsn);
+    assert_eq!(a.snapshots_skipped, b.snapshots_skipped);
     assert_eq!(a.components, b.components);
     assert_eq!(a.keystore, b.keystore);
     assert_eq!(a.keys_missing, b.keys_missing);

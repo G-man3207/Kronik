@@ -236,10 +236,10 @@ round, at most `promote.max_gap` of traffic, are added after the approval).
   compaction deletes nothing and the newest snapshot at or before that
   switch's `base_lsn` is not pruned.
 - **Shipping and restore.** `StateRebase` records ship with their segments.
-  `kronik restore` picks the newest snapshot; if a switch in the restored
-  segments has a `base_lsn` below it, it also downloads the newest
-  snapshot at or before that `base_lsn`, which the first start uses to
-  build the shadow.
+  `kronik restore` picks the newest snapshot the restored log reaches; if a
+  switch in the restored segments has a `base_lsn` below it, it also
+  downloads the newest snapshot at or before that `base_lsn`, which the
+  first start uses to build the shadow.
 - **Forks after a switch.** A fork point is never before main's newest
   switch: propose clamps its window to start after it, and `--at` or
   `kronik fork create --at` before it is `BAD_REQUEST`. A production cursor

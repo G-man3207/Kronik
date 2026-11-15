@@ -320,9 +320,20 @@ $ kronik doctor
 
 Restores a data directory from object storage (M6). Offline: the daemon
 must not be running on the directory, and the command does not talk to
-one. It downloads the newest snapshot of the branch, every remote segment
-and the deployed components, checks the snapshot against its manifest, and
-installs it. `kronik serve` then applies the log from the snapshot's LSN.
+one. It downloads the newest snapshot the bucket's log reaches, every
+remote segment and the deployed components, checks the snapshot against
+its manifest, and installs it. `kronik serve` then applies the log from
+the snapshot's LSN.
+
+A bucket can hold a snapshot newer than its newest segment: a shipping
+round reads the segments, the node then applies records and takes the
+snapshot it uploads in that round, and the source can be lost before the
+next round uploads the segments holding them. Restore does not install
+that snapshot; it takes the newest older one the log reaches, lists it
+under `Skipped` (`snapshots_skipped` in the JSON), and reports the log's
+end as `Log last LSN` (`log_last_lsn`). When no snapshot in the bucket is
+reached, restore exits non-zero and writes nothing. The restored
+directory is always one `kronik serve` starts.
 
 It writes no log record, so it takes no `--reason`. The master key is never
 in the bucket. Put it in place before restoring, where `kronik serve` will
@@ -399,6 +410,7 @@ Restored snapshot main-00000000000000000012 at lsn 12 into /var/lib/kronik
   State hash    b3:9f2c1a0e4b7d8c6a5e3f1d0c9b8a7061524332415069788a7b6c5d4e3f2a1b0
   Segments      2
   Log first LSN 1
+  Log last LSN  12
   Components    1
   Keystore      installed with the master key, which serve will use too
 Next     kronik serve --data-dir /var/lib/kronik

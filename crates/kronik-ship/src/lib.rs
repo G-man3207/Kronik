@@ -1113,6 +1113,13 @@ pub struct RestoreReport {
     pub state_hash: String,
     pub segments: usize,
     pub log_first_lsn: Lsn,
+    /// The last LSN of the restored log: the newest record in the bucket's
+    /// segments, and the LSN `kronik serve` applies the log through.
+    pub log_last_lsn: Lsn,
+    /// Snapshots newer than [`RestoreReport::log_last_lsn`] were not
+    /// installed, because the bucket's log does not reach them. Empty when
+    /// the newest snapshot was restored.
+    pub snapshots_skipped: Vec<Lsn>,
     pub components: usize,
     /// Wall time of the keystore backup installed into `keys/keystore.db`.
     /// `None` when the bucket had no backup, or with `--without-keystore`. A backup that is there but can't be
@@ -1634,8 +1641,10 @@ struct Staged {
     keys_missing: Vec<String>,
     /// The snapshot at or before a later rebase switch's base (M13).
     older: Option<Manifest>,
-    /// The last LSN of the staged log (the snapshot's without a segment).
+    /// The last LSN of the staged log (0 when the bucket has no segments).
     through_lsn: Lsn,
+    /// Snapshots newer than `through_lsn`; their records are not in the bucket.
+    snapshots_skipped: Vec<Lsn>,
     wrapped_path: Option<PathBuf>,
     blobs: BlobRestore,
 }
@@ -1698,7 +1707,10 @@ async fn stage_after_keys(
     if check_stores_first && let Some(master) = &master {
         kronik_privacy::key_source::validate_staged_stores(master, &data.join("keys"))?;
     }
-    // 1. The newest complete remote snapshot.
+    // 1. The remote snapshots. The newest is installed only when the log
+    //    reaches it (step 2 below): a snapshot past the log's end would leave
+    //    state.db applied beyond the last record, which `kronik serve`
+    //    refuses to start.
     let (_, lsns) = remote.list(&format!("{branch}/snapshots")).await?;
     let mut newest: Option<Manifest> = None;
     let mut all: Vec<Manifest> = Vec::new();
@@ -1717,23 +1729,7 @@ async fn stage_after_keys(
         }
         all.push(m);
     }
-    let m = newest.ok_or_else(|| ShipError::Restore("no snapshot in the bucket".into()))?;
-    let snap = stage.join("snapshot");
-    download_snapshot(remote, &snap, branch, &m).await?;
-    if mode != KeystoreMode::Without && snap.join("secrets.db").exists() {
-        // The snapshot holds a secret store, so the key is needed after all.
-        match (&master, deferred) {
-            (Some(master), _) if !check_stores_first => {
-                kronik_privacy::key_source::validate_staged_stores(master, &data.join("keys"))?;
-            }
-            (None, Some(why)) => return Err(why.into()),
-            _ => {}
-        }
-    }
-    // Validate the snapshot's encrypted secret store before touching the target.
-    if let Some(master) = &master {
-        master.validate_stores(&snap).map_err(ShipError::Key)?;
-    }
+    let newest = newest.ok_or_else(|| ShipError::Restore("no snapshot in the bucket".into()))?;
     let wrapped_path = if let Some((path, bytes)) = wrapped {
         kronik_privacy::key_source::write_envelope(
             env,
@@ -1755,7 +1751,8 @@ async fn stage_after_keys(
     std::fs::create_dir_all(&log)?;
     let (names, _) = remote.list(&format!("{branch}/segments")).await?;
     let mut segments = Vec::new();
-    let mut through_lsn = m.lsn;
+    // The last LSN the staged log reaches; a snapshot past it is unusable.
+    let mut through_lsn: Lsn = 0;
     // Every blob the staged log references (ADR 0122 §5).
     let mut blob_refs: BTreeMap<String, kronik_proto::log::v1::BlobRef> = BTreeMap::new();
     for n in &names {
@@ -1797,13 +1794,60 @@ async fn stage_after_keys(
         std::fs::write(log.join(seg), bytes)?;
         segments.push(seg.to_owned());
     }
+    // m6-storage §6 step 2: the segments must reach the snapshot. Manifests
+    // the staged log does not reach are skipped, named in the report, and
+    // the newest one it does reach is installed. When none is covered,
+    // restore fails before writing rather than installing a directory
+    // `kronik serve` would refuse.
+    let oldest = all.iter().map(|m| m.lsn).min().unwrap_or(newest.lsn);
+    let Some(m) = all
+        .iter()
+        .filter(|m| m.lsn <= through_lsn)
+        .max_by_key(|m| m.lsn)
+        .cloned()
+    else {
+        return Err(ShipError::Restore(format!(
+            "the bucket's log ends at lsn {through_lsn}, before its oldest snapshot at \
+             {oldest}: no snapshot in the bucket is covered by its log"
+        )));
+    };
+    let mut skipped: Vec<Lsn> = all
+        .iter()
+        .map(|m| m.lsn)
+        .filter(|&lsn| lsn > through_lsn)
+        .collect();
+    skipped.sort_unstable();
+    skipped.dedup();
+    if !skipped.is_empty() {
+        tracing::warn!(
+            taking = m.lsn,
+            skipped = ?skipped,
+            "the newest snapshot is past the log; restoring the newest covered one"
+        );
+    }
     let local = kronik_log::segment_starts(&log)?;
-    let first = local.first().copied().unwrap_or(m.lsn + 1);
+    let first = local.first().copied().unwrap_or(through_lsn + 1);
     if first > m.lsn + 1 {
         return Err(ShipError::Restore(format!(
             "the bucket's log starts at lsn {first}, after the snapshot at {}",
             m.lsn
         )));
+    }
+    let snap = stage.join("snapshot");
+    download_snapshot(remote, &snap, branch, &m).await?;
+    if mode != KeystoreMode::Without && snap.join("secrets.db").exists() {
+        // The snapshot holds a secret store, so the key is needed after all.
+        match (&master, deferred) {
+            (Some(master), _) if !check_stores_first => {
+                kronik_privacy::key_source::validate_staged_stores(master, &data.join("keys"))?;
+            }
+            (None, Some(why)) => return Err(why.into()),
+            _ => {}
+        }
+    }
+    // Validate the snapshot's encrypted secret store before touching the target.
+    if let Some(master) = &master {
+        master.validate_stores(&snap).map_err(ShipError::Key)?;
     }
     // The snapshot's state: sealed values whose records retention deleted.
     for ((subject, _), sample) in kronik_store::snapshot::sealed_keys(&snap)
@@ -1916,6 +1960,7 @@ async fn stage_after_keys(
         keys_missing,
         older,
         through_lsn,
+        snapshots_skipped: skipped,
         wrapped_path,
         blobs: blob_report,
     })
@@ -2279,6 +2324,8 @@ fn install_staged(
         state_hash: s.m.state_hash,
         segments: s.segments.len(),
         log_first_lsn: first,
+        log_last_lsn: s.through_lsn,
+        snapshots_skipped: s.snapshots_skipped,
         components: s.components.len(),
         keystore_backup_ms: s.keystore_backup_ms,
         keystore: s.keystore,

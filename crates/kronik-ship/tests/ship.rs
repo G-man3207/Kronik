@@ -229,6 +229,184 @@ fn ship_destroy_and_restore_from_a_directory_bucket() {
     ship_and_restore(&remote);
 }
 
+/// The start LSNs of the bucket's segments, ascending.
+fn bucket_starts(rt: &Runtime, remote: &Remote) -> Vec<u64> {
+    let (names, _) = rt.block_on(remote.list("main/segments")).unwrap();
+    let mut starts: Vec<u64> = names
+        .iter()
+        .filter_map(|n| n.strip_suffix(".seg.zst")?.parse().ok())
+        .collect();
+    starts.sort_unstable();
+    starts
+}
+
+/// A shipper round uploads a snapshot after the segments that were read at
+/// the round's start, but the node applies records while the round runs and
+/// a snapshot taken after that read can be in the same round, ahead of the
+/// log. A bucket can therefore hold a snapshot whose records no segment
+/// object does. Restore must take the newest snapshot the staged log
+/// reaches, report the last LSN it applied and name the ones it skipped; an
+/// installed state ahead of the log is one `kronik serve` refuses to start
+/// (m6-storage §6 step 2).
+#[test]
+fn restore_keeps_the_snapshot_the_bucket_log_reaches() {
+    let bucket = tempdir("ship-covered-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let src = tempdir("ship-covered-src-");
+    let p = start(src.path(), None);
+    p.rt.block_on(p.node.deploy(
+        &guest("counter"),
+        audit(),
+        false,
+        p.node.local_operator_authority().unwrap(),
+    ))
+    .unwrap();
+    let mut count = 0;
+    for _ in 0..3 {
+        count = p.send("counter/a", "increment", "").parse().unwrap();
+    }
+    let old =
+        p.rt.block_on(
+            p.node
+                .snapshot("manual", p.node.local_operator_authority().unwrap()),
+        )
+        .unwrap();
+    p.ship(&remote, src.path());
+
+    // Roll the log into a segment after the snapshot's marker: that segment
+    // holds every record the snapshot does not.
+    let log = src.path().join("branches/main/log");
+    let mut sent = 0;
+    while kronik_log::segment_starts(&log)
+        .unwrap()
+        .last()
+        .copied()
+        .unwrap_or(0)
+        <= old.lsn
+    {
+        count = p.send("counter/a", "increment", "").parse().unwrap();
+        sent += 1;
+        assert!(sent < 1000, "the log never rolled past lsn {}", old.lsn);
+    }
+    let new =
+        p.rt.block_on(
+            p.node
+                .snapshot("manual", p.node.local_operator_authority().unwrap()),
+        )
+        .unwrap();
+    p.ship(&remote, src.path());
+    let starts = bucket_starts(&p.rt, &remote);
+    let next = starts
+        .iter()
+        .position(|s| *s > old.lsn)
+        .expect("no segment after the old snapshot");
+    let through = starts[next] - 1;
+    assert!(
+        new.lsn > through,
+        "the new snapshot at {} is covered by the log through {through}",
+        new.lsn
+    );
+    // Simulate the lost round: the segments holding the records after the
+    // old snapshot are not in the bucket, the rest of it and both snapshots
+    // are.
+    for s in &starts[next..] {
+        p.rt.block_on(remote.delete_object(&format!(
+            "main/segments/{}.zst",
+            kronik_log::segment_name(*s)
+        )))
+        .unwrap();
+    }
+    let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
+    drop(p);
+
+    let dst = tempdir("ship-covered-dst-");
+    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
+    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
+    let rt = rt();
+    let report = rt
+        .block_on(restore(
+            &remote,
+            dst.path(),
+            "main",
+            false,
+            &Env::real(rt.handle().clone()),
+            &Default::default(),
+            KeystoreMode::Require,
+        ))
+        .unwrap();
+    assert_eq!(report.snapshot_lsn, old.lsn, "{report:?}");
+    assert_eq!(report.log_last_lsn, through, "{report:?}");
+    assert_eq!(report.snapshots_skipped, vec![new.lsn], "{report:?}");
+    assert_eq!(report.log_first_lsn, starts[0], "{report:?}");
+    drop(rt);
+
+    // The installation is one the daemon starts, and it applied exactly the
+    // log the bucket held (the turn that rolled the segment is in the log the
+    // bucket lost).
+    let q = start(dst.path(), None);
+    assert_eq!(q.node.applied_lsn(), through);
+    assert_eq!(q.send("counter/a", "increment", ""), count.to_string());
+}
+
+/// Without an older snapshot the log reaches, restore writes nothing: a
+/// bucket missing the segments after its only snapshot has lost records,
+/// and installing that snapshot produces a directory `kronik serve`
+/// refuses.
+#[test]
+fn restore_refuses_a_bucket_whose_log_reaches_no_snapshot() {
+    let bucket = tempdir("ship-uncovered-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let src = tempdir("ship-uncovered-src-");
+    let p = start(src.path(), None);
+    p.rt.block_on(p.node.deploy(
+        &guest("counter"),
+        audit(),
+        false,
+        p.node.local_operator_authority().unwrap(),
+    ))
+    .unwrap();
+    p.send("counter/a", "increment", "");
+    let only =
+        p.rt.block_on(
+            p.node
+                .snapshot("manual", p.node.local_operator_authority().unwrap()),
+        )
+        .unwrap();
+    p.ship(&remote, src.path());
+    for s in bucket_starts(&p.rt, &remote) {
+        p.rt.block_on(remote.delete_object(&format!(
+            "main/segments/{}.zst",
+            kronik_log::segment_name(s)
+        )))
+        .unwrap();
+    }
+    let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
+    drop(p);
+
+    let dst = tempdir("ship-uncovered-dst-");
+    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
+    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
+    let rt = rt();
+    let err = rt
+        .block_on(restore(
+            &remote,
+            dst.path(),
+            "main",
+            false,
+            &Env::real(rt.handle().clone()),
+            &Default::default(),
+            KeystoreMode::Require,
+        ))
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("lsn 0"), "{text}");
+    assert!(text.contains(&only.lsn.to_string()), "{text}");
+    assert!(
+        !dst.path().join("branches/main/state.db").exists(),
+        "{text}"
+    );
+}
+
 /// Review F2: a restore interrupted while it moves into place leaves no
 /// `state.db` (never the old state with the new log), so it can simply run
 /// again; and nothing of the staging directory is left behind. Perf review

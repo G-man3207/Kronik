@@ -1774,6 +1774,11 @@ kronik restore --from s3://my-bucket/kronik/prod --data-dir /var/lib/kronik
 kronik serve --data-dir /var/lib/kronik
 ```
 
+`restore` installs the newest snapshot the bucket's log reaches; it
+reports the log's first and last LSN, and names a newer snapshot it skipped
+when the source died before shipping the segments that hold it, rather
+than writing a directory `serve` would refuse.
+
 `--endpoint` is the same URL as `[ship] endpoint` when the bucket is not
 AWS. An existing `state.db` is refused unless `--force`. `--dry-run` prints
 the plan and writes nothing. Restore writes no log record, so it takes no

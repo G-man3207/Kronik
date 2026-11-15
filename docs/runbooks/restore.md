@@ -33,6 +33,13 @@ existing encrypted store.
    as root, gives up root, and finishes as `kronik`: a `file://` source must
    be readable by that user, and the command says so before it writes
    anything. `--dry-run` as root cannot tell.
+
+   A `Skipped` line (`snapshots_skipped` in the JSON) means the bucket's newest
+   snapshot is ahead of the segments it holds: restore installed the log's
+   last covered snapshot, and the recovery point is `Log last LSN`
+   (`log_last_lsn`), not the skipped snapshot. Record the skipped LSNs and the
+   gap; do not treat the unshipped records as recovered.
+
 3. Refuse `MASTER_KEY_MISSING`, `MASTER_KEY_MISMATCH`, `KEY_SOURCE_UNAVAILABLE`
    or `KEYSTORE_INCOMPLETE` until the actual source/key problem is resolved.
    `--allow-missing-keys` and `--without-keystore` explicitly accept unreadable
