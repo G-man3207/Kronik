@@ -2162,10 +2162,16 @@ impl Node {
                 ErrorCode::SubjectErased,
                 "the input belongs to an erased subject".to_owned(),
             )),
-            Ok(()) if rerun.as_ref().is_some_and(|r| self.recorded_erased(&r.recorded)) => Some((
-                ErrorCode::SubjectErased,
-                "a result the turn recorded belongs to an erased subject".to_owned(),
-            )),
+            Ok(())
+                if rerun
+                    .as_ref()
+                    .is_some_and(|r| self.recorded_erased(&r.recorded)) =>
+            {
+                Some((
+                    ErrorCode::SubjectErased,
+                    "a result the turn recorded belongs to an erased subject".to_owned(),
+                ))
+            }
             Ok(()) => None,
         };
         if let Some((code, message)) = refused {

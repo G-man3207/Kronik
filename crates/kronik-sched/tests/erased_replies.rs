@@ -427,7 +427,13 @@ fn an_answer_an_erasure_tombstoned_is_a_subject_erased_call_error() {
         let r = r.unwrap();
         assert!(r.committed(), "{mode:?}: {r:?}");
         assert_erased_reply(&reply_text(Some(&r.outcome)));
-        assert!(p.rt.block_on(blocker).unwrap().unwrap().unwrap().committed());
+        assert!(
+            p.rt.block_on(blocker)
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .committed()
+        );
         assert_tombstoned_answer(&p.turn_records("w")[0]);
         let a = p.turn_records("a");
         assert_eq!(a.len(), 1, "{mode:?}: {a:?}");

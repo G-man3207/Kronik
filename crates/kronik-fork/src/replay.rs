@@ -3413,7 +3413,10 @@ impl ReplayGate {
             }
             let outcome = match (map_call_outcome(o)?, recorded_erased) {
                 (CallOutcome::Ok(Some(reply)), Some(error))
-                    if reply.body.as_ref().is_some_and(|body| body.subject.is_some()) =>
+                    if reply
+                        .body
+                        .as_ref()
+                        .is_some_and(|body| body.subject.is_some()) =>
                 {
                     rec.grounding = pb::Grounding::Exact as i32;
                     CallOutcome::Failed(error)
