@@ -1846,7 +1846,7 @@ same number bounds what one turn writes into blobs. Raise it for a kind
 that keeps originals:
 
 ```sh
-kronik limits set media --blob-size-per-actor 4GiB --reason "media keeps originals"
+kronik limits set media --blob-size-per-actor 4Gi --reason "media keeps originals"
 ```
 
 ### What keeps a blob
