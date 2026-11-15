@@ -638,7 +638,10 @@ for at least 8 per CPU (at least 16, at most 128): 8 for each of the
 replay workers a proposal gets by default, one per CPU. `kronik upgrade
 check` is its own process; its pool has room for 8 instances per worker
 (`--workers`), at least 16, and at least the default concurrency of the
-machine.
+machine. A replayed turn that still finds the pool full did not run: the
+replay, the preview or the check stops with `UNAVAILABLE` (`replay could not
+run`) and compares nothing, so the pool's size never shows up as a
+difference.
 
 Each instance has room for two linear memories. After an instance ends, its
 memory slot keeps up to 2 MiB resident (zeroed), so the next instance does

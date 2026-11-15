@@ -1453,3 +1453,32 @@ fn a_check_with_one_worker_over_calls_passes() {
         "{text}"
     );
 }
+
+/// A pool without room for the window's calls stops the check as one that
+/// could not run (the CLI says `UNAVAILABLE` and writes no report), never as
+/// a divergence that would call the upgrade unsafe.
+#[test]
+fn a_check_without_room_for_its_calls_could_not_run() {
+    let dir = tempdir();
+    call_workload(dir.path());
+    let rt = rt();
+    let error = rt
+        .block_on(async {
+            let env = Env::real(tokio::runtime::Handle::current());
+            kronik_fork::upgrade::check_with_pool(
+                &env,
+                dir.path(),
+                Duration::from_secs(6 * 3600),
+                1,
+                None,
+                kronik_runtime::PoolSize { concurrency: 2 },
+            )
+            .await
+        })
+        .err()
+        .expect("the check could not run");
+    assert!(
+        error.starts_with("replay could not run: maximum concurrent limit of 2 for"),
+        "{error}"
+    );
+}

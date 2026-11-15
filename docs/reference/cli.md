@@ -437,9 +437,11 @@ one was written, even when the command exits 1.
 inputs at once. The check's Wasm instance pool has room for 8 instances
 per worker, at least 16, and at least `serve`'s default `--concurrency` on
 the machine, because a replayed `call` keeps its caller's instance while
-the callee runs. Before v0.5.0 the pool had one instance per worker, so a
-check with one worker reported any call in its window as
-`ENGINE_UPGRADE_DIVERGED`.
+the callee runs. A replay that still finds the pool full compares nothing:
+the check writes no report and exits 1 with `UNAVAILABLE` (`replay could
+not run: ...`). Run it again, with fewer `--workers` if it persists. Before
+v0.5.0 the pool had one instance per worker, so a check with one worker
+reported any call in its window as `ENGINE_UPGRADE_DIVERGED`.
 
 A turn whose recorded input was **erased** (`kronik privacy erase`, M8)
 is unverifiable, not divergent, and so is every turn the erased data

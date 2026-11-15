@@ -30,7 +30,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    Entry, Live, Proposal, Proposals, encode_kind, internal, lock, shown_record, unfinished,
+    Entry, Live, Proposal, Proposals, encode_kind, internal, lock, replay_error, shown_record,
+    unfinished,
 };
 use crate::diff::{self, DiffOptions, MAX_SAMPLES, PREVIEW_ROOT};
 
@@ -748,7 +749,7 @@ impl Proposals {
         let turn = c
             .send_input(actor, input, key, now, subject, authority)
             .await
-            .map_err(internal)?;
+            .map_err(replay_error)?;
         self.write_log(id, live).await?;
         forget_logged(live);
         // The reply leaves the fork: no real SQL rows in it (M5), as

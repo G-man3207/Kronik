@@ -57,6 +57,11 @@ pub enum ReplayError {
         "replay failed: SUBJECT_ERASED: a sealed value of an erased subject reached a fork turn"
     )]
     Erased,
+    /// A fork turn, or a callee it ran, found the engine's instance pool
+    /// full: the replay could not run it. An infrastructure failure, never a
+    /// difference: nothing of the replay is a result.
+    #[error("replay could not run: {0}")]
+    Unavailable(String),
 }
 
 /// One kind's code in the fork.
@@ -1290,6 +1295,19 @@ impl Runner {
                 "naming the fork turn's blobs: {e}"
             )));
         }
+        // The engine's instance pool had no room for the turn, or for a
+        // callee it called: the turn did not run, so its outcome is not the
+        // code's. The replay stops as one that could not run, never with a
+        // difference.
+        let callee = lock(&gate.state).unavailable.take();
+        let unavailable = callee.or_else(|| match &run {
+            Ok(out) if out.pool_exhausted => Some(out.outcome.message.clone()),
+            _ => None,
+        });
+        if let Some(message) = unavailable {
+            let _ = lock(&sql).end(false, &[] as &[(&str, &[u8])]);
+            return Err(ReplayError::Unavailable(message));
+        }
         let mut out = match run {
             Ok(o) => o,
             Err(e) => {
@@ -1713,6 +1731,9 @@ struct GateState {
     /// A callee the replay could not verify ([`ForkTurn::erased`]): what it
     /// answered need not be what production's answered.
     unverified_callee: bool,
+    /// Why a callee could not run ([`ReplayError::Unavailable`]): the caller
+    /// could not either, and the replay stops with that.
+    unavailable: Option<String>,
 }
 
 /// The inline bytes of a fork turn's request body. Blob request bodies
@@ -3360,7 +3381,14 @@ impl ReplayGate {
                     self.dispatch.clone(),
                 )
                 .await
-                .map_err(|e| GateError::Host(e.to_string()))?;
+                .map_err(|e| {
+                    // A callee that could not run: neither can its caller,
+                    // whose turn stops here (`Runner::run_turn`).
+                    if let ReplayError::Unavailable(message) = &e {
+                        lock(&self.state).unavailable = Some(message.clone());
+                    }
+                    GateError::Host(e.to_string())
+                })?;
             let o =
                 turn.record.outcome.take().ok_or_else(|| {
                     GateError::Host("The committed callee outcome is missing".into())

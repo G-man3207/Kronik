@@ -458,6 +458,13 @@ fn check_error(msg: String) -> ApiError {
         ApiError::new(ErrorCode::BadRequest, msg).with_hint(
             "Point --data-dir at a data directory that has served, or start one with `kronik serve --data-dir <dir>`.",
         )
+    } else if msg.contains("replay could not run: ") {
+        // Not a verdict on the upgrade: the report is not written.
+        ApiError::new(ErrorCode::Unavailable, msg).with_hint(
+            "The check's Wasm instance pool had no room for a replayed turn (8 instances per \
+             worker, for the turn and the callees of its calls). Nothing was compared and no \
+             report was written. Run the check again, with fewer --workers if it persists.",
+        )
     } else if let Some(i) = msg.find("SUBJECT_ERASED: ") {
         ApiError::new(ErrorCode::SubjectErased, msg[i..].to_owned()).with_hint(
             "A sealed value of an erased subject reached a replayed turn; erased values cannot \
@@ -595,6 +602,20 @@ mod tests {
                 .into(),
         );
         assert_eq!(missing.code, ErrorCode::KeystoreIncomplete);
+    }
+
+    /// A check that found its instance pool full could not run: no verdict
+    /// on the upgrade (`UNAVAILABLE`, and no report is written), never
+    /// `ENGINE_UPGRADE_DIVERGED`.
+    #[test]
+    fn a_check_without_room_in_its_pool_is_unavailable() {
+        let e = check_error(
+            "replay could not run: maximum concurrent limit of 16 for component instances \
+             reached"
+                .into(),
+        );
+        assert_eq!(e.code, ErrorCode::Unavailable);
+        assert!(e.hint.is_some_and(|h| h.contains("--workers")));
     }
 
     /// The count is always shown, also when it is 0: a passing check did not

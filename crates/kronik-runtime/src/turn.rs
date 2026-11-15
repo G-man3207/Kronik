@@ -52,6 +52,11 @@ pub struct TurnOutput {
     pub logs: Vec<LogEvent>,
     /// The SQL host handed in, returned so the caller can end its turn.
     pub sql: Option<Box<dyn SqlHost>>,
+    /// The engine's instance pool had no room for the turn (wasmtime's
+    /// `PoolConcurrencyLimitError`): the guest did not run, and `outcome`
+    /// is the `TURN_FAILED` a daemon records for that. A replay must not
+    /// compare such a turn: it could not run it.
+    pub pool_exhausted: bool,
 }
 
 impl TurnOutput {
@@ -60,8 +65,8 @@ impl TurnOutput {
     }
 }
 
-/// A host-side failure: the turn did not run to a recordable outcome (pool
-/// exhaustion, a state read error). Nothing is recorded for it.
+/// A host-side failure: the turn did not run to a recordable outcome (a
+/// state read error, a key the keystore lacks). Nothing is recorded for it.
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
     #[error("host failure during turn: {0}")]
@@ -331,6 +336,10 @@ impl Program {
             return Err(fatal);
         }
         host.warn_unsent();
+        // The instance pool had no room for the turn: the guest did not run.
+        // A typed error, so a guest's own failure text cannot pass for it.
+        let pool_exhausted =
+            matches!(&result, Err(e) if e.is::<wasmtime::PoolConcurrencyLimitError>());
         let subject = host.subject.clone();
         let refs = with_blobs.then_some(&host.blob_state);
         let mut outcome = match result {
@@ -402,6 +411,7 @@ impl Program {
             memory_peak_bytes: host.limiter.peak_bytes as u64,
             logs: host.logs.take(),
             sql: host.sql.take(),
+            pool_exhausted,
         })
     }
 }

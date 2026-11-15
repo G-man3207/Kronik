@@ -69,6 +69,34 @@ pub async fn check(
     workers: usize,
     sealer: Option<Arc<kronik_privacy::sealer::Sealer>>,
 ) -> Result<Checked, String> {
+    // Room for each worker's turn and the callees of its calls, which a
+    // replay runs inside the worker. A pool of one instance per worker
+    // failed the first replayed call, as a divergence.
+    let pool = kronik_sched::pool::replay_instances(workers, kronik_sched::pool::available_cpus());
+    check_with_pool(
+        env,
+        data,
+        window,
+        workers,
+        sealer,
+        PoolSize::instances(pool),
+    )
+    .await
+}
+
+/// [`check`] on an instance pool of `pool`. A turn that finds the pool full
+/// stops the check as one that could not run, with
+/// [`ReplayError::Unavailable`](crate::ReplayError::Unavailable)'s message,
+/// never as a divergence. Tests use it to make the pool too small.
+#[doc(hidden)]
+pub async fn check_with_pool(
+    env: &Env,
+    data: &Path,
+    window: Duration,
+    workers: usize,
+    sealer: Option<Arc<kronik_privacy::sealer::Sealer>>,
+    pool: PoolSize,
+) -> Result<Checked, String> {
     let branch = "main";
     let log_dir = data.join("branches").join(branch).join("log");
     let reader = LogReader::new(env.clone(), log_dir.clone(), branch);
@@ -110,11 +138,7 @@ pub async fn check(
         index.reveal(p);
     }
     let index = Arc::new(index);
-    // Room for each worker's turn and the callees of its calls, which a
-    // replay runs inside the worker. A pool of one instance per worker
-    // failed the first replayed call, as a divergence.
-    let pool = kronik_sched::pool::replay_instances(workers, kronik_sched::pool::available_cpus());
-    let engine = build_engine(PoolSize::instances(pool)).map_err(|e| e.to_string())?;
+    let engine = build_engine(pool).map_err(|e| e.to_string())?;
     let code = CodeStore::new(engine, Some(data.join("code"))).map_err(|e| e.to_string())?;
     let fc = fork_kinds(
         &index,

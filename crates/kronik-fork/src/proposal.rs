@@ -353,6 +353,14 @@ fn replay_error(e: replay::ReplayError) -> ApiError {
                 "The subject was erased with `kronik privacy erase`: its values cannot be read \
                  again, by any replay.",
             ),
+        e @ replay::ReplayError::Unavailable(_) => {
+            ApiError::new(ErrorCode::Unavailable, e.to_string()).with_hint(
+                "The daemon's Wasm instance pool had no room for a fork turn: forks, replays and \
+                 previews share it with the node's turns, and a replayed call holds an instance \
+                 for each callee. Nothing was compared. Run it again, with fewer --threads if \
+                 it persists.",
+            )
+        }
         e => internal(e),
     }
 }
@@ -2093,11 +2101,11 @@ impl Proposals {
             let roots = sample::sample(&fresh, id, options.sample);
             let trees = replay::isolated(self.node.env(), setup.clone(), roots, self.workers)
                 .await
-                .map_err(internal)?;
+                .map_err(replay_error)?;
             live.trees.extend(trees);
         }
         if let Some(c) = live.continuous.as_mut() {
-            c.extend(setup.clone()).await.map_err(internal)?;
+            c.extend(setup.clone()).await.map_err(replay_error)?;
         }
         self.save_model_cache(&setup)?;
         live.index = index;
@@ -2373,7 +2381,7 @@ impl Proposals {
                 let mut turn = c
                     .send(actor, msg, root, time, authority)
                     .await
-                    .map_err(internal)?;
+                    .map_err(replay_error)?;
                 this.save_model_cache(c.setup())?;
                 // The reply leaves the fork: no real SQL rows in it (M5).
                 turn.record = shown_record(&turn);
@@ -2809,4 +2817,25 @@ fn targets_of_value(d: &Value) -> Vec<String> {
 
 pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), ApiError> {
     crate::write_atomic(path, bytes).map_err(internal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A replay that found the instance pool full could not run: the
+    /// answer is `UNAVAILABLE`, which a client may retry, never a diff.
+    #[test]
+    fn a_replay_without_room_in_the_pool_is_unavailable() {
+        let e = replay_error(replay::ReplayError::Unavailable(
+            "maximum concurrent limit of 16 for component instances reached".into(),
+        ));
+        assert_eq!(e.code, ErrorCode::Unavailable);
+        assert!(
+            e.message.starts_with("replay could not run: "),
+            "{}",
+            e.message
+        );
+        assert!(e.hint.is_some_and(|h| h.contains("--threads")));
+    }
 }

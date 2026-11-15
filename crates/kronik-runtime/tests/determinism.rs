@@ -7,11 +7,15 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use kronik_core::env::BoxFuture;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
-use kronik_runtime::{CodeStore, PoolSize, StateView, TurnLimits, TurnRequest, build_engine};
+use kronik_runtime::{
+    CallOutcome, CodeStore, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchOutcome, FetchRequest,
+    GateError, PoolSize, Program, StateView, TurnLimits, TurnRequest, build_engine,
+};
 use prost::Message as _;
 
 const COUNTER: &[u8] = include_bytes!("../../../tests/guests/counter.wasm");
@@ -175,5 +179,137 @@ async fn outcomes_classify_failures() {
             ("s".to_string(), Some("user:1".to_string())),
             ("t".to_string(), Some("user:2".to_string()))
         ]
+    );
+}
+
+/// Runs the callee of a call on the same program inside the caller's
+/// `call`, as a replay does, and keeps whether the pool had room for it
+/// and its outcome.
+struct Nested {
+    program: Arc<Program>,
+    state: Arc<Map>,
+    callee: Arc<Mutex<Option<(bool, pb::Outcome)>>>,
+}
+
+impl EffectGate for Nested {
+    fn fetch(
+        &self,
+        _ordinal: u32,
+        _req: FetchRequest,
+    ) -> BoxFuture<'static, Result<FetchOutcome, GateError>> {
+        Box::pin(async { Ok(FetchOutcome::Network("no network here".into())) })
+    }
+    fn call(
+        &self,
+        _ordinal: u32,
+        to: ActorRef,
+        msg: pb::Message,
+        _compensate: Option<pb::Message>,
+    ) -> BoxFuture<'static, Result<CallOutcome, GateError>> {
+        let (program, state, callee) = (
+            self.program.clone(),
+            self.state.clone(),
+            self.callee.clone(),
+        );
+        Box::pin(async move {
+            let out = program
+                .run(
+                    TurnRequest {
+                        actor: to,
+                        causal_key: kronik_core::causal::root("callee".into()),
+                        logical_time_ms: 1,
+                        seed: [0; 32],
+                        input: message(&msg.name, b""),
+                        limits: TurnLimits::default(),
+                        subject: None,
+                    },
+                    state,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|e| GateError::Host(e.to_string()))?;
+            *callee.lock().unwrap() = Some((out.pool_exhausted, out.outcome));
+            Ok(CallOutcome::Failed("the callee did not commit".into()))
+        })
+    }
+    fn crypto(
+        &self,
+        _ordinal: u32,
+        _algorithm: CryptoAlgorithm,
+        _secret: String,
+        _data: Vec<u8>,
+    ) -> BoxFuture<'static, Result<CryptoOutcome, GateError>> {
+        Box::pin(async { Ok(CryptoOutcome::Unsupported("none".into())) })
+    }
+    fn reveal(
+        &self,
+        _ordinal: u32,
+        _name: String,
+    ) -> BoxFuture<'static, Result<Result<String, String>, GateError>> {
+        Box::pin(async { Ok(Err("none".into())) })
+    }
+}
+
+/// A turn the instance pool has no room for did not run: its outcome is
+/// the `TURN_FAILED` a daemon records, marked `pool_exhausted` so that a
+/// replay does not take it for the code's failure. With one instance, the
+/// callee of a call that runs while its caller waits has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_without_room_in_the_pool_is_marked_as_not_run() {
+    let engine = build_engine(PoolSize { concurrency: 1 }).unwrap();
+    let code = CodeStore::new(engine, None).unwrap();
+    let (_, program) = code.add(COUNTER).unwrap();
+    let state = Arc::new(Map(BTreeMap::new()));
+    let callee = Arc::new(Mutex::new(None));
+    let gate = Arc::new(Nested {
+        program: program.clone(),
+        state: state.clone(),
+        callee: callee.clone(),
+    });
+    let run = |input: pb::Input, gate: Option<Arc<dyn EffectGate>>| {
+        let (program, state) = (program.clone(), state.clone());
+        async move {
+            program
+                .run(
+                    TurnRequest {
+                        actor: ActorRef::parse("counter/a").unwrap(),
+                        causal_key: kronik_core::causal::root("caller".into()),
+                        logical_time_ms: 1,
+                        seed: [0; 32],
+                        input,
+                        limits: TurnLimits::default(),
+                        subject: None,
+                    },
+                    state,
+                    None,
+                    gate,
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let gate: Arc<dyn EffectGate> = gate;
+    let caller = run(message("call", b"counter/b increment"), Some(gate)).await;
+    let (exhausted, outcome) = callee.lock().unwrap().take().expect("the call ran");
+    assert!(exhausted, "{outcome:?}");
+    assert_eq!(outcome.error_code, "TURN_FAILED");
+    assert!(
+        outcome
+            .message
+            .contains("maximum concurrent limit of 1 for"),
+        "{outcome:?}"
+    );
+    // The caller ran, and so does a guest that fails on its own.
+    assert!(
+        caller.committed() && !caller.pool_exhausted,
+        "{:?}",
+        caller.outcome
+    );
+    let failed = run(message("fail", b""), None).await;
+    assert!(
+        !failed.committed() && !failed.pool_exhausted,
+        "{:?}",
+        failed.outcome
     );
 }

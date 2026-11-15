@@ -49,7 +49,10 @@ engine-compatibility exemption.
    prerequisite is reported, keep the current binary. Read the saved
    report/diff. Never edit historical engine strings, suppress divergence, or
    copy a report from another directory/pair. An unavailable prerequisite is
-   not a passing check.
+   not a passing check. `UNAVAILABLE` with `replay could not run` is no
+   verdict either way: the check's instance pool was full, so it compared
+   nothing and wrote no report. Run it again, with fewer `--workers` if it
+   persists.
 4. Stop only the owned old process/service using its recorded lifecycle handle,
    replace its binary through the normal verified installation mechanism, and
    start the candidate with the same owned data/config/key source. In a local

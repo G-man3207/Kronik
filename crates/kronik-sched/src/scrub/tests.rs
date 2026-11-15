@@ -241,6 +241,7 @@ fn core_spelling_is_not_guest_code_provenance_but_real_host_traps_remain_structu
         memory_peak_bytes: 29,
         logs: Vec::new(),
         sql: None,
+        pool_exhausted: false,
     };
     let secrets = [("H", b"H".as_slice())];
     let matcher = plan(&secrets);

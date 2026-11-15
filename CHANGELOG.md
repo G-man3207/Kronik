@@ -47,7 +47,10 @@ until the v1.0 compatibility promise takes effect.
   `--concurrency`. A daemon's forks, replays and previews share its pool
   with its turns; the pool now has room for 8 instances per CPU (16 to 128)
   even with a lower `--concurrency`, which at the default changes nothing on
-  2 to 8 CPUs.
+  2 to 8 CPUs. A replayed turn that still finds the pool full is not a
+  result: the replay, the preview or the check stops as one that could not
+  run (`UNAVAILABLE`, "replay could not run"), and the check writes no
+  report.
 - Erasure reaches blobs (M26, docs/design/m26-blobs.md §9). Applying a
   subject's erasure marks its blobs erased, and the node deletes their files
   at once, in main's store and in every fork's space (`blobs` in the answer
