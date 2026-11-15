@@ -12,12 +12,14 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{Node, NodeConfig, TurnResult, start_local};
+use kronik_sched::snapshots::StorageConfig;
+use kronik_sched::{HoldPoint, Node, NodeConfig, TestHold, TurnResult, start_local};
 use tokio::runtime::Runtime;
 
 const COUNTER: &str = concat!(
@@ -118,6 +120,17 @@ fn start(dir: &Path) -> Proc {
 
 /// [`start`] with the log's record limit `limit`.
 fn start_limit(dir: &Path, limit: u32) -> Proc {
+    start_with(dir, limit, None, None, None)
+}
+
+/// [`start_limit`] with a crash hold, retention settings and a segment size.
+fn start_with(
+    dir: &Path,
+    limit: u32,
+    hold: Option<TestHold>,
+    storage: Option<StorageConfig>,
+    segment_max_bytes: Option<u64>,
+) -> Proc {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -131,6 +144,9 @@ fn start_limit(dir: &Path, limit: u32) -> Proc {
             NodeConfig {
                 concurrency: 4,
                 test_max_record_bytes: Some(limit),
+                test_hold: hold,
+                storage,
+                segment_max_bytes,
                 ..NodeConfig::default()
             },
         )
@@ -476,4 +492,249 @@ fn an_open_turn_whose_input_no_longer_fits_is_closed_not_rerun_for_ever() {
         server.seen().iter().filter(|path| *path == "/hang").count(),
         1
     );
+}
+
+/// Issue #87: a turn begun before 0.5 could record compensation messages that
+/// no budget charged. When this release re-ran it and the recorded compensation
+/// put its failed record over the budget, the closing record kept the
+/// compensation, the log refused it, and every start ran the turn again and
+/// pinned its segment from retention. The closing record now leaves it out
+/// before the effects: the call stays without a compensation to deliver, the
+/// turn is closed, and the pin goes.
+#[test]
+fn an_open_turn_whose_compensations_no_longer_fit_is_closed_not_rerun_for_ever() {
+    let dir = tempfile::tempdir().unwrap();
+    let armed = dir.path().join("hold-armed");
+    let reached = dir.path().join("hold-reached");
+    std::fs::write(&armed, b"armed").unwrap();
+    let mut storage = StorageConfig::new(dir.path().to_path_buf());
+    storage.history = Duration::ZERO;
+    storage.snapshot_interval = Duration::from_secs(3600);
+    let hold = TestHold {
+        point: HoldPoint::BeforeCommit,
+        armed,
+        reached: reached.clone(),
+    };
+
+    let p = start_with(
+        dir.path(),
+        LIMIT,
+        Some(hold),
+        Some(storage.clone()),
+        Some(4096),
+    );
+    p.deploy();
+    // The counter/callee turn parks before its record (the hold); the call
+    // times out, and the caller records the compensation of a timed-out call
+    // exactly as it records a successful one's. Then the caller parks too.
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "counter".into(),
+            effect_timeout_ms: Some(100),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    let compensation = "c".repeat(100 << 10);
+    let spec = format!("counter/callee increment {compensation}");
+    let node = p.node.clone();
+    let owner = p.owner();
+    p.rt.spawn(async move {
+        let _ = node
+            .send(
+                ActorRef::parse("counter/h").unwrap(),
+                msg("call", spec.as_bytes()),
+                audit(),
+                false,
+                owner,
+            )
+            .await;
+    });
+
+    // The caller is open with its call result recorded: a crash there leaves
+    // a TurnBegin whose open_effects hold a compensation past the next
+    // start's budget.
+    let mut caller = None;
+    for _ in 0..600 {
+        let open = p.node.store().db().open_turns().unwrap();
+        if let Some(turn) = open.iter().find(|t| t.actor.key == "h")
+            && !p
+                .node
+                .store()
+                .db()
+                .open_effects(&turn.execution_id)
+                .unwrap()
+                .is_empty()
+        {
+            caller = Some((turn.execution_id.clone(), turn.pos.segment));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (execution_id, begin_segment) =
+        caller.expect("the caller did not reach its record's commit");
+    assert!(reached.is_file(), "the caller is held before its commit");
+
+    // A crash: the TurnBegin and the call result are durable, the TurnRecord
+    // is never written.
+    let Proc { rt, node } = p;
+    drop(node);
+    rt.shutdown_timeout(Duration::from_secs(1));
+    let begin = bodies(dir.path())
+        .into_iter()
+        .find_map(|(_, record, _)| match record {
+            Record::TurnBegin(begin) if begin.execution_id == execution_id => Some(begin),
+            _ => None,
+        })
+        .expect("the caller's turn began");
+    let base = {
+        let mut input = begin.input.clone().unwrap();
+        let input_cost = kronik_sched::record_budget::input_cost(&mut input);
+        kronik_sched::record_budget::base_cost(
+            begin.actor.as_ref().unwrap(),
+            &begin.code_hash,
+            begin.causal_key.as_ref().unwrap(),
+            begin.logical_time_ms,
+            &begin.random_seed,
+            input_cost,
+            begin.config_epoch,
+        )
+    };
+    // A turn's budget is the log's limit less 4 KiB: this limit lets the
+    // guest re-run under the budget (the input and a short outcome fit) and
+    // holds the closing record once its recorded compensation is left out.
+    let limit = u32::try_from(base + 8192).unwrap();
+    assert!(base <= kronik_sched::record_budget::turn_limit(limit as usize));
+
+    let p = start_with(dir.path(), limit, None, Some(storage.clone()), Some(4096));
+    let mut closed = None;
+    for _ in 0..600 {
+        closed = bodies(dir.path())
+            .into_iter()
+            .find_map(|(_, record, _)| match record {
+                Record::TurnRecord(t) if t.execution_id == execution_id => Some(t),
+                _ => None,
+            });
+        if closed.is_some() && p.node.store().db().open_turns().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let closed = closed.expect("the open turn was never closed");
+    let len = Record::TurnRecord(closed.clone()).encoded_len();
+    assert!(len <= limit as usize, "the closing record is {len} bytes");
+    assert_eq!(closed.input, begin.input);
+    // The turn re-ran under the budget and replayed its recorded call; the
+    // compensation is what put its record over. That goes, the call stays
+    // without a compensation to deliver, and its EffectResult keeps the
+    // request and response the closing record leaves out.
+    assert!(
+        closed.compensations.is_empty(),
+        "{} compensations stayed",
+        closed.compensations.len()
+    );
+    assert_eq!(closed.effects.len(), 1);
+    assert!(closed.effects[0].request.is_none() && closed.effects[0].response.is_none());
+    assert!(
+        bodies(dir.path())
+            .into_iter()
+            .any(|(_, record, _)| matches!(
+                record,
+                Record::EffectResult(effect)
+                    if effect.execution_id == execution_id
+                        && effect
+                        .effect
+                        .as_ref()
+                        .is_some_and(|e| e.kind == "actor.call")
+            )),
+        "the call's result is not in the log"
+    );
+    let outcome = closed.outcome.clone().unwrap();
+    assert_eq!(outcome.kind, pb::OutcomeKind::Trap as i32, "{outcome:?}");
+    assert_eq!(outcome.error_code, "TURN_TOO_LARGE", "{outcome:?}");
+    assert!(
+        outcome
+            .message
+            .contains("its 1 compensations are not recorded: their calls are orphans"),
+        "{outcome:?}"
+    );
+    assert!(p.node.store().db().open_turns().unwrap().is_empty());
+    assert_every_record_fits(dir.path());
+
+    // A later start has nothing to run, and the pin is gone: retention may
+    // delete the segment that held the begin.
+    drop(p);
+    let p = start_with(dir.path(), limit, None, Some(storage), Some(4096));
+    assert!(p.node.store().db().open_turns().unwrap().is_empty());
+    assert_eq!(
+        bodies(dir.path())
+            .into_iter()
+            .filter(|(_, record, _)| matches!(
+                record,
+                Record::TurnRecord(t) if t.execution_id == execution_id
+            ))
+            .count(),
+        1
+    );
+    for i in 0..40 {
+        p.send(&format!("counter/k{}", i % 5), msg("increment", b""));
+    }
+    p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
+    let before = p.node.store().db().time_hwm().unwrap();
+    loop {
+        std::thread::sleep(Duration::from_millis(2));
+        p.send("counter/tick", msg("increment", b""));
+        if p.node.store().db().time_hwm().unwrap() > before {
+            break;
+        }
+    }
+    // The compensation left out was not delivered either. The callee has a
+    // failed record from the lost-call close at startup, but no turn of a
+    // compensation, and it never ran.
+    assert!(
+        !bodies(dir.path())
+            .into_iter()
+            .any(|(_, record, _)| matches!(
+                record,
+                Record::TurnRecord(turn)
+                    if turn.actor.as_ref().is_some_and(|actor| actor.key == "callee")
+                        && matches!(
+                            turn.input.as_ref().and_then(|input| input.kind.as_ref()),
+                            Some(pb::input::Kind::Message(m))
+                                if m.source == pb::MessageSource::Compensation as i32
+                        )
+            )),
+        "a compensation the closing record left out was delivered"
+    );
+    assert_eq!(
+        p.node
+            .store()
+            .db()
+            .kv_get("counter", "callee", "n")
+            .unwrap(),
+        None,
+        "a compensation the closing record left out changed the callee"
+    );
+    let log_dir = dir.path().join("branches/main/log");
+    let starts = kronik_log::segment_starts(&log_dir).unwrap();
+    let next = starts
+        .iter()
+        .position(|start| *start == begin_segment)
+        .and_then(|i| starts.get(i + 1).copied())
+        .expect("the begin's segment and a later one");
+    let first = p.node.compact(p.node.storage_config().unwrap()).unwrap();
+    assert!(
+        first >= next,
+        "compact returned {first}, the begin's segment ended at {next}"
+    );
+    assert!(
+        !log_dir
+            .join(kronik_log::segment_name(begin_segment))
+            .is_file(),
+        "the begin's segment was not deleted"
+    );
+    assert_eq!(p.node.retention_pin(), None);
 }

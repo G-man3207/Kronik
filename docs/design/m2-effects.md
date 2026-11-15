@@ -235,6 +235,19 @@ its ingress key belong to the re-run (an HTTP retry with the same
   delivered exactly once like a sent message: source `COMPENSATION`, causal
   key `child(callee turn key, callee, COMPENSATION_ORDINAL = 2^32 - 2)`,
   message id = its `causal-id`, `compensates` = the call's message id.
+- **A legacy compensation past the budget.** A re-run of a turn a release
+  before 0.5 began takes its compensations from the recorded calls, which
+  the gate never charged. If the failed record is still over the budget
+  after its effects' payloads go, the closing ladder (ADR 0130's
+  2026-11-15 amendment, issue #87) leaves the compensations out before the
+  effects. Such a call whose callee committed is an orphan with no
+  compensation: its `EffectResult` record stays, the callee's committed
+  change stays visible, and no compensation message is delivered for it.
+  When the effects stay in the closing record, the applier lists the call in
+  `orphans` with no compensation; when only the input fits, the effects go
+  too and `history --orphans` does not name it, though the call's
+  `EffectResult` and the callee's history still do. The outcome names the
+  number left out.
 - **Orphans.** When the caller's turn fails, every successful call (status
   OK, `HOST_REDACTION_FAILURE` that observed OK, or a call error whose
   `FAILED` record observed the callee's committed outcome, ADR 0124) adds an

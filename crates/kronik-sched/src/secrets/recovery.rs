@@ -265,7 +265,13 @@ impl Node {
     /// guest code: with the TurnBegin's own execution id, so applying the
     /// record deletes its `open_turns` and `open_effects` rows and no later
     /// start runs it again; with its recorded `effects`, so a successful call
-    /// stays an orphan, and the compensations those calls recorded are sent.
+    /// stays an orphan, and the compensations those calls recorded are sent
+    /// when the record can hold them. The closing record is fitted to one log
+    /// record (#26): what an earlier release recorded past the budget is left
+    /// out, but its input is never. Only a legacy input that alone exceeds the
+    /// log's own record limit can therefore leave the turn open; the error
+    /// below says so, as the record format has no closing record without an
+    /// input.
     /// `erased_calls`: a call request of an erased subject cannot be opened,
     /// so whether it had a compensation is gone with it; the call is skipped
     /// instead of refusing the close (the turn's input or kind is gone for
@@ -353,23 +359,31 @@ impl Node {
             config_epoch: begin.config_epoch,
             ..Default::default()
         };
-        match crate::record_budget::fit_closing(&mut record, self.turn_record_limit(), input_cost) {
+        let fitted =
+            crate::record_budget::fit_closing(&mut record, self.turn_record_limit(), input_cost);
+        match fitted {
             crate::record_budget::Fit::Fits => {}
             crate::record_budget::Fit::Over => {
-                // The log takes TURN_RESERVE more than the budget. A TurnBegin
-                // that an earlier release wrote within a few hundred bytes of
-                // the log's own limit leaves no room for the outcome's text:
-                // keep its code only.
-                if Record::TurnRecord(record.clone()).encoded_len() > self.record_limit()
+                // Only the input is left, and an earlier release recorded it
+                // past this budget. The log takes TURN_RESERVE more than the
+                // budget; a TurnBegin that an earlier release wrote within a
+                // few hundred bytes of the log's own limit leaves no room for
+                // the outcome's text. Keep its code only, then let the append
+                // decide: sealing may add to what is measured here.
+                let limit = self.record_limit();
+                if Record::TurnRecord(record.clone()).encoded_len() > limit
                     && let Some(outcome) = record.outcome.as_mut()
                 {
                     outcome.message.clear();
                 }
-                tracing::error!(
+                let bytes = Record::TurnRecord(record.clone()).encoded_len();
+                tracing::warn!(
                     execution_id = %record.execution_id,
-                    "the record closing the turn is over the turn budget even without its \
-                     effects (an earlier release recorded its input or compensations past it); \
-                     appending it anyway"
+                    bytes,
+                    limit,
+                    "the record closing the turn is over the turn budget without its effects \
+                     and compensations (its input alone is); appending it, and the log refuses \
+                     it if it is over its record limit"
                 );
             }
             _ => tracing::warn!(
@@ -378,28 +392,52 @@ impl Node {
                  record; the effect results in the log keep them"
             ),
         }
+        // The stripping ladder may have left the compensations out: then
+        // the committed calls are orphans, and nothing may be delivered as
+        // if the record still held them.
+        let deliver_compensations = !record.compensations.is_empty();
+        let execution_id = record.execution_id.clone();
         let mut closing = Record::TurnRecord(record);
         let fence = self.seal_born(&mut closing, born).await?;
         self.tombstone_outbound(&mut compensations, born);
         let lsn = self.commit(closing).await;
         drop(fence);
-        let lsn = lsn?;
-        for message in compensations {
-            let compensates = causal::message_id(&key, message.ordinal);
-            if timed_out.contains(&message.ordinal)
-                && self.released_compensation(&compensates, lsn).is_none()
+        let lsn = match lsn {
+            Err(error)
+                if fitted == crate::record_budget::Fit::Over
+                    && error.code == ErrorCode::PayloadTooLarge =>
             {
-                continue;
+                // The input alone is over the log's record limit, so no
+                // record of this format could close the begin. Say what the
+                // surviving row and its pin mean.
+                tracing::error!(
+                    execution_id = %execution_id,
+                    "the record closing the turn is over the log's record limit even without \
+                     its effects and compensations (its input alone is): the turn cannot be \
+                     closed, and its segment stays pinned for retention"
+                );
+                return Err(error);
             }
-            self.deliver(
-                &actor,
-                &key,
-                time,
-                message,
-                pb::MessageSource::Compensation,
-                &compensates,
-                born,
-            );
+            other => other?,
+        };
+        if deliver_compensations {
+            for message in compensations {
+                let compensates = causal::message_id(&key, message.ordinal);
+                if timed_out.contains(&message.ordinal)
+                    && self.released_compensation(&compensates, lsn).is_none()
+                {
+                    continue;
+                }
+                self.deliver(
+                    &actor,
+                    &key,
+                    time,
+                    message,
+                    pb::MessageSource::Compensation,
+                    &compensates,
+                    born,
+                );
+            }
         }
         Ok(TurnResult {
             turn_id: TurnId {

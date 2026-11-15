@@ -2889,13 +2889,21 @@ impl Node {
         };
         match fitted {
             crate::record_budget::Fit::Fits => {}
-            crate::record_budget::Fit::Over => tracing::error!(
-                actor = %actor,
-                execution_id = %record.execution_id,
-                "the turn's failed record is over the turn budget even without its effects \
-                 (an earlier release recorded its input or compensations past it); appending \
-                 it anyway"
-            ),
+            crate::record_budget::Fit::Over => {
+                // Only a legacy input can be left: the budget above already
+                // refused that case before the guest ran.
+                let bytes = Record::TurnRecord(record.clone()).encoded_len();
+                let limit = self.record_limit();
+                tracing::error!(
+                    actor = %actor,
+                    execution_id = %record.execution_id,
+                    bytes,
+                    limit,
+                    "the turn's failed record is over the turn budget even without its effects \
+                     and compensations (its input alone is); it fits the log only within its \
+                     record limit, and the log refuses it otherwise"
+                );
+            }
             _ => tracing::warn!(
                 actor = %actor,
                 stripped = fitted == crate::record_budget::Fit::Stripped,
@@ -2917,6 +2925,11 @@ impl Node {
         }
         let mut outcome = record.outcome.clone().unwrap_or_default();
         let committed = outcome.kind == pb::OutcomeKind::Committed as i32;
+        // The stripping ladder may have left the compensations out of the
+        // record, for a failed turn an earlier release began: then its
+        // committed calls are orphans, and a compensation must not be
+        // delivered as if the record held it.
+        let deliver_compensations = !record.compensations.is_empty();
         let mut messages = if committed {
             record.messages.clone()
         } else {
@@ -3018,7 +3031,7 @@ impl Node {
         for m in messages {
             self.deliver(actor, &key, time, m, pb::MessageSource::Actor, "", born);
         }
-        if !committed {
+        if !committed && deliver_compensations {
             for m in compensations {
                 let compensates = causal::message_id(&key, m.ordinal);
                 // A timed-out call's compensation goes out only once its

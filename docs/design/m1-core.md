@@ -101,22 +101,35 @@ its plaintext form.
   its input, effects and compensations stay, its writes, messages, timers,
   SQL changes and output go, its compensations are delivered and a message
   becomes a dead letter. The gate kept the effects within the budget, which
-  starts with 512 bytes taken for the outcome of such a record, so that
-  failed record always fits and closes any `TurnBegin`; an HTTP client gets
-  `TURN_FAILED`, as for `FUEL_EXHAUSTED`. A turn that does not commit after
-  an effect whose outcome is unknown (an `unsafe` effect a re-run did not
-  perform again) ends with `EFFECT_OUTCOME_UNKNOWN` instead, also when its
-  record was too large: the outcome's message says why it failed, the
-  effect's record stays, and the code tells a client that the effect may
-  have happened. Production and its replays decide this on the final
-  record (`record_budget::mark_unknown_outcome`).
+  starts with 512 bytes taken for the outcome of such a record, so a record
+  this release assembled fits and closes any `TurnBegin`; an HTTP client
+  gets `TURN_FAILED`, as for `FUEL_EXHAUSTED`. A record only a release before
+  0.5 could have left over the budget (the re-run of its open turn) is
+  stripped further, because the gate did not charge it: its effects' requests
+  and responses go, then their compensations (their committed calls are not
+  compensated, and are listed as orphans only while their effects stay),
+  then the effects; only its input is never left out. `Over` means that input
+  alone is over the turn budget, and the record can still be appended when it
+  is within the log's own 128 MiB limit, 4 KiB above the budget. An input alone
+  over that limit cannot be closed by this format, and only a pre-0.5 data
+  directory can hold one. A turn that does not commit after an effect whose
+  outcome is unknown (an `unsafe` effect a re-run did not perform again) ends
+  with `EFFECT_OUTCOME_UNKNOWN` instead, also when its record was too large:
+  the outcome's message says why it failed, the effect's record stays, and the
+  code tells a client that the effect may have happened. Production and its
+  replays decide this on the final record (`record_budget::mark_unknown_outcome`).
 - An input whose record could hold nothing else is refused before its turn
   runs (`PAYLOAD_TOO_LARGE`). With the default limits (1 MiB messages and
   bodies) this does not happen. The re-run of an open turn whose input an
   earlier release accepted past this budget is not refused, which would
   leave it open and run it again at every start: it is closed with a failed
   record (`TURN_TOO_LARGE`) under the `TurnBegin`'s own execution id,
-  without running the guest again.
+  without running the guest again. Its compensations and effects, if the
+  earlier release recorded them past the budget too, go first (see below);
+  the input stays. When even that input alone is over the log's 128 MiB
+  limit, no record of this format can close the begin: the turn stays open
+  and its segment stays pinned, and the start logs it. A release from 0.5
+  never writes such an input.
 - A fork's replay charges the same budget at the same points, so it makes
   production's decisions and an identity replay stays empty. It denies with
   production's error texts, which the budget counts, and fits every answer
@@ -129,12 +142,15 @@ its plaintext form.
 - Effects re-run from an earlier release's `EffectResult` records are
   charged but never refused (they happened). Only they can make even the
   failed record too large: then its effects keep their status and errors
-  without their requests and responses, and if that is still too large the
-  record leaves the effects out; the log's `EffectResult` records keep them
-  and the outcome's message says so. Each step is checked. A record that is
-  still over the budget (an input or compensations an earlier release
-  recorded past it) is appended as it is, with an error in the log: the log
-  takes 4 KiB more than the budget.
+  without their requests and responses, then its compensations go (their
+  committed calls are not compensated, and the applier lists them as
+  orphans while their effects stay in the record), and if that is still too
+  large the record leaves the effects out; the log's
+  `EffectResult` records keep them and the outcome's message says which step
+  it took. Each step is checked. Only the input can remain over the turn
+  budget, and such a record is appended when it is within the log's own
+  limit, 4 KiB above the budget. An input alone over that limit leaves the
+  turn open, with an error in the log.
 
 ### Record kinds (envelope `kind` byte)
 
