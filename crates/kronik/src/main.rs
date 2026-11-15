@@ -44,7 +44,8 @@ struct Cli {
 enum Command {
     /// Run the daemon: the gateway (HTTP) and the API (Unix socket).
     Serve(serve::ServeArgs),
-    /// Create an actor project (TypeScript or Rust) with the SDK vendored.
+    /// Create an actor project (TypeScript, Rust, Python or Go) with the SDK
+    /// vendored.
     Init(project::InitArgs),
     /// Build the actor project into dist/<name>.wasm and check its imports.
     Build(project::BuildArgs),
