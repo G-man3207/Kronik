@@ -282,11 +282,11 @@ Give the token to `kronik mcp` only, as above: exported in your own shell,
 it would make your next `kronik approve` act as the agent, which lacks the
 `approve` scope (`SCOPE_MISSING`). `kronik mcp` is meant to be started by
 the agent's host, as a subprocess, with `KRONIK_TOKEN` in its environment.
-There is no `--token` flag. The agent starts from `kronik explain agent`
-(the same text as the [agent guide](agent.md)) and uses only the tools that
-guide names: list actors, read history, propose, read the diff, and ask for
-approval. A human approves and promotes, in a shell without the agent's
-token.
+`--token` works too, but a flag shows in the shell history and the process
+list. The agent starts from `kronik explain agent` (the same text as the
+[agent guide](agent.md)) and uses only the tools that guide names: list
+actors, read history, propose, read the diff, and ask for approval. A human
+approves and promotes, in a shell without the agent's token.
 
 ## 11. Live updates over SSE and WebSocket
 
@@ -355,8 +355,9 @@ curl -N http://127.0.0.1:8080/live/demo/events
 node -e 'const ws = new WebSocket("ws://127.0.0.1:8080/live/demo/ws"); ws.onmessage = (e) => console.log(e.data)'
 ```
 
-Each prints `{"n":0}` when it connects (`data: {"n":0}` on the SSE stream).
-Count in the first terminal, and both print the new value:
+Each prints `{"n":0}` when it connects (`data: {"n":0}` on the SSE stream,
+which also gets a `: keep-alive` comment every 15 seconds). Count in the
+first terminal, and both print the new value:
 
 ```sh
 curl -s -X POST http://127.0.0.1:8080/live/demo/increment
@@ -370,9 +371,110 @@ connection, each frame a client sends and its close are turns of the actor,
 recorded like any other input, and the frames a turn sends are recorded with
 it and go out only after it commits: `kronik history --connection` shows a
 connection's turns and what became of each frame (`written`, `queued`,
-`dropped`). A frame to a connection that has closed is dropped, not an
-error. Stop the clients with Ctrl-C: each connection gets its `close` turn.
-A restart of the daemon closes every connection (WebSocket code 1012), and
-clients reconnect: a browser's `EventSource` does so by itself.
-`examples/chat-ts` in the repository is a chat room built the same way, and
-[Connections](connections.md) has the rest.
+`dropped` or `unknown`). A frame to a connection that has closed is
+dropped, not an error. Stop the clients with Ctrl-C: each connection gets
+its `close` turn. A restart of the daemon closes every connection
+(WebSocket code 1012), and clients reconnect: a browser's `EventSource`
+does so by itself. `examples/chat-ts` in the repository is a chat room
+built the same way, and [Connections](connections.md) has the rest.
+
+## 12. Large files as blobs
+
+A request body above its kind's blob threshold, 1 MiB by default, does not
+go into the log. For code that reads blobs, as code built with the
+TypeScript SDK does, the gateway streams it into the blob store as it
+arrives, and the turn gets a blob: a reference made of the bytes' hash and
+size. A blob is the turn's only until it ends; to keep it, the actor holds
+it. Here is a store with one file per key: create a third app and give it
+this `src/actor.ts`:
+
+```sh
+cd ..
+kronik init --lang ts files
+cd files
+rm test/actor.test.ts
+```
+
+```ts
+import { actor, BlobRef } from "@kronik/sdk";
+
+// One file per key: PUT /files/<key> keeps the body, GET /files/<key>
+// gives it back. The actor holds the file's blob; its state keeps only
+// the reference, which keeps nothing alive by itself.
+export default actor({
+  kind: "files",
+  schemaVersion: 1,
+  routes: [
+    { method: "PUT", pattern: "/files/{key}" },
+    { method: "GET", pattern: "/files/{key}" },
+  ],
+  http(req, ctx) {
+    const kept = ctx.state.getJson<{ hash: string; size: number }>("file");
+    const old = kept && new BlobRef(kept.hash, BigInt(kept.size));
+    if (req.method === "GET") return old ? ctx.blob(200, old) : ctx.status(404);
+    // Hold the upload: a blob as it came, a small inline body through put.
+    const file = req.blob ?? ctx.blobs.put(req.body);
+    if (req.blob) ctx.blobs.retain(file);
+    // Let the previous file go.
+    if (old && old.hash !== file.hash) ctx.blobs.release(old);
+    ctx.state.setJson("file", { hash: file.hash, size: Number(file.size) });
+    return ctx.json(201, { hash: file.hash, size: Number(file.size) });
+  },
+});
+```
+
+The template's test counts requests, which this actor does not do, so the
+commands above remove it; `examples/media-ts/test` in the repository tests
+large uploads with the test host. Build and deploy:
+
+```sh
+npm install
+kronik build
+kronik deploy dist/files.wasm --reason 'a file store'
+```
+
+Make a file of 5 MiB, upload it (`curl -T` sends it with `PUT`, streamed
+from the disk), read it back and compare:
+
+```sh
+head -c 5M /dev/urandom > report.bin
+curl -s -T report.bin http://127.0.0.1:8080/files/report; echo
+curl -s -o copy.bin http://127.0.0.1:8080/files/report
+cmp report.bin copy.bin && echo same
+```
+
+The upload answers with the blob's reference,
+`{"hash":"b3:…","size":5242880}`: `b3:` and the BLAKE3 hash of the bytes.
+The turn's record holds only that reference; the bytes are in the blob
+store, under the data directory's `blobs`, and the daemon's memory stays
+flat whatever their size. Now ask the daemon about its blobs, with the hash
+the upload printed:
+
+```sh
+kronik blobs status
+kronik blobs inspect <hash>
+```
+
+`kronik blobs status` counts the blobs the store keeps and their bytes, and
+shows the free disk and the collector's last pass. `kronik blobs inspect`
+shows what keeps one blob: a hold (`held by files/report`) and the records
+that name it (`log`), while they are within retention.
+
+A reference is not a permission. A turn may use only the blobs its actor
+holds, the ones that reached it (an upload, a message's `blobs`, a `fetch`
+response) and the ones it wrote. The hash in this actor's state is data: if
+the actor did not hold the file, the `GET`'s turn would fail with
+`BLOB_NOT_HELD`, and the client would get `500 TURN_FAILED`. Holds change
+when the turn commits, as state does. Upload another file to the same key,
+and the actor releases the old blob; once retention passes the records that
+name it, nothing keeps it, and the collector deletes it
+(`kronik blobs gc --dry-run` lists what nothing keeps, and why). A body
+below the threshold arrives inline, and `put` stores it as a blob the actor
+holds. A request above the kind's upload size, 64 MiB by default, gets
+`413 PAYLOAD_TOO_LARGE`, and an actor keeps at most 1 GiB of blobs
+(`BLOB_QUOTA_EXCEEDED`);
+`kronik limits set files --upload-size 1Gi --reason '...'` raises the
+first. `examples/media-ts` in the repository is an image album built the
+same way, which also shares images by message and lets them expire by
+timer, and [Blobs](operations.md#blobs) in the operations guide has the
+rest.
