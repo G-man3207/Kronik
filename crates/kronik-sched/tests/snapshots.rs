@@ -1254,7 +1254,6 @@ fn below_the_disk_reserve_incident_actions_and_retention_still_work() {
         pinned: vec![],
         cause: pb::DeploymentCause::Rollback,
         verified_through_lsn: 0,
-        unverified_inputs: 0,
         proposal_id: String::new(),
         rollback_of_epoch: 1,
     };

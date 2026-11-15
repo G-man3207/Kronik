@@ -2029,13 +2029,10 @@ impl Proposals {
                 ));
             }
         }
-        // 3. The switch.
+        // 3. The switch. The node counts the root inputs in
+        // `(verified, lsn]` under its gate: the ones that commit while the
+        // switch waits are unverified too, and no earlier count sees them.
         let verified = live.index.to_lsn;
-        let unverified = self
-            .index(verified, self.node.applied_lsn(), true)
-            .await?
-            .roots
-            .len() as u64;
         let switched = self
             .node
             .switch_code(
@@ -2044,7 +2041,6 @@ impl Proposals {
                     pinned,
                     cause: pb::DeploymentCause::Promote,
                     verified_through_lsn: verified,
-                    unverified_inputs: unverified,
                     proposal_id: id.to_owned(),
                     rollback_of_epoch: 0,
                 },
@@ -2053,7 +2049,7 @@ impl Proposals {
                 authority,
             )
             .await;
-        let (epoch, lsn) = match switched {
+        let (epoch, lsn, unverified) = match switched {
             Ok(s) => s,
             Err(e) => {
                 if e.code == ErrorCode::ProposalStale && !dry_run {
@@ -2630,7 +2626,7 @@ impl Proposals {
         authority: AuthLease,
     ) -> Result<(u64, Lsn, Vec<pb::KindVersion>), ApiError> {
         let (_, kinds) = self.plan_rollback(epoch)?;
-        let (new_epoch, lsn) = self
+        let (new_epoch, lsn, _) = self
             .node
             .switch_code(
                 CodeSwitch {
@@ -2638,7 +2634,6 @@ impl Proposals {
                     pinned: Vec::new(),
                     cause: pb::DeploymentCause::Rollback,
                     verified_through_lsn: 0,
-                    unverified_inputs: 0,
                     proposal_id: String::new(),
                     rollback_of_epoch: epoch,
                 },
@@ -2661,7 +2656,7 @@ impl Proposals {
     ) -> Result<(u64, Lsn, Vec<pb::KindVersion>), ApiError> {
         // Only the configured daemon guard may use the fixed-origin producer.
         let (target, kinds) = self.plan_rollback(epoch)?;
-        let (new_epoch, lsn) = self
+        let (new_epoch, lsn, _) = self
             .node
             .switch_code_from_guard(
                 CodeSwitch {
@@ -2669,7 +2664,6 @@ impl Proposals {
                     pinned: target,
                     cause: pb::DeploymentCause::Rollback,
                     verified_through_lsn: 0,
-                    unverified_inputs: 0,
                     proposal_id: String::new(),
                     rollback_of_epoch: epoch,
                 },

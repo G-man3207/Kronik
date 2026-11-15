@@ -183,8 +183,9 @@ pub struct CodeSwitch {
     /// `PROPOSAL_STALE`.
     pub pinned: Vec<pb::KindVersion>,
     pub cause: pb::DeploymentCause,
+    /// The last main LSN a promote verified; it counts the root inputs
+    /// after it itself, when it holds the switch gate. Other causes ignore it.
     pub verified_through_lsn: Lsn,
-    pub unverified_inputs: u64,
     pub proposal_id: String,
     pub rollback_of_epoch: u64,
 }
@@ -4654,14 +4655,17 @@ impl Node {
     /// Switches a set of kinds to other code with one `Deployment` (promote,
     /// rollback): one epoch and one LSN for the whole set. Turns that start
     /// after it run the new code of every kind in the set, running turns
-    /// finish with the old. Returns (epoch, lsn); lsn is 0 for a dry run.
+    /// finish with the old. Returns `(epoch, lsn, unverified_inputs)`; `lsn`
+    /// is 0 for a dry run, whose count is a projection through main's committed
+    /// head. A promote counts the root inputs in `(verified_through_lsn, lsn]`
+    /// under the switch gate; other causes count none.
     pub async fn switch_code(
         &self,
         switch: CodeSwitch,
         audit: pb::Audit,
         dry_run: bool,
         authority: AuthLease,
-    ) -> Result<(u64, Lsn), ApiError> {
+    ) -> Result<(u64, Lsn, u64), ApiError> {
         authority.check()?;
         self.switch_code_impl(switch, audit, dry_run, OperationOrigin::Request(authority))
             .await
@@ -4672,7 +4676,7 @@ impl Node {
         &self,
         mut switch: CodeSwitch,
         mut audit: pb::Audit,
-    ) -> Result<(u64, Lsn), ApiError> {
+    ) -> Result<(u64, Lsn, u64), ApiError> {
         let reason = audit
             .reason
             .strip_prefix("watch ")
@@ -4701,7 +4705,6 @@ impl Node {
                 .any(|pin| CodeHash::from_slice(&pin.code_hash).is_none())
             || !switch.proposal_id.is_empty()
             || switch.verified_through_lsn != 0
-            || switch.unverified_inputs != 0
             || !reason
         {
             return Err(ApiError::new(
@@ -4717,13 +4720,48 @@ impl Node {
             .await
     }
 
+    /// Main's root inputs with `after < lsn <= through`: what a `Deployment`
+    /// at `through` leaves unverified (docs/design/m3-fork.md §8).
+    async fn root_inputs_between(&self, after: Lsn, through: Lsn) -> Result<u64, ApiError> {
+        if through <= after {
+            return Ok(0);
+        }
+        let mut roots = 0u64;
+        self.reader
+            .read(after + 1, through, |c| {
+                if let Record::TurnRecord(t) = &c.record
+                    && causal::is_root_input(t)
+                {
+                    roots += 1;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| match e {
+                LogError::Corrupt(m) => ApiError::new(ErrorCode::StorageCorrupt, m),
+                other => internal(other),
+            })?;
+        Ok(roots)
+    }
+
+    /// The root inputs a promote of `switch` switched over: none for any
+    /// other cause.
+    async fn unverified_inputs(&self, switch: &CodeSwitch) -> Result<u64, ApiError> {
+        if switch.cause != pb::DeploymentCause::Promote {
+            return Ok(0);
+        }
+        let through = self.committed_head();
+        self.root_inputs_between(switch.verified_through_lsn, through)
+            .await
+    }
+
     async fn switch_code_impl(
         &self,
         switch: CodeSwitch,
         audit: pb::Audit,
         dry_run: bool,
         origin: OperationOrigin,
-    ) -> Result<(u64, Lsn), ApiError> {
+    ) -> Result<(u64, Lsn, u64), ApiError> {
         origin.check()?;
         // Promote and rollback: needed in an incident, also on a full disk.
         self.check_alive()?;
@@ -4746,22 +4784,25 @@ impl Node {
         }
         let epoch = self.epoch.load(Ordering::Acquire) + 1;
         if dry_run {
-            return Ok((epoch, 0));
+            let unverified_inputs = self.unverified_inputs(&switch).await?;
+            return Ok((epoch, 0, unverified_inputs));
         }
+        let gate = match &origin {
+            OperationOrigin::Internal => self.gate.switch().await,
+            OperationOrigin::Request(authority) => self.switch_authorized(authority).await?,
+        };
+        // Under the gate: no promote count is minted before the switch waits.
+        let unverified_inputs = self.unverified_inputs(&switch).await?;
         let record = pb::Deployment {
             epoch,
             kinds: switch.kinds,
             effective_lsn: 0,
             verified_through_lsn: switch.verified_through_lsn,
-            unverified_inputs: switch.unverified_inputs,
+            unverified_inputs,
             cause: switch.cause as i32,
             proposal_id: switch.proposal_id,
             rollback_of_epoch: switch.rollback_of_epoch,
             audit: Some(audit),
-        };
-        let gate = match &origin {
-            OperationOrigin::Internal => self.gate.switch().await,
-            OperationOrigin::Request(authority) => self.switch_authorized(authority).await?,
         };
         let lsn = self
             .finish_switch(
@@ -4775,7 +4816,7 @@ impl Node {
             )
             .await?;
         tracing::info!(epoch, lsn, "switched code");
-        Ok((epoch, lsn))
+        Ok((epoch, lsn, unverified_inputs))
     }
 
     /// Writes an `Approval` record in this branch's log, its command

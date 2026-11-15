@@ -712,7 +712,6 @@ fn two_kinds_of_a_set_cannot_claim_one_route() {
                     pinned: Vec::new(),
                     cause: pb::DeploymentCause::Promote,
                     verified_through_lsn: 0,
-                    unverified_inputs: 0,
                     proposal_id: String::new(),
                     rollback_of_epoch: 0,
                 },
