@@ -3063,6 +3063,14 @@ impl Node {
             .map_or(0, |slot| slot.queue.len())
     }
 
+    /// How many turns have taken their provenance and not ended: running,
+    /// or waiting for a worker permit (tests: a turn that waits for a permit
+    /// runs across an erasure that begins meanwhile, crate::erasure).
+    #[doc(hidden)]
+    pub fn running_turns(&self) -> usize {
+        lock(&self.running_born).len()
+    }
+
     /// What a value the node takes in now is born at (crate::erasure).
     pub(crate) fn born_now(&self) -> Born {
         lock(&self.erasure_marks).now()
