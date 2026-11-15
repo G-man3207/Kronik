@@ -9028,6 +9028,13 @@
           "actor": {
             "type": "string"
           },
+          "blobs": {
+            "description": "The blob references the turn carries (M25/M26), as in `TurnSummary`;\nabsent when it has none.",
+            "items": {
+              "$ref": "#/components/schemas/BlobReference"
+            },
+            "type": "array"
+          },
           "children": {
             "items": {
               "$ref": "#/components/schemas/TraceNode"
@@ -9101,6 +9108,13 @@
       },
       "TraceRoot": {
         "properties": {
+          "blobs": {
+            "description": "The blob references the root turn carries (M25/M26); absent when it\nhas none.",
+            "items": {
+              "$ref": "#/components/schemas/BlobReference"
+            },
+            "type": "array"
+          },
           "input": {
             "$ref": "#/components/schemas/InputSummary"
           },
@@ -10374,6 +10388,13 @@
       },
       "TurnSummary": {
         "properties": {
+          "blobs": {
+            "description": "Every blob reference the turn carries (M25/M26): its input's body or\nmessage, its effects' bodies, the messages, timers and compensations\nit made, its hold operations and its reply, distinct and in walk\norder. Absent when it has none.",
+            "items": {
+              "$ref": "#/components/schemas/BlobReference"
+            },
+            "type": "array"
+          },
           "code_hash": {
             "type": "string"
           },
@@ -11480,7 +11501,7 @@
             "browserSession": []
           }
         ],
-        "summary": "An actor's turns, newest first",
+        "summary": "An actor's turns, newest first, with the blob references each carries",
         "x-kronik-scope": "read"
       }
     },
@@ -17104,7 +17125,7 @@
             "browserSession": []
           }
         ],
-        "summary": "A turn's causal tree: its root input, ancestors and descendants",
+        "summary": "A turn's causal tree: its root input, ancestors and descendants, each with the blobs it carries",
         "x-kronik-scope": "read"
       }
     },

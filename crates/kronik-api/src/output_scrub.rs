@@ -443,6 +443,8 @@ fn summary(value: &mut TurnSummary, secrets: &mut Context<'_>) {
         sql_changes: _,
         fuel_used: _,
         effects: turn_effects,
+        // Blob hashes and sizes are producer-owned, like a connection id.
+        blobs: _,
         // Connection ids, kinds and counts: no free text.
         connection_ops: _,
     } = value;
@@ -470,6 +472,8 @@ fn trace_node(value: &mut TraceNode, secrets: &mut Context<'_>) {
         actor: _,
         input: turn_input,
         outcome: turn_outcome,
+        // Blob hashes and sizes: producer-owned.
+        blobs: _,
         children,
     } = value;
     input(turn_input, secrets);
@@ -570,6 +574,7 @@ impl ScrubbedOutput for TraceResponse {
             lsn: _,
             root_id: _,
             input: turn_input,
+            blobs: _,
         }) = root
         {
             input(turn_input, secrets);
@@ -1250,6 +1255,7 @@ mod tests {
                 sql_changes: 0,
                 fuel_used: 1,
                 effects: vec![effect.clone()],
+                blobs: Vec::new(),
                 connection_ops: Vec::new(),
             }],
             next: None,
@@ -1368,6 +1374,7 @@ mod tests {
                 error_code: None,
                 message: None,
             },
+            blobs: Vec::new(),
             children,
         };
         let mut tree = node(vec![node(Vec::new())]);

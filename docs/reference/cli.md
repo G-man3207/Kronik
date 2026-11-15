@@ -745,8 +745,9 @@ Next     kronik history counter/t
 `kronik history <KIND/KEY> [--limit <N>] [--before <LSN>] [--connection <ID>]`
 
 Shows an actor's turns, newest first, 100 per page by default: the input,
-the outcome, what the turn changed and the hash of the code that ran it
-(`CODE`). `--json` gives each turn's logical time and fuel too.
+the outcome, what the turn changed, the blobs it carried (`BLOBS`, when a
+turn has one) and the hash of the code that ran it (`CODE`). `--json` gives
+each turn's logical time, fuel and whole blob hashes too.
 
 ```text
 $ kronik history counter/a
@@ -799,6 +800,23 @@ while the turns before it keep the one they used. The value is never shown.
 `--json` gives the effect a `secrets` list of `name`, `version` and
 `version_hash`; it is absent when the effect used no secret, and, like
 `request`, when the request is sealed for a data subject.
+
+A turn that carries blobs (M25, M26) has them in a `BLOBS` column, there
+only when a turn on the page carries one: each is `blob <hash> (<size>)`
+with the hash shortened to its first 12 hex characters and the size in
+binary units, several separated by a comma, such as
+`blob b3:4f1c09ab77e9 (300.0 MiB)`. They are every reference the turn has:
+its input's body or message, its effects' bodies, the messages, timers and
+compensations it made, its blob hold operations, and its reply. `--json`
+gives the whole hash and the exact size in a turn's `blobs`; it is absent
+when the turn has none. The hash is the one `kronik blobs inspect` takes.
+
+```text
+$ kronik history media/a
+TURN    TYPE  INPUT                OUTCOME    CHANGES  BLOBS                             CODE
+main:8  http  POST /media/a/write  committed  -        blob b3:4f1c09ab77e9 (195.3 KiB)  b3:d440473283f4
+Next     kronik actors inspect media/a
+```
 
 ```text
 $ kronik history billing/acme
@@ -885,6 +903,14 @@ this one, and everything this turn caused, as a tree of at most 1000
 turns. Turn ids are on main (`main:<lsn>`); fork turns follow once forks
 keep logs. `--json` also has the traced turn's effects, with the secret
 versions each used (`secrets`).
+
+A turn that carries blobs (M25, M26) ends its line with them, as
+`blob b3:4f1c09ab77e9 (300.0 MiB)`: every reference its input, effects,
+messages, holds and reply carry, several separated by a comma. The hash is
+shortened to its first 12 hex characters for the line; `--json` gives the
+whole hash and exact size in each turn's `blobs` (the traced turn, its
+`ancestors`, the root and every `descendants` node), absent when it has
+none.
 
 ```text
 $ kronik trace main:2

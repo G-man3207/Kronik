@@ -829,9 +829,13 @@ uploads, and `SUBJECT_ERASED` (410) erased blobs. A concept page
 
 As built for v0.5.0 (2026-11-14): `GET /v1/turns/{id}` renders a blob body
 as above, and a message's blobs as `blobs`. `kronik history` and `kronik
-trace` do not show a turn's blobs yet: their summaries are unchanged, and
-`kronik blobs list --actor`, `kronik blobs inspect` and the turn JSON are
-where a hash shows.
+trace` left the references out in v0.5.0; they now read the same log
+format. `kronik history` shows a turn's references in a `BLOBS` column
+when a page has any, and `kronik trace` appends them to the turn's line, as
+`blob b3:4f1c09ab77e9 (300.0 MiB)`; both carry the same list as `blobs` in
+their JSON, and the MCP history tools expose it unchanged. The full hash
+is in the JSON, `kronik blobs list --actor`, `kronik blobs inspect` and the
+turn JSON.
 
 Every command has `--json`; the CLI, JSON and OpenAPI references and their
 examples are regenerated in the slice that adds the route (the

@@ -391,6 +391,12 @@ pub struct TurnSummary {
     pub fuel_used: u64,
     #[serde(default)]
     pub effects: Vec<EffectSummary>,
+    /// Every blob reference the turn carries (M25/M26): its input's body or
+    /// message, its effects' bodies, the messages, timers and compensations
+    /// it made, its hold operations and its reply, distinct and in walk
+    /// order. Absent when it has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blobs: Vec<BlobReference>,
     /// The turn's buffered connection operations, in call order (M24);
     /// absent when it has none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1484,6 +1490,10 @@ pub struct TraceNode {
     pub actor: String,
     pub input: InputSummary,
     pub outcome: Outcome,
+    /// The blob references the turn carries (M25/M26), as in `TurnSummary`;
+    /// absent when it has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blobs: Vec<BlobReference>,
     pub children: Vec<TraceNode>,
 }
 
@@ -1492,6 +1502,10 @@ pub struct TraceRoot {
     pub lsn: u64,
     pub root_id: String,
     pub input: InputSummary,
+    /// The blob references the root turn carries (M25/M26); absent when it
+    /// has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blobs: Vec<BlobReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

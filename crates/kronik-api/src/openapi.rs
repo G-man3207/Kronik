@@ -501,7 +501,7 @@ pub const OPERATIONS: &[Operation] = &[
     Operation {
         method: "GET",
         path: "/v1/actors/{kind}/{key}/history",
-        summary: "An actor's turns, newest first",
+        summary: "An actor's turns, newest first, with the blob references each carries",
         query: &[
             Param {
                 name: "before",
@@ -553,7 +553,8 @@ pub const OPERATIONS: &[Operation] = &[
     Operation {
         method: "GET",
         path: "/v1/turns/{id}/trace",
-        summary: "A turn's causal tree: its root input, ancestors and descendants",
+        summary: "A turn's causal tree: its root input, ancestors and descendants, each \
+            with the blobs it carries",
         query: &[],
         request: None,
         answer: Answer::Json(schema::<TraceResponse>),

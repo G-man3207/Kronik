@@ -9036,6 +9036,13 @@ against both.
     "actor": {
       "type": "string"
     },
+    "blobs": {
+      "description": "The blob references the turn carries (M25/M26), as in `TurnSummary`;\nabsent when it has none.",
+      "items": {
+        "$ref": "#/components/schemas/BlobReference"
+      },
+      "type": "array"
+    },
     "children": {
       "items": {
         "$ref": "#/components/schemas/TraceNode"
@@ -9119,6 +9126,13 @@ against both.
 ```json
 {
   "properties": {
+    "blobs": {
+      "description": "The blob references the root turn carries (M25/M26); absent when it\nhas none.",
+      "items": {
+        "$ref": "#/components/schemas/BlobReference"
+      },
+      "type": "array"
+    },
     "input": {
       "$ref": "#/components/schemas/InputSummary"
     },
@@ -9188,6 +9202,13 @@ against both.
 ```json
 {
   "properties": {
+    "blobs": {
+      "description": "Every blob reference the turn carries (M25/M26): its input's body or\nmessage, its effects' bodies, the messages, timers and compensations\nit made, its hold operations and its reply, distinct and in walk\norder. Absent when it has none.",
+      "items": {
+        "$ref": "#/components/schemas/BlobReference"
+      },
+      "type": "array"
+    },
     "code_hash": {
       "type": "string"
     },

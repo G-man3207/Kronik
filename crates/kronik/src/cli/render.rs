@@ -4,13 +4,13 @@
 use std::fmt::Write as _;
 
 use kronik_api::types::{
-    ActorsResponse, Connection, ConnectionCloseResponse, ConnectionsResponse, DeadLettersResponse,
-    DeployResponse, DeploymentsResponse, EffectSecret, EffectSummary, ForkTurnResponse,
-    GrantResponse, GrantsResponse, HistoryResponse, InspectResponse, LimitsListResponse,
-    LimitsResponse, LimitsView, OrphansResponse, Outcome, Payload, Reply, RevokeResponse, Route,
-    SecretBackendsResponse, SecretDeleteResponse, SecretHistoryResponse, SecretLinkResponse,
-    SecretResponse, SecretVersionPhase, SecretsResponse, TimersResponse, TraceNode, TraceResponse,
-    TurnResponse, TurnSummary,
+    ActorsResponse, BlobReference, Connection, ConnectionCloseResponse, ConnectionsResponse,
+    DeadLettersResponse, DeployResponse, DeploymentsResponse, EffectSecret, EffectSummary,
+    ForkTurnResponse, GrantResponse, GrantsResponse, HistoryResponse, InspectResponse,
+    LimitsListResponse, LimitsResponse, LimitsView, OrphansResponse, Outcome, Payload, Reply,
+    RevokeResponse, Route, SecretBackendsResponse, SecretDeleteResponse, SecretHistoryResponse,
+    SecretLinkResponse, SecretResponse, SecretVersionPhase, SecretsResponse, TimersResponse,
+    TraceNode, TraceResponse, TurnResponse, TurnSummary,
 };
 use kronik_core::error::ApiError;
 use kronik_core::explain::{Topic, TopicKind};
@@ -327,28 +327,65 @@ pub fn inspect(r: &InspectResponse) -> String {
     out
 }
 
+/// A blob's hash as the CLI shows it: its scheme and first 12 hex
+/// characters, as `CodeHash::short` does. `--json` has the whole hash.
+fn short_blob_hash(hash: &str) -> String {
+    match hash.split_once(':') {
+        Some((scheme, hex)) if hex.len() > 12 => format!("{scheme}:{}", &hex[..12]),
+        _ => hash.to_owned(),
+    }
+}
+
+/// A turn's blob references as `blob b3:4f1c09ab77e9 (300.0 MiB)`, several
+/// separated by a comma; `-` when it carries none.
+fn blobs_cell(blobs: &[BlobReference]) -> String {
+    if blobs.is_empty() {
+        return "-".to_owned();
+    }
+    blobs
+        .iter()
+        .map(|b| {
+            format!(
+                "blob {} ({})",
+                short_blob_hash(&b.hash),
+                units::rounded_size(b.size)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn history(actor: &str, r: &HistoryResponse, limit: Option<u32>) -> String {
     if r.turns.is_empty() {
         return format!("{actor} has no turns.\n");
     }
+    // The references a turn carries (M25/M26) are one more column, there
+    // only when a turn on this page has one.
+    let with_blobs = r.turns.iter().any(|t| !t.blobs.is_empty());
     let rows = r
         .turns
         .iter()
         .map(|t| {
-            vec![
+            let mut row = vec![
                 t.turn_id.clone(),
                 t.input.kind.clone(),
                 clip(&short_connection_ids(&t.input.summary), 40),
                 clip(&outcome(&t.outcome), 60),
                 clip(&changes(t), 40),
-                t.code_hash.clone(),
-            ]
+            ];
+            if with_blobs {
+                row.push(clip(&blobs_cell(&t.blobs), 60));
+            }
+            row.push(t.code_hash.clone());
+            row
         })
         .collect();
-    let mut out = table(
-        &["TURN", "TYPE", "INPUT", "OUTCOME", "CHANGES", "CODE"],
-        rows,
-    );
+    let mut header = vec!["TURN", "TYPE", "INPUT", "OUTCOME", "CHANGES"];
+    if with_blobs {
+        header.push("BLOBS");
+    }
+    header.push("CODE");
+    let mut out = table(&header, rows);
     // An HTTP effect's target is its request; a denied one has no request.
     // The secret versions the effects used (M23) are one more column, there
     // only when some effect used a secret.
@@ -538,13 +575,29 @@ pub fn fork_turn(t: &ForkTurnResponse, actor: &str) -> String {
     out
 }
 
+/// The blob references after a trace line's outcome, or nothing.
+fn blob_suffix(blobs: &[BlobReference]) -> String {
+    if blobs.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", clip(&blobs_cell(blobs), 60))
+    }
+}
+
 /// One turn of a causal tree on one line.
-fn trace_line(turn_id: &str, actor: Option<&str>, input: &str, o: &Outcome) -> String {
+fn trace_line(
+    turn_id: &str,
+    actor: Option<&str>,
+    input: &str,
+    o: &Outcome,
+    blobs: &[BlobReference],
+) -> String {
     let actor = actor.map(|a| format!("  {a}")).unwrap_or_default();
     format!(
-        "{turn_id}{actor}  {}  {}",
+        "{turn_id}{actor}  {}  {}{}",
         clip(input, 50),
-        clip(&outcome(o), 60)
+        clip(&outcome(o), 60),
+        blob_suffix(blobs)
     )
 }
 
@@ -555,11 +608,12 @@ pub fn trace(r: &TraceResponse) -> String {
     if let Some(root) = &r.root {
         let _ = writeln!(
             out,
-            "Root     {} {} at lsn {} (root id {})",
+            "Root     {} {} at lsn {} (root id {}){}",
             root.input.kind,
             root.input.summary,
             root.lsn,
-            clip(&root.root_id, 13)
+            clip(&root.root_id, 13),
+            blob_suffix(&root.blobs)
         );
     }
     out.push('\n');
@@ -573,7 +627,7 @@ pub fn trace(r: &TraceResponse) -> String {
             out,
             "{}{}",
             prefix(depth),
-            trace_line(&t.turn_id, None, &summary(t), &t.outcome)
+            trace_line(&t.turn_id, None, &summary(t), &t.outcome, &t.blobs)
         );
     }
     let depth = r.ancestors.len();
@@ -585,7 +639,8 @@ pub fn trace(r: &TraceResponse) -> String {
             &r.turn.turn_id,
             Some(&r.actor),
             &summary(&r.turn),
-            &r.turn.outcome
+            &r.turn.outcome,
+            &r.turn.blobs
         )
     );
     tree(&mut out, &r.descendants, &"   ".repeat(depth));
@@ -607,7 +662,8 @@ fn tree(out: &mut String, nodes: &[TraceNode], indent: &str) {
                 &n.turn_id,
                 Some(&n.actor),
                 &format!("{} {}", n.input.kind, n.input.summary),
-                &n.outcome
+                &n.outcome,
+                &n.blobs
             )
         );
         let deeper = format!("{indent}{}", if last { "   " } else { "│  " });
@@ -1775,6 +1831,7 @@ mod tests {
             sql_changes: 1,
             fuel_used: 1,
             effects: Vec::new(),
+            blobs: Vec::new(),
             connection_ops: vec![
                 ConnectionOpSummary {
                     op: "send".into(),
@@ -1817,6 +1874,93 @@ mod tests {
             "{out}"
         );
         assert!(out.contains(&format!("close          {BOB}")), "{out}");
+    }
+
+    #[test]
+    fn history_and_trace_show_a_turns_blobs() {
+        use kronik_api::types::{BlobReference, InputSummary, TraceNode, TraceRoot};
+        let hash = format!("b3:4f1c09ab77e9{}", "ab".repeat(26));
+        let blob = BlobReference {
+            hash: hash.clone(),
+            size: 300 << 20,
+        };
+        let summary = |id: &str| TurnSummary {
+            turn_id: id.into(),
+            lsn: 9,
+            logical_time_ms: 0,
+            code_hash: "b3:0123456789ab".into(),
+            input: InputSummary {
+                kind: "message".into(),
+                summary: "fanout from operator".into(),
+            },
+            outcome: Outcome {
+                kind: "committed".into(),
+                error_code: None,
+                message: None,
+            },
+            writes: Vec::new(),
+            messages: Vec::new(),
+            sql_changes: 0,
+            fuel_used: 1,
+            effects: Vec::new(),
+            blobs: vec![blob.clone()],
+            connection_ops: Vec::new(),
+        };
+        let shown = history(
+            "counter/a",
+            &HistoryResponse {
+                turns: vec![summary("main:9")],
+                next: None,
+            },
+            None,
+        );
+        println!("{shown}");
+        assert!(
+            words(&shown)
+                .iter()
+                .any(|l| l == "TURN TYPE INPUT OUTCOME CHANGES BLOBS CODE"),
+            "{shown}"
+        );
+        assert!(
+            words(&shown).iter().any(|l| l
+                == "main:9 message fanout from operator committed - blob \
+                    b3:4f1c09ab77e9 (300.0 MiB) b3:0123456789ab"),
+            "{shown}"
+        );
+
+        let descendant = summary("main:10");
+        let shown = trace(&TraceResponse {
+            turn: summary("main:9"),
+            actor: "counter/a".into(),
+            root: Some(TraceRoot {
+                lsn: 2,
+                root_id: format!("4c3568017ff1{}", "ab".repeat(22)),
+                input: InputSummary {
+                    kind: "message".into(),
+                    summary: "fanout from operator".into(),
+                },
+                blobs: vec![blob.clone()],
+            }),
+            ancestors: Vec::new(),
+            descendants: vec![TraceNode {
+                turn_id: "main:10".into(),
+                actor: "counter/b".into(),
+                input: InputSummary {
+                    kind: "message".into(),
+                    summary: "note from counter/a".into(),
+                },
+                outcome: descendant.outcome,
+                blobs: vec![blob],
+                children: Vec::new(),
+            }],
+            truncated: false,
+        });
+        println!("{shown}");
+        assert_eq!(
+            shown.matches("blob b3:4f1c09ab77e9 (300.0 MiB)").count(),
+            3,
+            "{shown}"
+        );
     }
 
     #[test]
@@ -1968,6 +2112,7 @@ mod tests {
             sql_changes: 0,
             fuel_used: 1,
             effects,
+            blobs: Vec::new(),
             connection_ops: Vec::new(),
         };
         let denied = kronik_api::types::EffectSummary {
@@ -2072,6 +2217,7 @@ mod tests {
             sql_changes: 0,
             fuel_used: 1,
             effects,
+            blobs: Vec::new(),
             connection_ops: Vec::new(),
         };
         let effect = |kind: &str, request: Option<&str>, secrets| EffectSummary {
@@ -2214,6 +2360,7 @@ mod tests {
             sql_changes: 0,
             fuel_used: 1,
             effects: Vec::new(),
+            blobs: Vec::new(),
             connection_ops: Vec::new(),
         };
         assert_eq!(changes(&t), "set s [erased], set t");
@@ -2321,6 +2468,7 @@ mod tests {
             sql_changes: 0,
             fuel_used: 1,
             effects: Vec::new(),
+            blobs: Vec::new(),
             connection_ops: Vec::new(),
         };
         let shown = history(

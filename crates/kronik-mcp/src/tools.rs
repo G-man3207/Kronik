@@ -81,12 +81,14 @@ const TOOLS: &[Spec] = &[
         title: "Query an actor's history",
         scope: "read",
         description: "An actor's turns: turn id, LSN, logical time, code hash, input, outcome \
-            with its error code, state writes, messages sent, SQL changes, effects and fuel. \
-            An effect that used a secret lists it in `secrets` (name, version and the first 8 \
-            hex characters of the version hash, never a value), so a rotation shows as a new \
-            version. A connection turn's `connection_ops` are its sends and closes on WebSocket \
-            and SSE connections, with the frames' fates; `connection` limits the history to one \
-            connection's turns. To page, pass the previous result's `next` as `before`.",
+            with its error code, state writes, messages sent, SQL changes, effects, the \
+            blob references the turn carries (`blobs`, each with its hash and size), and \
+            fuel. An effect that used a secret lists it in `secrets` (name, version and the \
+            first 8 hex characters of the version hash, never a value), so a rotation shows \
+            as a new version. A connection turn's `connection_ops` are its sends and closes \
+            on WebSocket and SSE connections, with the frames' fates; `connection` limits \
+            the history to one connection's turns. To page, pass the previous result's \
+            `next` as `before`.",
         mutates: false,
         dry_run: false,
         destructive: false,
@@ -114,8 +116,10 @@ const TOOLS: &[Spec] = &[
         scope: "read",
         description: "A turn's causal tree: the root input that started it, the turns from \
             the root down to it (`ancestors`), and every turn it caused (`descendants`, a tree, \
-            at most 1000 turns). Turn ids come from query_history, trace results and a diff's \
-            `samples`; fork turns have ids such as `try:7` or `p-7h3k2a9c1d0e:r12.0`.",
+            at most 1000 turns). Each turn carries its `blobs`: the hash and size of every blob \
+            reference its input, effects, messages, holds and reply carry. Turn ids come from \
+            query_history, trace results and a diff's `samples`; fork turns have ids such as \
+            `try:7` or `p-7h3k2a9c1d0e:r12.0`.",
         mutates: false,
         dry_run: false,
         destructive: false,
@@ -164,8 +168,8 @@ const TOOLS: &[Spec] = &[
         name: "inspect_blob",
         title: "Inspect a blob",
         scope: "read",
-        description: "A blob of the blob store by its hash (`b3:` or `b3s:`, as the API's \
-            turn JSON and `kronik blobs list --actor` show it; history does not show blobs): \
+        description: "A blob of the blob store by its hash (`b3:` or `b3s:`, as history, \
+            a trace, the API's turn JSON and `kronik blobs list --actor` show it): \
             its state (live, erased, missing, or loose: in the store and never referenced), \
             size, the first and last LSN that referenced it, whether its file is sealed, and \
             what keeps it (`roots`: a `log` record within retention, `held` by an actor, a \
