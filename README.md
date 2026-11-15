@@ -152,13 +152,13 @@ for how the brief maps to the tree.
 ## Getting started
 
 The [installation guide](docs/guides/install.md) describes the signed-release
-contract and standalone curl-pipe installer. `v0.4.1` and `v0.4.0` are
-attested: the installer verifies each archive's Sigstore attestation, and
+contract and standalone curl-pipe installer. `v0.5.0`, `v0.4.1` and `v0.4.0`
+are attested: the installer verifies each archive's Sigstore attestation, and
 historical `v0.3.0` and `v0.1.0` remain unsigned, so current consumers
 intentionally refuse their archives. To run the latest release:
 
 ```sh
-curl -fsSL https://github.com/G-man3207/Kronik/releases/download/v0.4.1/install.sh | sh
+curl -fsSL https://github.com/G-man3207/Kronik/releases/download/v0.5.0/install.sh | sh
 kronik doctor
 ```
 
