@@ -703,7 +703,8 @@ effect results and the API's turn JSON show the reference, never the bytes.
   production, so the fingerprints agree; a reference the turn may not use is
   matched to production's recorded denial, or denied in production's words.
 - **Keys.** A fork's blob takes its key as the fork's record that names it
-  does (`Sealer::fork_blob_keys`, after `seal_record_keeping_erasures`):
+  does (`Sealer::fork_blob_keys`, after the record's provenance tombstones
+  and `keep_erased_without_keys`):
   with privacy on, the subject's existing key, else a new one when the
   subject was never erased, and none for an erased subject without a newer
   key, whose blob the fork refuses (`erased` to the guest, `SUBJECT_ERASED`

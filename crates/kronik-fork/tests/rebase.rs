@@ -19,9 +19,11 @@ use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
 use kronik_fork::diff::{DiffOptions, Mode};
 use kronik_fork::proposal::{Proposals, ProposeRequest, RebaseRequest};
+use kronik_privacy::sealer::Opened;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Ingress, NodeConfig, SwitchHold, TurnResult};
+use prost::Message as _;
 use serde_json::Value;
 
 const QUIET: &str = "[[rule]]\nname = \"quiet\"\nwhen = \"false\"\naction = \"allow\"\n";
@@ -1748,7 +1750,17 @@ fn a_rebase_resumes_after_a_restart_with_privacy_on() {
     );
     // Values the fork's own turns tag (state.set-for user:1): plaintext in
     // the replay, sealed in the fork log.
-    for key in ["alice", "bob"] {
+    s.p.http("alice", "subject", "");
+    // The subject is erased and comes back before the rebase: the fork must
+    // seal alice's copied values from before it as the erasure's tombstones,
+    // never under the key version carol's turn creates.
+    s.p.rt
+        .block_on(
+            s.p.node
+                .erase_subject("user:1", audit(), false, s.p.owner()),
+        )
+        .unwrap();
+    for key in ["carol", "bob"] {
         s.p.http(key, "subject", "");
     }
     let r = rebase(&s);
@@ -1773,6 +1785,77 @@ fn a_rebase_resumes_after_a_restart_with_privacy_on() {
         !rebased_turns(&s.p, &r.id).is_empty(),
         "staged before the bound"
     );
+    // The failed promote wrote the fork's log first: alice's pre-erasure
+    // values are the erasure's tombstones there, not values under carol's
+    // key version, and the pre-erasure plaintext is gone.
+    let mut saw_alice = false;
+    for lsn in r.fork_lsn + 1..=r.created_lsn {
+        let Some(t) = s.p.rt.block_on(s.props.fork_turn(&r.id, lsn)).unwrap() else {
+            continue;
+        };
+        let alice = t
+            .actor
+            .as_ref()
+            .is_some_and(|a| a.kind == "counter" && a.key == "alice");
+        if !alice {
+            continue;
+        }
+        saw_alice = true;
+        assert!(
+            !t.encode_to_vec()
+                .windows(b"personal".len())
+                .any(|w| w == b"personal"),
+            "the pre-erasure turn at {lsn} kept its plaintext"
+        );
+        for write in t.writes.iter().filter(|w| {
+            w.value
+                .as_ref()
+                .and_then(|v| v.subject.as_deref())
+                .is_some_and(|s| s == "user:1")
+        }) {
+            assert!(
+                matches!(
+                    s.p.node.sealer().open(write.value.as_ref().unwrap()),
+                    Opened::Erased { ref subject } if subject == "user:1"
+                ),
+                "the fork log at {lsn} sealed alice's value under a live key"
+            );
+        }
+    }
+    assert!(saw_alice, "the fork log has alice's turn");
+    // Staging copied alice's turn into main's log: its provenance is still
+    // the production LSN the fork copied it from, not the fork log's LSN.
+    let staged: Vec<pb::TurnRecord> = rebased_turns(&s.p, &r.id)
+        .into_iter()
+        .filter(|t| {
+            t.actor
+                .as_ref()
+                .is_some_and(|a| a.kind == "counter" && a.key == "alice")
+        })
+        .collect();
+    assert!(!staged.is_empty(), "alice's turn was staged");
+    for t in &staged {
+        assert!(
+            !t.encode_to_vec()
+                .windows(b"personal".len())
+                .any(|w| w == b"personal"),
+            "a staged turn kept the pre-erasure plaintext"
+        );
+        for write in t.writes.iter().filter(|w| {
+            w.value
+                .as_ref()
+                .and_then(|v| v.subject.as_deref())
+                .is_some_and(|s| s == "user:1")
+        }) {
+            assert!(
+                matches!(
+                    s.p.node.sealer().open(write.value.as_ref().unwrap()),
+                    Opened::Erased { ref subject } if subject == "user:1"
+                ),
+                "a staged turn sealed alice's value under a live key"
+            );
+        }
+    }
     let Setup { p, props, .. } = s;
     drop(props);
     drop(p);
@@ -2074,18 +2157,19 @@ fn rebase_staging_keeps_to_the_disk_reserve() {
         .block_on(s.props.approve(&r.id, audit(), false, None, s.p.owner()))
         .unwrap();
     // The fork's turns as staging takes them.
-    let fork_turns: Vec<(Lsn, pb::TurnRecord)> = (r.fork_lsn + 1..=s.p.node.applied_lsn() + 64)
+    let fork_turns: Vec<(Lsn, pb::TurnRecord, kronik_sched::Born)> = (r.fork_lsn + 1
+        ..=s.p.node.applied_lsn() + 64)
         .filter_map(|lsn| {
             s.p.rt
                 .block_on(s.props.fork_turn(&r.id, lsn))
                 .unwrap()
-                .map(|t| (lsn, t))
+                .map(|t| (lsn, t, s.p.node.born_now()))
         })
         .collect();
     assert!(!fork_turns.is_empty());
     let bare: u64 = fork_turns
         .iter()
-        .map(|(_, t)| prost::Message::encoded_len(t) as u64)
+        .map(|(_, t, _)| prost::Message::encoded_len(t) as u64)
         .sum();
     // (1) Room for the bare turns, not for what staging writes.
     set_free(&s.p, &free, RESERVE + bare + 1);

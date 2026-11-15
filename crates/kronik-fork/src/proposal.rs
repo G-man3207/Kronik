@@ -23,7 +23,7 @@ use kronik_core::ids::{CodeHash, Lsn, random_id};
 use kronik_policy::RuleSet;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{CodeSwitch, Node};
+use kronik_sched::{Born, CodeSwitch, Node};
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -570,6 +570,12 @@ impl Proposals {
         write_atomic(&dir.join("proposal.json"), &bytes)
     }
 
+    /// Where a fork turn's values were born: the production turn it copied,
+    /// or now for a turn the fork computed itself.
+    fn fork_born(&self, t: &crate::ForkTurn) -> Born {
+        t.prod_lsn.map_or_else(|| self.node.born_now(), Born::Lsn)
+    }
+
     /// Persists the isolated trees the diff names (samples, causes, changed
     /// responses, effects, errors) to `branches/<id>/isolated.jsonl`, so
     /// `kronik trace` finds `<fork>:r<root>.<n>` turns after a restart.
@@ -586,7 +592,7 @@ impl Proposals {
                 // Sealed like production's log: the fork's turns hold the
                 // values it revealed (m8-privacy §5).
                 let mut record = Record::TurnRecord(shown_record(t));
-                self.node.seal_fork_record(&mut record)?;
+                self.node.seal_fork_record(&mut record, self.fork_born(t))?;
                 let line = serde_json::json!({
                     "id": t.id,
                     "root_lsn": tree.root_lsn,
@@ -1111,23 +1117,27 @@ impl Proposals {
             if dir.exists() {
                 std::fs::remove_dir_all(&dir).map_err(internal)?;
             }
-            records.extend(live.head.iter().cloned());
+            // The fork's own leading records. They hold no turn values, so
+            // the seal below leaves them as they are.
+            let head_born = self.node.born_now();
+            records.extend(live.head.iter().cloned().map(|r| (r, head_born)));
         }
         let turns = c.turns();
         records.extend(
             turns
                 .iter()
                 .filter(|t| t.lsn > live.logged_to)
-                .map(|t| Record::TurnRecord(shown_record(t))),
+                .map(|t| (Record::TurnRecord(shown_record(t)), self.fork_born(t))),
         );
         // Sealed like production's log: the fork holds revealed values. An
         // erased subject's values become tombstones, never a new key version.
-        for r in &mut records {
-            self.node.seal_fork_record(r)?;
+        for (r, born) in &mut records {
+            self.node.seal_fork_record(r, *born)?;
         }
         if records.is_empty() {
             return Ok(());
         }
+        let records: Vec<Record> = records.into_iter().map(|(r, _)| r).collect();
         let mut cfg = kronik_log::LogConfig::new(dir, id);
         cfg.group_commit_window = self.node.group_commit_window();
         cfg.first_lsn = live.index.fork_lsn + 1;

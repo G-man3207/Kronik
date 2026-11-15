@@ -53,6 +53,7 @@ use kronik_runtime::{CodeStore, PoolSize, build_engine};
 use kronik_store::Store;
 use kronik_store::sql::{FileOpener, Limits, SqlPool};
 
+pub use erasure::Born;
 pub use gate::Drain;
 pub use node::{
     BodyPolicy, CONNECTION_METHODS, CodeSwitch, DeployResult, Ingress, IngressExtras, METHODS,

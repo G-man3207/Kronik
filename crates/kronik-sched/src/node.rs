@@ -3086,7 +3086,7 @@ impl Node {
     }
 
     /// What a value the node takes in now is born at (crate::erasure).
-    pub(crate) fn born_now(&self) -> Born {
+    pub fn born_now(&self) -> Born {
         lock(&self.erasure_marks).now()
     }
 
