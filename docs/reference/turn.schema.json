@@ -334,6 +334,13 @@
         },
         "body": {
           "$ref": "#/$defs/TurnSealable"
+        },
+        "blobs": {
+          "description": "The blobs the message carries (M26), when it carries any.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnBlobRef"
+          }
         }
       }
     },
@@ -447,6 +454,9 @@
           "anyOf": [
             {
               "$ref": "#/$defs/TurnSealable"
+            },
+            {
+              "$ref": "#/$defs/TurnBlobBody"
             },
             {
               "type": "null"
@@ -639,6 +649,9 @@
           "anyOf": [
             {
               "$ref": "#/$defs/TurnSealable"
+            },
+            {
+              "$ref": "#/$defs/TurnBlobBody"
             },
             {
               "type": "null"
@@ -917,6 +930,9 @@
           "anyOf": [
             {
               "$ref": "#/$defs/TurnSealable"
+            },
+            {
+              "$ref": "#/$defs/TurnBlobBody"
             },
             {
               "type": "null"
@@ -1251,6 +1267,45 @@
             "string",
             "null"
           ]
+        }
+      }
+    },
+    "TurnBlobRef": {
+      "description": "A blob reference (M25, M26): its identity, `b3:` and the BLAKE3 of its bytes or `b3s:` and a hash keyed for its subject, its size and its subject. Never its bytes: `kronik blobs get` reads them.",
+      "type": "object",
+      "required": [
+        "hash",
+        "size",
+        "subject"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "hash": {
+          "type": "string",
+          "pattern": "^b3s?:[0-9a-f]{64}$"
+        },
+        "size": {
+          "$ref": "#/$defs/TurnCount"
+        },
+        "subject": {
+          "description": "The data subject of a `b3s:` blob; null for a `b3:` blob, and for a caller without `pii:read`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TurnBlobBody": {
+      "description": "A body stored as a blob (M25): its reference, never its bytes.",
+      "type": "object",
+      "required": [
+        "blob"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "blob": {
+          "$ref": "#/$defs/TurnBlobRef"
         }
       }
     }

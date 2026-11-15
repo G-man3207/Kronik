@@ -9,7 +9,8 @@
 //!   whose key this keystore lacks is `[unreadable:<subject>]` (only callers
 //!   with `pii:read` get that far).
 //! - Callers without `pii:read` never see a subject id: [`redact`] drops
-//!   the subject of every value for them.
+//!   the subject of every value for them, and [`redact_turn`] that of every
+//!   blob reference (M26 §9.5; its keyed hash reveals nothing).
 
 use kronik_privacy::sealer::{Opened, Sealer};
 use kronik_proto::log::v1 as pb;
@@ -67,9 +68,13 @@ pub fn is_erased(s: &pb::Sealable, sealer: &Sealer) -> bool {
         && matches!(sealer.open(s), Opened::Erased { .. })
 }
 
-/// [`redact`] for every value of a turn record.
+/// [`redact`] for every value of a turn record; without `pii` the blob
+/// references lose their subject too.
 pub fn redact_turn(t: &mut pb::TurnRecord, sealer: &Sealer, pii: bool) {
     kronik_proto::sealables::turn_mut(t, &mut |s| redact(s, sealer, pii));
+    if !pii {
+        kronik_proto::blobs::turn_mut(t, &mut |r| r.subject = None);
+    }
 }
 
 /// [`redact`] for every value of an input.
@@ -126,5 +131,50 @@ mod tests {
             v.value,
             Some(pb::sealable::Value::Plain(b"[unreadable:user:1]".to_vec()))
         );
+    }
+
+    /// A blob reference keeps its hash and size for every caller, and its
+    /// subject only for one with `pii:read` (M26 §9.5).
+    #[test]
+    fn a_blob_reference_shows_its_subject_only_with_pii_read() {
+        let blob = pb::BlobRef {
+            hash: format!("b3s:{}", "ab".repeat(32)),
+            size: 7,
+            subject: Some("user:1".into()),
+            key_version: 1,
+        };
+        let turn = pb::TurnRecord {
+            outcome: Some(pb::Outcome {
+                output: Some(pb::outcome::Output::Http(pb::HttpResponse {
+                    status: 200,
+                    body: Some(pb::Body {
+                        value: Some(pb::body::Value::Blob(blob.clone())),
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+            messages: vec![pb::OutboundMessage {
+                msg: Some(pb::Message {
+                    blobs: vec![blob.clone()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let shown = |pii| {
+            let mut t = turn.clone();
+            redact_turn(&mut t, &Sealer::plain(), pii);
+            let mut refs = Vec::new();
+            kronik_proto::blobs::turn(&t, &mut refs);
+            refs.into_iter().cloned().collect::<Vec<_>>()
+        };
+        assert_eq!(shown(true), [blob.clone(), blob.clone()]);
+        let hidden = pb::BlobRef {
+            subject: None,
+            ..blob
+        };
+        assert_eq!(shown(false), [hidden.clone(), hidden]);
     }
 }

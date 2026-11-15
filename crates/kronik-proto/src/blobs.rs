@@ -141,6 +141,62 @@ pub fn turn<'a>(t: &'a pb::TurnRecord, out: &mut Vec<&'a pb::BlobRef>) {
     outcome(t.outcome.as_ref(), out);
 }
 
+/// A visitor of [`turn_mut`].
+type Visit<'a> = &'a mut dyn FnMut(&mut pb::BlobRef);
+
+fn message_mut(m: Option<&mut pb::Message>, f: Visit<'_>) {
+    if let Some(m) = m {
+        m.blobs.iter_mut().for_each(f);
+    }
+}
+
+fn body_mut(b: Option<&mut pb::Body>, f: Visit<'_>) {
+    if let Some(pb::Body {
+        value: Some(pb::body::Value::Blob(r)),
+    }) = b
+    {
+        f(r);
+    }
+}
+
+/// [`turn`] for a reader that changes the references, such as the API,
+/// which shows a reference's subject only to a caller with `pii:read`:
+/// every reference of the record, in the same order.
+pub fn turn_mut(t: &mut pb::TurnRecord, f: Visit<'_>) {
+    use pb::input::Kind;
+    match t.input.as_mut().and_then(|i| i.kind.as_mut()) {
+        Some(Kind::Http(h)) => body_mut(h.body.as_mut(), f),
+        Some(Kind::Message(m)) => message_mut(m.msg.as_mut(), f),
+        Some(Kind::Timer(timer)) => message_mut(timer.msg.as_mut(), f),
+        Some(Kind::Connection(c)) => {
+            if let Some(pb::connection_input::Event::Open(open)) = &mut c.event
+                && let Some(request) = &mut open.request
+            {
+                body_mut(request.body.as_mut(), f);
+            }
+        }
+        Some(Kind::Migrate(_)) | None => {}
+    }
+    for e in &mut t.effects {
+        e.blobs.iter_mut().for_each(&mut *f);
+    }
+    for m in t.messages.iter_mut().chain(&mut t.compensations) {
+        message_mut(m.msg.as_mut(), f);
+    }
+    for timer in &mut t.timers {
+        message_mut(timer.msg.as_mut(), f);
+    }
+    t.blob_refs
+        .iter_mut()
+        .filter_map(|op| op.blob.as_mut())
+        .for_each(&mut *f);
+    match t.outcome.as_mut().and_then(|o| o.output.as_mut()) {
+        Some(pb::outcome::Output::Reply(m)) => message_mut(Some(m), f),
+        Some(pb::outcome::Output::Http(h)) => body_mut(h.body.as_mut(), f),
+        Some(pb::outcome::Output::Accept(_)) | None => {}
+    }
+}
+
 /// Every reference of `record` outside sealed payloads, in walk order.
 pub fn refs(record: &Record) -> Vec<&pb::BlobRef> {
     let mut out = Vec::new();
@@ -349,6 +405,57 @@ mod tests {
         let mut visited = Vec::new();
         for_each(&record, &mut |r| visited.push(r.size));
         assert_eq!(visited, sizes);
+        // The mutable walk visits the same references in the same order.
+        let mut t = turn_with_every_reference();
+        let mut changed = Vec::new();
+        turn_mut(&mut t, &mut |r| {
+            changed.push(r.size);
+            r.size += 100;
+        });
+        assert_eq!(changed, sizes);
+        let mut after = Vec::new();
+        turn(&t, &mut after);
+        let after: Vec<u64> = after.iter().map(|r| r.size).collect();
+        assert_eq!(after, [101, 102, 103, 104, 105, 106, 107]);
+        // So does it for the other inputs that carry references, and a reply.
+        let opened = pb::connection_input::Event::Open(pb::ConnectionOpen {
+            request: Some(pb::HttpInput {
+                body: Some(pb::Body {
+                    value: Some(pb::body::Value::Blob(plain_ref(8, 8))),
+                }),
+                ..Default::default()
+            }),
+        });
+        for kind in [
+            pb::input::Kind::Timer(pb::TimerInput {
+                msg: Some(message_with(vec![plain_ref(8, 8)])),
+                ..Default::default()
+            }),
+            pb::input::Kind::Message(pb::MessageInput {
+                msg: Some(message_with(vec![plain_ref(8, 8)])),
+                ..Default::default()
+            }),
+            pb::input::Kind::Connection(pb::ConnectionInput {
+                event: Some(opened.clone()),
+                ..Default::default()
+            }),
+        ] {
+            let mut t = turn_with_every_reference();
+            t.input = Some(pb::Input { kind: Some(kind) });
+            t.outcome = Some(pb::Outcome {
+                output: Some(pb::outcome::Output::Reply(message_with(vec![plain_ref(
+                    9, 9,
+                )]))),
+                ..Default::default()
+            });
+            let mut walked = Vec::new();
+            turn_mut(&mut t, &mut |r| walked.push(r.size));
+            let mut listed = Vec::new();
+            turn(&t, &mut listed);
+            let listed: Vec<u64> = listed.iter().map(|r| r.size).collect();
+            assert_eq!(walked, listed);
+            assert_eq!(walked, [8, 2, 3, 4, 5, 6, 9]);
+        }
 
         // A rebased turn carries the same references.
         let rebased = Record::StateRebase(pb::StateRebase {

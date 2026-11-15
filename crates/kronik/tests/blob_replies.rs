@@ -2,8 +2,10 @@
 //! `media` (M25, M26), as the v0.5.0 release rehearsal met them, where each
 //! failed: a call whose callee answers with a blob it wrote (`write` always
 //! makes one), from an HTTP turn and from a message turn (503 UNAVAILABLE,
-//! and the caller's turn stayed open); and an operator's message answered
-//! with such a blob (503 UNAVAILABLE, "retry shortly", for good).
+//! and the caller's turn stayed open); an operator's message answered with
+//! such a blob (503 UNAVAILABLE, "retry shortly", for good); and the turn
+//! JSON of an answer that is a blob (`"body": null`), whose subject only a
+//! caller with `pii:read` sees.
 
 // A test harness of a real daemon: unwraps, and deadlines on the wall clock.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
@@ -15,10 +17,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use kronik_api::openapi::TURN_SCHEMA;
 use serde_json::{Value, json};
 
 const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
+const TURN_URL: &str = "file:///kronik/docs/reference/turn.schema.json";
 
 const SETTINGS_ENV: [&str; 7] = [
     "KRONIK_CONFIG",
@@ -312,6 +316,17 @@ fn deploy(d: &Daemon) {
     );
 }
 
+/// The turn JSON schema (docs/reference/turn.schema.json), compiled.
+fn turn_schema() -> (boon::Schemas, boon::SchemaIndex) {
+    let mut schemas = boon::Schemas::new();
+    let mut c = boon::Compiler::new();
+    c.set_default_draft(boon::Draft::V2020_12);
+    c.add_resource(TURN_URL, serde_json::from_str(TURN_SCHEMA).unwrap())
+        .unwrap();
+    let index = c.compile(TURN_URL, &mut schemas).unwrap();
+    (schemas, index)
+}
+
 /// A call whose callee answers with a blob it wrote gives the caller that
 /// blob, an HTTP turn (the gateway's answer) and a message turn alike: the
 /// caller reads it, retains it and holds it; the pins that keep the blob
@@ -404,4 +419,45 @@ fn an_operator_message_answered_with_a_blob() {
         out.contains("Blob b3:") && out.contains("(2000 bytes)"),
         "{out}"
     );
+}
+
+/// `GET /v1/turns/{id}` of a turn whose HTTP answer is a blob shows the
+/// blob's reference: its hash and size to every reader, its subject only
+/// to one with `pii:read`. The JSON matches the turn schema.
+#[test]
+fn the_turn_json_shows_an_answers_blob() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = Daemon::start(tmp.path());
+    deploy(&d);
+    let r = d.post("/media/w/write?size=100000", Some("user:1"));
+    assert_eq!(r.status, 200, "{}\n{}", r.text(), d.log());
+    assert!(r.body == pattern(100_000), "the answer is the blob's bytes");
+    let id = r.header("kronik-turn-id").unwrap().to_owned();
+    let reader = d.api(
+        "POST",
+        "/v1/tokens",
+        json!({"name": "reader", "scopes": ["read"], "reason": "blob replies"}),
+        None,
+    )["secret"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (schemas, schema) = turn_schema();
+    let path = format!("/v1/turns/{id}");
+    let shown = |token: Option<&str>| {
+        let t = d.api("GET", &path, Value::Null, token);
+        if let Err(e) = schemas.validate(&t, schema) {
+            panic!("the turn does not match its schema: {e:#}\n{t:#}");
+        }
+        t["output"]["http"]["body"]["blob"].clone()
+    };
+    let with = shown(None);
+    let hash = with["hash"].as_str().unwrap_or_else(|| panic!("{with}"));
+    assert!(hash.starts_with("b3s:"), "a subject's blob: {with}");
+    assert_eq!(with["size"], 100_000, "{with}");
+    assert_eq!(with["subject"], "user:1", "{with}");
+    let without = shown(Some(&reader));
+    assert_eq!(without["hash"], hash, "{without}");
+    assert_eq!(without["size"], 100_000, "{without}");
+    assert_eq!(without["subject"], Value::Null, "{without}");
 }

@@ -9440,6 +9440,45 @@
           "null"
         ]
       },
+      "TurnBlobBody": {
+        "additionalProperties": false,
+        "description": "A body stored as a blob (M25): its reference, never its bytes.",
+        "properties": {
+          "blob": {
+            "$ref": "#/components/schemas/TurnBlobRef"
+          }
+        },
+        "required": [
+          "blob"
+        ],
+        "type": "object"
+      },
+      "TurnBlobRef": {
+        "additionalProperties": false,
+        "description": "A blob reference (M25, M26): its identity, `b3:` and the BLAKE3 of its bytes or `b3s:` and a hash keyed for its subject, its size and its subject. Never its bytes: `kronik blobs get` reads them.",
+        "properties": {
+          "hash": {
+            "pattern": "^b3s?:[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "size": {
+            "$ref": "#/components/schemas/TurnCount"
+          },
+          "subject": {
+            "description": "The data subject of a `b3s:` blob; null for a `b3:` blob, and for a caller without `pii:read`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "hash",
+          "size",
+          "subject"
+        ],
+        "type": "object"
+      },
       "TurnCausalKey": {
         "additionalProperties": false,
         "properties": {
@@ -9734,6 +9773,9 @@
                 "$ref": "#/components/schemas/TurnSealable"
               },
               {
+                "$ref": "#/components/schemas/TurnBlobBody"
+              },
+              {
                 "type": "null"
               }
             ]
@@ -9972,6 +10014,9 @@
                 "$ref": "#/components/schemas/TurnSealable"
               },
               {
+                "$ref": "#/components/schemas/TurnBlobBody"
+              },
+              {
                 "type": "null"
               }
             ]
@@ -10043,6 +10088,9 @@
                 "$ref": "#/components/schemas/TurnSealable"
               },
               {
+                "$ref": "#/components/schemas/TurnBlobBody"
+              },
+              {
                 "type": "null"
               }
             ]
@@ -10067,6 +10115,13 @@
       "TurnMessage": {
         "additionalProperties": false,
         "properties": {
+          "blobs": {
+            "description": "The blobs the message carries (M26), when it carries any.",
+            "items": {
+              "$ref": "#/components/schemas/TurnBlobRef"
+            },
+            "type": "array"
+          },
           "body": {
             "$ref": "#/components/schemas/TurnSealable"
           },

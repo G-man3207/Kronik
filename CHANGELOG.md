@@ -14,7 +14,10 @@ until the v1.0 compatibility promise takes effect.
   may read and retain. An operator's message answered with a blob (`kronik
   send`, `POST /v1/actors/{kind}/{key}/messages`) failed with 503
   `UNAVAILABLE` and the hint to retry; its reply now carries the blob's
-  reference as `blob`, and a reply message's blobs as `blobs`.
+  reference as `blob`, and a reply message's blobs as `blobs`. `GET
+  /v1/turns/{id}` showed a body that is a blob as `null` and left out the
+  blobs a message carries; it shows their references: hash, size and, to a
+  caller with `pii:read`, subject (`TurnBlobRef` in the turn schema).
 - `kronik upgrade check`, and the start of a daemon whose engine changed,
   replay blob turns (M25, M26): they replayed without the blob store, so a
   turn with a recorded blob response failed the check, and a node with one

@@ -355,6 +355,13 @@ fn real_diffs_and_turns_match_their_schemas() {
         "/v1/grants",
         json!({"kind": "counter", "capability": "http:127.0.0.1", "reason": "schemas"}),
     );
+    // Blobs (M25, M26): bodies above 64 KiB of the media guest are blobs.
+    d.deploy("media");
+    d.api(
+        "POST",
+        "/v1/limits",
+        json!({"kind": "media", "blob_threshold_bytes": 65_536, "reason": "schemas"}),
+    );
     let setup = d.applied_lsn();
 
     // Production: HTTP inputs (one with a subject), payments and a GET
@@ -381,6 +388,24 @@ fn real_diffs_and_turns_match_their_schemas() {
     d.send("counter/d", "fetch-ok", "GET http://denied.example/x", None);
     d.send("notes/n", "add", "a note", Some("user:1"));
     d.send("notes/n", "list", "", None);
+    // An upload and an answer that are blobs (above the kind's 64 KiB
+    // threshold), a put, and a message that carries the put's blob: the
+    // turns show their references.
+    let text = "blob body ".repeat(10_000);
+    let echoed = d.post("/media/u/echo", &text, None);
+    assert!(
+        echoed.starts_with("HTTP/1.1 200") && echoed.ends_with(&text),
+        "{}",
+        &echoed[..200.min(echoed.len())]
+    );
+    assert!(
+        d.post("/media/h/put?size=100000", "", None)
+            .contains("blob b3:")
+    );
+    assert!(
+        d.post("/media/h/send?to=r&op=retain", "", None)
+            .contains("sent")
+    );
 
     // Diffs, and every fork turn they name. The identity diff comes from a
     // plain fork: a proposal of the code main runs is refused (M9).
@@ -410,7 +435,8 @@ fn real_diffs_and_turns_match_their_schemas() {
         json!({"stubs": [{"method": "GET", "url_prefix": format!("http://{target}/items/"), "body": "stubbed"}]}),
     );
     let fail_get = d.propose(&s, "counter-fail-get", json!({"mode": "isolated"}));
-    // A system proposal (M9): two kinds in one fork, reported per kind.
+    // A system proposal (M9): two kinds in one fork, reported per kind, with
+    // the media kind's unchanged turns.
     let system = d.propose(
         &s,
         "counter-calls-tally",
@@ -430,7 +456,11 @@ fn real_diffs_and_turns_match_their_schemas() {
         .collect();
     assert_eq!(
         kinds,
-        [("counter", "changed"), ("notes", "changed")],
+        [
+            ("counter", "changed"),
+            ("media", "unchanged"),
+            ("notes", "changed")
+        ],
         "{system_diff}"
     );
     // A fork without personal data, replayed through the same code.
@@ -571,6 +601,15 @@ fn real_diffs_and_turns_match_their_schemas() {
     assert!(seen(&|t| t["input"]["headers"].as_array().is_some_and(
         |h| h.iter().any(|h| h["value"]["subject"] == "user:1")
     )));
+    // Blobs as references (M25, M26): the upload, the echo's answer, and
+    // the blob a message carries, as it was sent and received.
+    let reference = |r: &Value| {
+        r["hash"].as_str().is_some_and(|h| h.starts_with("b3:")) && r["size"].as_u64() > Some(0)
+    };
+    assert!(seen(&|t| reference(&t["input"]["body"]["blob"])));
+    assert!(seen(&|t| reference(&t["output"]["http"]["body"]["blob"])));
+    assert!(seen(&|t| reference(&t["messages"][0]["msg"]["blobs"][0])));
+    assert!(seen(&|t| reference(&t["input"]["msg"]["blobs"][0])));
 
     // The schemas have teeth: an unknown field or a missing one fails.
     let mut extra = diffs[1].clone();

@@ -619,11 +619,35 @@ fn sealable_json(s: Option<&pb::Sealable>) -> serde_json::Value {
 
 fn message_json(m: Option<&pb::Message>) -> serde_json::Value {
     match m {
-        Some(m) => serde_json::json!({
-            "name": m.name,
-            "content_type": m.content_type,
-            "body": sealable_json(m.body.as_ref()),
-        }),
+        Some(m) => {
+            let mut v = serde_json::json!({
+                "name": m.name,
+                "content_type": m.content_type,
+                "body": sealable_json(m.body.as_ref()),
+            });
+            // The blobs it carries (M26), as references.
+            if !m.blobs.is_empty() {
+                v["blobs"] = m.blobs.iter().map(blob_ref_json).collect();
+            }
+            v
+        }
+        None => serde_json::Value::Null,
+    }
+}
+
+/// A blob reference (M25, M26): its identity, size and subject, never its
+/// bytes. `redact::redact_turn` has dropped the subject for a caller
+/// without `pii:read`.
+fn blob_ref_json(b: &pb::BlobRef) -> serde_json::Value {
+    serde_json::json!({"hash": b.hash, "size": b.size, "subject": b.subject})
+}
+
+/// An HTTP body as the turn view shows it: inline as a sealable value, a
+/// blob (M25) as its reference.
+fn body_json(body: Option<&pb::Body>) -> serde_json::Value {
+    match body.and_then(|b| b.value.as_ref()) {
+        Some(pb::body::Value::Inline(s)) => sealable_json(Some(s)),
+        Some(pb::body::Value::Blob(b)) => serde_json::json!({"blob": blob_ref_json(b)}),
         None => serde_json::Value::Null,
     }
 }
@@ -702,10 +726,7 @@ fn http_request_json(h: &pb::HttpInput) -> serde_json::Map<String, serde_json::V
         "route": h.route,
         "params": h.param_values(),
         "headers": headers_json(&h.headers),
-        "body": match h.body.as_ref().and_then(|b| b.value.as_ref()) {
-            Some(pb::body::Value::Inline(s)) => sealable_json(Some(s)),
-            _ => serde_json::Value::Null,
-        },
+        "body": body_json(h.body.as_ref()),
         "idempotency_key": h.idempotency_key,
     });
     match v {
@@ -868,10 +889,7 @@ fn turn_json(branch: &str, lsn: u64, t: &pb::TurnRecord) -> TurnJson {
         Some(pb::outcome::Output::Http(h)) => serde_json::json!({"http": {
             "status": h.status,
             "headers": headers_json(&h.headers),
-            "body": match h.body.as_ref().and_then(|b| b.value.as_ref()) {
-                Some(pb::body::Value::Inline(s)) => sealable_json(Some(s)),
-                _ => serde_json::Value::Null,
-            },
+            "body": body_json(h.body.as_ref()),
         }}),
         // The selected subprotocol's value is filled in for callers with
         // pii:read only ([`accept_subprotocol`]).
@@ -3116,5 +3134,109 @@ mod connection_turn_json_tests {
             input_summary(close.input.as_ref(), true).summary,
             format!("close {CONN} restart 1012")
         );
+    }
+
+    /// M25, M26: a body that is a blob shows as its reference, as do the
+    /// blobs a message carries; a reference's subject shows only with
+    /// `pii:read`. The release rehearsal found an HTTP answer's blob shown
+    /// as `"body": null`.
+    #[test]
+    fn blob_references_match_the_turn_schema() {
+        let keyed = pb::BlobRef {
+            hash: format!("b3s:{}", "5a".repeat(32)),
+            size: 100_000,
+            subject: Some("user:1".into()),
+            key_version: 1,
+        };
+        let upload = pb::BlobRef {
+            hash: format!("b3:{}", "0f".repeat(32)),
+            size: 70_000,
+            subject: None,
+            key_version: 0,
+        };
+        let blob_body = |r: &pb::BlobRef| {
+            Some(pb::Body {
+                value: Some(pb::body::Value::Blob(r.clone())),
+            })
+        };
+        let message = |blobs: Vec<pb::BlobRef>| pb::Message {
+            name: "retain".into(),
+            content_type: "text/plain".into(),
+            body: plain(None, b""),
+            blobs,
+            retained_compensation_source: None,
+        };
+        let media = |key: &str| pb::ActorRef {
+            kind: "media".into(),
+            key: key.into(),
+        };
+        let record = pb::TurnRecord {
+            actor: Some(media("w")),
+            code_hash: vec![1; 32],
+            causal_key: Some(pb::CausalKey {
+                root: "0123456789abcdef0123456789abcdef".into(),
+                path: vec![],
+            }),
+            input: Some(pb::Input {
+                kind: Some(pb::input::Kind::Http(pb::HttpInput {
+                    method: "POST".into(),
+                    path: "/media/w/write".into(),
+                    route: "/media/{key}/{op}".into(),
+                    body: blob_body(&upload),
+                    ..Default::default()
+                })),
+            }),
+            messages: vec![pb::OutboundMessage {
+                to: Some(media("r")),
+                ordinal: 1,
+                message_id: "m-1".into(),
+                msg: Some(message(vec![keyed.clone(), upload.clone()])),
+            }],
+            outcome: Some(pb::Outcome {
+                kind: pb::OutcomeKind::Committed as i32,
+                output: Some(pb::outcome::Output::Http(pb::HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: blob_body(&keyed),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let shown = |pii: bool| {
+            let mut t = record.clone();
+            redact::redact_turn(&mut t, &kronik_privacy::sealer::Sealer::plain(), pii);
+            let v = turn_json("main", 7, &t).0;
+            validate(&v);
+            v
+        };
+        fn reference(r: &pb::BlobRef, subject: Option<&str>) -> serde_json::Value {
+            serde_json::json!({"hash": r.hash, "size": r.size, "subject": subject})
+        }
+        let with = shown(true);
+        assert_eq!(
+            with["output"]["http"]["body"],
+            serde_json::json!({"blob": reference(&keyed, Some("user:1"))})
+        );
+        assert_eq!(
+            with["input"]["body"],
+            serde_json::json!({"blob": reference(&upload, None)})
+        );
+        assert_eq!(
+            with["messages"][0]["msg"]["blobs"],
+            serde_json::json!([reference(&keyed, Some("user:1")), reference(&upload, None)])
+        );
+        let without = shown(false);
+        assert_eq!(
+            without["output"]["http"]["body"],
+            serde_json::json!({"blob": reference(&keyed, None)})
+        );
+        assert!(!without.to_string().contains("user:1"), "{without}");
+        // A message without blobs lists none.
+        let mut bare = record;
+        bare.messages[0].msg = Some(message(Vec::new()));
+        let v = turn_json("main", 7, &bare).0;
+        validate(&v);
+        assert!(v["messages"][0]["msg"].get("blobs").is_none(), "{v}");
     }
 }
