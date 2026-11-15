@@ -6,6 +6,9 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- A zero-length `blobs.get` is an empty read, not `invalid`; like every other
+  length it checks the reference first, so one the turn does not hold is
+  `not-held`.
 - A dry-run deploy, fork deploy or propose compiles and describes the
   candidate without storing it (I12): the component and its precompiled
   cache no longer appear in `<data_dir>/code/` for a component no committed

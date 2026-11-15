@@ -275,7 +275,7 @@ and new components.
 
 ### 5.2 Semantics
 
-- `get`: `len` 1 to 1 MiB, else `invalid`; a reference not in `T` is
+- `get`: `len` 0 to 1 MiB, else `invalid`; a reference not in `T` is
   `not-held`; an erased subject's blob is `erased`. Returns
   `min(len, size - offset)` bytes, an empty list at or past the end.
 - `writer`: the constructor records the default subject; `write` takes at

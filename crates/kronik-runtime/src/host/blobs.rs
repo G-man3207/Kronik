@@ -488,14 +488,17 @@ impl wit::Host for TurnHost {
         len: u32,
     ) -> wasmtime::Result<Result<Vec<u8>, wit::BlobError>> {
         let host = self.blob_host("blobs.get")?;
-        if len == 0 || len as usize > MAX_BLOB_CALL_BYTES {
+        if len as usize > MAX_BLOB_CALL_BYTES {
             return Ok(Err(invalid(format!(
-                "get reads 1 to {MAX_BLOB_CALL_BYTES} bytes, not {len}"
+                "get reads at most {MAX_BLOB_CALL_BYTES} bytes, not {len}"
             ))));
         }
         let Some(full) = self.complete_ref(&blob)? else {
             return Ok(Err(wit::BlobError::NotHeld));
         };
+        if len == 0 {
+            return Ok(Ok(Vec::new()));
+        }
         self.charge_blob_bytes(read_charge(full.size, offset, len))?;
         if offset >= full.size {
             return Ok(Ok(Vec::new()));
