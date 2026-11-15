@@ -440,7 +440,7 @@ See also: [`turn`](#turn), [`root-input`](#root-input), [`TURN_FAILED`](../error
 
 A callee's committed change whose caller then failed. Milestone M2.
 
-An orphaned change is a change that a called actor committed in a `call` whose caller then failed without compensation. `call` is not atomic: the callee's turn stands. If the call carried a compensation message, Kronik delivers it exactly once to the callee; a compensation that itself fails ends up in dead letters, and the change counts as orphaned until a compensation succeeds. Orphaned changes show up in `kronik history --orphans` and, from M3, in the diff.
+An orphaned change is a change that a called actor committed in a `call` whose caller then failed without compensation. `call` is not atomic: the callee's turn stands. If the call carried a compensation message, Kronik delivers it exactly once to the callee, unless the caller's failed record is one an earlier release left over the turn budget and its closing record has to leave the compensations out (ADR 0130, amended 2026-11-15, issue #87): then the change is orphaned with no compensation to deliver and is listed as such. A compensation that itself fails ends up in dead letters, and the change counts as orphaned until a compensation succeeds. Orphaned changes show up in `kronik history --orphans` and, from M3, in the diff.
 
 See also: [`message`](#message), [`dead-letters`](#dead-letters).
 

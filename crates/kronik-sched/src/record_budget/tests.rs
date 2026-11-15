@@ -43,6 +43,16 @@ fn compensation() -> pb::OutboundMessage {
     }
 }
 
+/// A compensation of `bytes` bytes, as a successful call of `ordinal`
+/// records it.
+fn big_compensation(ordinal: u32, bytes: usize) -> pb::OutboundMessage {
+    let mut compensation = compensation();
+    compensation.ordinal = ordinal;
+    compensation.message_id = format!("{ordinal:032x}");
+    compensation.msg = Some(message(&vec![b'c'; bytes]));
+    compensation
+}
+
 /// A committed turn with every kind of user data.
 fn turn(writes: usize, value: usize) -> pb::TurnRecord {
     pb::TurnRecord {
@@ -283,6 +293,78 @@ fn effects_an_earlier_release_recorded_past_the_budget_are_left_out_last() {
     );
     assert!(turn_cost(&mut record, input) <= limit);
     assert_eq!(record.outcome.unwrap().error_code, "TURN_TOO_LARGE");
+}
+
+/// Issue #87: a pre-0.5 turn can record compensation messages that, alone
+/// and after its effects' payloads are left out, take its failed record past
+/// the budget. They are the last rung before the effects: left out, the
+/// successful calls become orphans; leaving them in would make the log
+/// refuse the record and keep the turn open at every start.
+#[test]
+fn an_earlier_releases_compensations_are_left_out_last() {
+    let effects = || (0..2).map(|o| effect(o, 100)).collect::<Vec<_>>();
+    let compensations: Vec<pb::OutboundMessage> =
+        (0..2).map(|o| big_compensation(o, 40_000)).collect();
+    let limit = 60_000;
+
+    let mut record = turn(0, 0);
+    record.effects = effects();
+    let input = ic(&mut record);
+    assert_eq!(
+        fail(&mut record, &compensations, limit, input),
+        Fit::Stripped
+    );
+    assert!(record.compensations.is_empty());
+    assert_eq!(
+        record.effects.len(),
+        2,
+        "the effects' own records stay: their results are still in the log"
+    );
+    assert!(
+        record
+            .effects
+            .iter()
+            .all(|e| e.request.is_none() && e.response.is_none()),
+        "the effects' payloads go before their records do"
+    );
+    assert!(turn_cost(&mut record, input) <= limit);
+    let outcome = record.outcome.clone().unwrap();
+    assert_eq!(outcome.error_code, "TURN_TOO_LARGE");
+    assert!(
+        outcome
+            .message
+            .contains("; its 2 compensations are not recorded: their calls are orphans"),
+        "{outcome:?}"
+    );
+
+    // fit_closing, the re-run that closes a turn without running its guest,
+    // applies the same ladder to compensations already in its record.
+    let mut closing = turn(0, 0);
+    closing.writes.clear();
+    closing.messages.clear();
+    closing.timers.clear();
+    closing.effects = effects();
+    closing.compensations = compensations;
+    closing.outcome = Some(pb::Outcome {
+        kind: pb::OutcomeKind::Failed as i32,
+        error_code: "TURN_TOO_LARGE".into(),
+        ..Default::default()
+    });
+    let input = ic(&mut closing);
+    assert_eq!(fit_closing(&mut closing, limit, input), Fit::Stripped);
+    assert!(closing.compensations.is_empty());
+    assert_eq!(closing.effects.len(), 2);
+    assert!(turn_cost(&mut closing, input) <= limit);
+    assert!(
+        closing
+            .outcome
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("its 2 compensations are not recorded"),
+        "{:?}",
+        closing.outcome
+    );
 }
 
 /// `Fit::Stripped` promises a record that fits: when leaving out the

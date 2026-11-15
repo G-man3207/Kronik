@@ -1,6 +1,6 @@
 # 0130. A turn's record fits in one log record
 
-- **Status:** Accepted (2026-11-13), amended 2026-11-14
+- **Status:** Accepted (2026-11-13), amended 2026-11-14 and 2026-11-15
 - **Date:** 2026-11-13
 
 ## Context
@@ -39,7 +39,8 @@ re-run and in a fork's replay.
 - **The end of the turn** turns a record over the budget into a failed
   `TURN_TOO_LARGE` turn: input, effects and compensations stay, the rest
   goes. The gate kept the effects within the budget, so it fits and closes
-  the turn's `TurnBegin`.
+  the turn's `TurnBegin`. (A record a release before 0.5 began is the one
+  exception: see the amendment of 2026-11-15.)
 - **`TURN_TOO_LARGE`** (500, a host trap like `FUEL_EXHAUSTED`, so an HTTP
   client gets `TURN_FAILED`) is a new code: `PAYLOAD_TOO_LARGE` is defined
   as a refusal before any turn ran, and the turn here did run.
@@ -84,3 +85,71 @@ The alternative "a per-turn cap on effect bytes" was decided (issue #74):
 `effect_bytes_per_turn` (32 MiB by default). An effect that would pass it
 fails with `EFFECT_BYTES_EXCEEDED`, recorded as its result. One turn now
 writes at most about that limit plus one record limit to the log.
+
+## Amendment (2026-11-15): a legacy compensation goes before the effects
+
+The Decision above says the failed record "fits and closes the turn's
+`TurnBegin`". That is true for a record this release assembled, because the
+gate charged every effect and compensation while it filled the budget. It
+was not true for the re-run of a `TurnBegin` an earlier release wrote
+(issue #87). A pre-0.5 turn could record one compensation message per
+successful `call`, and nothing charged them; on a re-run `fail` copied every
+recorded compensation into `record.compensations`, after which `strip`
+cleared only the effects' requests and responses and then the effects. If
+the compensations alone were over the budget, the failed record stayed over
+`MAX_RECORD`, the log refused it (`LogError::TooLarge`), no `TurnRecord`
+closed the begin, `open_turns` kept the row, and every start ran the turn
+again. `open_turn_pin` then kept its segment from retention for ever, so
+compaction stopped and the log grew until the disk reserve refused writes.
+The `Fit::Over` doc comment's premise — that the overrun is within the 4 KiB
+`TURN_RESERVE` — had the same provenance: nothing bounded a legacy
+compensation, or a legacy input.
+
+The maintainer decision recorded here:
+
+- **The input stays.** Every failed record keeps its input. It is the
+  request that caused the turn, the log format and its validator require
+  it, and the applier reads it for dead letters and connection inputs. A
+  closing record without an input, or with a reference to the begin's, is a
+  format change and is not part of this amendment.
+- **The last-resort order** in `strip`, after each step is re-measured:
+  first the requests and responses of the effects; then the compensations;
+  then the effects themselves. Only the input is never left out.
+- **A compensation left out makes its call's committed change an orphan.**
+  Its `EffectResult` record stays in the log, so the call and the callee's
+  committed change remain visible, but no compensation is delivered for it,
+  in the record or from the node's in-memory list; a callee that never
+  committed leaves nothing to compensate. When the effects stay in the
+  closing record (the common case, where the input fits the turn budget), the
+  applier lists the call as an `orphans` row with no compensation id — the
+  design's existing fallback for a successful call with no compensation.
+  When only the input fits, the effects go too and there is no closing effect
+  for the applier to list: the call's `EffectResult` stays in the log and the
+  callee's change stands, but `kronik history --orphans` does not name it.
+  The outcome message says `; its N compensations are not recorded: their
+  calls are orphans`, and, if that rung was also reached, the existing effects
+  note follows it.
+- **`Fit::Over` means the input alone.** After the ladder, `Over` is
+  returned only when the record without its effects and compensations is
+  still over the turn budget. The caller may append it only if it is within
+  the log's own record limit (`MAX_RECORD`, `TURN_RESERVE` more than the
+  budget); `close_open_turn` says so, and whether the turn can be closed,
+  in its log line. A 0.5 release never writes such an input: a new input
+  over the budget is refused before the turn runs (`PAYLOAD_TOO_LARGE`),
+  and a re-run of an earlier one is closed before its guest runs. Only a
+  pre-0.5 data directory whose ingress accepted an input over 128 MiB can
+  hold one. Such a turn still cannot be closed by this format — there is no
+  closing record without the input — and the amendment does not pretend
+  otherwise; a future format change would have to make the input optional
+  on a failed record, or cite the `TurnBegin`.
+
+Verified by
+`record_budget/tests.rs::an_earlier_releases_compensations_are_left_out_last`
+(2 effects, 2 compensations of 40 KiB against a 60 KiB limit: `Stripped`,
+the compensations gone, the effects kept, each step noted in the outcome)
+and `record_limit.rs::an_open_turn_whose_compensations_no_longer_fit_is_closed_not_rerun_for_ever`
+(an open turn with a recorded 100 KiB compensation and a limit that holds
+only its input: the closing `TURN_TOO_LARGE` record fits, `open_turns` is
+empty, a second start runs nothing, no compensation is delivered, and a
+retention pass deletes the begin's segment). The input-over-the-budget case
+is still covered by `an_open_turn_whose_input_no_longer_fits_is_closed_not_rerun_for_ever`.

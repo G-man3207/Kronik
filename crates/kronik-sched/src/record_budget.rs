@@ -170,24 +170,29 @@ pub enum Fit {
     Fits,
     /// The record became a failed turn with `TURN_TOO_LARGE`.
     Failed,
-    /// Even the failed turn was too large, which only effects recorded
-    /// before this budget existed can cause (the re-run of a turn an earlier
-    /// release began): their requests and responses were left out of the
-    /// turn record, and when that was not enough the effects themselves. The
-    /// log's `EffectResult` records of the execution still hold them. The
-    /// record fits.
+    /// Even the failed turn was too large, which only what an earlier
+    /// release recorded before this budget existed can cause (the re-run of
+    /// a turn it began): its effects' requests and responses were left out
+    /// of the turn record, then its compensations, and when that was not
+    /// enough the effects themselves. The log's `EffectResult` records of
+    /// the execution still hold the effects; a compensation that was left
+    /// out is not delivered, so its call's committed change stays an orphan.
+    /// The outcome says what was left out. The record fits.
     Stripped,
-    /// Even without its effects the record is over the limit: its input or
-    /// its compensations, which an earlier release recorded past this
-    /// budget, are. Nothing more is left out; the caller can only try to
-    /// append it, as the log's own limit is [`TURN_RESERVE`] larger.
+    /// Only the input is left and it alone is over the limit: an earlier
+    /// release recorded it past this budget. Nothing more is left out; the
+    /// record format requires an input and has no reference to the begin's.
+    /// The caller can append it only if it is within the log's own record
+    /// limit, which is [`TURN_RESERVE`] larger than a turn's budget.
     Over,
 }
 
 /// Makes a finished turn's record fit `limit` ([`turn_limit`]). A record
-/// over it becomes the failed turn the brief describes: its input, effects
-/// and compensations stay; its state writes, messages, timers, SQL changes,
-/// schema changes and output go; its outcome is `TURN_TOO_LARGE`.
+/// over it becomes the failed turn the brief describes: its input stays;
+/// its state writes, messages, timers, SQL changes, schema changes and output
+/// go; its outcome is `TURN_TOO_LARGE`. Its effects and compensations stay
+/// too, unless an earlier release recorded them past the budget, when
+/// the last-resort stripping leaves them out in its ladder's order.
 /// `compensations` are the turn's compensation messages, which a committed
 /// turn did not record; `input_cost` is [`input_cost`] of its plaintext
 /// input.
@@ -282,12 +287,16 @@ pub fn invalid(record: &mut pb::TurnRecord, compensations: &[pb::OutboundMessage
     mark_unknown_outcome(record);
 }
 
-/// Leaves out of a failed record what effects an earlier release recorded
-/// past this budget take, checking after each step: first their requests
-/// and responses, then the effects themselves. The outcome says which; the
-/// log's `EffectResult` records keep them.
+/// Leaves out of a failed record what an earlier release recorded past this
+/// budget, checking after each step: first its effects' requests and
+/// responses, then its compensations, then the effects themselves. A
+/// compensation that goes is not delivered, so its call's change stays an
+/// orphan. The outcome says what was left out; the log's `EffectResult`
+/// records keep the effects.
 fn strip(record: &mut pb::TurnRecord, limit: usize, input_cost: usize) -> Fit {
+    let mut payloads = false;
     for e in &mut record.effects {
+        payloads |= e.request.is_some() || e.response.is_some();
         e.request = None;
         e.response = None;
     }
@@ -296,19 +305,36 @@ fn strip(record: &mut pb::TurnRecord, limit: usize, input_cost: usize) -> Fit {
             outcome.message.push_str(text);
         }
     };
-    note(
-        record,
-        "; the requests and responses of its effects are only in its effect results",
-    );
+    if payloads {
+        note(
+            record,
+            "; the requests and responses of its effects are only in its effect results",
+        );
+    }
+    if turn_cost(record, input_cost) <= limit {
+        return Fit::Stripped;
+    }
+    let compensations = record.compensations.len();
+    record.compensations.clear();
+    if compensations > 0 {
+        note(
+            record,
+            &format!(
+                "; its {compensations} compensations are not recorded: their calls are orphans"
+            ),
+        );
+    }
     if turn_cost(record, input_cost) <= limit {
         return Fit::Stripped;
     }
     let effects = record.effects.len();
     record.effects.clear();
-    note(
-        record,
-        &format!("; its {effects} effects are only in its effect results"),
-    );
+    if effects > 0 {
+        note(
+            record,
+            &format!("; its {effects} effects are only in its effect results"),
+        );
+    }
     if turn_cost(record, input_cost) <= limit {
         Fit::Stripped
     } else {
@@ -321,9 +347,9 @@ fn strip(record: &mut pb::TurnRecord, limit: usize, input_cost: usize) -> Fit {
 /// fit in a turn's record) fit `limit`, keeping its outcome. Only what an
 /// earlier release recorded past the budget can make it too large: then
 /// the requests and responses of its effects are left out of the turn
-/// record, and if that is not enough the effects themselves; the log's
-/// `EffectResult` records of the execution keep them. [`Fit::Over`] when
-/// even that is over the limit.
+/// record, then its compensations, and if that is not enough the effects
+/// themselves; the log's `EffectResult` records of the execution keep them.
+/// [`Fit::Over`] only when its input alone is over the limit.
 pub fn fit_closing(record: &mut pb::TurnRecord, limit: usize, input_cost: usize) -> Fit {
     if turn_cost(record, input_cost) <= limit {
         return Fit::Fits;

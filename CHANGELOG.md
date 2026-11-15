@@ -6,6 +6,15 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- An open turn begun before v0.5 whose recorded call compensations, not just
+  its input, exceed the turn budget is closed as `TURN_TOO_LARGE` at the next
+  start instead of being re-run at every start and pinning its log segment
+  from retention for ever. The closing record keeps the input, leaves the
+  effect payloads out, then the compensations (a call whose callee committed
+  is left uncompensated, and listed as an orphan when its effect stays in the
+  record), then the effects; only an input that alone exceeds the log's
+  128 MiB record limit cannot be closed. `Fit::Over` now means the input alone
+  is over the budget.
 - A promote's `Deployment.unverified_inputs` counts the root inputs the
   switch actually made unverified: the node now takes the count under the
   switch gate, over main's log through the switch, instead of using the

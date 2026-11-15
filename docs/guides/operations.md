@@ -714,6 +714,21 @@ cut cannot get the record back from itself: restore it from a shipped copy
 (`kronik restore --from ...`) taken before the crash, or keep it as it is
 and ask for help.
 
+An open turn that such a release began is closed at the next start under
+this release's budget instead of running again for ever. Its closing
+`TURN_TOO_LARGE` record keeps the input and leaves out what the earlier
+release recorded past the budget, in this order: the requests and responses
+of its effects, then the compensations of its calls, then the
+effects themselves. The committed changes of the omitted calls stay
+uncompensated. When their effects stay in the closing record, they are listed
+as orphans with no compensation; when only the input fits, the effects go
+too and the orphans list does not name them, although their `EffectResult`
+records and the callee's own history still hold them. Only an input that
+alone exceeds the log's 128 MiB record limit cannot be written back into a
+closing record; that turn stays open, its segment stays pinned from
+retention, and every start logs it (a 0.5 release never accepts such an
+input).
+
 ## systemd
 
 `kronik serve --init` installs `deploy/systemd/kronik-root.service` in the
