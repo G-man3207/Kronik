@@ -2477,9 +2477,26 @@ fn apply_turn(
                     }
                 }
             } else {
-                pb::CallEffectResponse::decode(sealable_plain(e.response.as_ref()).as_slice())
-                    .map(|r| r.turn_id)
-                    .unwrap_or_default()
+                let turn_id =
+                    pb::CallEffectResponse::decode(sealable_plain(e.response.as_ref()).as_slice())
+                        .map(|r| r.turn_id)
+                        .unwrap_or_default();
+                // An erased answer carries no response body, but its
+                // committed callee is the effect's source (ADR 0124).
+                if !turn_id.is_empty() {
+                    turn_id
+                } else {
+                    e.callee_source
+                        .as_ref()
+                        .map(|source| {
+                            kronik_core::ids::TurnId {
+                                branch: source.branch.clone(),
+                                lsn: source.lsn,
+                            }
+                            .to_string()
+                        })
+                        .unwrap_or_default()
+                }
             };
             orphan_insert(
                 tx,
@@ -2898,10 +2915,22 @@ fn call_committed(tx: &Connection, call_message_id: &str) -> Result<Option<bool>
         .optional()?;
     Ok(saved.map(|outcome| {
         outcome.is_none_or(|bytes| {
-            pb::Outcome::decode(bytes.as_slice())
-                .is_ok_and(|o| o.kind == pb::OutcomeKind::Committed as i32)
+            pb::Outcome::decode(bytes.as_slice()).is_ok_and(|o| call_outcome_committed(&o))
         })
     }))
+}
+
+/// Whether a saved call answer is a committed callee outcome. A v0.5.0
+/// erasure replaced the answer with its `SUBJECT_ERASED` failure, which was
+/// still a committed callee's turn and must keep counting as one (ADR 0124);
+/// from this release on the erasure tombstones the answer and keeps
+/// `OutcomeKind::Committed`.
+fn call_outcome_committed(o: &pb::Outcome) -> bool {
+    o.kind == pb::OutcomeKind::Committed as i32
+        || (o.kind == pb::OutcomeKind::Failed as i32
+            && o.error_code == kronik_core::error::ErrorCode::SubjectErased.as_str()
+            && o.message == ERASED_CALL_RESPONSE
+            && o.output.is_none())
 }
 
 // One orphans row's columns, in their order: naming them would only repeat
@@ -3098,21 +3127,56 @@ fn connection_subject(c: &pb::ConnectionInput) -> Option<&str> {
     }
 }
 
-/// The message of [`erased_call_outcome`]: stored in `state.db`, so these
-/// words never change.
+/// The message of a v0.5.0 saved call answer whose values an erasure replaced
+/// with `SUBJECT_ERASED`: stored in `state.db`, so these words never change.
+/// Current erasures keep the committed kind and the tombstoned reply instead
+/// (ADR 0124); [`call_outcome_committed`] and the scheduler still read this
+/// shape.
 pub const ERASED_CALL_RESPONSE: &str = "the call's response belonged to an erased subject";
 
-/// What a saved call response of an erased subject becomes: the message
-/// stays delivered (no second run), and a repeated call gets this failure
-/// (`SUBJECT_ERASED`), which the caller's call answers as a call error.
-fn erased_call_outcome() -> Vec<u8> {
+/// What a saved call answer of an erased subject becomes when its bytes
+/// cannot be decoded: a committed reply whose body is the erasure's
+/// tombstone, never a failed turn. The callee did commit; the caller's
+/// answer and any compensation it owes must still know that (ADR 0124).
+fn erased_call_outcome(key_version: u32, subject: &str) -> Vec<u8> {
     pb::Outcome {
-        kind: pb::OutcomeKind::Failed as i32,
-        error_code: "SUBJECT_ERASED".into(),
-        message: ERASED_CALL_RESPONSE.into(),
-        output: None,
+        kind: pb::OutcomeKind::Committed as i32,
+        output: Some(pb::outcome::Output::Reply(pb::Message {
+            body: Some(pb::Sealable {
+                subject: Some(subject.into()),
+                value: Some(erased_value(key_version)),
+            }),
+            ..Default::default()
+        })),
+        ..Default::default()
     }
     .encode_to_vec()
+}
+
+/// The tombstoned form of a saved call answer, keeping its committed kind and
+/// its shape: a replay reads the same `SUBJECT_ERASED` call error, and
+/// `call_committed` still knows the callee's turn stood (ADR 0124).
+fn tombstoned_call_outcome(
+    bytes: &[u8],
+    subject: &str,
+    key_version: u32,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    let mut outcome: pb::Outcome = decode(bytes, "call outcome")?;
+    let mut hit = false;
+    kronik_proto::sealables::outcome_mut(Some(&mut outcome), &mut |s| {
+        if s.subject.as_deref() == Some(subject) {
+            s.value = Some(erased_value(key_version));
+            hit = true;
+        }
+    });
+    if !hit {
+        return Ok(None);
+    }
+    // The callee's turn stood: the answer is not a failure, only gone.
+    outcome.kind = pb::OutcomeKind::Committed as i32;
+    outcome.error_code.clear();
+    outcome.message.clear();
+    Ok(Some(outcome.encode_to_vec()))
 }
 
 /// What a queued value of an erased subject becomes: a tombstone of its
@@ -3169,8 +3233,26 @@ fn erase_rows(
         "DELETE FROM connection_dead_letters WHERE lsn NOT IN (SELECT lsn FROM dead_letters)",
     )?
     .execute([])?;
-    tx.prepare_cached("UPDATE deliveries SET outcome = ?2, subject = NULL WHERE subject = ?1")?
-        .execute(params![subject, erased_call_outcome()])?;
+    // A saved call answer keeps the callee's commit: only its values of the
+    // subject become the erasure's tombstone. A caller that fails after the
+    // call still owes the orphan and the compensation (ADR 0124).
+    let saved: Vec<(String, Vec<u8>)> = tx
+        .prepare_cached(
+            "SELECT message_id, outcome FROM deliveries \
+             WHERE subject = ?1 AND outcome IS NOT NULL",
+        )?
+        .query_map([subject], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for (message_id, bytes) in saved {
+        let outcome = tombstoned_call_outcome(&bytes, subject, key_version)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| erased_call_outcome(key_version, subject));
+        tx.prepare_cached(
+            "UPDATE deliveries SET outcome = ?2, subject = NULL WHERE message_id = ?1",
+        )?
+        .execute(params![message_id, outcome])?;
+    }
     let mut f = tombstone(subject, key_version);
     let timers: Vec<(String, String, i64, Vec<u8>)> = tx
         .prepare_cached("SELECT kind, key, timer_id, msg FROM timers")?
@@ -4708,6 +4790,104 @@ mod tests {
         }
     }
 
+    /// #80/ADR 0124: a callee committed, then its subject was erased, then
+    /// the caller's failed record was applied. The saved answer is the
+    /// tombstone now, but the callee still committed: the call is an orphan
+    /// and the compensation it held is released, not dropped as a failed
+    /// callee's.
+    #[test]
+    fn an_erased_saved_answer_keeps_a_failed_callers_compensation() {
+        let mut db = StateDb::open(Connection::open_in_memory().unwrap()).unwrap();
+        let (caller, call_id, mut callee) = timed_out_caller("erased-ok", true);
+        let Record::TurnRecord(callee_turn) = &mut callee else {
+            unreachable!()
+        };
+        callee_turn.outcome = Some(pb::Outcome {
+            kind: pb::OutcomeKind::Committed as i32,
+            output: Some(pb::outcome::Output::Reply(pb::Message {
+                name: "reply".into(),
+                body: tagged("user:2", "NEEDLE"),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let erasure = Record::Erasure(pb::Erasure {
+            subject: "user:2".into(),
+            key_version: 1,
+            ..Default::default()
+        });
+        db.apply(&[committed(1, callee), committed(2, erasure)])
+            .unwrap();
+        // The erasure tombstoned the saved answer without withdrawing the
+        // callee's commit.
+        let (_, saved) = db.call_outcome(&call_id).unwrap().unwrap();
+        assert_eq!(saved.kind, pb::OutcomeKind::Committed as i32);
+        assert!(call_outcome_committed(&saved));
+        assert!(matches!(
+            saved.output,
+            Some(pb::outcome::Output::Reply(message))
+                if message.body.as_ref().is_some_and(kronik_privacy::sealer::is_erased)
+        ));
+
+        db.apply(&[committed(3, caller)]).unwrap();
+        let orphans = db.orphans(false).unwrap();
+        assert_eq!(orphans.len(), 1, "{orphans:?}");
+        assert_eq!(orphans[0].call_message_id, call_id);
+        assert_eq!(orphans[0].callee.to_string(), "counter/b");
+        assert_eq!(orphans[0].caller_lsn, 3);
+        assert!(orphans[0].compensation_id.is_some(), "{orphans:?}");
+        let released = db
+            .released_compensation(&call_id, 3)
+            .unwrap()
+            .expect("the held compensation is released for the committed callee");
+        assert_eq!(
+            Some(&released.message_id),
+            orphans[0].compensation_id.as_ref()
+        );
+        assert_eq!(
+            db.mailbox()
+                .unwrap()
+                .iter()
+                .map(|m| &m.message_id)
+                .collect::<Vec<_>>(),
+            vec![&released.message_id]
+        );
+    }
+
+    /// An unreadable saved answer cannot keep plaintext or a failure: the
+    /// erasure replaces it with a committed tombstone, so a caller that
+    /// fails afterwards still owes the orphan (ADR 0124).
+    #[test]
+    fn an_erasure_replaces_an_unreadable_saved_answer_with_a_commit() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut db = StateDb::open(conn).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO deliveries (message_id, lsn, outcome, subject) \
+                 VALUES ('unreadable', 0, x'00ff', 'user:1')",
+                [],
+            )
+            .unwrap();
+        db.apply(&[committed(
+            1,
+            Record::Erasure(pb::Erasure {
+                subject: "user:1".into(),
+                key_version: 2,
+                ..Default::default()
+            }),
+        )])
+        .unwrap();
+        let (_, o) = db.call_outcome("unreadable").unwrap().unwrap();
+        assert_eq!(o.kind, pb::OutcomeKind::Committed as i32);
+        assert!(call_outcome_committed(&o));
+        let Some(pb::outcome::Output::Reply(message)) = o.output else {
+            panic!("the fallback did not keep a reply: {o:?}");
+        };
+        let body = message.body.unwrap();
+        assert_eq!(body.value, Some(erased_value(2)));
+        assert!(kronik_privacy::sealer::is_erased(&body));
+    }
+
     /// A bulk window that mixes simple catch-up batches (counter-style
     /// HTTP turns) with normal-path batches (a message turn, a turn with
     /// an effect) must leave `applied_lsn` at the highest applied LSN,
@@ -5045,11 +5225,23 @@ mod tests {
         let dl = db.dead_letters(0, 10).unwrap();
         assert_eq!(dl.iter().map(|d| d.lsn).collect::<Vec<_>>(), vec![2]);
         assert!(db.ingress("counter", "a", "k1").unwrap().is_none());
-        // The call stays delivered; a repeat gets the tombstone, not a rerun.
+        // The call stays delivered; a repeat gets the tombstone, not a rerun,
+        // and the callee's commit is still in the saved answer (ADR 0124).
         assert_eq!(db.delivery("c1").unwrap(), Some(4));
         let (lsn, o) = db.call_outcome("c1").unwrap().unwrap();
-        assert_eq!((lsn, o.error_code.as_str()), (4, "SUBJECT_ERASED"));
-        assert!(o.output.is_none());
+        assert_eq!(lsn, 4);
+        assert_eq!(o.kind, pb::OutcomeKind::Committed as i32);
+        assert!(o.error_code.is_empty());
+        assert!(call_outcome_committed(&o));
+        let Some(pb::outcome::Output::Reply(message)) = o.output else {
+            panic!("the saved answer lost its reply: {o:?}");
+        };
+        let body = message.body.unwrap();
+        assert_eq!(body.subject.as_deref(), Some("user:1"));
+        assert!(
+            kronik_privacy::sealer::is_erased(&body),
+            "the saved answer is not the tombstone: {body:?}"
+        );
     }
 
     /// Issue #31: a reseal seals the bodies a rewritten turn left queued
@@ -5308,6 +5500,15 @@ mod tests {
             vec![None, Some("user:2".to_owned())]
         );
         let (_, o) = db.call_outcome("user:1").unwrap().unwrap();
-        assert_eq!(o.error_code, "SUBJECT_ERASED");
+        assert_eq!(o.kind, pb::OutcomeKind::Committed as i32);
+        assert!(call_outcome_committed(&o));
+        let Some(pb::outcome::Output::Reply(message)) = o.output else {
+            panic!("the migrated answer lost its reply: {o:?}");
+        };
+        assert!(
+            kronik_privacy::sealer::is_erased(message.body.as_ref().unwrap()),
+            "{:?}",
+            message.body
+        );
     }
 }
