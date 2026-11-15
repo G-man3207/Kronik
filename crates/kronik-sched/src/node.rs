@@ -2051,7 +2051,9 @@ impl Node {
                         .call_outcome(&m.message_id)
                         .map_err(store_err)?
                 {
-                    self.unseal_outcome(&mut outcome);
+                    // For its caller: a value of an erased subject is the
+                    // erasure's tombstone, as in a live answer.
+                    self.unseal_response(&mut outcome);
                     return Ok(TurnResult {
                         turn_id: TurnId { branch, lsn },
                         outcome,
@@ -2151,12 +2153,18 @@ impl Node {
         // The guest gets plaintext; an input of an erased subject can't run
         // (docs/design/m8-privacy.md §5), and neither can one holding a value,
         // plain or sealed, of a subject erased since the input came in (§6.8):
-        // a re-run's recorded effects count as its input.
+        // a re-run's recorded effects count as its input, also those that
+        // hold an erased value already (`recorded_erased`): a wait for them
+        // would never end.
         let refused = match self.check_input(&input) {
             Err(e) => Some(Node::unreadable_input(&e)),
             Ok(()) if self.predates_erasure(&mut input, rerun.as_mut(), born) => Some((
                 ErrorCode::SubjectErased,
                 "the input belongs to an erased subject".to_owned(),
+            )),
+            Ok(()) if rerun.as_ref().is_some_and(|r| self.recorded_erased(&r.recorded)) => Some((
+                ErrorCode::SubjectErased,
+                "a result the turn recorded belongs to an erased subject".to_owned(),
             )),
             Ok(()) => None,
         };

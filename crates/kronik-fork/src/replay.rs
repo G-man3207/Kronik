@@ -3319,6 +3319,18 @@ impl ReplayGate {
                     && sealer.fingerprint_matches(msg_subject.as_deref(), &p.fingerprint, &plain)
             })
             .cloned();
+        // The same request whose callee's answer belonged to an erased
+        // subject in production (ADR 0123): it failed with SUBJECT_ERASED,
+        // and that answer is gone for good, for the fork too. The fork's
+        // callee still runs where production's ran; when it answers with a
+        // value of a subject, the caller gets production's recorded result.
+        let recorded_erased = self
+            .prod_at(ordinal)
+            .filter(|p| {
+                kronik_sched::effects::erased_answer_recorded(p)
+                    && sealer.fingerprint_matches(msg_subject.as_deref(), &p.fingerprint, &plain)
+            })
+            .map(|p| p.error.clone());
         let mut rec = pb::EffectRecord {
             ordinal,
             kind: "actor.call".into(),
@@ -3399,7 +3411,16 @@ impl ReplayGate {
                 state.personal |= turn.personal;
                 state.unverified_callee |= turn.erased;
             }
-            (map_call_outcome(o)?, turn.id, Some(turn.lsn))
+            let outcome = match (map_call_outcome(o)?, recorded_erased) {
+                (CallOutcome::Ok(Some(reply)), Some(error))
+                    if reply.body.as_ref().is_some_and(|body| body.subject.is_some()) =>
+                {
+                    rec.grounding = pb::Grounding::Exact as i32;
+                    CallOutcome::Failed(error)
+                }
+                (outcome, _) => outcome,
+            };
+            (outcome, turn.id, Some(turn.lsn))
         };
         // The callee's turn ran in the fork, so its source is the fork's: its
         // position in the fork's store, in the fork's namespace, as

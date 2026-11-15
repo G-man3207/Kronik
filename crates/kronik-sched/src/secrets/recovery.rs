@@ -33,10 +33,14 @@ pub(crate) const RERUN_WARN_EVERY: u32 = 12;
 /// secret, without bound (the recorded value is needed again, design m23
 /// 5.3), and a prerequisite that is unavailable for a while, for a few
 /// attempts. The latter is the call machinery and the recorded call results,
-/// which can also be permanent (an erased subject, a record that cannot be
-/// projected): the actor must not be held for ever behind one of those, so
-/// after `RERUN_UNAVAILABLE_ATTEMPTS` the job ends, as before, and the next
-/// start runs the turn again. Nothing is retried on a node that has failed.
+/// which can also be permanent (a record that cannot be projected): the
+/// actor must not be held for ever behind one of those, so after
+/// `RERUN_UNAVAILABLE_ATTEMPTS` the job ends, as before, and the next start
+/// runs the turn again. Nothing is retried on a node that has failed. An
+/// erased subject's value is never waited for: a callee's answer of one is
+/// the call error `SUBJECT_ERASED` (`effects::map_call_outcome`), and a
+/// re-run whose recorded results hold one is closed with that code before
+/// its guest runs (`Node::recorded_erased`).
 pub(crate) fn rerun_waits(code: ErrorCode, unavailable_waits: u32, node_failed: bool) -> bool {
     match code {
         ErrorCode::SecretUnavailable => true,

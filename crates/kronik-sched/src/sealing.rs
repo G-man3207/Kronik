@@ -127,8 +127,29 @@ impl Node {
         guest
     }
 
+    /// Whether a re-run's recorded effects hold a value that opens as
+    /// erased: the erasure's tombstone, or a value sealed under a key that
+    /// is gone. They count as the turn's input (§6.8): such a value cannot
+    /// be handed to the guest again. A turn whose provenance predates an
+    /// erasure records the tombstone in place of the subject's values even
+    /// when its `TurnBegin` is in the log after the erasure's record, which
+    /// the re-run's provenance (that `TurnBegin`'s LSN) does not predate.
+    pub(crate) fn recorded_erased(&self, effects: &[pb::EffectRecord]) -> bool {
+        effects
+            .iter()
+            .flat_map(|e| [e.request.as_ref(), e.response.as_ref()])
+            .flatten()
+            .any(|s| {
+                matches!(
+                    self.sealer.open(s),
+                    kronik_privacy::sealer::Opened::Erased { .. }
+                )
+            })
+    }
+
     /// Unseals recorded effects for a re-run in place; unreadable values
-    /// stay sealed, and the guest gets what decoding them gives.
+    /// stay sealed, and the guest gets what decoding them gives (a value of
+    /// an erased subject does not get here: [`Node::recorded_erased`]).
     pub(crate) fn unseal_effects(&self, effects: &mut [pb::EffectRecord]) {
         for e in effects {
             kronik_proto::sealables::effect_mut(e, &mut |s| {
@@ -137,19 +158,13 @@ impl Node {
         }
     }
 
-    /// Unseals a saved outcome (a call's reply, an ingress response) in
-    /// place before a caller sees it.
-    pub(crate) fn unseal_outcome(&self, outcome: &mut pb::Outcome) {
-        kronik_proto::sealables::outcome_mut(Some(outcome), &mut |s| {
-            let _ = self.sealer.unseal_value(s);
-        });
-    }
-
-    /// [`Node::unseal_outcome`] for a saved response that goes back to its
-    /// requester (an idempotent retry): a value of an erased subject, sealed
-    /// under a key that is gone, becomes the erasure's tombstone, as in the
-    /// live answer of a turn that ran across the erasure (ADR 0123). The
-    /// gateway answers either with `SUBJECT_ERASED`.
+    /// Unseals a saved outcome in place for whoever asked for it: an
+    /// ingress response that an idempotent retry gets back, or a callee's
+    /// answer that its caller's call gets. A value of an erased subject,
+    /// sealed under a key that is gone, becomes the erasure's tombstone, as
+    /// in the live answer of a turn that ran across the erasure (ADR 0123).
+    /// The gateway answers either with `SUBJECT_ERASED`, and a call gets the
+    /// call error `SUBJECT_ERASED` (`effects::map_call_outcome`).
     pub(crate) fn unseal_response(&self, outcome: &mut pb::Outcome) {
         self.sealer.unseal_answer(outcome);
     }

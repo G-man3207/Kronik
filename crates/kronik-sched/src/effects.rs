@@ -229,9 +229,53 @@ enum Exchanged {
     OverEffectBytes,
 }
 
+/// The call error of a call whose callee's answer belongs to an erased
+/// subject (ADR 0123): `call-error::failed` with the code and the words of
+/// the outcome the store saves in place of such an answer
+/// ([`kronik_store::db::ERASED_CALL_RESPONSE`]). The answer's values are
+/// gone for good, so this is a result like any other: recorded, served to a
+/// re-run and to a fork's replay, and the caller's turn goes on as its
+/// guest decides.
+pub const ERASED_ANSWER: &str = "SUBJECT_ERASED: the call's response belonged to an erased subject";
+
+/// Whether a callee's outcome is an answer that belongs to an erased
+/// subject ([`map_call_outcome`]): a reply or an HTTP answer whose body is
+/// the erasure's tombstone (the callee's turn ran across the erasure, or
+/// its saved answer was sealed under a key that is gone), or the failure
+/// the store saves in place of a call's answer once the erasure is applied.
+fn erased_answer(outcome: &pb::Outcome) -> bool {
+    use kronik_privacy::sealer::is_erased;
+    match &outcome.output {
+        Some(pb::outcome::Output::Reply(message)) => message.body.as_ref().is_some_and(is_erased),
+        Some(pb::outcome::Output::Http(response)) => matches!(
+            response.body.as_ref().and_then(|body| body.value.as_ref()),
+            Some(pb::body::Value::Inline(body)) if is_erased(body)
+        ),
+        Some(pb::outcome::Output::Accept(_)) => false,
+        None => {
+            outcome.kind == pb::OutcomeKind::Failed as i32
+                && outcome.error_code == ErrorCode::SubjectErased.as_str()
+                && outcome.message == kronik_store::db::ERASED_CALL_RESPONSE
+        }
+    }
+}
+
+/// Whether `rec` is a call that failed because its callee's answer belonged
+/// to an erased subject: [`ERASED_ANSWER`], or the store's words alone, as
+/// a caller recorded them before the error carried its code. A fork's
+/// replay serves it as recorded: the answer is gone for the fork too.
+pub fn erased_answer_recorded(rec: &pb::EffectRecord) -> bool {
+    rec.kind == "actor.call"
+        && rec.status == pb::EffectStatus::Failed as i32
+        && (rec.error == ERASED_ANSWER || rec.error == kronik_store::db::ERASED_CALL_RESPONSE)
+}
+
 /// A successful reply must already be resolved through the gate's actual
 /// source/key path. Opaque protected data and closed cleanup references are
-/// not empty successful replies or ordinary call arguments.
+/// not empty successful replies or ordinary call arguments. An answer that
+/// belongs to an erased subject never gets here: [`map_call_outcome`] makes
+/// it a call error first. A sealed body that is not erased is a missing
+/// prerequisite (its key may come back with a restored keystore).
 pub fn validate_call_reply(reply: Option<&pb::Message>) -> Result<(), GateError> {
     if let Some(reply) = reply {
         if reply.retained_compensation_source.is_some() {
@@ -2429,7 +2473,9 @@ impl TurnFx {
                     .map_err(|_| GateError::Prerequisite(ErrorCode::Unavailable))?;
                 saved
                     .map(|(lsn, mut outcome)| {
-                        node.unseal_outcome(&mut outcome);
+                        // An erased subject's value is its tombstone, as in
+                        // the live answer: a call error, not a prerequisite.
+                        node.unseal_response(&mut outcome);
                         Ok((lsn, map_call_outcome(outcome)?))
                     })
                     .transpose()
@@ -2942,10 +2988,18 @@ pub fn outcome_of_call(rec: &pb::EffectRecord) -> Result<CallOutcome, GateError>
     )
 }
 
-/// The callee's turn outcome as the caller sees it.
+/// The callee's turn outcome as the caller sees it. An answer that belongs
+/// to an erased subject is the call error [`ERASED_ANSWER`] (ADR 0123): a
+/// callee whose turn ran across the erasure answers with its tombstones,
+/// and so does its saved outcome, which a re-run of the caller gets. As a
+/// missing prerequisite it left the caller's turn open, to fail the same
+/// way at every start.
 pub fn map_call_outcome(outcome: pb::Outcome) -> Result<CallOutcome, GateError> {
     let kind = pb::OutcomeKind::try_from(outcome.kind)
         .map_err(|_| GateError::Host("The committed callee outcome kind is invalid".into()))?;
+    if erased_answer(&outcome) {
+        return Ok(CallOutcome::Failed(ERASED_ANSWER.into()));
+    }
     Ok(match kind {
         pb::OutcomeKind::Committed => CallOutcome::Ok(match outcome.output {
             // Only an open turn accepts (M24), and a callee's turn is a
@@ -3251,6 +3305,102 @@ mod secret_tests {
         assert!(matches!(
             validate_call_reply(Some(&pb::Message::default())),
             Err(GateError::Prerequisite(ErrorCode::Unavailable))
+        ));
+    }
+
+    /// A callee's answer that belongs to an erased subject - a reply or an
+    /// HTTP answer whose body is the erasure's tombstone, or the outcome the
+    /// store saves in its place - is the call error `SUBJECT_ERASED`, never
+    /// a missing prerequisite, which left the caller's turn open for every
+    /// start (ADR 0123). A sealed body that is not erased stays one, and so
+    /// does a callee's own failure with the code: its message is unchanged.
+    #[test]
+    fn an_answer_of_an_erased_subject_is_a_subject_erased_call_error() {
+        let tombstone = pb::Sealable {
+            subject: Some("user:1".into()),
+            value: Some(pb::sealable::Value::Sealed(
+                kronik_privacy::sealer::erased_value(3),
+            )),
+        };
+        let committed = |output| pb::Outcome {
+            kind: pb::OutcomeKind::Committed as i32,
+            output: Some(output),
+            ..Default::default()
+        };
+        let erased = |outcome| match map_call_outcome(outcome) {
+            Ok(CallOutcome::Failed(error)) => error == ERASED_ANSWER,
+            _ => false,
+        };
+        assert!(erased(committed(pb::outcome::Output::Reply(pb::Message {
+            name: "reply".into(),
+            body: Some(tombstone.clone()),
+            ..Default::default()
+        }))));
+        assert!(erased(committed(pb::outcome::Output::Http(
+            pb::HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: Some(pb::Body {
+                    value: Some(pb::body::Value::Inline(tombstone.clone())),
+                }),
+            }
+        ))));
+        let stored = pb::Outcome {
+            kind: pb::OutcomeKind::Failed as i32,
+            error_code: ErrorCode::SubjectErased.as_str().into(),
+            message: kronik_store::db::ERASED_CALL_RESPONSE.into(),
+            output: None,
+        };
+        assert!(erased(stored.clone()));
+        assert_eq!(
+            ERASED_ANSWER,
+            format!(
+                "{}: {}",
+                ErrorCode::SubjectErased.as_str(),
+                kronik_store::db::ERASED_CALL_RESPONSE
+            )
+        );
+        // The callee's own input was erased: its failure, as it was.
+        let own = pb::Outcome {
+            message: "the input belongs to an erased subject".into(),
+            ..stored
+        };
+        assert!(matches!(
+            map_call_outcome(own),
+            Ok(CallOutcome::Failed(m)) if m == "the input belongs to an erased subject"
+        ));
+        // Sealed under a key this keystore lacks, not erased: a restored
+        // keystore may still open it.
+        let sealed = pb::Sealable {
+            subject: Some("user:1".into()),
+            value: Some(pb::sealable::Value::Sealed(pb::Sealed {
+                key_version: 1,
+                nonce: vec![7; 24],
+                ciphertext: vec![1; 32],
+            })),
+        };
+        assert!(matches!(
+            map_call_outcome(committed(pb::outcome::Output::Reply(pb::Message {
+                body: Some(sealed),
+                ..Default::default()
+            }))),
+            Err(GateError::Prerequisite(ErrorCode::Unavailable))
+        ));
+        // A recorded result of either wording is one a fork serves.
+        let recorded = |error: &str| pb::EffectRecord {
+            kind: "actor.call".into(),
+            status: pb::EffectStatus::Failed as i32,
+            error: error.into(),
+            ..Default::default()
+        };
+        assert!(erased_answer_recorded(&recorded(ERASED_ANSWER)));
+        assert!(erased_answer_recorded(&recorded(
+            kronik_store::db::ERASED_CALL_RESPONSE
+        )));
+        assert!(!erased_answer_recorded(&recorded("deliberate failure")));
+        assert!(matches!(
+            outcome_of_call(&recorded(ERASED_ANSWER)),
+            Ok(CallOutcome::Failed(m)) if m == ERASED_ANSWER
         ));
     }
 

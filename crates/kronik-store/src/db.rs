@@ -3098,13 +3098,18 @@ fn connection_subject(c: &pb::ConnectionInput) -> Option<&str> {
     }
 }
 
+/// The message of [`erased_call_outcome`]: stored in `state.db`, so these
+/// words never change.
+pub const ERASED_CALL_RESPONSE: &str = "the call's response belonged to an erased subject";
+
 /// What a saved call response of an erased subject becomes: the message
-/// stays delivered (no second run), and a repeated call gets this failure.
+/// stays delivered (no second run), and a repeated call gets this failure
+/// (`SUBJECT_ERASED`), which the caller's call answers as a call error.
 fn erased_call_outcome() -> Vec<u8> {
     pb::Outcome {
         kind: pb::OutcomeKind::Failed as i32,
         error_code: "SUBJECT_ERASED".into(),
-        message: "the call's response belonged to an erased subject".into(),
+        message: ERASED_CALL_RESPONSE.into(),
         output: None,
     }
     .encode_to_vec()
