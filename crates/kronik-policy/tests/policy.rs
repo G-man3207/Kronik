@@ -158,6 +158,90 @@ fn payments_must_be_exact_fires_on_one_target_when_total_confidence_is_above_99_
     assert_eq!(RuleSet::defaults().evaluate(&diff).outcome, Action::Allow);
 }
 
+/// ADR 0147: a payment call the fork no longer makes has no grounding row.
+/// The default payment rule stays quiet; the effect counts see it, and a
+/// same-kind successor leaves no `removed` item for a target-specific rule.
+#[test]
+fn a_removed_payment_call_needs_the_effects_section() {
+    let mut diff = fixture_named("diff-identity.json");
+    diff["summary"]["changed"] = json!(true);
+    diff["summary"]["confidence"] = json!(1.0);
+    diff["grounding"] = json!([]);
+    diff["effects"] = json!({
+        "added": 0,
+        "removed": 1,
+        "changed": 0,
+        "items": [{
+            "change": "removed",
+            "kind": "http.fetch",
+            "method": "POST",
+            "host": "payments.internal",
+            "route": "/v1/charges/{}",
+            "grounding": "live",
+            "turn_prod": "main:1300",
+            "turn_fork": "p-000000000003:r1300.0",
+            "fields": [{
+                "field": "url",
+                "prod": "https://payments.internal/v1/charges/42",
+                "fork": null
+            }]
+        }]
+    });
+    assert_eq!(RuleSet::defaults().evaluate(&diff).outcome, Action::Allow);
+
+    let rules = rule_set(&[
+        (
+            "external-effects-need-review",
+            "diff.effects.added + diff.effects.removed + diff.effects.changed > 0",
+            "require_approval",
+        ),
+        (
+            "payments-not-removed",
+            "diff.effects.items.exists(e, e.host.endsWith('payments.internal') && e.change == 'removed')",
+            "require_approval",
+        ),
+    ]);
+    let evaluation = rules.evaluate(&diff);
+    assert_eq!(evaluation.errors, []);
+    assert_eq!(
+        fired(&evaluation),
+        [
+            ("external-effects-need-review", Action::RequireApproval),
+            ("payments-not-removed", Action::RequireApproval),
+        ]
+    );
+
+    // The payment call is replaced by another target's call at its ordinal.
+    // The pair is `changed`, the host is the successor's, and only the
+    // complete counts still see that an external effect moved.
+    diff["effects"] = json!({
+        "added": 0,
+        "removed": 0,
+        "changed": 1,
+        "items": [{
+            "change": "changed",
+            "kind": "http.fetch",
+            "method": "POST",
+            "host": "ledger.internal",
+            "route": "/v1/entries/{}",
+            "grounding": "exact",
+            "turn_prod": "main:1300",
+            "turn_fork": "p-000000000003:r1300.0",
+            "fields": [{
+                "field": "url",
+                "prod": "https://payments.internal/v1/charges/42",
+                "fork": "https://ledger.internal/v1/entries/42"
+            }]
+        }]
+    });
+    let evaluation = rules.evaluate(&diff);
+    assert_eq!(evaluation.errors, []);
+    assert_eq!(
+        fired(&evaluation),
+        [("external-effects-need-review", Action::RequireApproval)]
+    );
+}
+
 /// M9: a rule can single out one actor kind of a system proposal through
 /// the diff's per-kind `kinds` entries.
 #[test]

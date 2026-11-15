@@ -165,12 +165,19 @@ Call `get_diff` with `{"proposal": "<id>"}` for the whole diff
   that the fork's code never accepted, which continuous replay does not run.
 - `effects`: calls to the outside world that were added, removed or
   changed, with the changed fields (`url`, `method`, `header:<name>`,
-  `body`).
+  `body`). They are paired with production by the turn's operation ordinal,
+  so a call inserted or removed before another in the same turn shows as
+  changed pairs plus a tail `added` or `removed`, not as one insertion at its
+  position. The item list is capped at 200; the counts are not.
 - `grounding`: one entry per target (`host` and `route`), with its own
   `exact`, `approximate` and `synthetic` counts. Payments must be exact: the
   rule `payments-must-be-exact` asks for approval whenever a
   `payments.internal` target has a single approximate or synthetic effect,
-  however high the total confidence.
+  however high the total confidence. It counts the fork's effects only: a
+  payment call the fork no longer makes has no row and does not lower
+  confidence (a payment effect that takes its ordinal is graded on its
+  own). Gate that absence with a rule on `diff.effects` (the uncapped
+  counts, or the capped per-target items), not on grounding (ADR 0147).
 - `state`: values written differently, per root input and per actor.
 - `kinds`: each actor kind on its own, with whether its code changed and its
   share of the divergent turns, responses, effects, changed actors and

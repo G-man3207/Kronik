@@ -1527,6 +1527,26 @@ of TARGET as of the fork point, which is what a fork uses otherwise (I5),
 and the diff records it in `options.simulator_overrides`. The flag repeats,
 one per target.
 
+**Effect matching.** Replay grades each external effect against production's
+effect at the same causal key and operation ordinal; the exact and
+approximate checks do not align the two call lists or search another ordinal.
+The ordinal is one counter per turn, shared with `send`, `call`,
+`timers.schedule` and `connection.send-now`, so a call inserted, removed or
+moved before another in the same turn changes the ordinals after it. Two
+calls to different targets swapped both become synthetic and fail closed
+unless a stub, live allowlist or simulator answers; two calls to the same
+target swapped both become approximate and each reuses the response recorded
+at its ordinal; later calls shifted onto another target's ordinal become
+synthetic. Only an effect appended after production's last external effect
+in a turn has no shifted successor, so only it is a pure addition; a pure
+removal is the last effect of the turn. Any earlier change is reported
+through the shifted pairs and the tail. A payment effect that is approximate
+or synthetic needs an approval under the default rules. A payment call the
+fork no longer makes has no row of its own; if the ordinal now carries
+nothing or a non-payment effect, the default rules see no payment change.
+Gate that with a rule on `diff.effects` (see `kronik diff show` below and
+[ADR 0147](../adr/0147-effect-matching-by-operation-ordinal.md)).
+
 ```text
 $ kronik replay try --reason "see the diff"
 Replayed 3 of 3 root inputs in fork try (isolated and continuous), verified through lsn 4
@@ -1590,14 +1610,33 @@ interpolated name is inline code ([ADR 0023](../adr/0023-diff-summary.md)).
   their input is the same as production's, and their consequences further
   down the same causal trees.
 - **Responses**: the HTTP root inputs whose response changed.
-- **Effects**: external effects added, removed or changed, per target.
+- **Effects**: external effects added, removed or changed, paired with
+  production by the turn's operation ordinal, per target. A call inserted
+  or removed before another call appears as `changed` at each shifted
+  ordinal plus `added` or `removed` at the tail, not as a pure insertion at
+  its position; `fields` shows the two requests. A `removed` item's
+  `grounding` is `live` because no fork effect exists, not because the fork
+  called the target ([ADR 0147](../adr/0147-effect-matching-by-operation-ordinal.md)).
 - **State**: the actors whose state changed, and those whose state drifts
   only over the window, in continuous replay.
 - **Errors**: errors introduced and fixed, and new orphaned calls.
 - **Resources**: the change in fuel and memory at p99.
 - **Grounding**: how many of the fork's effects rest on exact or
   approximate recordings, or on a synthetic answer, with the confidence and
-  the targets that are not exact.
+  the targets that are not exact. It counts the fork's effects only: a call
+  production made and the fork no longer makes has no row here and does not
+  lower the confidence. Read it with **Effects**, which pairs by ordinal and
+  also shows removals; `effects.items` is capped at 200, the counts are not.
+
+A policy gates a payment call the fork makes through its approximate or
+synthetic grounding row (`payments-must-be-exact` does). A payment call the
+fork no longer makes has no such row of its own; if the ordinal now carries
+nothing or a non-payment effect, no payment row is raised. Gate that on the
+uncapped counts with `diff.effects.added + diff.effects.removed +
+diff.effects.changed > 0`, or on `diff.effects.items` for a target-specific
+rule that can miss an item past the cap. The diff's `exact` says the same
+request was answered at the same ordinal; it does not order the effect
+against local state writes.
 
 ```text
 $ kronik diff show try

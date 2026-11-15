@@ -3882,6 +3882,196 @@ mod tests {
         );
     }
 
+    /// ADR 0147: the diff pairs external effects by operation ordinal, not
+    /// by request and not as a sequence. A same-target swap therefore shows
+    /// as two changed, approximate effects (each recording is the other
+    /// call's), and an internal operation inserted before them shifts the
+    /// external ordinals: the old first is removed, the middle is a changed
+    /// pair, and the old last is added. This pins the behavior the docs now
+    /// state; a future alignment must update it and the ADR together.
+    #[test]
+    fn effects_pair_by_operation_ordinal_not_by_request() {
+        fn http_effect(
+            ordinal: u32,
+            url: &str,
+            fingerprint: &[u8],
+            grounding: pb::Grounding,
+        ) -> pb::EffectRecord {
+            let request = pb::HttpEffectRequest {
+                method: "GET".into(),
+                url: url.into(),
+                fingerprint_version: 2,
+                ..Default::default()
+            };
+            pb::EffectRecord {
+                ordinal,
+                kind: "http.fetch".into(),
+                target: "http:api.internal".into(),
+                fingerprint: fingerprint.to_vec(),
+                status: pb::EffectStatus::Ok as i32,
+                grounding: grounding as i32,
+                request: Some(pb::Sealable {
+                    subject: None,
+                    value: Some(pb::sealable::Value::Plain(request.encode_to_vec())),
+                }),
+                ..Default::default()
+            }
+        }
+        fn turn(root: &str, effects: Vec<pb::EffectRecord>) -> pb::TurnRecord {
+            pb::TurnRecord {
+                actor: Some(pb::ActorRef {
+                    kind: "billing".into(),
+                    key: "acme".into(),
+                }),
+                causal_key: Some(pb::CausalKey {
+                    root: root.into(),
+                    path: Vec::new(),
+                }),
+                effects,
+                outcome: Some(pb::Outcome {
+                    kind: pb::OutcomeKind::Committed as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+        fn fork(record: pb::TurnRecord) -> ForkTurn {
+            ForkTurn {
+                id: "f:r1.0".into(),
+                record,
+                lsn: 1,
+                prod_lsn: Some(1),
+                masked: false,
+                pseudonyms: false,
+                erased: false,
+                sql: false,
+                personal: false,
+            }
+        }
+        fn url_fields(item: &EffectItem) -> (String, String) {
+            let url = item
+                .fields
+                .iter()
+                .find(|field| field.field == "url")
+                .unwrap_or_else(|| panic!("no url field: {item:?}"));
+            let side = |value: &Value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| panic!("url is not text: {value}"))
+            };
+            (side(&url.prod), side(&url.fork))
+        }
+
+        // Two calls to the same route target, swapped: each is approximate
+        // and reuses the recording at its ordinal, i.e. the other call's.
+        let one = "https://payments.internal/v1/charges/1";
+        let two = "https://payments.internal/v1/charges/2";
+        let prod = turn(
+            "1",
+            vec![
+                http_effect(0, one, b"charge-1", pb::Grounding::Live),
+                http_effect(1, two, b"charge-2", pb::Grounding::Live),
+            ],
+        );
+        let swapped = fork(turn(
+            "1",
+            vec![
+                http_effect(0, two, b"charge-2", pb::Grounding::Approximate),
+                http_effect(1, one, b"charge-1", pb::Grounding::Approximate),
+            ],
+        ));
+        let mut acc = Acc::new(&DiffOptions::default(), Arc::new(Sealer::plain()));
+        acc.turn_effects(Some((1, &prod)), Some(&swapped), false, false);
+        assert_eq!(
+            (acc.effects.added, acc.effects.removed, acc.effects.changed),
+            (0, 0, 2)
+        );
+        let items: Vec<_> = acc
+            .effect_items
+            .iter()
+            .map(|item| {
+                (
+                    item.change.as_ref(),
+                    item.grounding.as_ref(),
+                    url_fields(item),
+                )
+            })
+            .collect();
+        assert_eq!(
+            items,
+            [
+                ("changed", "approximate", (one.into(), two.into())),
+                ("changed", "approximate", (two.into(), one.into())),
+            ]
+        );
+        // The same method, host and route pattern is one grounding target:
+        // the row says two approximate answers, not that they were swapped.
+        assert_eq!(acc.grounding.len(), 1);
+        assert_eq!(
+            acc.grounding.values().next().unwrap(),
+            &[0, 2, 0, 0, 0],
+            "exact, approximate, synthetic, live, forked"
+        );
+
+        // An operation that takes an ordinal but is not an external effect
+        // shifts both HTTP calls. Production recorded A at 0 and B at 1; the
+        // fork runs A at 1 and B at 2.
+        let a = "https://a.internal/items/1";
+        let b = "https://b.internal/items/2";
+        let prod = turn(
+            "2",
+            vec![
+                http_effect(0, a, b"a", pb::Grounding::Live),
+                http_effect(1, b, b"b", pb::Grounding::Live),
+            ],
+        );
+        let shifted = fork(turn(
+            "2",
+            vec![
+                http_effect(1, a, b"a", pb::Grounding::Synthetic),
+                http_effect(2, b, b"b", pb::Grounding::Synthetic),
+            ],
+        ));
+        let mut acc = Acc::new(&DiffOptions::default(), Arc::new(Sealer::plain()));
+        acc.turn_effects(Some((1, &prod)), Some(&shifted), false, false);
+        assert_eq!(
+            (acc.effects.added, acc.effects.removed, acc.effects.changed),
+            (1, 1, 1)
+        );
+        let items: Vec<_> = acc
+            .effect_items
+            .iter()
+            .map(|item| {
+                (
+                    item.change.as_ref(),
+                    item.grounding.as_ref(),
+                    item.host.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            items,
+            [
+                ("removed", "live", "a.internal"),
+                ("changed", "synthetic", "a.internal"),
+                ("added", "synthetic", "b.internal"),
+            ]
+        );
+        // The unfinished ordinal pair is production's call A; its `live`
+        // grounding is the no-fork-effect sentinel, not a live fetch.
+        let removed = &acc.effect_items[0];
+        let removed_url = removed
+            .fields
+            .iter()
+            .find(|field| field.field == "url")
+            .unwrap_or_else(|| panic!("no url field: {removed:?}"));
+        assert_eq!(removed_url.prod, json!(a));
+        assert_eq!(removed_url.fork, Value::Null);
+        let changed = &acc.effect_items[1];
+        assert_eq!(url_fields(changed), (b.into(), a.into()));
+    }
+
     #[test]
     fn rounding_and_percentiles() {
         assert_eq!(r6(5.0 / 7.0), 0.714286);

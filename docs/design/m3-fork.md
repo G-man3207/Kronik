@@ -152,7 +152,8 @@ the root id).
   after everything at the previous LSN and before the root input. Timers
   still pending at the end of the window stay pending.
 - **Effect matching**, per external effect of a fork turn (`http.fetch`,
-  `crypto.*`, `secret.reveal`):
+  `foreign.http`, `crypto.*`, `secret.reveal`; `connection.send-now` is
+  matched outside `grounding`, ADR 0116):
   1. **Exact**: a production effect with the same causal key, ordinal, kind
      and fingerprint: its recorded result is returned (`GROUNDING_EXACT`).
   2. **Approximate**: same causal key, ordinal, kind and *target*, but a
@@ -166,29 +167,79 @@ the root id).
      matches, else `FailClosed`, which gives the guest
      `denied("replay: no recording")` (`GROUNDING_SYNTHETIC`); the turn is
      marked divergent.
-  Crypto matches exactly by fingerprint (name and data hash): the recorded
-  result is returned (exact). An unmatched call depends on the in-forks mode
-  of the `secret:<name>` grant (ADR 0112). `compute` recomputes it on the
-  host with the production key (the key never leaves the host, but the fork
-  gets a real HMAC or signature over data its code chose), and it counts as
-  exact. `recorded`, the default for a new grant, does not compute: the
-  guest gets `denied("replay: no recording")` and the effect is graded
-  synthetic (`fail-closed`). A grant written before the mode existed is
-  `compute`. Under `compute`, a name that is linked to an external backend
-  at the fork point is recomputed with the value the node already holds for
-  that link (m23 §6); when it holds none the effect is denied with
-  `SECRET_UNAVAILABLE`, as a fork never fetches. Both are graded synthetic
-  (ADR 0132): what the node holds is not in the log, so the grade does not
-  depend on it. `secret.reveal` in a fork never
-  gets the value: it answers the placeholder `[secret:<name>]` (exact when
-  production revealed at that point, else synthetic). Production records
-  HTTP and call requests, and fingerprints them, with the same placeholder
-  in place of revealed values, so requests a fork builds from a value used
-  verbatim match exactly. A value the guest transformed (Basic auth's
-  base64 of `user:secret`, an HMAC or a JWT it computed from a revealed
-  key) is not scrubbed in production and comes out differently from the
-  placeholder in the fork, so such requests match approximately or not at
-  all: a known gap of exact-only scrubbing.
+- **Crypto and reveal.** Crypto matches exactly by fingerprint (name and
+  data hash): the recorded result is returned (exact). An unmatched call
+  depends on the in-forks mode of the `secret:<name>` grant (ADR 0112).
+  `compute` recomputes it on the host with the production key (the key never
+  leaves the host, but the fork gets a real HMAC or signature over data its
+  code chose), and it counts as exact. `recorded`, the default for a new
+  grant, does not compute: the guest gets `denied("replay: no recording")`
+  and the effect is graded synthetic (`fail-closed`). A grant written before
+  the mode existed is `compute`. Under `compute`, a name that is linked to an
+  external backend at the fork point is recomputed with the value the node
+  already holds for that link (m23 §6); when it holds none the effect is
+  denied with `SECRET_UNAVAILABLE`, as a fork never fetches. Both are graded
+  synthetic (ADR 0132): what the node holds is not in the log, so the grade
+  does not depend on it. `secret.reveal` in a fork never gets the value: it
+  answers the placeholder `[secret:<name>]` (exact when production revealed
+  at that point, else synthetic). Production records HTTP and call requests,
+  and fingerprints them, with the same placeholder in place of revealed
+  values, so requests a fork builds from a value used verbatim match exactly.
+  A value the guest transformed (Basic auth's base64 of `user:secret`, an
+  HMAC or a JWT it computed from a revealed key) is not scrubbed in
+  production and comes out differently from the placeholder in the fork, so
+  such requests match approximately or not at all: a known gap of exact-only
+  scrubbing.
+- **Order and count.** The ordinal is the operation's position in the
+  turn's one counter, not a hint, and the gate grades a fork effect only
+  against production's effect at the same `(causal key, ordinal)`. The
+  exact and approximate checks do not search another ordinal for a better
+  fingerprint, and the gate does not align the two sequences (ADR 0147).
+  A change in the order or the number of calls is graded at the ordinals it
+  moves, not normalized away:
+  - **Two HTTP calls to different targets swapped.** Neither ordinal has
+    production's other target, so both calls take the synthetic path (a
+    live allowlisted GET would be `live`); with no stub, live rule or
+    simulator the guest gets `denied` and code that uses the answer can
+    fail. The diff reports two changed effects, not one moved pair, and
+    those failures would not happen in production.
+  - **Two HTTP calls to the same target swapped.** Each ordinal has a
+    production request of the target but a different fingerprint, so
+    both are approximate and each gets the recording at its own ordinal:
+    the response to the other call. The diff shows two changed requests;
+    it does not say the responses crossed.
+  - **Two calls with the same kind, target and fingerprint swapped.**
+    They are indistinguishable to the gate, so both are exact. Each
+    still gets the response at its ordinal; nothing in the log says the
+    code meant the other one.
+  - **An external effect in `effects` inserted or removed before another
+    external effect.** Every later ordinal shifts. At each shifted ordinal the
+    fork's effect is graded against production's effect there, so it
+    becomes approximate (same target, other fingerprint), synthetic
+    (other target) or exact (identical request); an insertion after the
+    last external effect, or a removal of the last, is the only one that
+    is `added` or `removed` at its own ordinal. The diff pairs by the same
+    ordinal (§5.5), so a mid-turn insertion is reported as changed pairs
+    plus an added tail, not as a pure insertion at its position; a
+    removal is the mirror with a removed tail.
+  - **An operation outside `effects` inserted or removed.** `send`,
+    `call`, `timers.schedule` and `connection.send-now` take the same
+    ordinal counter, so inserting one before an HTTP effect shifts the
+    HTTP effect although the external call sequence did not change. The
+    shifted effects are graded against production's effects at their new
+    ordinals; the first vacated ordinal in `effects` has production only
+    (removed) and the new tail has the fork only (added). A removal is the
+    mirror: added at the first re-used ordinal, removed at the old tail.
+    The operation's message id, timer id or child causal key also changes
+    with the ordinal, and a `send-now` is paired in `frames` by its new
+    ordinal, so descendants or frames can be new or missing in the diff.
+    Buffered connection frames (`send`, `broadcast`, `close`) take no
+    ordinal (ADR 0115).
+  The `effects` counts are ordinal-pair differences, not a set difference
+  of call sites: a single inserted call can make one `added` and several
+  `changed` items, and a removed call before another call of the same kind
+  that takes its ordinal is a `changed` pair, not a `removed` item. The
+  diff's policy uses this (§7).
 
 ## 4. Comparison
 
@@ -201,6 +252,15 @@ memory are compared separately (§5.10); a fuel change under 2 % is not a
 change. **Noise filters**: per proposal, `ignore_headers` (names) and
 `ignore_json_paths` (JSONPath subset `$.a.b[*].c`) are removed from bodies
 and headers before comparison.
+
+**Effects are compared per ordinal.** A turn's external effects are paired
+with production's effect at the same operation ordinal (§3.5), not as a
+multiset and not by request. A change that moves a call before another
+therefore shifts every later ordinal and differs at each shifted pair whose
+request differs; an insertion or removal before the last external effect
+also leaves an added or removed item at the tail, not a pure one at its
+position (ADR 0147). The effect counts in §5.5 are pair counts, and a removed
+call is not a fork effect that §5.3 can ground.
 
 **Causal grouping.** An **origin** is a differing turn whose input is
 byte-identical to production's (the root turn of a tree, or a turn whose
@@ -285,6 +345,13 @@ One entry per external target, sorted by kind, host, route:
 For crypto and reveal: `method` is `""`, `host` is the secret name, `route`
 is `""`.
 
+The rows count the fork's effects only. A production call the fork no
+longer makes has no row, so it does not lower a row's `confidence` or
+`summary.confidence`; it appears in `effects` (§5.5). An approximate row
+reuses a recording of a *different* request at the same ordinal; on a
+write target that difference can be the behavior change, not a harmless
+normalization.
+
 ### 5.4 `responses`
 
 Per HTTP root input (isolated mode): `{"unchanged": N, "changed": N, "items": [{"root_lsn", "route", "turn_prod", "turn_fork", "status": {"prod", "fork"}, "headers": [{"name", "prod", "fork"}], "body": [ <json diff ops> ]}]}`, items in root LSN
@@ -299,6 +366,16 @@ base64>, "fork": …}]`. Values with a subject tag are redacted:
 `{"added": N, "removed": N, "changed": N, "items": [{"change": "added" | "removed" | "changed", "kind", "method", "host", "route", "grounding", "turn_prod", "turn_fork", "fields": [{"field": "url" | "method" | "header:<name>" | "body", "prod", "fork"}]}]}`
 grouped (sorted) by kind, host, route, then turn. Secret header values never
 appear (name and version hash only).
+
+Effects are paired with production per turn and operation ordinal (§3.5),
+not aligned as a sequence. The item's kind, method, host and route describe
+the fork's effect; for `removed` there is no fork effect, so they describe
+production's, and `fields` carries the two sides. An external effect inserted
+or removed in mid-turn therefore shifts the pairs: at each ordinal from that
+point whose request differs, the item is `changed`; the extra or missing
+effect is `added` or `removed` at the tail. A `removed` item's `grounding` is
+`live` only because there is no fork effect to grade. `items` is capped at
+200; the counts are not. ADR 0147 gives the cases and the policy limits.
 
 ### 5.6 `state`
 
@@ -409,6 +486,23 @@ This section is the contract for `kronik-policy`.
   the brief. Next to any rule set, a floor in code: `pii-masked-needs-approval`
   (require_approval) fires when `summary.pii_masked + summary.pii_unverified
   > 0` (ADR 0031).
+- **Reordering and count changes.** Grounding is per target, so
+  `payments-must-be-exact` already requires approval when a payment effect is
+  approximate or synthetic: a call moved, inserted or changed in its
+  request. It cannot see a payment call the fork no longer makes, because
+  that call has no fork effect. If the ordinal now carries nothing or a
+  non-payment effect, no payment grounding row is raised; if it carries
+  another payment effect, that effect is graded on its own. An uncapped but
+  target-blind gate is `when = "diff.effects.added + diff.effects.removed +
+  diff.effects.changed > 0"`; it reviews any difference in the `effects`
+  section.
+  A targeted gate on removed items is
+  `when = "diff.effects.items.exists(e, e.host.endsWith('payments.internal') && e.change == 'removed')"`,
+  but `effects.items` is capped at 200 and a same-kind successor that takes
+  the ordinal turns the removal into a `changed` item whose host is the
+  successor. A per-target absence gate that is both complete and narrow needs
+  the production-side counts that ADR 0147 defers. `exact` does not order an
+  effect against local state writes, which the turn record does not order.
 - **JSON rendering of an evaluation**: `{"outcome": "allow" |
   "require_approval" | "deny", "fired": [{"name", "action", "reason"?}],
   "errors": [{"name", "message"}]}`; only the floor has a `reason`.

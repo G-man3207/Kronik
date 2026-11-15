@@ -145,3 +145,4 @@
 - [ADR 0142: Encrypted scrub-only copies of recorded external secret versions](adr/0142-scrub-only-copies-of-external-secret-versions.md)
 - [ADR 0145: A per-turn cap on the effect bytes a turn records](adr/0145-effect-bytes-per-turn.md)
 - [ADR 0146: Restore installs the newest snapshot its log reaches](adr/0146-restore-installs-the-newest-snapshot-its-log-reaches.md)
+- [ADR 0147: An effect is matched by the turn's operation ordinal](adr/0147-effect-matching-by-operation-ordinal.md)
