@@ -35,15 +35,13 @@ change between releases.
 | [`v0.5.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.5.0) | The "Isolation, standards and web" release (M20–M26): long-lived connections (WebSocket, SSE, `send-now`, replay and diff, the SDKs and `chat-ts`), streaming bodies and app blob storage (blobs above a threshold, holds, a collector, erasure and reseal, shipping and restore, `media-ts`), external secret backends, the nonroot daemon and the microVM level (opt-in), and durability fixes across the log, snapshots and reseal. WIT `kronik:actor@0.1.1`; engine `kronik-0.5.0+wasmtime-50.0.1` |
 
 `v0.5.0` is the latest release: the brief's "Isolation, standards and web"
-line (M20–M26), engine `kronik-0.5.0+wasmtime-50.0.1`. Its archives are static
-musl binaries for x86_64 and aarch64 with `install.sh`, checksums, CycloneDX
-SBOMs and two-build byte-equality evidence (`reproducibility.json`);
+line (M20–M26), engine `kronik-0.5.0+wasmtime-50.0.1`. Its archives are
+static musl binaries for x86_64 and aarch64 with `install.sh`, checksums,
+CycloneDX SBOMs and two-build byte-equality evidence (`reproducibility.json`);
 `install.sh` verifies each archive's Sigstore attestation and refuses
-unsigned ones. `v0.4.1` was a patch on the line `v0.4.0` opened.
-The archives are static musl binaries for x86_64 and aarch64 with `install.sh`,
-checksums, CycloneDX SBOMs and two-build byte-equality evidence
-(`reproducibility.json`); `install.sh` verifies each archive's Sigstore
-attestation and refuses unsigned ones. `v0.4.1` fixes a security issue in
+unsigned ones.
+
+`v0.4.1` was a patch on the line `v0.4.0` opened. It fixes a security issue in
 `kronik restore` (the manifest paths and the component names it takes from the
 snapshot bucket are now validated, see the
 [advisory](https://github.com/G-man3207/Kronik/security/advisories/GHSA-f9xv-7cmm-95v6))
