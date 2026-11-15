@@ -1145,6 +1145,48 @@ fn identity_replay_over_turns_past_their_effect_bytes_is_empty() {
     assert_eq!(hits.load(Ordering::SeqCst), 3);
 }
 
+/// F5: a fork replay with one worker over calls (one to another actor, and
+/// counter/a calling counter/b, whose `call` calls counter/x) on a daemon
+/// that runs one turn at a time. Its instance pool was sized by
+/// `--concurrency` alone, but a replayed call keeps its caller's instance
+/// while the callee runs: the callee's turn failed with "maximum concurrent
+/// limit of 1 for component instances reached", and the replay reported it
+/// as a difference. The pool has room for a replay's workers and their
+/// calls whatever the concurrency, so the replay is empty in every mode.
+#[test]
+fn a_replay_with_one_worker_over_calls_is_empty_at_any_concurrency() {
+    let dir = tempdir();
+    let fork_lsn = {
+        let p = Proc::start(dir.path());
+        let fork_lsn = p.settle();
+        p.send("counter/c", "call", "counter/ledger increment");
+        p.send("counter/a", "call", "counter/b call");
+        p.settle();
+        fork_lsn
+    };
+    let p = Proc::open(
+        dir.path(),
+        kronik_sched::NodeConfig {
+            concurrency: 1,
+            ..kronik_sched::NodeConfig::default()
+        },
+    );
+    for mode in [Mode::Isolated, Mode::Continuous, Mode::Both] {
+        let out = replay(&p, None, fork_lsn, &opts(mode), 1);
+        let s = &out.diff.summary;
+        assert!(
+            !s.changed,
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&out.bytes)
+        );
+        assert_eq!(
+            (s.root_inputs, s.replayed, s.divergent_turns),
+            (2, 2, 0),
+            "{mode:?}"
+        );
+    }
+}
+
 #[test]
 fn isolated_identity_over_timers_and_calls_is_empty() {
     let dir = tempdir();

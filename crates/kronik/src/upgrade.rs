@@ -450,9 +450,7 @@ fn write_diff(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 fn default_workers() -> usize {
-    std::thread::available_parallelism()
-        .map_or(2, |n| n.get())
-        .clamp(1, 16)
+    kronik_sched::pool::replay_workers_for(kronik_sched::pool::available_cpus())
 }
 
 fn check_error(msg: String) -> ApiError {

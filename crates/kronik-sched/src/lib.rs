@@ -29,6 +29,7 @@ mod gate;
 pub mod host;
 mod native_execution;
 mod node;
+pub mod pool;
 mod privacy;
 mod rebase;
 pub mod record_budget;
@@ -80,7 +81,9 @@ pub const LEGACY_INGRESS_HASH_VERSION: u8 = 3;
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     pub branch: String,
-    /// Turns running at once (Wasm instances).
+    /// Turns running at once (worker permits). `start_local` sizes the Wasm
+    /// instance pool for these and for the node's replays
+    /// ([`pool::node_instances`]).
     pub concurrency: usize,
     /// How long an ingress `Idempotency-Key` is remembered (default 24 h).
     pub ingress_ttl: Duration,
@@ -385,9 +388,12 @@ pub async fn start_local_locked(
         256,
     );
     let store = Store::open(state, pool)?;
-    let engine = build_engine(PoolSize {
-        concurrency: config.concurrency as u32,
-    })?;
+    // Room for the node's turns, and for the forks, replays and previews
+    // that run on the same pool with nested calls (pool::node_instances).
+    let engine = build_engine(PoolSize::instances(pool::node_instances(
+        config.concurrency,
+        pool::available_cpus(),
+    )))?;
     let code = Arc::new(CodeStore::new(engine, Some(data.join("code")))?);
     let mut log = LogConfig::new(branch_dir.join("log"), config.branch.clone());
     if let Some(b) = config.segment_max_bytes {

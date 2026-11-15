@@ -32,6 +32,22 @@ until the v1.0 compatibility promise takes effect.
   with the rest of `kronik.toml`, and the operations guide has a section on
   blobs: which bodies become blobs, holds and the quota, what keeps a blob,
   collection, disk sizing, failures, and shipping and restoring them.
+- `kronik upgrade check` no longer reports a replayed `call` as a
+  divergence because its Wasm instance pool was full. The pool had one
+  instance per worker (`--workers`, by default one per CPU), but a replayed
+  call keeps its caller's instance while the callee runs, and the check runs
+  its continuous replay next to the workers. The callee's turn then failed
+  with "maximum concurrent limit of N for component instances reached", the
+  check reported `ENGINE_UPGRADE_DIVERGED`, and the daemon refused to start
+  on the new engine: with one worker, the default on a one-CPU machine,
+  whenever the window held a call, and now and then with two. v0.1.0 to
+  v0.4.1 have this. The check runs with the new binary, so the check before
+  the upgrade to v0.5.0 already has the fix. Its pool now has room for 8
+  instances per worker, at least 16, and at least the machine's default
+  `--concurrency`. A daemon's forks, replays and previews share its pool
+  with its turns; the pool now has room for 8 instances per CPU (16 to 128)
+  even with a lower `--concurrency`, which at the default changes nothing on
+  2 to 8 CPUs.
 - Erasure reaches blobs (M26, docs/design/m26-blobs.md §9). Applying a
   subject's erasure marks its blobs erased, and the node deletes their files
   at once, in main's store and in every fork's space (`blobs` in the answer

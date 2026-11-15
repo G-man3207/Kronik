@@ -628,19 +628,34 @@ stays the same when it is replayed again.
 
 ### Memory
 
-One daemon has one Wasm instance pool, sized by `--concurrency`: room for
-`2 × concurrency` linear memories. Forks, replays and promote catch-up run
-on the same pool; `kronik upgrade check` is its own process with a pool of
-`2 × workers` memories. After an instance ends, its memory slot keeps up to
-2 MiB resident (zeroed), so the next instance does not fault those pages
-back in. That bounds what the pool holds on top of running instances:
+One daemon has one Wasm instance pool. A turn holds an instance while it
+runs, so the daemon's turns hold at most `--concurrency` of them. Forks,
+replays (`kronik replay`, proposals, promote catch-up) and previews run on
+the same pool without taking a turn's place, and a replay runs the callee
+of a `call` while its caller keeps its instance, so a chain of calls holds
+one per link. The pool therefore has room for `--concurrency` instances and
+for at least 8 per CPU (at least 16, at most 128): 8 for each of the
+replay workers a proposal gets by default, one per CPU. `kronik upgrade
+check` is its own process; its pool has room for 8 instances per worker
+(`--workers`), at least 16, and at least the default concurrency of the
+machine.
 
-| `--concurrency` | Memory slots | Kept resident, worst case |
-|---|---|---|
-| 16 (default on 2 CPUs) | 32 | 64 MiB |
-| 32 (default on 4 CPUs) | 64 | 128 MiB |
-| 64 (default from 8 CPUs) | 128 | 256 MiB |
-| 128 | 256 | 512 MiB |
+Each instance has room for two linear memories. After an instance ends, its
+memory slot keeps up to 2 MiB resident (zeroed), so the next instance does
+not fault those pages back in. That bounds what the pool holds on top of
+running instances, at the default concurrency:
+
+| CPUs | `--concurrency` | Instances | Memory slots | Kept resident, worst case |
+|---|---|---|---|---|
+| 1 | 8 | 16 | 32 | 64 MiB |
+| 2 | 16 | 16 | 32 | 64 MiB |
+| 4 | 32 | 32 | 64 | 128 MiB |
+| 8 | 64 | 64 | 128 | 256 MiB |
+| 16 or more | 64 | 128 | 256 | 512 MiB |
+
+A higher `--concurrency` raises the pool to it: `--concurrency 128` on 8
+CPUs has 128 instances, 256 slots and 512 MiB at worst. A lower one leaves
+the pool as large as the table says.
 
 A slot keeps only what its instances used, so a small Rust guest (about
 1 MiB of linear memory) holds little; large guests such as TypeScript ones

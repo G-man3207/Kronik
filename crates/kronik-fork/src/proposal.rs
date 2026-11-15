@@ -436,9 +436,9 @@ impl Proposals {
                 entries.insert(meta.id.clone(), Entry { meta, live: None });
             }
         }
-        let workers = std::thread::available_parallelism()
-            .map_or(2, |n| n.get())
-            .clamp(1, 16);
+        // The daemon's instance pool has room for a replay with this many
+        // workers and their calls (kronik_sched::pool::node_instances).
+        let workers = kronik_sched::pool::replay_workers_for(kronik_sched::pool::available_cpus());
         let previews = entries
             .values()
             .filter(|e| e.meta.preview.is_some())

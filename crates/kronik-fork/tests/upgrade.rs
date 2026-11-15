@@ -1394,3 +1394,62 @@ fn a_turn_whose_outputs_alone_hold_an_erased_value_is_compared() {
     assert_eq!(checked.diff.summary.unverifiable, 0, "{text}");
     keep(&dir, "erased-output-only");
 }
+
+/// A data directory whose window holds calls: one to another actor, and a
+/// chain (counter/a calls counter/b, whose `call` calls counter/x) whose
+/// three turns run at once.
+fn call_workload(dir: &Path) {
+    let rt = rt();
+    let node = start(&rt, dir).unwrap();
+    rt.block_on(async {
+        node.deploy(&guest("counter"), audit(), false, owner(&node))
+            .await
+            .unwrap();
+        for (actor, body) in [
+            ("counter/c", "counter/ledger increment"),
+            ("counter/a", "counter/b call"),
+        ] {
+            let r = node
+                .send(
+                    ActorRef::parse(actor).unwrap(),
+                    msg("call", body),
+                    audit(),
+                    false,
+                    owner(&node),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(r.committed(), "{r:?}");
+        }
+    });
+}
+
+/// F5: the check with one worker, the default on a one-CPU machine, over a
+/// window with calls. Its instance pool had one instance per worker, but a
+/// replayed call keeps its caller's instance while the callee runs, and the
+/// check runs its continuous replay next to the worker: the fork's turn
+/// failed with "maximum concurrent limit of 1 for component instances
+/// reached", the check reported a divergence, and the startup gate refused
+/// the new engine.
+#[test]
+fn a_check_with_one_worker_over_calls_passes() {
+    let dir = tempdir();
+    call_workload(dir.path());
+    let rt = rt();
+    let checked = rt
+        .block_on(async {
+            let env = Env::real(tokio::runtime::Handle::current());
+            kronik_fork::upgrade::check(&env, dir.path(), Duration::from_secs(6 * 3600), 1, None)
+                .await
+        })
+        .unwrap();
+    let text = String::from_utf8_lossy(&checked.diff_bytes);
+    assert!(checked.report.passed, "{text}");
+    let s = &checked.diff.summary;
+    assert_eq!(
+        (s.root_inputs, s.divergent_turns, s.unverifiable),
+        (2, 0, 0),
+        "{text}"
+    );
+}

@@ -44,8 +44,10 @@ fn wt(e: wasmtime::Error) -> CodeError {
     CodeError::Wasmtime(format!("{e:#}"))
 }
 
-/// Sizing of the instance pool; `concurrency` is the number of turns that can
-/// run at once (the scheduler's worker permits).
+/// Sizing of the instance pool: `concurrency` component instances can be
+/// live at once, each with up to two linear memories. A turn holds one for
+/// as long as it runs, and a turn that waits for its `call` keeps it while
+/// the callee's turn holds another.
 #[derive(Debug, Clone, Copy)]
 pub struct PoolSize {
     pub concurrency: u32,
@@ -54,6 +56,15 @@ pub struct PoolSize {
 impl Default for PoolSize {
     fn default() -> Self {
         PoolSize { concurrency: 128 }
+    }
+}
+
+impl PoolSize {
+    /// A pool of `instances` instances, at least one.
+    pub fn instances(instances: usize) -> PoolSize {
+        PoolSize {
+            concurrency: u32::try_from(instances.max(1)).unwrap_or(u32::MAX),
+        }
     }
 }
 

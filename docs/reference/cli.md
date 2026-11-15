@@ -433,6 +433,14 @@ result, and writes neither file. A bad window or a data directory with no
 log is `BAD_REQUEST`. `--json` prints the report, and the diff path when
 one was written, even when the command exits 1.
 
+`--workers` (default: one per CPU, at most 16) replays that many root
+inputs at once. The check's Wasm instance pool has room for 8 instances
+per worker, at least 16, and at least `serve`'s default `--concurrency` on
+the machine, because a replayed `call` keeps its caller's instance while
+the callee runs. Before v0.5.0 the pool had one instance per worker, so a
+check with one worker reported any call in its window as
+`ENGINE_UPGRADE_DIVERGED`.
+
 A turn whose recorded input was **erased** (`kronik privacy erase`, M8)
 is unverifiable, not divergent, and so is every turn the erased data
 reached: one whose input or state it shaped, one that read a state value

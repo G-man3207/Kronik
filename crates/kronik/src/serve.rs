@@ -14,6 +14,7 @@ use kronik_api::Api;
 use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_gateway::{Gateway, GatewayConfig};
+use kronik_sched::pool::concurrency_for;
 use kronik_sched::{NodeConfig, start_local};
 
 use crate::config::{Config, Overrides};
@@ -1340,14 +1341,11 @@ async fn record_key_source(
 /// process may use, at least 8 and at most 64. Rust's `available_parallelism`
 /// honours the CPU affinity and a cgroup v2 CPU quota, so a daemon confined
 /// to 2 CPUs runs 16 turns at once, and the Wasm instance pool, which is
-/// sized by the concurrency, keeps fewer slots warm on a small machine.
+/// sized from the concurrency (and from what the node's replays need,
+/// `kronik_sched::pool::node_instances`), keeps fewer slots warm on a small
+/// machine.
 fn default_concurrency() -> usize {
-    concurrency_for(std::thread::available_parallelism().map_or(1, |n| n.get()))
-}
-
-/// [`default_concurrency`] for `cpus` CPUs.
-fn concurrency_for(cpus: usize) -> usize {
-    cpus.saturating_mul(8).clamp(8, 64)
+    concurrency_for(kronik_sched::pool::available_cpus())
 }
 
 #[cfg(test)]

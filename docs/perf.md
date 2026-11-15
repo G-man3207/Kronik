@@ -195,13 +195,14 @@ What changed:
 ### Memory cost of the resident Wasm memories
 
 The pool has `2 × concurrency` linear memory slots per engine (one engine
-per daemon; forks and replays share it, `kronik upgrade check` builds its
-own of `2 × workers`). Each reused slot now keeps up to 2 MiB resident
-instead of 64 KiB, so the worst case on top of running instances is
-128 × 2 MiB = 256 MiB at `--concurrency 64` (512 MiB at 128), 248 MiB more
-than before. 64 was then the default everywhere; since
-[ADR 0140](adr/0140-default-concurrency-follows-the-cpus.md) it is the
-default from eight CPUs, and less below them.
+per daemon; forks and replays share it, and `kronik upgrade check` built
+its own of `2 × workers`; since v0.5.0 both have room for the instances a
+replay's calls hold, see the operations guide's "Memory"). Each reused
+slot now keeps up to 2 MiB resident instead of 64 KiB, so the worst case
+on top of running instances is 128 × 2 MiB = 256 MiB at `--concurrency
+64` (512 MiB at 128), 248 MiB more than before. 64 was then the default
+everywhere; since [ADR 0140](adr/0140-default-concurrency-follows-the-cpus.md)
+it is the default from eight CPUs, and less below them.
 
 Measured on the test VPS (4 GB): `kronik serve` from the same tree with
 64 KiB (before) and 2 MiB (after), the guest deployed, 20 s of 64 clients

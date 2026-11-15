@@ -110,10 +110,11 @@ pub async fn check(
         index.reveal(p);
     }
     let index = Arc::new(index);
-    let engine = build_engine(PoolSize {
-        concurrency: workers.max(1) as u32,
-    })
-    .map_err(|e| e.to_string())?;
+    // Room for each worker's turn and the callees of its calls, which a
+    // replay runs inside the worker. A pool of one instance per worker
+    // failed the first replayed call, as a divergence.
+    let pool = kronik_sched::pool::replay_instances(workers, kronik_sched::pool::available_cpus());
+    let engine = build_engine(PoolSize::instances(pool)).map_err(|e| e.to_string())?;
     let code = CodeStore::new(engine, Some(data.join("code"))).map_err(|e| e.to_string())?;
     let fc = fork_kinds(
         &index,

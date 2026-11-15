@@ -319,6 +319,44 @@ fn upgrade_check_writes_a_report_and_rejects_a_bad_window() {
     assert_eq!(file["to_engine"], v["to_engine"]);
 }
 
+/// F5: `upgrade check --workers 1`, the default on a one-CPU machine, over a
+/// window with calls passes. Its instance pool had one instance per worker,
+/// but a replayed call keeps its caller's instance while the callee runs:
+/// the check reported `ENGINE_UPGRADE_DIVERGED`, and the start refused the
+/// new engine.
+#[test]
+fn upgrade_check_with_one_worker_passes_over_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let serve = Serve::start(dir.path());
+    assert_eq!(serve.run(&["deploy", COUNTER, "--reason", "test"]).code, 0);
+    for (actor, body) in [
+        ("counter/c", "counter/ledger increment"),
+        ("counter/a", "counter/b call"),
+    ] {
+        let sent = serve.run(&["send", actor, "call", "--text", body, "--reason", "test"]);
+        assert_eq!(sent.code, 0, "{sent:?}");
+    }
+    let data = serve.data.clone();
+    drop(serve);
+
+    let ran = kronik(&[
+        "--json",
+        "upgrade",
+        "check",
+        "--data-dir",
+        data.to_str().unwrap(),
+        "--workers",
+        "1",
+    ]);
+    assert_eq!(ran.code, 0, "{ran:?}");
+    let v = ran.json();
+    assert_eq!(v["passed"], true, "{ran:?}");
+    assert_eq!(v["root_inputs"], 2, "{ran:?}");
+    let report = v["report_path"].as_str().unwrap();
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(report).unwrap()).unwrap();
+    assert_eq!(file["passed"], true);
+}
+
 const NOTES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/notes.wasm");
 
 /// A data directory whose log retention has compacted past the only SQL
