@@ -4,6 +4,14 @@ All notable changes to Kronik are recorded here. The project is pre-alpha; the
 formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
+## Unreleased
+
+- A test daemon is given a minute, not ten seconds, to answer its health
+  check in the M1 acceptance, the M1 perf run and the privacy bench, and
+  those scripts print the tail of its log when it does not; the acceptance
+  run of one hosted CI job failed on the tight wait after the rest of the
+  same job had passed.
+
 ## v0.5.0 — 2026-11-15
 
 The "Isolation, standards and web" release (M20 to M26 of the build brief).
