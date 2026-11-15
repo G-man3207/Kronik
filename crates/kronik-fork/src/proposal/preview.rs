@@ -3,8 +3,8 @@
 //! gateway (`<id>.<preview_domain>`, or `/__preview/<id>/...` without a
 //! preview domain). Each request is a new root input of the fork's
 //! continuous state, with the fork's effect host: no live effects but
-//! `[fork] live_allowlist` GETs (I7). The fork expires after its time to
-//! live and the daemon deletes it.
+//! `[fork] live_allowlist` replay-safe GETs (I7). The fork expires after its
+//! time to live and the daemon deletes it.
 //!
 //! A preview's serving state is a [`Served`], outside the proposals'
 //! `entries` lock: a request waits only for requests to the same preview,

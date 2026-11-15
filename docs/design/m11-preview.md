@@ -3,9 +3,9 @@
 A preview lets a person try a proposal's code with new requests before it
 is promoted: `kronik preview create <proposal>` gives a URL, and requests to
 it run against the new code in a fork, without live effects (I7) but
-`[fork] live_allowlist` GETs. A preview is a fork (no new concept, I13);
-`kronik preview` is a command over forks and proposals. Decision record:
-[ADR 0025](../adr/0025-preview-forks.md).
+`[fork] live_allowlist` replay-safe GETs. A preview is a fork (no new
+concept, I13); `kronik preview` is a command over forks and proposals.
+Decision record: [ADR 0025](../adr/0025-preview-forks.md).
 
 ## 1. What a preview is
 
@@ -125,8 +125,9 @@ requests to one preview (one request at a time per preview).
 A preview's effects go through the fork's effect gate (m3-fork §3.5): a
 preview root never matches a production recording, so a fetch is answered
 by a stub rule, goes out live only if it is a `GET` without secret headers
-to a `[fork] live_allowlist` host, and is otherwise denied (`replay: no
-recording`). Allowlisted GETs are the one thing a preview does in the
+to a `[fork] live_allowlist` host whose grant's effective delivery class is
+`replay-safe`, and is otherwise denied (`replay: no recording`). Allowlisted
+GETs are the one thing a preview does in the
 outside world. The model simulator is not an exception: a preview does not
 POST to `[simulators.model]`, even when that server setting is present and
 the target's `SimulatorConfig.model` is set. An ordinary fork replay still

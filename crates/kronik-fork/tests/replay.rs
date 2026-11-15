@@ -757,6 +757,89 @@ fn stub_rules_and_the_live_allowlist() {
     assert_eq!((row.method.as_str(), row.live), ("GET", 3));
 }
 
+/// One production POST per root input, whose fork build then makes an
+/// unrecorded GET the live allowlist could admit.
+fn extra_get_with_delivery(delivery: kronik_effects::Delivery) -> (ReplayOutput, Arc<AtomicUsize>) {
+    let (addr, hits) = server();
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    p.grant_with_delivery("http:127.0.0.1", Some(delivery));
+    let fork_lsn = p.settle();
+    for i in 0..3 {
+        let spec = format!("POST http://{addr}/v1/charges/{i}\n\namount=10");
+        p.http("pay", "fetch-ok", &spec);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    // Isolated: a live branch in both modes would send the same GET twice.
+    let options = DiffOptions {
+        mode: Mode::Isolated,
+        live_allowlist: vec!["127.0.0.1".into()],
+        ..DiffOptions::default()
+    };
+    let out = replay(&p, Some("counter-fetch-extra"), fork_lsn, &options, 2);
+    (out, hits)
+}
+
+fn assert_extra_get_denied(out: &ReplayOutput, hits: &Arc<AtomicUsize>) {
+    let s = &out.diff.summary;
+    assert_eq!(
+        (s.exact, s.synthetic, s.live),
+        (3, 3, 0),
+        "{}",
+        String::from_utf8_lossy(&out.bytes)
+    );
+    assert_eq!(out.diff.responses.changed, 3);
+    for item in &out.diff.responses.items {
+        assert!(
+            serde_json::to_string(&item.body)
+                .unwrap()
+                .contains("replay: no recording"),
+            "{:?}",
+            item.body
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+}
+
+/// The live allowlist admits an unrecorded GET only when the matching
+/// grant's effective delivery class is replay-safe (I7, m3-fork §11): an
+/// operator who declared the target unsafe said a repeat is not harmless.
+#[test]
+fn an_unsafe_granted_get_is_not_live_even_when_its_host_is_allowlisted() {
+    let (out, hits) = extra_get_with_delivery(kronik_effects::Delivery::Unsafe);
+    assert_extra_get_denied(&out, &hits);
+}
+
+/// An idempotency-keyed target tolerates a repeat only with production's
+/// key, which the live path does not send: it stays in the fork.
+#[test]
+fn an_idempotency_keyed_granted_get_is_not_live_even_when_its_host_is_allowlisted() {
+    let (out, hits) = extra_get_with_delivery(kronik_effects::Delivery::IdempotencyKeyed);
+    assert_extra_get_denied(&out, &hits);
+}
+
+/// The control: the same unrecorded GET does go out when the grant (or the
+/// GET default) says replay-safe.
+#[test]
+fn a_replay_safe_granted_get_is_live_when_its_host_is_allowlisted() {
+    let (out, hits) = extra_get_with_delivery(kronik_effects::Delivery::ReplaySafe);
+    let s = &out.diff.summary;
+    assert_eq!(
+        (s.exact, s.synthetic, s.live),
+        (3, 0, 3),
+        "{}",
+        String::from_utf8_lossy(&out.bytes)
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 6);
+    let row = out
+        .diff
+        .grounding
+        .iter()
+        .find(|g| g.route == "/v1/charges/{}/extra")
+        .unwrap();
+    assert_eq!((row.method.as_str(), row.live), ("GET", 3));
+}
+
 /// A fork denies a call to a foreign actor that is not declared in
 /// production's words (review of the integration branch, item 6): the guest
 /// sees the same error, so the identity replay is empty, and the effect

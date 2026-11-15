@@ -2134,9 +2134,10 @@ prefix `<scheme>://<host>/__preview/<id>/`, where `<host>` is the first
 `http`. Each request is a root input of the fork, its turns go to the
 fork's log, and its diff lists them as preview inputs. A preview makes no
 live effects (I7) but one: a fetch without a stub is denied, except a GET
-without secret headers to a host in `[fork] live_allowlist`, which goes
-out live. A preview runs without personal data when the proposal does,
-with `--no-pii`, or for a token without `pii:read`. It is deleted after
+without secret headers to a host in `[fork] live_allowlist` whose grant's
+effective delivery class is `replay-safe`, which goes out live. A preview
+runs without personal data when the proposal does, with `--no-pii`, or for
+a token without `pii:read`. It is deleted after
 `--ttl` (default `[fork] preview_ttl`, 24 h). Creating one needs the
 `fork` scope; at most 16 previews live at once (`PREVIEW_LIMIT`).
 
@@ -2145,7 +2146,7 @@ $ kronik preview create p-1a2b3c4d5e6f --reason "show the new checkout"
 Preview v-9f8e7d6c5b4a of proposal p-1a2b3c4d5e6f at lsn 12
   URL           http://127.0.0.1:8080/__preview/v-9f8e7d6c5b4a/
   Expires       2026-10-28T12:00:00Z
-  Effects       only allowlisted GETs go live ([fork] live_allowlist)
+  Effects       only allowlisted replay-safe GETs go live ([fork] live_allowlist)
 Next     curl http://127.0.0.1:8080/__preview/v-9f8e7d6c5b4a/
          kronik diff show v-9f8e7d6c5b4a --md
          kronik preview delete v-9f8e7d6c5b4a --reason "..."

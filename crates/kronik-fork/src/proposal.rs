@@ -526,8 +526,9 @@ impl Proposals {
         self
     }
 
-    /// `[fork] live_allowlist`: hosts whose unrecorded GETs (without
-    /// secret headers) may go out live from forks; empty by default.
+    /// `[fork] live_allowlist`: hosts whose unrecorded replay-safe GETs
+    /// (without secret headers) may go out live from forks; empty by
+    /// default.
     pub fn with_live_allowlist(mut self, hosts: Vec<String>) -> Proposals {
         self.live_allowlist = hosts;
         self

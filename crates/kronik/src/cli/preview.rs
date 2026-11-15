@@ -18,7 +18,7 @@ use super::{Ctx, Error, Mutation, http, reason, units};
 pub enum PreviewCommand {
     /// Create a preview of a proposal: a fork of HEAD with its code that
     /// takes new requests at its URL. No live effects but `[fork]
-    /// live_allowlist` GETs.
+    /// live_allowlist` replay-safe GETs.
     Create {
         /// The proposal, e.g. p-1a2b3c4d5e6f.
         proposal: String,
@@ -125,7 +125,7 @@ fn details(out: &mut String, p: &PreviewInfo) {
     field(
         out,
         "Effects",
-        &["only allowlisted GETs go live ([fork] live_allowlist)".to_owned()],
+        &["only allowlisted replay-safe GETs go live ([fork] live_allowlist)".to_owned()],
         "",
     );
 }
