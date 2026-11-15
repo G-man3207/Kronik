@@ -31,9 +31,15 @@ change between releases.
 | [`v0.1.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.1.0) | Durable turns, effects and capabilities, fork, replay and behavior diff with policy and approvals, proposals that span several actors, the TypeScript and Rust SDKs, the JSON API and MCP server, operations on a VPS, foreign actors in gVisor, privacy mode |
 | [`v0.3.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.3.0) | Python and Go SDKs, the CLI against a remote API, watch and preview forks, effect simulators, rollback via replay, foreign actors copied into forks |
 | [`v0.4.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.4.0) | Standard `fetch` through `wasi:http`, OpenTelemetry traces with a complete verifiable audit export, KMS-wrapped master key (OpenBao/AWS/GCP/Azure), Wasmtime 50.0.1, and crash-path hardening: atomic secret-catalogue publication, paced rate windows, restart-safe custody |
+| [`v0.5.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.5.0) | The "Isolation, standards and web" release (M20–M26): long-lived connections (WebSocket, SSE, `send-now`, replay and diff, the SDKs and `chat-ts`), streaming bodies and app blob storage (blobs above a threshold, holds, a collector, erasure and reseal, shipping and restore, `media-ts`), external secret backends, the nonroot daemon and the microVM level (opt-in), and durability fixes across the log, snapshots and reseal. WIT `kronik:actor@0.1.1`; engine `kronik-0.5.0+wasmtime-50.0.1` |
 | [`v0.4.1`](https://github.com/G-man3207/Kronik/releases/tag/v0.4.1) | Patch release: `kronik restore` validates the manifest paths and the component names it takes from the snapshot bucket; restarts no longer grow with the log, nor stop on one whose retention compacted past an idle SQL actor; erasure no longer strands scrubbed reads at 503; the audit export and its followers recover at once from an overtaking configuration commit. Engine `kronik-0.4.1+wasmtime-50.0.1` |
 
-`v0.4.1` is the latest release: a patch on the attested line `v0.4.0` opened.
+`v0.5.0` is the latest release: the brief's "Isolation, standards and web"
+line (M20–M26), engine `kronik-0.5.0+wasmtime-50.0.1`. Its archives are static
+musl binaries for x86_64 and aarch64 with `install.sh`, checksums, CycloneDX
+SBOMs and two-build byte-equality evidence (`reproducibility.json`);
+`install.sh` verifies each archive's Sigstore attestation and refuses
+unsigned ones. `v0.4.1` was a patch on the line `v0.4.0` opened.
 The archives are static musl binaries for x86_64 and aarch64 with `install.sh`,
 checksums, CycloneDX SBOMs and two-build byte-equality evidence
 (`reproducibility.json`); `install.sh` verifies each archive's Sigstore
@@ -45,9 +51,8 @@ and the defects found since `v0.4.0` in restart, retention, secret handling and
 the audit export; the engine is `kronik-0.4.1+wasmtime-50.0.1`. `v0.3.0` and
 `v0.1.0` are the historical unsigned releases.
 
-`main` is the unreleased `0.5.0-dev` line, the brief's "Isolation, standards
-and web" release (M20–M26); the [changelog](CHANGELOG.md) lists what changed
-since `v0.4.1`. On `main` today:
+`main` is the unreleased `0.6.0-dev` line; the [changelog](CHANGELOG.md) lists
+what changed since `v0.4.1`. In `v0.5.0`:
 
 - **External secret backends (M23 B2–B6):** secret names linked to OpenBao or
   Vault, AWS Secrets Manager, GCP Secret Manager or Azure Key Vault, read

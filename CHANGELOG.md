@@ -4,7 +4,48 @@ All notable changes to Kronik are recorded here. The project is pre-alpha; the
 formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
-## Unreleased
+## v0.5.0 — 2026-11-15
+
+The "Isolation, standards and web" release (M20 to M26 of the build brief).
+Log format v1 gains records, all additive, but a release before this one
+cannot read a log that holds them; the actor WIT becomes
+`kronik:actor@0.1.1`, also additive; API `/v1` and the CLI's JSON gain fields
+and endpoints.
+
+- **Long-lived connections (M24):** `WEBSOCKET` and `SSE` routes, whose owner
+  actor accepts, sends and closes in recorded turns; `send-now`; the replay
+  and diff of connections; their API, CLI and MCP surface; the four SDKs and
+  the `chat-ts` example.
+- **Streaming bodies and app blob storage (M25, M26):** bodies above a kind's
+  threshold stream into a content-addressed blob store, also through
+  `wasi:http`; actors hold, pass and release blobs; a collector deletes what
+  nothing keeps; blobs are sealed, erased and resealed with their subject,
+  shipped and restored with the log, read by forks and previews, capped and
+  paced in previews; `media-ts` and the SDKs show them. Blobs are always on.
+- **External secret backends (M23 B2–B6):** OpenBao or Vault, AWS Secrets
+  Manager, GCP Secret Manager and Azure Key Vault behind a cached, outage-
+  tolerant reader; a PKCS#11 helper; scrub-only copies of external secret
+  versions at rest (ADR 0142).
+- **Isolation, opt-in (M20, M21):** the nonroot daemon and the microVM level,
+  both proven on disposable hosted runners; gVisor and the root service stay
+  the defaults.
+- **Replay, forks and the upgrade check:** every point of the retention
+  window; erased inputs reported unverifiable rather than divergent
+  (ADR 0109); calls and timers in forks; replay instance pools sized for
+  nested calls, so a check on a one-CPU machine no longer fails on a call.
+- **Privacy and erasure:** connection frames, requester answers and blobs of
+  an erased subject are tombstoned or deleted, locally and in the bucket;
+  `privacy reseal` seals blobs written in the clear and re-uploads their
+  objects; erasure keeps reporting pending until its objects are gone.
+- **Durability:** a node makes durable whatever a dead process left in the
+  page cache before building on it (a segment's tail, its footer, a segment
+  name never directory-synced); a snapshot is durable before its marker; a
+  reseal marks a segment durably before replacing it, fails when the rename
+  is not durable, and is finished at the next start if it stopped in between.
+- **The gateway, the API, the CLI and MCP:** connection routes and commands,
+  blob routes and commands, upload pacing, preview blob caps and space
+  deletion, the piece of a failure an operator sees.
+
 
 - An answer that is a blob reaches whoever asked for it (M25, M26). A
   `call` whose callee answered with a blob body, such as a blob it wrote,
@@ -747,51 +788,6 @@ M23, key and secret backends:
   revealed and wrote into such a request body is stored and sent as its
   placeholder, with a warning in the turn's log.
 
-<!--
-Draft of the v0.5.0 section, to finish at the release. Then rename
-"## Unreleased" to "## v0.5.0 — <date>", open it with the summary below,
-sort the entries above into the groups below (keeping their text), and end
-it with the upgrade paragraph.
-
-Summary:
-
-  The "Isolation, standards and web" release (M20 to M26 of the build
-  brief). Log format v1 gains records, all additive, but a release before
-  this one cannot read a log that holds them; the actor WIT becomes
-  `kronik:actor@0.1.1`, also additive; API `/v1` and the CLI's JSON gain
-  fields and endpoints.
-
-Groups, in this order:
-
-1. Long-lived connections (M24): the WIT and log-format entries, WebSocket
-   and SSE routes, the hub and its limits, send-now, replay and diff, the
-   API, CLI and MCP, the SDKs and the chat example.
-2. Streaming bodies and blob storage (M25, M26), if they land.
-3. External secret backends (M23 B2-B6, accepted for this release): the
-   backends, the cache and outage handling, the PKCS#11 helper, the
-   scrub-only copies (ADR 0142: external secret values are now at rest,
-   encrypted, in the data directory), and their fixes.
-4. Isolation, opt-in: the nonroot daemon (M21) and the microVM level (M20),
-   with where their proofs ran.
-5. Replay, forks and the upgrade check: every point of the log, erased
-   inputs as unverifiable (ADR 0109), calls and timers in forks.
-6. Privacy and erasure.
-7. The gateway, the API, the CLI and MCP.
-8. Recovery and records: the record budget (ADR 0130), open turns at
-   snapshots, the clock stepping back.
-
-Upgrade paragraph (checked on the v0.4.1 corpus with a 0.5.0-dev build;
-check the engine name against `kronik --version` of the release build):
-
-  The engine is now `kronik-0.5.0+wasmtime-50.0.1` (was
-  `kronik-0.4.1+wasmtime-50.0.1`). Data written by any earlier release
-  needs a passing `kronik upgrade check` with this binary before the first
-  start; without one the start stops with `ENGINE_VERSION_MISMATCH`, and a
-  passing start appends one `engine.upgrade` record. Going back to v0.4.1
-  needs its own check and works only until the log holds a record v0.4.1
-  cannot read, such as a connection's turn: the operations guide's
-  "Upgrading from v0.4.1" has the details.
--->
 - A snapshot is durable before its marker is appended, and so before a
   compaction may delete the segments it replaces: its files and directories
   are fsynced before it is renamed into place, and the snapshots directory
@@ -807,6 +803,12 @@ check the engine name against `kronik --version` of the release build):
 - A reseal fails when the fsync of the log directory after it renames a
   resealed segment into place fails; before, it went on as if the rename
   were durable. v0.4.1 has the same gap.
+- A call whose callee answers with an erased subject's tombstone, or with the
+  row the store keeps in place of such an answer, is a recorded call error
+  `SUBJECT_ERASED` instead of a missing prerequisite: before, the caller's
+  turn stayed open and was re-run at every start, forever, and a message turn
+  was neither delivered nor dead-lettered. An answer sealed under a key this
+  node does not hold stays a prerequisite (a restored keystore may read it).
 - A reseal that stops between renaming a resealed segment into place and
   fixing `state.db` for it (a crash, an error) is finished at the next
   start, or by the next reseal pass: the fix is journaled durably before
@@ -825,6 +827,17 @@ check the engine name against `kronik --version` of the release build):
   lifetime ended", which hid the cause (found by the DST: an erasure whose
   record a start recovered, then the snapshot the erasure takes failed its
   log fsync). v0.4.1 has the same gap.
+
+The engine is now `kronik-0.5.0+wasmtime-50.0.1` (was
+`kronik-0.4.1+wasmtime-50.0.1`). Data written by any earlier release needs a
+passing `kronik upgrade check` with this binary before the first start;
+without one the start stops with `ENGINE_VERSION_MISMATCH`, and a passing
+start appends one `engine.upgrade` record. Going back to v0.4.1 needs its own
+check and works only until the log holds a record v0.4.1 cannot read, such as
+a connection's turn: the operations guide's "Upgrading from v0.4.1" has the
+details, including why a copy of the shipping bucket's prefix is taken before
+the upgrade and what to do about erasures made after it.
+
 
 ## v0.4.1 — 2026-11-07
 

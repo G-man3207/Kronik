@@ -1,7 +1,7 @@
 # Standalone static actor; build separately from the Wasm examples workspace.
 [package]
 name = "foreign-probe"
-version = "0.5.0-dev"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.99.1"
 license = "Elastic-2.0"
