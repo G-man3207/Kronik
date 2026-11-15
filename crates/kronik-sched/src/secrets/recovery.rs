@@ -285,13 +285,15 @@ impl Node {
             ActorRef::new(actor_pb.kind.clone(), actor_pb.key.clone()).map_err(|_| corrupt())?;
         let key = begin.causal_key.as_ref().ok_or_else(corrupt)?;
         let mut compensations = Vec::new();
-        // A timed-out call's callee may still commit (#30): its compensation
-        // is recorded too, and delivered only if it does.
+        // A timed-out call's callee may still commit (#30), and a successful
+        // call whose answer an erasure tombstoned did commit (ADR 0124):
+        // both compensations are recorded here, and delivered only if the
+        // callee's change stands.
         let mut timed_out = std::collections::BTreeSet::new();
-        for effect in effects.iter().filter(|effect| {
-            (effect.kind == "actor.call" && effect.status == pb::EffectStatus::Ok as i32)
-                || effect.timed_out_call()
-        }) {
+        for effect in effects
+            .iter()
+            .filter(|effect| effect.successful_call() || effect.timed_out_call())
+        {
             if erased_calls
                 && effect
                     .request

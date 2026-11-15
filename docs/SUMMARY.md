@@ -133,6 +133,7 @@
 - [ADR 0121: Reading and writing blobs on WASI 0.2, and the path to WASI 0.3](adr/0121-blob-interface-and-wasi-0-3.md)
 - [ADR 0122: Shipping and restoring blobs](adr/0122-shipping-and-restoring-blobs.md)
 - [ADR 0123: An erasure stops the plaintext already in flight](adr/0123-erasure-stops-plaintext-in-flight.md)
+- [ADR 0124: An erased answer keeps the callee's commit](adr/0124-an-erased-answer-keeps-the-callees-commit.md)
 - [ADR 0130: A turn's record fits in one log record](adr/0130-one-log-record-per-turn.md)
 - [ADR 0131: Retention keeps a base for the whole history window](adr/0131-retention-keeps-a-base-for-the-window.md)
 - [ADR 0132: A fork's computation with a held linked secret is synthetic](adr/0132-fork-crypto-with-a-held-secret.md)

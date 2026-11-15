@@ -225,10 +225,14 @@ The erasure itself:
    values, its rows in every table with `_subject` of every actor, its
    saved responses to requests with an `Idempotency-Key` (a repeated
    request runs anew) and its dead letters. A saved response of a call to
-   an actor becomes an erased marker: a repeated call fails with
-   `SUBJECT_ERASED` instead of running again. So does the body of each of
-   its pending timers and undelivered messages, and its values in the
-   recorded effects of a turn still open, also those written in `off` mode:
+   an actor keeps the callee's committed outcome, with the reply's values
+   replaced by the erased marker: a repeated call fails with
+   `SUBJECT_ERASED` instead of running again, and if the caller's turn then
+   fails, the change is still an orphan and its compensation is delivered
+   ([ADR 0124](../adr/0124-an-erased-answer-keeps-the-callees-commit.md)).
+   The bodies of its pending timers and undelivered messages become erased
+   markers too, and so do its values in the recorded effects of a turn
+   still open, also those written in `off` mode:
    the turn still runs, and fails with `SUBJECT_ERASED` (step 3) instead of
    handing the value to the actor. The same happens when the
    state is rebuilt from the log, so a rebuild equals the live databases.

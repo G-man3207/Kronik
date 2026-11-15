@@ -123,6 +123,13 @@ the root id).
   in its log, so a reply over what the caller may take is withheld and
   recorded as `HOST_REDACTION_FAILURE` with the callee's status, as in
   production.
+- **Calls whose answer an erasure tombstoned.** The callee committed and its
+  reply is the erasure's tombstone. The fork replays the callee at
+  production's position and answers the caller the recorded
+  `SUBJECT_ERASED` call error, exactly as production did; the effect names
+  the fork's callee turn and records the observed commit (ADR 0124). It is
+  a committed outcome, not a failed callee: a caller that then fails still
+  owns the orphan and receives the call's compensation once.
 - **Calls that timed out.** The fork's own calls never time out, so a call
   that timed out in production and makes the same request again (same
   ordinal and fingerprint) is served its recorded `timeout`, as recorded
@@ -312,7 +319,7 @@ whose drift grows: `{"actors_changed": N, "items": [{"actor", "keys": [...], "sq
 | --- | --- |
 | `introduced` | fork turns that fail where production committed, plus new turns that fail |
 | `fixed` | turns that committed in the fork but failed in production |
-| `new_orphans` | orphans created in the fork that production did not create: calls without a compensation, in a failed turn, whose callee committed (a successful call, one whose reply was withheld, or one that timed out while its callee's turn still committed, as in the `orphans` table) |
+| `new_orphans` | orphans created in the fork that production did not create: calls without a compensation, in a failed turn, whose callee committed (a successful call, one whose reply was withheld, one whose committed answer an erasure tombstoned, or one that timed out while its callee's turn still committed, as in the `orphans` table) |
 | `outcome_unknown` | fork effects matched to a production effect whose recorded status was outcome-unknown |
 | `items` | `[{"kind": "introduced" | "fixed" | "new_orphan" | "outcome_unknown", "error_code", "message", "turn_prod", "turn_fork", "input"}]`, at most 20 per kind |
 

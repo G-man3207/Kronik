@@ -213,6 +213,11 @@ pub enum CallOutcome {
     NotFound,
     Rejected(String),
     Failed(String),
+    /// The callee's turn committed, but the answer belongs to a subject an
+    /// erasure tombstoned (ADR 0123). The guest sees the call error
+    /// [`CallOutcome::Failed`]; the gate records that the callee committed,
+    /// so the caller's failure still owes an orphan and its compensation.
+    Erased(String),
     Reentrant,
     Timeout,
 }
@@ -893,6 +898,9 @@ impl messaging::Host for TurnHost {
             CallOutcome::NotFound => Err(messaging::CallError::NotFound),
             CallOutcome::Rejected(m) => Err(messaging::CallError::Rejected(m)),
             CallOutcome::Failed(m) => Err(messaging::CallError::Failed(m)),
+            // The callee committed, but the answer is the erasure's
+            // tombstone: the guest still sees a failed call (ADR 0123).
+            CallOutcome::Erased(m) => Err(messaging::CallError::Failed(m)),
             CallOutcome::Reentrant => Err(messaging::CallError::Reentrant),
             CallOutcome::Timeout => Err(messaging::CallError::Timeout),
         })

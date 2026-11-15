@@ -946,6 +946,44 @@ async fn current_privacy_seals_only_the_new_copy_without_rewriting_recorded_logi
 }
 
 #[tokio::test]
+async fn an_erased_committed_call_contributes_its_compensation_on_close() {
+    let _serial = TESTS.lock().await;
+    let (_data, node) = node().await;
+    let begin = begin(&node);
+    let mut erased = call(&begin, 4, true);
+    erased.status = pb::EffectStatus::Failed as i32;
+    erased.error = kronik_proto::ERASED_CALL_ERROR.into();
+    erased.response = None;
+    erased.callee_source = Some(pb::ActorSource {
+        shard: None,
+        lsn: 7,
+        branch: "main".into(),
+    });
+    erased.observed_callee_status = Some(pb::EffectStatus::Ok as i32);
+    persist(&node, &begin, std::slice::from_ref(&erased)).await;
+    let result = node
+        .fail_recorded_secret(
+            begin,
+            vec![erased.clone()],
+            ErrorCode::SecretVersionGone,
+            crate::erasure::Born::Gen(0),
+        )
+        .await
+        .unwrap();
+    let Record::TurnRecord(terminal) = record(&node, result.turn_id.lsn).await else {
+        panic!("missing terminal")
+    };
+    assert_eq!(terminal.effects, vec![erased]);
+    assert_eq!(terminal.compensations.len(), 1, "{terminal:?}");
+    assert_eq!(terminal.compensations[0].ordinal, 4);
+    assert!(
+        terminal.compensations[0].msg.is_some(),
+        "the call's compensation survives the close: {terminal:?}"
+    );
+    assert_eq!(node.probe.turns_run.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn only_successful_calls_with_a_recorded_compensation_generate_a_message() {
     let _serial = TESTS.lock().await;
     let (_data, node) = node().await;

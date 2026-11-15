@@ -1,6 +1,6 @@
 # 0123. An erasure stops the plaintext already in flight
 
-- **Status:** Accepted (2026-11-14)
+- **Status:** Accepted (2026-11-14), amended 2026-11-15
 - **Date:** 2026-11-13
 
 ## Context
@@ -75,16 +75,23 @@ running turns: it must not depend on how long other work takes.
 4. **Scrub.** Applying the record tombstones the subject's values in the
    inputs still queued, and in `state.db` the erasure tombstones its values in
    `open_effects` as it does in timers and the mailbox; reseal rewrites
-   `open_effects` with the effect results it rewrites.
-5. **Count.** `privacy status` counts an erasure as pending while the log,
+   `open_effects` with the effect results it rewrites. A saved call answer
+   keeps its `Committed` kind and is rewritten to those tombstones, never to
+   a failed callee outcome.
+5. **The callee did commit.** An answer that became a tombstone is still the
+   callee's committed turn. If the caller's turn then fails, the change is an
+   orphan and the compensation the call carried is delivered exactly once;
+   the caller's guest still sees `SUBJECT_ERASED` as the call error
+   ([ADR 0124](0124-an-erased-answer-keeps-the-callees-commit.md)).
+6. **Count.** `privacy status` counts an erasure as pending while the log,
    `state.db`, or an input queued in this process holds a plain value of it,
    and while a turn that began before it was applied still runs.
-6. **Forks.** A fork seals what it writes without creating a key version
+7. **Forks.** A fork seals what it writes without creating a key version
    for an erased subject - its log, its samples, and the turns a rebase
    stages into main's log: such a value becomes the erasure's tombstone. A
    rebase that resumes compares its fresh replay with its log with those
    values as tombstones on both sides.
-7. **SQL of a running turn.** A turn runs its SQL inside a savepoint, and
+8. **SQL of a running turn.** A turn runs its SQL inside a savepoint, and
    its end rolls the savepoint back (its changeset is applied from its
    record). An erasure applied to an actor database while one of the
    actor's turns has its savepoint open ran its deletes inside it, so the

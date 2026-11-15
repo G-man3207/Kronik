@@ -236,21 +236,29 @@ enum Exchanged {
 /// gone for good, so this is a result like any other: recorded, served to a
 /// re-run and to a fork's replay, and the caller's turn goes on as its
 /// guest decides.
-pub const ERASED_ANSWER: &str = "SUBJECT_ERASED: the call's response belonged to an erased subject";
+pub const ERASED_ANSWER: &str = kronik_proto::ERASED_CALL_ERROR;
 
-/// Whether a callee's outcome is an answer that belongs to an erased
-/// subject ([`map_call_outcome`]): a reply or an HTTP answer whose body is
-/// the erasure's tombstone (the callee's turn ran across the erasure, or
-/// its saved answer was sealed under a key that is gone), or the failure
-/// the store saves in place of a call's answer once the erasure is applied.
+/// Whether a callee's outcome is a committed answer that belongs to an
+/// erased subject ([`map_call_outcome`]): a reply or an HTTP answer whose
+/// body is the erasure's tombstone (the callee's turn ran across the
+/// erasure, or its saved answer was sealed under a key that is gone), or the
+/// failure a v0.5.0 store saved in place of a committed answer when the
+/// erasure was applied. A failed callee turn is not one, whatever its
+/// message says.
 fn erased_answer(outcome: &pb::Outcome) -> bool {
     use kronik_privacy::sealer::is_erased;
+    let committed = outcome.kind == pb::OutcomeKind::Committed as i32;
     match &outcome.output {
-        Some(pb::outcome::Output::Reply(message)) => message.body.as_ref().is_some_and(is_erased),
-        Some(pb::outcome::Output::Http(response)) => matches!(
-            response.body.as_ref().and_then(|body| body.value.as_ref()),
-            Some(pb::body::Value::Inline(body)) if is_erased(body)
-        ),
+        Some(pb::outcome::Output::Reply(message)) => {
+            committed && message.body.as_ref().is_some_and(is_erased)
+        }
+        Some(pb::outcome::Output::Http(response)) => {
+            committed
+                && matches!(
+                    response.body.as_ref().and_then(|body| body.value.as_ref()),
+                    Some(pb::body::Value::Inline(body)) if is_erased(body)
+                )
+        }
         Some(pb::outcome::Output::Accept(_)) => false,
         None => {
             outcome.kind == pb::OutcomeKind::Failed as i32
@@ -267,7 +275,7 @@ fn erased_answer(outcome: &pb::Outcome) -> bool {
 pub fn erased_answer_recorded(rec: &pb::EffectRecord) -> bool {
     rec.kind == "actor.call"
         && rec.status == pb::EffectStatus::Failed as i32
-        && (rec.error == ERASED_ANSWER || rec.error == kronik_store::db::ERASED_CALL_RESPONSE)
+        && (rec.error == ERASED_ANSWER || rec.error == kronik_proto::ERASED_CALL_MESSAGE)
 }
 
 /// A successful reply must already be resolved through the gate's actual
@@ -322,6 +330,10 @@ pub fn prepare_call_outcome(
     prepared_scope: Option<&[pb::SecretRef]>,
 ) -> Result<CallOutcome, GateError> {
     record.observed_callee_status = None;
+    // An erased answer is the callee's committed outcome, even though the
+    // guest gets a call error: the caller's failure still owes its orphan
+    // and compensation (ADR 0123, ADR 0124).
+    let callee_committed = matches!(&outcome, CallOutcome::Erased(_));
     let mut response = None;
     let (observed, prepared) = match outcome {
         CallOutcome::Ok(reply) => {
@@ -380,7 +392,7 @@ pub fn prepare_call_outcome(
             error.zeroize();
             (pb::EffectStatus::Rejected, result)
         }
-        CallOutcome::Failed(mut error) => {
+        CallOutcome::Failed(mut error) | CallOutcome::Erased(mut error) => {
             let prepared = crate::scrub::prepared_fields_safe(
                 current_scope,
                 prepared_scope,
@@ -394,7 +406,14 @@ pub fn prepare_call_outcome(
                     Err(ScrubError::OutputLimit)
                 }
             });
-            let result = prepared.map(|()| CallOutcome::Failed(std::mem::take(&mut error)));
+            let result = prepared.map(|()| {
+                let error = std::mem::take(&mut error);
+                if callee_committed {
+                    CallOutcome::Erased(error)
+                } else {
+                    CallOutcome::Failed(error)
+                }
+            });
             error.zeroize();
             (pb::EffectStatus::Failed, result)
         }
@@ -429,7 +448,11 @@ pub fn prepare_call_outcome(
             return Err(GateError::Prerequisite(ErrorCode::Unavailable));
         }
         record.status = pb::EffectStatus::HostRedactionFailure as i32;
-        record.observed_callee_status = Some(observed as i32);
+        record.observed_callee_status = Some(if callee_committed {
+            pb::EffectStatus::Ok as i32
+        } else {
+            observed as i32
+        });
         record.error = error.to_string();
         if let Some(response) = response {
             let subject = response
@@ -442,6 +465,9 @@ pub fn prepare_call_outcome(
         return Err(GateError::HostRedactionFailure);
     }
     record.status = observed as i32;
+    if callee_committed && record.callee_source.is_some() {
+        record.observed_callee_status = Some(pb::EffectStatus::Ok as i32);
+    }
     let prepared = match prepared {
         // The redaction plan already handled every failure class that could
         // carry callee content; a bare Ok without a response is a host bug
@@ -483,6 +509,10 @@ pub fn prepare_call_outcome(
         CallOutcome::Failed(error) => {
             record.error = error.clone();
             Ok(CallOutcome::Failed(error))
+        }
+        CallOutcome::Erased(error) => {
+            record.error = error.clone();
+            Ok(CallOutcome::Erased(error))
         }
         _ => unreachable!("the prepared callee result"),
     }
@@ -2986,22 +3016,26 @@ pub fn outcome_of_call(rec: &pb::EffectRecord) -> Result<CallOutcome, GateError>
             pb::EffectStatus::Rejected => CallOutcome::Rejected(rec.error.clone()),
             pb::EffectStatus::Reentrant => CallOutcome::Reentrant,
             pb::EffectStatus::Timeout => CallOutcome::Timeout,
+            pb::EffectStatus::Failed if rec.successful_call() => {
+                CallOutcome::Erased(rec.error.clone())
+            }
             _ => CallOutcome::Failed(rec.error.clone()),
         },
     )
 }
 
 /// The callee's turn outcome as the caller sees it. An answer that belongs
-/// to an erased subject is the call error [`ERASED_ANSWER`] (ADR 0123): a
-/// callee whose turn ran across the erasure answers with its tombstones,
-/// and so does its saved outcome, which a re-run of the caller gets. As a
-/// missing prerequisite it left the caller's turn open, to fail the same
-/// way at every start.
+/// to an erased subject is the call error [`ERASED_ANSWER`] on a callee that
+/// committed ([`CallOutcome::Erased`], ADR 0123/0124): a callee whose turn
+/// ran across the erasure answers with its tombstones, and so does its saved
+/// outcome, which a re-run of the caller gets. As a missing prerequisite it
+/// left the caller's turn open, to fail the same way at every start; as a
+/// failed callee it would have dropped the caller's compensation.
 pub fn map_call_outcome(outcome: pb::Outcome) -> Result<CallOutcome, GateError> {
     let kind = pb::OutcomeKind::try_from(outcome.kind)
         .map_err(|_| GateError::Host("The committed callee outcome kind is invalid".into()))?;
     if erased_answer(&outcome) {
-        return Ok(CallOutcome::Failed(ERASED_ANSWER.into()));
+        return Ok(CallOutcome::Erased(ERASED_ANSWER.into()));
     }
     Ok(match kind {
         pb::OutcomeKind::Committed => CallOutcome::Ok(match outcome.output {
@@ -3331,7 +3365,7 @@ mod secret_tests {
             ..Default::default()
         };
         let erased = |outcome| match map_call_outcome(outcome) {
-            Ok(CallOutcome::Failed(error)) => error == ERASED_ANSWER,
+            Ok(CallOutcome::Erased(error)) => error == ERASED_ANSWER,
             _ => false,
         };
         assert!(erased(committed(pb::outcome::Output::Reply(pb::Message {
@@ -3405,6 +3439,82 @@ mod secret_tests {
             outcome_of_call(&recorded(ERASED_ANSWER)),
             Ok(CallOutcome::Failed(m)) if m == ERASED_ANSWER
         ));
+        let mut recorded_committed = recorded(ERASED_ANSWER);
+        recorded_committed.callee_source = Some(pb::ActorSource {
+            shard: None,
+            lsn: 11,
+            branch: "main".into(),
+        });
+        recorded_committed.observed_callee_status = Some(pb::EffectStatus::Ok as i32);
+        assert!(matches!(
+            outcome_of_call(&recorded_committed),
+            Ok(CallOutcome::Erased(m)) if m == ERASED_ANSWER
+        ));
+
+        // A failed caller's record still names the callee it owes and carries
+        // the commit the guest could not read (ADR 0124).
+        let secrets = [("none", b"none".as_slice())];
+        let matcher = CompiledScrubber::new(&secrets, 1024).unwrap();
+        let source = pb::ActorSource {
+            shard: None,
+            lsn: 11,
+            branch: "main".into(),
+        };
+        let mut record = pb::EffectRecord {
+            kind: "actor.call".into(),
+            callee_source: Some(source.clone()),
+            grounding: pb::Grounding::Live as i32,
+            ..Default::default()
+        };
+        let outcome = prepare_call_outcome(
+            &mut record,
+            CallOutcome::Erased(ERASED_ANSWER.into()),
+            "main:11".into(),
+            &matcher,
+            4096,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(outcome, CallOutcome::Erased(m) if m == ERASED_ANSWER));
+        assert_eq!(record.status, pb::EffectStatus::Failed as i32);
+        assert_eq!(record.error, ERASED_ANSWER);
+        assert!(record.response.is_none());
+        assert_eq!(
+            record.observed_callee_status,
+            Some(pb::EffectStatus::Ok as i32)
+        );
+        assert!(record.successful_call());
+        assert!(
+            Record::EffectResult(pb::EffectResult {
+                execution_id: "0".repeat(32),
+                effect: Some(record.clone()),
+            })
+            .validate()
+            .is_ok()
+        );
+
+        // A deliberate callee failure is not a committed answer, even with
+        // the same source.
+        let mut failed = pb::EffectRecord {
+            kind: "actor.call".into(),
+            callee_source: Some(source),
+            ..Default::default()
+        };
+        let outcome = prepare_call_outcome(
+            &mut failed,
+            CallOutcome::Failed("deliberate failure".into()),
+            String::new(),
+            &matcher,
+            4096,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(outcome, CallOutcome::Failed(m) if m == "deliberate failure"));
+        assert_eq!(failed.status, pb::EffectStatus::Failed as i32);
+        assert!(failed.observed_callee_status.is_none());
+        assert!(!failed.successful_call());
     }
 
     #[test]

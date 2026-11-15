@@ -6,6 +6,12 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- A call whose callee committed but whose answer an erasure tombstoned is a
+  standing call: if the caller then fails, the change is listed as an orphan
+  and the call's compensation is delivered exactly once, instead of being
+  recorded as a failed callee and silently dropped. A saved answer keeps the
+  callee's committed outcome with its values tombstoned, so a call that
+  arrives across the erasure still owes the same guarantee (ADR 0124).
 - Changing a grant's rate takes effect on the next call: the target's limiter
   starts its window over at the new rate instead of spending the superseded
   grant's pace. Raising `1/h` to `60/s` no longer waits out the hour.
