@@ -75,10 +75,9 @@ personal data unless your token has `pii:read`.
   gives one connection's turns, with what each sent and whether the frames
   were written.
 - A body larger than its kind's blob threshold (an upload, a large `fetch`
-  response, a blob an actor wrote) shows in a turn as a blob: a `b3:` hash,
-  or `b3s:` for a subject's, and a size, never the bytes. `inspect_blob`
-  with that hash says what keeps it; the bytes are for an operator
-  (`kronik blobs get`).
+  response, a blob an actor wrote) is a blob, outside the log. History does
+  not show a turn's blobs; "Large bodies and blobs" below says where their
+  hashes show and what you must know about them.
 
 ### 3. Make the change
 
@@ -154,7 +153,8 @@ Call `get_diff` with `{"proposal": "<id>"}` for the whole diff
   production. Anything above 0 is a regression, and the default policy
   denies it.
 - `responses`: HTTP answers that changed, as JSON diffs of status, headers
-  and body.
+  and body. A blob body is compared by reference and shown as
+  `{"blob": "b3:…", "size": N}`, never its bytes.
 - `frames`, when present: what the root inputs sent to WebSocket and SSE
   connections. `frames.changed` counts the inputs whose outgoing frames or
   whose open answers differ. Each item shows the changed frames as JSON
@@ -225,6 +225,54 @@ gets `SCOPE_MISSING` and a human creates it): a rebase proposal `r-...` whose di
 the effects that cannot be undone; it needs a human's approval, then
 `promote`.
 
+## Large bodies and blobs
+
+A body larger than its kind's blob threshold (1 MiB by default) is a
+**blob**: an upload, a `fetch` response, or bytes a turn writes. The record
+keeps only a reference, `b3:` and the BLAKE3 hash of the bytes (`b3s:` and
+a hash keyed per subject for a subject's blob) with the size; the bytes
+stay in the node's blob store. This holds for code that imports the blob
+interface, `kronik:actor/blobs` (`ctx.blobs` in the SDKs); other code gets
+no blobs. When you write or review such code:
+
+- **A hash is not a reference.** A turn may use exactly the blobs its actor
+  holds, the ones its input carries (an upload, a message's or timer's
+  `blobs`) and the ones it got during the turn (a `fetch` response, a
+  call's reply, a blob it wrote). Any other reference fails with
+  `BLOB_NOT_HELD`, even with the right hash: a hash kept in state, SQL or a
+  message body is data. Production and every replay check the same way.
+- **Holds keep blobs.** A blob a turn got is borrowed, readable until the
+  turn ends. To use it in later turns, the actor holds it: `retain(b)`, or
+  `put(bytes)` to store new bytes and hold them; `release(b)` ends the
+  actor's own hold. Holds change when the turn commits, like state. Keep
+  the hold, and store the hash and size to rebuild the reference later.
+- **Blobs travel in `blobs`.** A message, a timer or a call's reply carries
+  blobs in its `blobs` field, never in its body. The receiving turn may read
+  them, and holds one only if it retains it.
+- **Subjects.** A blob gets the subject in effect when it is written (the
+  turn's default; `putFor` names another), and in privacy mode it is sealed
+  with that subject's key, so erasing the subject makes it unreadable
+  (`SUBJECT_ERASED`). Keep its reference in a value or row of the same
+  subject, and send it under that subject.
+- **Quota.** An actor keeps at most its kind's blob quota alive (1 GiB by
+  default): its holds and the blobs of its timers, waiting messages and
+  dead letters. Past it, `put` and `retain` raise `BLOB_QUOTA_EXCEEDED`,
+  which the code can handle; a `send`, timer or `call` past it fails the
+  turn.
+- **Forks** read production's blobs, and the blobs a fork's turns write go
+  to the fork's own space.
+
+History shows a turn's input, writes and effects, not its blobs. A hash
+shows in an app's own answers and state (`inspect_actor`, which also counts
+the blobs an actor holds), in a diff's bodies, and in `blob_gc_plan`.
+`inspect_blob` with a hash gives the blob's state, size and what keeps it:
+`held` by an actor, a `pin` (a queued message, a timer, a dead letter, a
+saved response, a running turn), a `log` record within retention, a
+`snapshot`, a `fork` or a `lease`. `blob_gc_plan` lists the files nothing
+keeps, with why. Neither returns bytes or deletes anything: the collector
+deletes what nothing keeps, and the bytes are for an operator
+(`kronik blobs get`).
+
 ## Tools
 
 | Tool | Scope | Does |
@@ -232,7 +280,7 @@ the effects that cannot be undone; it needs a human's approval, then
 | `list_actors`, `inspect_actor` | `read` | Actors and their state |
 | `query_history`, `trace_turn` | `read` | History and causal trees |
 | `list_dead_letters` | `read` | Failed inputs and uncertain effects |
-| `inspect_blob` | `read` | A blob's state, size and what keeps it, by the hash a history shows; never its bytes |
+| `inspect_blob` | `read` | A blob's state, size and what keeps it, by its hash; never its bytes |
 | `list_connections` | `read` | WebSocket and SSE connections, or one by `id`; closing one is an operator's command |
 | `blob_gc_plan` | `read` | The blob files nothing keeps, with why (`loose`, `released`, `out-of-retention`, `erased`); deletes nothing |
 | `create_fork`, `send_to_fork` | `fork` | Forks and messages into them; never live effects |
@@ -268,6 +316,15 @@ never “fix” missing key material by making a new seed over existing data.
 | `VERIFY_REQUIRED` | A kind with history only changes through `propose_change`. |
 | `CAPABILITY_NOT_GRANTED` | The code calls a target it has no grant for. In a fork that call is denied; in production a human grants it. |
 | `SECRET_UNAVAILABLE` | A secret's value cannot be read now, often a linked secret whose backend is down. A fork never fetches one: it uses only a value the node already holds for the fork point. Ask the operator; do not retry in a loop. |
+| `BLOB_NOT_HELD` | The code used a blob reference its turn neither holds nor received, such as one rebuilt from a stored hash without a hold. Use the reference the turn got, or retain the blob in the turn that got it. |
+| `BLOB_QUOTA_EXCEEDED` | The actor would keep more blob bytes alive than its kind's quota. Release what it no longer needs, or handle the error in the code; raising the quota (`kronik limits set`) is the operator's. |
+| `BLOB_STORE_FULL` | The node's disk is below the blob store's reserve: uploads that would become blobs are refused, and turns that write blobs wait and run again. Ask the operator; do not retry in a loop. |
+| `BLOB_MISSING` | A committed blob's bytes are not in the store, which is never expected (a restore without them, or files removed by hand). Hand it to the operator. |
+| `BLOB_NOT_FOUND` | This node knows no such blob: a mistyped hash, another node's, or one nothing kept and the collector deleted. Check the hash. |
+| `UPLOAD_TOO_SLOW` | An upload arrived slower than the gateway's minimum rate (8 KiB/s, after 30 s), so nothing of it was kept. Send it faster. |
+| `PREVIEW_FULL` | A preview took as many requests, or as many blob bytes (256 MiB), as it can hold. It needs a new preview. |
+| `EFFECT_BYTES_EXCEEDED` | A turn's effects would record more inline bytes than its kind allows (32 MiB by default). Let large responses become blobs (code that reads blobs keeps them out of the log), or split the work over several turns. |
+| `SUBJECT_ERASED` | The data's subject was erased, a blob's too: it cannot be read. Do not retry; code that needs it must handle its absence. |
 | `ACTOR_NOT_FOUND`, `FORK_NOT_FOUND`, `PROPOSAL_NOT_FOUND`, `TURN_NOT_FOUND` | Check the id: list again. |
 | `UNAUTHENTICATED` | Your token is missing, unknown or revoked. |
 | `KEY_SOURCE_UNAVAILABLE` | A KMS operation could not complete within its total budget. Ask the operator to check provider reachability, credentials and key versions; the running node may still have its loaded key. |
