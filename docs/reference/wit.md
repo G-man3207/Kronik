@@ -105,9 +105,11 @@ The output:
   message.
 - An `http(http-response)` answer to a message is a message named
   `http <status>` (`http 200`), with an empty content type and the
-  response's body. A body that is a blob (M25) stays one: a caller of
-  `call` gets a message with an empty body and the blob as its one entry
-  in `blobs`, which it may read and retain (M26).
+  response's body. A body that is a blob (M25) stays one: the API caller
+  of an operator message gets its reference as the reply's `blob`, never
+  its bytes (`kronik blobs get` reads them), and a caller of `call` gets a
+  message with an empty body and the blob as its one entry in `blobs`,
+  which it may read and retain (M26).
 - `err(handler-error)` fails the turn, like a trap: `rejected(reason)` for an
   input the actor refuses, `failed(reason)` for an error. An HTTP client
   gets 500 `TURN_FAILED` with the turn id; a guest that wants a 4xx returns

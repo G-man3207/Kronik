@@ -1,8 +1,9 @@
 //! Answers that are blobs, on a real `kronik serve` with the test guest
-//! `media` (M25, M26), as the v0.5.0 release rehearsal met them: a call
-//! whose callee answers with a blob it wrote (`write` always makes one),
-//! from an HTTP turn and from a message turn, failed with 503 UNAVAILABLE,
-//! and the caller's turn stayed open.
+//! `media` (M25, M26), as the v0.5.0 release rehearsal met them, where each
+//! failed: a call whose callee answers with a blob it wrote (`write` always
+//! makes one), from an HTTP turn and from a message turn (503 UNAVAILABLE,
+//! and the caller's turn stayed open); and an operator's message answered
+//! with such a blob (503 UNAVAILABLE, "retry shortly", for good).
 
 // A test harness of a real daemon: unwraps, and deadlines on the wall clock.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
@@ -196,6 +197,18 @@ impl Daemon {
         assert_eq!(r.status, 200, "{path}: {}\n{}", r.text(), self.log());
         r.text()
     }
+
+    fn cli(&self, args: &[&str]) -> std::process::Output {
+        let socket = self.socket();
+        let mut all = vec!["--socket", socket.to_str().unwrap()];
+        all.extend_from_slice(args);
+        kronik()
+            .args(&all)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap()
+    }
 }
 
 impl Drop for Daemon {
@@ -354,4 +367,41 @@ fn a_call_answered_with_a_blob_the_callee_wrote() {
     let diff = d.api("GET", &format!("/v1/forks/{fork}/diff"), Value::Null, None);
     assert_eq!(diff["summary"]["changed"], false, "{diff}");
     assert!(diff["summary"]["replayed"].as_u64() >= Some(5), "{diff}");
+}
+
+/// An operator's message whose turn answers with a blob it wrote gets the
+/// blob's reference as its reply (`blob`, no inline bytes), which `kronik
+/// send` shows and `kronik blobs get` reads.
+#[test]
+fn an_operator_message_answered_with_a_blob() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = Daemon::start(tmp.path());
+    deploy(&d);
+    let turn = d.send("media/b", "write?size=100000");
+    assert_eq!(turn["outcome"]["kind"], "committed", "{turn}");
+    let reply = &turn["reply"];
+    assert_eq!(reply["name"], "http 200", "{turn}");
+    assert_eq!(reply["blob"]["size"], 100_000, "{turn}");
+    assert!(reply.get("text").is_none() && reply.get("base64").is_none());
+    let hash = reply["blob"]["hash"].as_str().unwrap().to_owned();
+    assert!(hash.starts_with("b3:"), "{turn}");
+    let file = tmp.path().join("reply.bin");
+    let o = d.cli(&["blobs", "get", &hash, "-o", file.to_str().unwrap()]);
+    assert!(o.status.success(), "{o:?}");
+    assert!(std::fs::read(&file).unwrap() == pattern(100_000));
+
+    let o = d.cli(&[
+        "send",
+        "media/b",
+        "write?size=2000",
+        "--reason",
+        "blob replies",
+    ]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{o:?}");
+    assert!(out.contains("committed on media/b"), "{out}");
+    assert!(
+        out.contains("Blob b3:") && out.contains("(2000 bytes)"),
+        "{out}"
+    );
 }

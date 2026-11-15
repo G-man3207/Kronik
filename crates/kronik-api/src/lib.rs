@@ -328,24 +328,15 @@ fn turn_response(r: Option<TurnResult>) -> Result<TurnResponse> {
             reply: None,
         });
     };
-    let missing_custody = || {
-        ApiError::new(
-            ErrorCode::Unavailable,
-            "the reply requires its original operation-held blob source, which this source projection does not carry",
-        )
-    };
+    // A reply's blobs (M25, M26) are shown as references, never their
+    // bytes: `kronik blobs get` reads one, with its own permissions.
     let reply = match &r.outcome.output {
-        Some(pb::outcome::Output::Reply(message)) => {
-            if !message.blobs.is_empty() {
-                return Err(missing_custody());
-            }
-            Some(Reply::inline(
-                message.name.clone(),
-                message.content_type.clone(),
-                Payload::from_bytes(output_bytes(message.body.as_ref(), &r.turn_id)?),
-                Vec::new(),
-            ))
-        }
+        Some(pb::outcome::Output::Reply(message)) => Some(Reply::inline(
+            message.name.clone(),
+            message.content_type.clone(),
+            Payload::from_bytes(output_bytes(message.body.as_ref(), &r.turn_id)?),
+            message.blobs.iter().map(BlobReference::from).collect(),
+        )),
         Some(pb::outcome::Output::Http(http)) => {
             match http.body.as_ref().and_then(|body| body.value.as_ref()) {
                 Some(pb::body::Value::Inline(value)) => Some(Reply::inline(
@@ -354,11 +345,17 @@ fn turn_response(r: Option<TurnResult>) -> Result<TurnResponse> {
                     Payload::from_bytes(output_bytes(Some(value), &r.turn_id)?),
                     Vec::new(),
                 )),
-                Some(pb::body::Value::Blob(_)) => return Err(missing_custody()),
+                Some(pb::body::Value::Blob(blob)) => Some(Reply::blob(
+                    format!("http {}", http.status),
+                    String::new(),
+                    BlobReference::from(blob),
+                )),
+                // A committed HTTP answer always has a body: a bug, not a
+                // condition to retry.
                 None => {
                     return Err(ApiError::new(
-                        ErrorCode::Unavailable,
-                        "the reply has no available body source",
+                        ErrorCode::Internal,
+                        "the turn's HTTP answer has no body",
                     ));
                 }
             }
@@ -2734,6 +2731,73 @@ mod tests {
         assert!(e.message.contains("turn main:5"), "{}", e.message);
         let plain = pb::sealable::Value::Plain(b"ok".to_vec());
         assert!(turn_response(Some(reply(plain))).is_ok());
+    }
+
+    /// A turn that answered an operator's message with a blob was refused
+    /// as `UNAVAILABLE` ("retry shortly"), although no retry could help
+    /// (found by the v0.5.0 release rehearsal). An HTTP answer's blob body
+    /// is the reply's `blob`, a reply message's blobs are its `blobs`, both
+    /// as references, never bytes; an HTTP answer without a body, which no
+    /// committed record has, is a bug.
+    #[test]
+    fn a_reply_with_blobs_shows_their_references() {
+        let blob = |n: u8| pb::BlobRef {
+            hash: format!("b3:{}", format!("{n:02x}").repeat(32)),
+            size: u64::from(n) * 1000,
+            subject: None,
+            key_version: 0,
+        };
+        let turn = |output| TurnResult {
+            turn_id: TurnId {
+                branch: "main".into(),
+                lsn: 7,
+            },
+            outcome: pb::Outcome {
+                kind: pb::OutcomeKind::Committed as i32,
+                output: Some(output),
+                ..Default::default()
+            },
+            scrubbed_with: None,
+        };
+        let http = |body| {
+            pb::outcome::Output::Http(pb::HttpResponse {
+                status: 200,
+                body,
+                ..Default::default()
+            })
+        };
+        let answered = turn_response(Some(turn(http(Some(pb::Body {
+            value: Some(pb::body::Value::Blob(blob(3))),
+        })))))
+        .unwrap();
+        let reply = answered.reply.unwrap();
+        assert_eq!(reply.name, "http 200");
+        assert_eq!(reply.blob, Some(BlobReference::from(&blob(3))));
+        assert!(reply.body.text.is_none() && reply.body.base64.is_none());
+        assert_eq!(
+            serde_json::to_value(&reply).unwrap(),
+            serde_json::json!({"name": "http 200", "content_type": "",
+                "blob": {"hash": blob(3).hash, "size": 3000}})
+        );
+        let message = pb::outcome::Output::Reply(pb::Message {
+            name: "done".into(),
+            body: Some(pb::Sealable {
+                subject: None,
+                value: Some(pb::sealable::Value::Plain(b"ok".to_vec())),
+            }),
+            blobs: vec![blob(1), blob(2)],
+            ..Default::default()
+        });
+        let reply = turn_response(Some(turn(message))).unwrap().reply.unwrap();
+        assert_eq!(reply.body.text.as_deref(), Some("ok"));
+        assert_eq!(
+            reply.blobs,
+            vec![BlobReference::from(&blob(1)), BlobReference::from(&blob(2))]
+        );
+        let Err(e) = turn_response(Some(turn(http(None)))) else {
+            panic!("an HTTP answer without a body was shown");
+        };
+        assert_eq!(e.code, ErrorCode::Internal);
     }
 
     /// `+` is literal in a path segment (#47) and a space in a query.

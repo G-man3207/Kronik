@@ -11,7 +11,10 @@ until the v1.0 compatibility promise takes effect.
   failed the caller with 503 `UNAVAILABLE` and left the caller's turn open,
   to fail the same way at every start; the caller now gets a reply named
   `http <status>` with an empty body and the blob in its `blobs`, which it
-  may read and retain.
+  may read and retain. An operator's message answered with a blob (`kronik
+  send`, `POST /v1/actors/{kind}/{key}/messages`) failed with 503
+  `UNAVAILABLE` and the hint to retry; its reply now carries the blob's
+  reference as `blob`, and a reply message's blobs as `blobs`.
 - `kronik upgrade check`, and the start of a daemon whose engine changed,
   replay blob turns (M25, M26): they replayed without the blob store, so a
   turn with a recorded blob response failed the check, and a node with one
