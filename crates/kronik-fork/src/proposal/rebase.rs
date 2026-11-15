@@ -39,14 +39,19 @@ pub struct RebaseDone {
 }
 
 /// The hash a fork turn is compared by when a rebase resumes (H3): its
-/// record as the fork's log holds it in plaintext, with an erased subject's
-/// values as the tombstones the log holds (`Sealer::keep_erasures`), so a
-/// fresh replay and the log agree on them.
-fn logged_hash(sealer: &kronik_privacy::sealer::Sealer, t: pb::TurnRecord) -> blake3::Hash {
+/// record as the fork's log holds it in plaintext, with the values of
+/// `born` that predate their subject's erasure as the erasure's tombstones.
+/// `born` is the same on both sides of the comparison (the production turn
+/// it copied, or the fork's generation for a turn it computed), so a fresh
+/// replay and the log agree on them.
+fn logged_hash(node: &Node, born: Born, t: pb::TurnRecord) -> blake3::Hash {
     let mut record = Record::TurnRecord(t);
-    // A keystore that cannot be read leaves the values as they are, and the
-    // comparison then refuses a resume rather than accepting one.
-    let _ = sealer.keep_erasures(&mut record);
+    node.tombstone_fork_record(&mut record, born);
+    // A fork creates no key version for an erased subject: the values it
+    // holds of one without a newer key are tombstones too. A keystore that
+    // cannot be read leaves them as they are, and the comparison then
+    // refuses a resume rather than accepting one.
+    let _ = node.sealer().keep_erased_without_keys(&mut record);
     match &record {
         Record::TurnRecord(t) => blake3::hash(&t.encode_to_vec()),
         _ => blake3::hash(&[]),
@@ -267,14 +272,17 @@ impl Proposals {
         self.write_log(id, live).await?;
         self.check_newest(rolled_back_epoch)?;
         let staged = self.node.rebase_staged_to(id).unwrap_or(0);
-        let turns: Vec<(Lsn, pb::TurnRecord)> = live
+        let turns: Vec<(Lsn, pb::TurnRecord, Born)> = live
             .continuous
             .as_ref()
             .map(Continuous::turns)
             .unwrap_or_default()
             .into_iter()
             .filter(|t| t.lsn > staged)
-            .map(|t| (t.lsn, t.record))
+            .map(|t| {
+                let born = self.fork_born(&t);
+                (t.lsn, t.record, born)
+            })
             .collect();
         for batch in turns.chunks(512) {
             self.node
@@ -305,8 +313,8 @@ impl Proposals {
         Ok(staged)
     }
 
-    /// The turns of the fork's own log (LSN, record hash), in order.
-    async fn logged_turns(&self, id: &str) -> Result<Vec<(Lsn, blake3::Hash)>, ApiError> {
+    /// The turns of the fork's own log (LSN, plaintext record), in order.
+    async fn logged_turns(&self, id: &str) -> Result<Vec<(Lsn, pb::TurnRecord)>, ApiError> {
         let dir = self.dir(id).join("log");
         let mut out = Vec::new();
         if !dir.exists() {
@@ -320,7 +328,7 @@ impl Proposals {
                 let mut record = c.record;
                 self.node.sealer().unseal_record(&mut record);
                 if let Record::TurnRecord(t) = record {
-                    out.push((c.lsn, logged_hash(self.node.sealer(), t)));
+                    out.push((c.lsn, t));
                 }
                 Ok(())
             })
@@ -438,7 +446,7 @@ impl Proposals {
         &self,
         meta: &mut Proposal,
         live: &mut Live,
-        logged: Option<Vec<(Lsn, blake3::Hash)>>,
+        logged: Option<Vec<(Lsn, pb::TurnRecord)>>,
         consistent: &mut bool,
         id: &str,
         audit: pb::Audit,
@@ -476,11 +484,20 @@ impl Proposals {
         // turns already staged into main's log, or none may be added (H3).
         if let Some(logged) = logged {
             let staged = self.staged_in_log(id, fork_lsn).await?;
-            let fresh: Vec<(Lsn, blake3::Hash)> = live
+            let turns = live
                 .continuous
                 .as_ref()
                 .map(Continuous::turns)
-                .unwrap_or_default()
+                .unwrap_or_default();
+            // A logged turn is hashed with the provenance of its fresh
+            // counterpart, so a copied production turn compares by its
+            // production LSN on both sides (a fork-computed turn by now).
+            let births: BTreeMap<Lsn, Born> = turns
+                .iter()
+                .filter(|t| t.lsn <= staged)
+                .map(|t| (t.lsn, self.fork_born(t)))
+                .collect();
+            let fresh: Vec<(Lsn, blake3::Hash)> = turns
                 .iter()
                 .filter(|t| t.lsn <= staged)
                 // As the fork log holds it (`write_log`), before sealing; an
@@ -488,11 +505,21 @@ impl Proposals {
                 .map(|t| {
                     (
                         t.lsn,
-                        logged_hash(self.node.sealer(), super::shown_record(t)),
+                        logged_hash(&self.node, self.fork_born(t), super::shown_record(t)),
                     )
                 })
                 .collect();
-            let before: Vec<_> = logged.into_iter().filter(|(l, _)| *l <= staged).collect();
+            let before: Vec<_> = logged
+                .into_iter()
+                .filter(|(l, _)| *l <= staged)
+                .map(|(l, t)| {
+                    let born = births
+                        .get(&l)
+                        .copied()
+                        .unwrap_or_else(|| self.node.born_now());
+                    (l, logged_hash(&self.node, born, t))
+                })
+                .collect();
             if fresh != before {
                 *consistent = false;
                 return Err(ApiError::new(

@@ -31,7 +31,7 @@ use kronik_proto::log::v1 as pb;
 
 /// Where a queued input's values came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Born {
+pub enum Born {
     /// Held in memory since the node's erasure generation was this.
     Gen(u64),
     /// Read back from the record at this LSN, or from a `state.db` row it

@@ -503,7 +503,7 @@ impl Sealer {
 
     /// The keys of a subject's blob that a fork writes (a preview's upload,
     /// a fork turn's writer), by the rule of the fork's own record sealing
-    /// ([`Sealer::seal_record_keeping_erasures`]). With the mode on: the
+    /// ([`Sealer::keep_erased_without_keys`]): with the mode on, the
     /// subject's key, created when it has none and was never erased, as the
     /// fork's record that names the blob creates it; `None` when it was
     /// erased and has no key newer than its erasure, as a fork never makes a
@@ -797,10 +797,12 @@ impl Sealer {
     }
 
     /// [`Sealer::seal_record`] for a record that is not production's own (a
-    /// fork's): it never creates a key version for an erased subject
-    /// ([`Sealer::keep_erasures`] first). A subject that came back after its
-    /// erasure seals with its new key, and one never erased gets a key as
-    /// usual. Returns how many values became tombstones.
+    /// fork's) and whose caller cannot supply provenance. It is a fallback:
+    /// without provenance it cannot tell a copied pre-erasure value from new
+    /// data, so it refuses ([`Sealer::keep_erasures`]) rather than seal a
+    /// value of an erased subject under a newer key. Callers that know the
+    /// record's provenance tombstone the values that predate their subject's
+    /// erasure and then call [`Sealer::seal_record`].
     pub fn seal_record_keeping_erasures(
         &self,
         r: &mut Record,
@@ -815,12 +817,52 @@ impl Sealer {
         Ok(tombstones)
     }
 
-    /// Every value of `r` of a subject the keystore erased and that has no
-    /// key newer than the erasure becomes the erasure's [`erased_value`]: a
-    /// plain one (a fork's stand-in or copy) and a sealed one that opens as
-    /// erased alike, so two records that differ only there compare equal.
-    /// Returns how many values it replaced.
+    /// Refuses to process `r` when any tagged value names a subject the
+    /// keystore has erased, because without the record's provenance this
+    /// cannot tell a pre-erasure copy from new data (ADR 0123 §3, §6). Its
+    /// fallback callers must pass provenance and use
+    /// [`Sealer::seal_record`]; the node's fork sealing does.
+    ///
+    /// Subjects that were never erased are not a decision: it reads their
+    /// erasure floor, and returns 0 without changing `r` when there is none.
     pub fn keep_erasures(&self, r: &mut Record) -> Result<u64, PrivacyError> {
+        if self.keystore.is_none() {
+            // Without a keystore there is no erasure history to check, and
+            // nothing is ever sealed.
+            return Ok(0);
+        }
+        let mut err = None;
+        kronik_proto::sealables::record_mut(r, &mut |s| {
+            if err.is_some() {
+                return;
+            }
+            let Some(subject) = &s.subject else {
+                return;
+            };
+            match self.erasure_floor(subject) {
+                Ok(None) => {}
+                Ok(Some(floor)) => {
+                    err = Some(PrivacyError::Decrypt(format!(
+                        "refusing to seal a value of {subject} without provenance: its \
+                         erasure floor is key version {floor}"
+                    )));
+                }
+                Err(e) => err = Some(e),
+            }
+        });
+        err.map_or(Ok(0), Err)
+    }
+
+    /// Tombstones every value of `r` whose subject was erased and has no key
+    /// version newer than the erasure: a fork never makes one for an erased
+    /// subject (M8 §6.8). A subject that came back keeps its values for
+    /// [`Sealer::seal_record`], under its new key.
+    ///
+    /// The caller must already have tombstoned the values that predate their
+    /// subject's erasure from the record's provenance; this is the rest of
+    /// the fork rule, not a substitute for that provenance. Returns how many
+    /// values it replaced.
+    pub fn keep_erased_without_keys(&self, r: &mut Record) -> Result<u64, PrivacyError> {
         let Some(ks) = &self.keystore else {
             return Ok(0);
         };
@@ -833,26 +875,25 @@ impl Sealer {
             let Some(subject) = &s.subject else {
                 return;
             };
-            let floor = match (self.erasure_floor(subject), ks.newest_version(subject)) {
-                (Ok(Some(floor)), Ok(None)) => floor,
-                (Ok(_), Ok(_)) => return,
-                (Err(e), _) | (_, Err(e)) => {
+            let floor = match self.erasure_floor(subject) {
+                Ok(Some(floor)) => floor,
+                Ok(None) => return,
+                Err(e) => {
                     err = Some(e);
                     return;
                 }
             };
-            let erased = match &s.value {
-                Some(pb::sealable::Value::Plain(_)) => true,
-                Some(pb::sealable::Value::Sealed(x)) => {
-                    *x != erased_value(floor) && matches!(self.open(s), Opened::Erased { .. })
+            match ks.newest_version(subject) {
+                Ok(None) => {}
+                Ok(Some(_)) => return,
+                Err(e) => {
+                    err = Some(e);
+                    return;
                 }
-                None => false,
-            };
-            if erased {
-                if let Some(pb::sealable::Value::Plain(mut plain)) = s
-                    .value
-                    .replace(pb::sealable::Value::Sealed(erased_value(floor)))
-                {
+            }
+            let tombstone = pb::sealable::Value::Sealed(erased_value(floor));
+            if s.value.as_ref() != Some(&tombstone) {
+                if let Some(pb::sealable::Value::Plain(mut plain)) = s.value.replace(tombstone) {
                     plain.zeroize();
                 }
                 replaced += 1;
@@ -1068,10 +1109,12 @@ mod tests {
         }
     }
 
-    /// A fork's record never brings an erased subject back: its values become
-    /// the erasure's tombstone, with no new key version, while a subject that
-    /// was never erased, and one that came back after its erasure, seal as
-    /// usual.
+    /// A fork's record without provenance never brings an erased subject
+    /// back: once a subject has an erasure floor the fallback refuses the
+    /// record instead of sealing it under a newer key. With provenance the
+    /// node tombstones the copied value and calls `seal_record`, which still
+    /// seals a subject that was never erased, and one that came back under a
+    /// new key, as usual.
     #[test]
     fn a_forks_record_keeps_erasures() {
         let dir = tempfile::tempdir().unwrap();
@@ -1106,20 +1149,51 @@ mod tests {
             ],
             ..Default::default()
         });
-        let fresh = record.clone();
-        let n = s
+        let unchanged = record.clone();
+        let err = s
             .seal_record_keeping_erasures(&mut record, &fill, 6)
-            .unwrap();
-        assert_eq!(n, 1);
-        // Read back, the record compares equal to the fork's fresh one once
-        // both keep the erasures (a rebase's resume check).
-        let mut logged = record.clone();
-        s.unseal_record(&mut logged);
-        let mut fresh = fresh;
-        s.keep_erasures(&mut fresh).unwrap();
-        s.keep_erasures(&mut logged).unwrap();
-        assert_eq!(logged, fresh);
-        let Record::TurnRecord(t) = record else {
+            .unwrap_err();
+        assert!(err.to_string().contains("without provenance"), "{err}");
+        assert_eq!(record, unchanged, "the fallback sealed something");
+        assert_eq!(
+            s.keystore().unwrap().newest_version("user:1").unwrap(),
+            None,
+            "a key version of user:1 was created after its erasure"
+        );
+        assert_eq!(
+            s.keystore().unwrap().newest_version("user:2").unwrap(),
+            None,
+            "the fallback sealed a value of an unprovenanced record"
+        );
+
+        // A caller that knows the erasure copies the tombstone; what is new
+        // and was never erased still seals, and a subject that came back
+        // seals under its new key.
+        let mut provided = Record::TurnRecord(pb::TurnRecord {
+            writes: vec![
+                pb::StateWrite {
+                    key: "a".into(),
+                    op: pb::StateOp::Set as i32,
+                    value: Some(pb::Sealable {
+                        subject: Some("user:1".into()),
+                        value: Some(pb::sealable::Value::Sealed(erased_value(1))),
+                    }),
+                },
+                pb::StateWrite {
+                    key: "b".into(),
+                    op: pb::StateOp::Set as i32,
+                    value: Some(val(Some("user:2"), b"never erased")),
+                },
+                pb::StateWrite {
+                    key: "c".into(),
+                    op: pb::StateOp::Set as i32,
+                    value: Some(val(Some("user:3"), b"came back")),
+                },
+            ],
+            ..Default::default()
+        });
+        s.seal_record(&mut provided, &fill, 6).unwrap();
+        let Record::TurnRecord(t) = provided else {
             unreachable!()
         };
         let sealed = |i: usize| match t.writes[i].value.as_ref().and_then(|v| v.value.as_ref()) {
@@ -1130,9 +1204,8 @@ mod tests {
         assert_eq!(sealed(1).key_version, 1);
         assert_eq!(sealed(2).key_version, 2, "user:3's key after its erasure");
         assert_eq!(
-            s.keystore().unwrap().newest_version("user:1").unwrap(),
-            None,
-            "a key version of user:1 was created after its erasure"
+            s.open(t.writes[2].value.as_ref().unwrap()).bytes(),
+            Some(&b"came back"[..])
         );
     }
 

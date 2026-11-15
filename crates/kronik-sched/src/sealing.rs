@@ -13,6 +13,7 @@ use kronik_privacy::sealer::Unreadable;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 
+use crate::erasure::Born;
 use crate::node::Node;
 
 fn is_sealed(s: Option<&pb::Sealable>) -> bool {
@@ -77,24 +78,44 @@ impl Node {
             .map_err(|e| ApiError::new(ErrorCode::Internal, format!("sealing: {e}")))
     }
 
+    /// Replaces every value of `record` that predates its subject's erasure
+    /// with that erasure's tombstone, as [`Node::seal_born`] does for
+    /// production's records. `born` is the record's provenance: the
+    /// production LSN it was recorded at, or the node's erasure generation
+    /// for a fork-computed turn. Returns how many values it replaced.
+    ///
+    /// A fork's log, its samples and the turns a rebase stages into main's
+    /// log call this before [`Node::seal`], so that a value of an erased
+    /// subject never seals under a key version newer than the erased ones
+    /// (ADR 0123 §6, docs/design/m8-privacy.md §6.8).
+    pub fn tombstone_fork_record(&self, record: &mut Record, born: Born) -> usize {
+        self.erasure_marks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tombstone(born, |f| {
+                kronik_proto::sealables::record_mut(record, f);
+            })
+    }
+
     /// Seals a record a fork writes to disk (its log, its samples): like
-    /// [`Node::seal`], except that a value of an erased subject becomes the
-    /// erasure's tombstone instead of being sealed under a new key version.
-    /// A fork's turns hold what it revealed or computed; none of it may bring
-    /// an erased subject back (docs/design/m8-privacy.md §6.8).
-    pub fn seal_fork_record(&self, record: &mut Record) -> Result<(), ApiError> {
+    /// [`Node::seal`], except that a value of a subject erased after the
+    /// record's provenance `born` becomes the erasure's tombstone instead of
+    /// being sealed under a new key version, and a fork never creates a key
+    /// version for an erased subject (`keep_erased_without_keys`). A fork's
+    /// turns hold what it revealed or computed; none of it may bring an
+    /// erased subject back (docs/design/m8-privacy.md §6.8).
+    ///
+    /// A copied production turn passes its production LSN; a fork-computed
+    /// turn passes [`Node::born_now`].
+    pub fn seal_fork_record(&self, record: &mut Record, born: Born) -> Result<(), ApiError> {
         if !self.sealer.is_on() {
             return Ok(());
         }
-        let entropy = self.env.entropy.clone();
+        self.tombstone_fork_record(record, born);
         self.sealer
-            .seal_record_keeping_erasures(
-                record,
-                &|b: &mut [u8]| entropy.fill(b),
-                self.env.clock.wall_ms(),
-            )
-            .map(|_| ())
-            .map_err(|e| ApiError::new(ErrorCode::Internal, format!("sealing: {e}")))
+            .keep_erased_without_keys(record)
+            .map_err(|e| ApiError::new(ErrorCode::Internal, format!("sealing: {e}")))?;
+        self.seal(record)
     }
 
     /// The error of a turn whose input cannot be unsealed.

@@ -13,7 +13,7 @@ use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use prost::Message as _;
 
-use crate::{Node, NodeConfig};
+use crate::{Born, Node, NodeConfig};
 
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -39,6 +39,118 @@ fn message(name: &str, body: &str, subject: Option<&str>) -> pb::Message {
         blobs: Vec::new(),
         retained_compensation_source: None,
     }
+}
+
+/// A value a fork copies from production predates the subject's erasure even
+/// when the subject has since come back with a newer key: the copy is the
+/// erasure's tombstone, while a value born after the erasure still seals
+/// under the newer key and opens (ADR 0123 §3, §6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copied_value_of_a_come_back_subject_is_the_tombstone() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = counter_node(dir.path()).await;
+    let authority = node.local_operator_authority().unwrap();
+    // Mode off: the erasure is recorded with no key version.
+    let erased = node
+        .erase_subject("user:1", audit(), false, authority.clone())
+        .await
+        .unwrap();
+    assert_eq!(erased.key_version, 0);
+    let erased_lsn = erased.lsn.unwrap();
+    // The subject comes back: a post-erasure value creates key version 1.
+    node.set_privacy_mode(pb::PrivacyState::On, audit(), false, authority)
+        .await
+        .unwrap();
+    let fill = |b: &mut [u8]| b.fill(7);
+
+    let copied = |needle: &[u8]| {
+        Record::TurnRecord(pb::TurnRecord {
+            writes: vec![pb::StateWrite {
+                key: "n".into(),
+                op: pb::StateOp::Set as i32,
+                value: Some(pb::Sealable {
+                    subject: Some("user:1".into()),
+                    value: Some(pb::sealable::Value::Plain(needle.to_vec())),
+                }),
+            }],
+            ..Default::default()
+        })
+    };
+
+    // A fork computes a new value before the subject has come back: it is
+    // still the erasure's tombstone, and creates no key version.
+    let mut computed = copied(b"FORK-COMPUTED");
+    node.seal_fork_record(&mut computed, node.born_now())
+        .unwrap();
+    let Record::TurnRecord(t) = &computed else {
+        unreachable!()
+    };
+    let value = t.writes[0].value.as_ref().unwrap();
+    assert_eq!(
+        value.value,
+        Some(pb::sealable::Value::Sealed(
+            kronik_privacy::sealer::erased_value(0)
+        ))
+    );
+    assert_eq!(
+        node.sealer()
+            .keystore()
+            .unwrap()
+            .newest_version("user:1")
+            .unwrap(),
+        None,
+        "a fork created a key version for an erased subject"
+    );
+
+    // The subject comes back: a post-erasure value creates key version 1.
+    let mut fresh = pb::Sealable {
+        subject: Some("user:1".into()),
+        value: Some(pb::sealable::Value::Plain(b"NEW".to_vec())),
+    };
+    node.sealer().seal_value(&mut fresh, &fill, 1).unwrap();
+    let version = match fresh.value.as_ref() {
+        Some(pb::sealable::Value::Sealed(s)) => s.key_version,
+        other => panic!("not sealed: {other:?}"),
+    };
+    assert_eq!(version, 1);
+
+    // Written before the erasure: it becomes the erasure's tombstone even
+    // though version 1 exists now.
+    let mut before = copied(b"NEEDLE");
+    node.seal_fork_record(&mut before, Born::Lsn(erased_lsn - 1))
+        .unwrap();
+    let Record::TurnRecord(t) = &before else {
+        unreachable!()
+    };
+    let value = t.writes[0].value.as_ref().unwrap();
+    assert_eq!(
+        value.value,
+        Some(pb::sealable::Value::Sealed(
+            kronik_privacy::sealer::erased_value(0)
+        ))
+    );
+    assert!(matches!(
+        node.sealer().open(value),
+        kronik_privacy::sealer::Opened::Erased { ref subject } if subject == "user:1"
+    ));
+
+    // The control: a genuinely new post-erasure value seals under version 1
+    // and opens.
+    let mut after = copied(b"NEEDLE-AFTER");
+    node.seal_fork_record(&mut after, Born::Lsn(erased_lsn + 1))
+        .unwrap();
+    let Record::TurnRecord(t) = &after else {
+        unreachable!()
+    };
+    let value = t.writes[0].value.as_ref().unwrap();
+    assert!(matches!(
+        value.value.as_ref(),
+        Some(pb::sealable::Value::Sealed(s)) if s.key_version == 1
+    ));
+    assert_eq!(
+        node.sealer().open(value).into_owned().as_deref(),
+        Some(&b"NEEDLE-AFTER"[..])
+    );
 }
 
 /// An HTTP server on an ephemeral port that answers its first request only

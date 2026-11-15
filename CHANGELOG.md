@@ -6,6 +6,13 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- A fork seals with the provenance of what it writes: a value copied from a
+  production turn before its subject's erasure is the erasure's tombstone in
+  the fork log, its samples and the turns a rebase stages into main's log,
+  never a value sealed under a key version created after the erasure. A
+  caller that cannot supply provenance refuses instead of sealing an erased
+  subject. The fork log's own leading records and a turn the fork computes
+  itself take its current generation.
 - A sampled proposal's promote re-samples the whole window on every catch-up
   round instead of appending a fresh sample of that round's roots. A promote
   after a restart therefore returns the same isolated trees, summary and

@@ -13,7 +13,7 @@ use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, Lsn};
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{CodeSwitch, Node, NodeConfig, SwitchHold, start_local};
+use kronik_sched::{Born, CodeSwitch, Node, NodeConfig, SwitchHold, start_local};
 
 fn guest(name: &str) -> Vec<u8> {
     std::fs::read(format!(
@@ -259,7 +259,7 @@ async fn nothing_is_staged_after_the_pause_bound() {
     let err = node
         .rebase_stage(
             "r-late",
-            vec![(head, turn)],
+            vec![(head, turn, Born::Lsn(head))],
             not_after,
             Some(&pause),
             owner(&node),

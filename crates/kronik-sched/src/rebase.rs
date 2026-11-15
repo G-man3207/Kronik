@@ -15,6 +15,7 @@ use kronik_proto::log::v1 as pb;
 use kronik_store::rebase::Shadow;
 use kronik_store::{Store, StoreError};
 
+use crate::erasure::Born;
 use crate::node::Node;
 use crate::node::{internal, store_err};
 
@@ -305,13 +306,13 @@ impl Node {
     async fn import_rebase_blobs(
         &self,
         id: &str,
-        turns: &[(Lsn, pb::TurnRecord)],
+        turns: &[(Lsn, pb::TurnRecord, Born)],
     ) -> Result<Option<kronik_blob::Lease>, ApiError> {
         let Some(store) = self.blob_store().cloned() else {
             return Ok(None);
         };
         let mut refs = Vec::new();
-        for (_, turn) in turns {
+        for (_, turn, _) in turns {
             kronik_proto::blobs::turn(turn, &mut refs);
         }
         if refs.is_empty() {
@@ -370,12 +371,14 @@ impl Node {
         }
     }
 
-    /// Writes fork turns of rebase `id` (fork LSN, record; in fork order)
-    /// into main's log and feeds them to the shadow.
+    /// Writes fork turns of rebase `id` (fork LSN, record, provenance; in
+    /// fork order) into main's log and feeds them to the shadow. The
+    /// provenance is the production turn a copied turn came from, or the
+    /// fork generation of a turn the fork computed (`Born`).
     pub async fn rebase_stage(
         &self,
         id: &str,
-        turns: Vec<(Lsn, pb::TurnRecord)>,
+        turns: Vec<(Lsn, pb::TurnRecord, Born)>,
         not_after: Lsn,
         pause: Option<&crate::gate::Drain>,
         authority: AuthLease,
@@ -393,13 +396,13 @@ impl Node {
                 "the last round did not fit in rebase.max_pause; nothing was switched",
             ));
         }
-        let Some(last_fork) = turns.last().map(|(l, _)| *l) else {
+        let Some(last_fork) = turns.last().map(|(l, _, _)| *l) else {
             return self.rebase_refresh(id, authority).await;
         };
         // Every batch keeps to the reserve, not only the estimate before the
         // first: turns staged so far stay unused and are reused by a later
         // promote (review N13-2).
-        let bytes: u64 = turns.iter().map(|(_, r)| rebase_turn_bytes(id, r)).sum();
+        let bytes: u64 = turns.iter().map(|(_, r, _)| rebase_turn_bytes(id, r)).sum();
         if self.disk_below_reserve().is_some()
             || self.disk_budget().is_some_and(|room| bytes > room)
         {
@@ -419,20 +422,23 @@ impl Node {
         // references them is appended (M25 §4.3), and stay leased until the
         // records are applied, which the appends below wait for.
         let _blobs = self.import_rebase_blobs(id, &turns).await?;
-        let records = turns.into_iter().map(|(fork_lsn, record)| {
-            Record::StateRebase(pb::StateRebase {
-                rebase_id: id.to_owned(),
-                part: Some(pb::state_rebase::Part::Turn(pb::RebasedTurn {
-                    fork_lsn,
-                    record: Some(record),
-                })),
-            })
+        let records = turns.into_iter().map(|(fork_lsn, record, born)| {
+            (
+                Record::StateRebase(pb::StateRebase {
+                    rebase_id: id.to_owned(),
+                    part: Some(pb::state_rebase::Part::Turn(pb::RebasedTurn {
+                        fork_lsn,
+                        record: Some(record),
+                    })),
+                }),
+                born,
+            )
         });
-        for mut record in records {
+        for (mut record, born) in records {
             // A rebased turn is a fork's: what it holds of an erased subject
             // is the erasure's tombstone, never a value under a new key
             // version (docs/design/m8-privacy.md §6.8).
-            self.seal_fork_record(&mut record)?;
+            self.seal_fork_record(&mut record, born)?;
             if let Some(pause) = pause {
                 if pause.expired() {
                     return Err(stale(
