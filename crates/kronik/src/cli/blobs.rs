@@ -116,17 +116,19 @@ fn render_status(r: &BlobsStatusResponse) -> String {
         out,
         "Indexed      {} blobs, {}",
         r.indexed,
-        units::size(r.indexed_bytes)
+        units::rounded_size(r.indexed_bytes)
     );
     if let Some(floor) = r.floor {
         let _ = writeln!(out, "Floor        lsn {floor}");
     }
     let _ = writeln!(out, "Leases       {}", r.leases);
-    let free = r.free_bytes.map_or("unknown".to_owned(), units::size);
+    let free = r
+        .free_bytes
+        .map_or("unknown".to_owned(), units::rounded_size);
     let _ = writeln!(
         out,
         "Disk         {free} free, reserve {}{}",
-        units::size(r.reserve_bytes),
+        units::rounded_size(r.reserve_bytes),
         if r.below_reserve {
             ": BELOW RESERVE, new blobs are refused"
         } else {
@@ -139,9 +141,9 @@ fn render_status(r: &BlobsStatusResponse) -> String {
                 out,
                 "Last pass    {} files ({}) left, {} deleted ({}), {} candidates, floor lsn {}",
                 g.objects,
-                units::size(g.bytes),
+                units::rounded_size(g.bytes),
                 g.deleted,
-                units::size(g.deleted_bytes),
+                units::rounded_size(g.deleted_bytes),
                 g.candidates,
                 g.floor
             );
@@ -178,7 +180,7 @@ fn render_inspect(r: &BlobInspectResponse) -> String {
     let _ = writeln!(out, "Blob         {}", r.hash);
     let _ = writeln!(out, "State        {}", r.state);
     if let Some(size) = r.size {
-        let _ = writeln!(out, "Size         {}", units::size(size));
+        let _ = writeln!(out, "Size         {}", units::rounded_size(size));
     }
     if let Some(subject) = &r.subject {
         let _ = writeln!(
@@ -194,7 +196,7 @@ fn render_inspect(r: &BlobInspectResponse) -> String {
         let _ = writeln!(out, "Sealed       {}", if sealed { "yes" } else { "no" });
     }
     if let Some(bytes) = r.file_bytes {
-        let _ = writeln!(out, "File         {}", units::size(bytes));
+        let _ = writeln!(out, "File         {}", units::rounded_size(bytes));
     }
     match (r.verified, &r.verify_error) {
         (Some(true), _) => out.push_str("Verified     the whole file checks out\n"),
@@ -294,7 +296,7 @@ fn get(ctx: &Ctx, a: GetArgs) -> Result<ExitCode, Error> {
             ctx.print(&format!(
                 "Wrote {} ({}) to {}\n",
                 a.hash,
-                units::size(written),
+                units::rounded_size(written),
                 path.display()
             ));
         }
@@ -344,7 +346,7 @@ fn render_list(actor: &str, r: &ActorBlobsResponse) -> String {
         .map(|b| {
             vec![
                 b.hash.clone(),
-                units::size(b.size),
+                units::rounded_size(b.size),
                 b.subject.clone().unwrap_or_else(|| "-".to_owned()),
                 b.lsn.to_string(),
             ]
@@ -416,7 +418,7 @@ fn gc(ctx: &Ctx, a: GcArgs) -> Result<ExitCode, Error> {
             out,
             "Dry run: a pass now would delete {} files ({}) and keep {} candidates for the next one.",
             r.deleted,
-            units::size(r.bytes),
+            units::rounded_size(r.bytes),
             r.candidates
         );
     } else {
@@ -424,7 +426,7 @@ fn gc(ctx: &Ctx, a: GcArgs) -> Result<ExitCode, Error> {
             out,
             "Deleted {} files ({}); {} candidates for the next pass; {} files left.",
             r.deleted,
-            units::size(r.bytes),
+            units::rounded_size(r.bytes),
             r.candidates,
             r.objects
         );
@@ -481,7 +483,7 @@ fn render_plan(r: &BlobGcPlanResponse) -> String {
                     Some(actor) if b.reason == "released" => format!("released by {actor}"),
                     _ => b.reason.clone(),
                 },
-                units::size(b.bytes),
+                units::rounded_size(b.bytes),
                 b.last_ref_lsn.map_or("-".to_owned(), |l| l.to_string()),
                 if b.candidate {
                     "next pass"
@@ -500,7 +502,7 @@ fn render_plan(r: &BlobGcPlanResponse) -> String {
         out,
         "{} files ({}) without a root; {} kept; floor lsn {}.",
         r.count,
-        units::size(r.bytes),
+        units::rounded_size(r.bytes),
         r.kept,
         r.floor.unwrap_or(0)
     );
@@ -518,4 +520,142 @@ fn local(message: String) -> Error {
 
 fn unavailable(message: String) -> Error {
     Error::Local(ApiError::new(ErrorCode::Unavailable, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use kronik_api::types::{ActorBlobEntry, BlobGcEntry, BlobGcSummary, BlobRootEntry};
+
+    use super::*;
+
+    const HASH: &str = "b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9";
+    const REFERENCE: &str = include_str!("../../../../docs/reference/cli.md");
+
+    /// `$ kronik <command>` and its output, as the CLI reference shows it.
+    fn documented(command: &str, output: &str) {
+        let shown = format!("$ kronik {command}\n{output}");
+        assert!(REFERENCE.contains(&shown), "not in cli.md:\n{shown}");
+    }
+
+    /// The sizes that `kronik blobs` measures are rounded, the exact counts
+    /// are in `--json`; the reference's samples are the CLI's output.
+    #[test]
+    fn blob_commands_render_as_documented() {
+        documented(
+            "blobs status",
+            &render_status(&BlobsStatusResponse {
+                enabled: true,
+                indexed: 12,
+                indexed_bytes: 325_480_000,
+                floor: Some(1190),
+                leases: 2,
+                free_bytes: Some(94_600_000_000),
+                reserve_bytes: 4 << 30,
+                below_reserve: false,
+                last_gc: Some(BlobGcSummary {
+                    objects: 14,
+                    bytes: 326_110_000,
+                    deleted: 3,
+                    deleted_bytes: 42_160_000,
+                    candidates: 1,
+                    floor: 1190,
+                }),
+            }),
+        );
+        documented(
+            &format!("blobs inspect {HASH}"),
+            &render_inspect(&BlobInspectResponse {
+                hash: HASH.into(),
+                state: "live".into(),
+                size: Some(31_457_000),
+                subject: None,
+                key_version: Some(0),
+                first_ref_lsn: Some(1203),
+                last_ref_lsn: Some(1203),
+                sealed: Some(false),
+                file_bytes: Some(31_459_436),
+                roots: vec![BlobRootEntry {
+                    kind: "log".into(),
+                    actor: None,
+                    lsn: Some(1203),
+                    floor: Some(1190),
+                    source: None,
+                    owner: None,
+                    fork: None,
+                }],
+                verified: None,
+                verify_error: None,
+            }),
+        );
+        documented(
+            "blobs list --actor media/alice",
+            &render_list(
+                "media/alice",
+                &ActorBlobsResponse {
+                    blobs: vec![ActorBlobEntry {
+                        hash: HASH.into(),
+                        size: 31_457_000,
+                        subject: None,
+                        lsn: 1203,
+                    }],
+                    next: None,
+                },
+            ),
+        );
+        documented(
+            "blobs gc --dry-run --verify",
+            &render_plan(&BlobGcPlanResponse {
+                enabled: true,
+                blobs: vec![BlobGcEntry {
+                    hash: HASH.into(),
+                    reason: "out-of-retention".into(),
+                    released_by: None,
+                    size: Some(31_457_000),
+                    bytes: 31_459_436,
+                    subject: None,
+                    last_ref_lsn: Some(1203),
+                    candidate: true,
+                }],
+                count: 1,
+                bytes: 31_459_436,
+                floor: Some(1290),
+                kept: 12,
+                drift: Some(Vec::new()),
+            }),
+        );
+    }
+
+    /// What the store measures is rounded: a free disk of 98203944 KiB is
+    /// 93.7 GiB.
+    #[test]
+    fn status_rounds_what_it_measures() {
+        let shown = render_status(&BlobsStatusResponse {
+            enabled: true,
+            indexed: 1,
+            indexed_bytes: 5_243_000,
+            floor: None,
+            leases: 0,
+            free_bytes: Some(98_203_944 << 10),
+            reserve_bytes: 1 << 30,
+            below_reserve: false,
+            last_gc: None,
+        });
+        assert!(shown.contains("Indexed      1 blobs, 5.0 MiB\n"), "{shown}");
+        assert!(
+            shown.contains("Disk         93.7 GiB free, reserve 1.0 GiB\n"),
+            "{shown}"
+        );
+        let shown = render_status(&BlobsStatusResponse {
+            enabled: true,
+            reserve_bytes: 1 << 30,
+            below_reserve: true,
+            ..BlobsStatusResponse::default()
+        });
+        assert!(
+            shown.contains(
+                "Disk         unknown free, reserve 1.0 GiB: BELOW RESERVE, new blobs are refused\n"
+            ),
+            "{shown}"
+        );
+    }
 }

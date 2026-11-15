@@ -2564,7 +2564,9 @@ their bytes, the floor (records at or after it keep their blobs: the lowest
 of the log's first LSN, each fork's point + 1 and each replay's floor), the
 leases the daemon holds (turns, uploads, streams, replays), the free disk
 and `[blobs] disk_reserve`, and the collector's last pass since the daemon
-started. A node without a blob store (an embedded test node) says so.
+started. A node without a blob store (an embedded test node) says so. The
+`kronik blobs` commands round the sizes they show to a tenth of a binary
+unit (`30.0 MiB`); `--json` has the exact bytes.
 
 ```text
 $ kronik blobs status
@@ -2638,7 +2640,7 @@ subject (only with `pii:read`) and the record that made the actor hold it.
 
 ```text
 $ kronik blobs list --actor media/alice
-blob                                                                     size     subject  held since lsn
+blob                                                                 size      subject  held since lsn
 b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9  30.0 MiB  -        1203
 Next     kronik blobs inspect b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9
 ```
@@ -2673,7 +2675,7 @@ says what such a pass would delete. A pass records an `AuditEvent`
 
 ```text
 $ kronik blobs gc --dry-run --verify
-blob                                                                     reason            bytes     last lsn  deleted by
+blob                                                                 reason            bytes     last lsn  deleted by
 b3:4f1c09ab77e9d0c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9  out-of-retention  30.0 MiB  1203      next pass
 1 files (30.0 MiB) without a root; 12 kept; floor lsn 1290.
 Pins         match the rows they mirror

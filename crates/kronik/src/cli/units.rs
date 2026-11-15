@@ -106,6 +106,25 @@ pub fn size(bytes: u64) -> String {
     }
 }
 
+/// A measured size, such as a file's or the free disk, rounded for a
+/// person: one decimal of the largest binary unit it reaches, e.g.
+/// `88.1 GiB`, and under 1 KiB the bytes. [`size`] is exact, for a size
+/// that was configured; `--json` has the exact count.
+pub fn rounded_size(bytes: u64) -> String {
+    if bytes < 1 << 10 {
+        return size(bytes);
+    }
+    // Tenths of the unit 2^shift, rounded half up.
+    let tenths = |shift: u32| (u128::from(bytes) * 10 + (1 << (shift - 1))) >> shift;
+    // The first unit that shows it below 1024.0: 1023.95 KiB is 1.0 MiB.
+    let (unit, shift) = [("KiB", 10), ("MiB", 20), ("GiB", 30)]
+        .into_iter()
+        .find(|&(_, shift)| tenths(shift) < 10_240)
+        .unwrap_or(("TiB", 40));
+    let t = tenths(shift);
+    format!("{}.{} {unit}", t / 10, t % 10)
+}
+
 /// Bytes as a value that [`parse_size`] reads back, e.g. `128Mi`.
 pub fn size_flag(bytes: u64) -> String {
     match binary(bytes) {
@@ -224,6 +243,29 @@ mod tests {
         assert_eq!(duration(120_000), "2m");
         assert_eq!(duration(3_600_000), "1h");
         assert_eq!(duration(0), "0ms");
+    }
+
+    #[test]
+    fn rounds_measured_sizes() {
+        assert_eq!(rounded_size(0), "0 bytes");
+        assert_eq!(rounded_size(1), "1 byte");
+        assert_eq!(rounded_size(1023), "1023 bytes");
+        assert_eq!(rounded_size(1024), "1.0 KiB");
+        assert_eq!(rounded_size(50_516), "49.3 KiB");
+        assert_eq!(rounded_size(5_243_712), "5.0 MiB");
+        assert_eq!(rounded_size(31_502_436), "30.0 MiB");
+        assert_eq!(rounded_size(128 << 20), "128.0 MiB");
+        assert_eq!(rounded_size(98_203_944 << 10), "93.7 GiB");
+        assert_eq!(rounded_size(4 << 30), "4.0 GiB");
+        assert_eq!(rounded_size(3 << 40), "3.0 TiB");
+        assert_eq!(rounded_size(2048 << 40), "2048.0 TiB");
+        assert_eq!(rounded_size(u64::MAX), "16777216.0 TiB");
+        // Half a tenth rounds up, and 1024.0 of a unit is 1.0 of the next.
+        assert_eq!(rounded_size(1075), "1.0 KiB");
+        assert_eq!(rounded_size(1076), "1.1 KiB");
+        assert_eq!(rounded_size((1 << 20) - 52), "1023.9 KiB");
+        assert_eq!(rounded_size((1 << 20) - 51), "1.0 MiB");
+        assert_eq!(rounded_size((1 << 30) - 1), "1.0 GiB");
     }
 
     #[test]
