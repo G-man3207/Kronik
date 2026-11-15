@@ -6,6 +6,12 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- `kronik history`, `kronik trace` and the MCP history tools show a turn's
+  blob references (M25, M26): each is the hash and size an operator passes to
+  `kronik blobs inspect` or the MCP `inspect_blob`. The text shows the first
+  12 hex characters, as the design planned; `--json` grows `blobs` on
+  `TurnSummary`, `TraceNode` and `TraceRoot` with the whole hash, and the
+  field is absent from a turn that carries none.
 - `kronik restore` installs the newest snapshot the bucket's log reaches,
   not the newest manifest: a shipping round can upload a snapshot ahead of
   the segments that hold its records, and installing it made a directory

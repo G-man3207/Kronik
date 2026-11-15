@@ -75,10 +75,12 @@ personal data unless your token has `pii:read`.
   gives one connection's turns, with what each sent and whether the frames
   were written.
 - A body larger than its kind's blob threshold (an upload, a large `fetch`
-  response, a blob an actor wrote) is a blob, outside the log. History does
-  not show a turn's blobs (the API's turn JSON does); "Large bodies and
-  blobs" below says where their hashes show and what you must know about
-  them.
+  response, a blob an actor wrote) is a blob, outside the log. History and
+  trace show a turn's blob references (`blobs` in their JSON, a `BLOBS`
+  column or a trailing `blob …` in text): each is the hash and size an
+  `inspect_blob` call takes. The API's turn JSON shows a body that is a blob
+  as its reference too. "Large bodies and blobs" below says what you must
+  know about them.
 
 ### 3. Make the change
 

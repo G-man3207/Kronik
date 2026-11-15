@@ -222,6 +222,90 @@ fn blobs_status_inspect_get_and_gc() {
     let o = d.run(&["blobs", "inspect", &kept]);
     assert!(o.stdout.contains("State        live"), "{o:?}");
 
+    // The turn that wrote it carries its reference in history and trace
+    // (M25/M26). The text shows the first 12 hex characters; --json, the
+    // whole hash and size.
+    let history = d.run(&["--json", "history", "media/a"]).json();
+    let write_turn = history["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| {
+            t["blobs"].as_array().is_some_and(|blobs| {
+                blobs
+                    .iter()
+                    .any(|b| b["hash"].as_str() == Some(kept.as_str()))
+            })
+        })
+        .unwrap_or_else(|| panic!("no turn names {kept}: {history}"));
+    assert!(
+        write_turn["blobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["hash"].as_str() == Some(kept.as_str()) && b["size"] == 200_000),
+        "{write_turn}"
+    );
+    let short = &kept[..15];
+    let o = d.run(&["history", "media/a"]);
+    assert!(o.stdout.contains("BLOBS"), "{o:?}");
+    assert!(
+        o.stdout.contains(&format!("blob {short} (195.3 KiB)")),
+        "{o:?}"
+    );
+    let turn_id = write_turn["turn_id"].as_str().unwrap();
+    let o = d.run(&["trace", turn_id]);
+    assert!(
+        o.stdout.contains(&format!("blob {short} (195.3 KiB)")),
+        "{o:?}"
+    );
+    let trace = d.run(&["--json", "trace", turn_id]).json();
+    assert!(
+        trace["turn"]["blobs"].as_array().is_some_and(|blobs| blobs
+            .iter()
+            .any(|b| { b["hash"].as_str() == Some(kept.as_str()) && b["size"] == 200_000 })),
+        "{trace}"
+    );
+
+    // A send copies the reference into the receiver's turn. The sender's
+    // trace has the receiver in `descendants`, and both name the blob.
+    fn carries(node: &Value, hash: &str) -> bool {
+        node["blobs"]
+            .as_array()
+            .is_some_and(|blobs| blobs.iter().any(|b| b["hash"].as_str() == Some(hash)))
+            || node["children"]
+                .as_array()
+                .is_some_and(|children| children.iter().any(|n| carries(n, hash)))
+    }
+    let sent = hash(&pattern(3000));
+    let o = d.post("put", "size=3000");
+    assert!(o.contains(" 200 "), "{o}");
+    let o = d.post("send", "to=b&op=info&with=ref");
+    assert!(o.contains(" 200 "), "{o}");
+    let mut receiver = None;
+    for _ in 0..200 {
+        let h = d.run(&["--json", "history", "media/b"]).json();
+        if let Some(turn) = h["turns"].as_array().and_then(|turns| turns.first())
+            && carries(turn, &sent)
+        {
+            receiver = Some(turn.clone());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let receiver = receiver.unwrap_or_else(|| panic!("media/b never received {sent}: {o}"));
+    let id = receiver["turn_id"].as_str().unwrap();
+    let traced = d.run(&["--json", "trace", id]).json();
+    assert_eq!(traced["turn"]["blobs"], receiver["blobs"], "{traced}");
+    let root = traced["root"]["lsn"].as_u64().unwrap();
+    let sender = d.run(&["--json", "trace", &format!("main:{root}")]).json();
+    assert!(
+        sender["descendants"]
+            .as_array()
+            .is_some_and(|nodes| nodes.iter().any(|n| carries(n, &sent))),
+        "{sender}"
+    );
+
     // The download scrubs the secret value, and only it. The pattern
     // repeats every 251 bytes, so the value is in it many times.
     let out = dir.path().join("out.bin");

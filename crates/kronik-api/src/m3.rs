@@ -804,6 +804,7 @@ impl Api {
                 lsn: *l,
                 root_id: key.root.clone(),
                 input: crate::input_summary(t.input.as_ref(), pii),
+                blobs: crate::blob_references(t),
             });
         const MAX: usize = 1000;
         let mut budget = MAX;
@@ -838,6 +839,7 @@ impl Api {
                     // The turns were prepared for the caller above.
                     input: crate::input_summary(t.input.as_ref(), true),
                     outcome: crate::outcome(&t.outcome.clone().unwrap_or_default()),
+                    blobs: crate::blob_references(t),
                     children: build(&ck, turns, children, budget, truncated),
                 });
             }

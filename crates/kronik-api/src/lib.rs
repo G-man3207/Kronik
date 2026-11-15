@@ -462,6 +462,17 @@ fn short_hash(b: &[u8]) -> String {
     CodeHash::from_slice(b).map_or_else(|| "-".into(), |h| h.short())
 }
 
+/// The distinct blob references a turn carries, in walk order (M25/M26).
+fn blob_references(t: &pb::TurnRecord) -> Vec<BlobReference> {
+    let mut refs = Vec::new();
+    kronik_proto::blobs::turn(t, &mut refs);
+    let mut seen = std::collections::HashSet::new();
+    refs.into_iter()
+        .filter(|r| seen.insert(r.hash.as_str()))
+        .map(BlobReference::from)
+        .collect()
+}
+
 fn turn_summary(branch: &str, lsn: u64, t: &pb::TurnRecord, pii: bool) -> TurnSummary {
     TurnSummary {
         turn_id: TurnId {
@@ -518,6 +529,7 @@ fn turn_summary(branch: &str, lsn: u64, t: &pb::TurnRecord, pii: bool) -> TurnSu
                 ..s
             })
             .collect(),
+        blobs: blob_references(t),
         connection_ops: connections::op_summaries(t),
     }
 }
