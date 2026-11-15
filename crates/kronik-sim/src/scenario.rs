@@ -1260,6 +1260,11 @@ impl World {
         // the drain below, after the workload's jumps and its step back of
         // 5 to 10 minutes.
         let mut node = None;
+        // A quiet node is not the last start's final word: a turn already in
+        // flight can still land, and stop the node on an injected I/O error.
+        // Only the checks after a settle see that, so the settle comes before
+        // the blob passes (which are the last start's work too).
+        let mut settled = false;
         // 100 s of virtual time, or 10 000 s after a long run.
         let rounds = if self.cfg.long.is_some() {
             1_000_000
@@ -1275,6 +1280,7 @@ impl World {
                 if id == self.st().node_id {
                     self.crash();
                     self.start_node();
+                    settled = false;
                 }
             }
             let n = self.st().node.clone();
@@ -1297,9 +1303,41 @@ impl World {
                 && (self.cfg.connections.is_none()
                     || n.store().db().open_connections().is_ok_and(|c| c.is_empty()))
             {
+                if !settled {
+                    // Let the last applies land, then look again.
+                    settled = true;
+                    self.sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                // B6's two passes: work of the last start, so a pass that
+                // stops the node on an injected I/O error is redone by the
+                // next start rather than lost.
+                if let Err(e) = self.blob_end_passes(&n).await {
+                    if let Some(fatal) = n.fatal() {
+                        self.event(format!(
+                            "the last passes stopped node {}: {e} (fatal: {fatal})",
+                            self.st().node_id
+                        ));
+                        settled = false;
+                        self.sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    self.violation(format!("the last passes: {e}"));
+                    return;
+                }
+                if let Some(fatal) = n.fatal() {
+                    self.event(format!(
+                        "the last passes raced a fatal stop of node {}: {fatal}",
+                        self.st().node_id
+                    ));
+                    settled = false;
+                    self.sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
                 node = Some(n);
                 break;
             }
+            settled = false;
             self.sleep(Duration::from_millis(10)).await;
         }
         let Some(node) = node else {
@@ -1322,8 +1360,6 @@ impl World {
                 detail.unwrap_or_default()
             ));
         };
-        // Let the last applies land.
-        self.sleep(Duration::from_millis(50)).await;
         self.check_counters(&node);
         self.check_log(&node).await;
         self.check_no_open_turns(&node).await;
