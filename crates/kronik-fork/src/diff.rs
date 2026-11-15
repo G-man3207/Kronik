@@ -3797,6 +3797,16 @@ mod tests {
             branch: "main".into(),
         });
         withheld.observed_callee_status = Some(pb::EffectStatus::Ok as i32);
+        // #80/ADR 0124: a committed callee whose answer the erasure
+        // tombstoned is just as standing, and has no reply body.
+        let mut erased = call(8, pb::EffectStatus::Failed, false);
+        erased.error = kronik_proto::ERASED_CALL_ERROR.into();
+        erased.callee_source = Some(pb::ActorSource {
+            shard: None,
+            lsn: 11,
+            branch: "main".into(),
+        });
+        erased.observed_callee_status = Some(pb::EffectStatus::Ok as i32);
         let caller = pb::ActorRef {
             kind: "counter".into(),
             key: "a".into(),
@@ -3816,6 +3826,7 @@ mod tests {
                 call(5, pb::EffectStatus::Timeout, false),
                 call(6, pb::EffectStatus::Timeout, false),
                 call(7, pb::EffectStatus::Timeout, true),
+                erased,
             ],
             outcome: Some(pb::Outcome {
                 kind: pb::OutcomeKind::Failed as i32,
@@ -3826,7 +3837,10 @@ mod tests {
         // The callee of ordinal 5 committed, the one of 6 did not.
         let committed_callee = causal::child(&key, &ActorRef::from_pb(&caller), 5);
         let committed = |k: &pb::CausalKey| *k == committed_callee;
-        assert_eq!(Acc::orphans(&turn, &committed), BTreeSet::from([1, 4, 5]));
+        assert_eq!(
+            Acc::orphans(&turn, &committed),
+            BTreeSet::from([1, 4, 5, 8])
+        );
         // A committed turn leaves none.
         turn.outcome = Some(pb::Outcome {
             kind: pb::OutcomeKind::Committed as i32,
