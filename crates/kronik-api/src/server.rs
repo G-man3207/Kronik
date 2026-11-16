@@ -310,6 +310,23 @@ pub async fn serve_fleet_connection(
     Ok(())
 }
 
+/// `GET /v1/blobs/{hash}/content`: the one GET the buffered router refuses
+/// because it answers with a stream. Every transport that fronts the router
+/// (the Unix socket, TCP and the admin listener) dispatches it with
+/// [`serve_blob_content`] before reading a request body.
+pub fn is_blob_content(request: &ApiRequest) -> bool {
+    request.method == "GET" && crate::blobs::content_path(&request.path).is_some()
+}
+
+/// The streamed answer for [`is_blob_content`].
+pub async fn serve_blob_content(
+    api: Arc<Api>,
+    request: ApiRequest,
+    captured: crate::CapturedRequest,
+) -> hyper::Response<Body> {
+    crate::blobs::serve_content(api, request, captured).await
+}
+
 /// One connection: HTTP/1.1 requests to the JSON API or to `mount`.
 async fn serve_connection<S>(
     stream: S,
@@ -386,8 +403,8 @@ async fn serve_connection<S>(
                 return Ok(crate::event_stream::serve_captured(api, req, captured, incoming).await);
             }
             // A blob's bytes stream (M25 §15); every other answer is buffered.
-            if req.method == "GET" && crate::blobs::content_path(&req.path).is_some() {
-                return Ok(crate::blobs::serve_content(api, req, captured).await);
+            if is_blob_content(&req) {
+                return Ok(serve_blob_content(api, req, captured).await);
             }
             if req.method == "GET" && req.path == "/v1/events" {
                 let incoming = hyper::Request::from_parts(parts, body);

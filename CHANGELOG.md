@@ -6,6 +6,13 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- The TLS admin listener serves `GET /v1/blobs/{hash}/content` with the
+  same streamed bytes, length and headers as the Unix socket and TCP
+  listeners. It forwarded every `/v1` request to the buffered router, which
+  refuses that answer with `BAD_REQUEST`, although OpenAPI and the API
+  reference document the operation on the listener (ADR 0104). A parity
+  test now drives every GET operation `openapi::OPERATIONS` declares
+  through the admin listener.
 - `kronik serve --init` writes the configuration path `--config` names into
   both `ExecStart` and `ExecStopPost` of the installed root
   `kronik.service`; before, the root unit kept
