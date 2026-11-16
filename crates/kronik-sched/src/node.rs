@@ -5961,6 +5961,7 @@ fn turn_limits(l: &KindLimits) -> TurnLimits {
         memory_bytes: size(l.memory_bytes),
         message_bytes: size(l.message_bytes),
         state_value_bytes: size(l.state_value_bytes),
+        host_bytes: size(l.memory_bytes),
         blob_bytes: l.blob_bytes_per_actor,
         blob_threshold: l.blob_threshold(),
     }
@@ -6357,6 +6358,16 @@ mod route_tests {
         );
         assert_eq!(ok(&[("CONNECT", "/chat")]), Some(ErrorCode::BadRequest));
         assert_eq!(ok(&[("websocket", "/chat")]), Some(ErrorCode::BadRequest));
+    }
+
+    /// Issue #121: the host buffers a turn fills are bounded by its kind's
+    /// memory limit, the same 64 MiB per-turn limit as its linear memories.
+    #[test]
+    fn the_host_budget_follows_the_memory_limit() {
+        let mut limits = KindLimits::default();
+        assert_eq!(turn_limits(&limits).host_bytes, 64 << 20);
+        limits.memory_bytes = 128 << 20;
+        assert_eq!(turn_limits(&limits).host_bytes, 128 << 20);
     }
 
     #[test]

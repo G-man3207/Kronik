@@ -312,7 +312,7 @@ codes! {
         "No turn with that id",
         "Check the turn id (`<branch>:<lsn>`) with `kronik history <kind/key>`.";
     TurnTooLarge = "TURN_TOO_LARGE", 500, "M1",
-        "The turn's record would not fit in one log record",
+        "The turn's record or host buffers would not fit its limits",
         "Split the work over several turns, or fetch and write less in one turn; see `kronik history <kind/key>`.";
     Unauthenticated = "UNAUTHENTICATED", 401, "M5",
         "No valid token",

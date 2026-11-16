@@ -36,6 +36,17 @@ repository root says how to report a vulnerability.
   MiB by default), and the host the size of messages, state values, SQL
   values and each actor's database. SQL runs in the host, but its VM steps
   count against the turn's fuel limit. Limits can be set per kind from M2.
+- **Host buffer budget.** The guest data the host copies into its per-turn
+  buffers shares one budget: guest logs and stdout/stderr, state writes,
+  messages and timers. The budget is the kind's memory limit (64 MiB by
+  default, at most 1 GiB), counted with 128 bytes of bookkeeping per
+  buffered entry. A turn that passes it fails with `TURN_TOO_LARGE` before
+  the daemon's memory grows further, and commits none of its writes,
+  messages or timers (the entries logged up to the budget remain for
+  diagnosis). A hostile actor therefore cannot make one turn allocate
+  gigabytes of host memory through `log.emit`, `state.set`,
+  `messaging.send` or `timers.schedule`; see
+  [ADR 0149](../adr/0149-bounded-host-buffers-per-turn.md).
 - **Default deny (I6, M2).** An actor can do nothing beyond its own state,
   its messages and its timers until the operator grants a capability:
   `http:<host>` or `http:*.<suffix>` for outgoing HTTP, `secret:<name>` to

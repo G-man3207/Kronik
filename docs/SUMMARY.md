@@ -147,3 +147,4 @@
 - [ADR 0146: Restore installs the newest snapshot its log reaches](adr/0146-restore-installs-the-newest-snapshot-its-log-reaches.md)
 - [ADR 0147: An effect is matched by the turn's operation ordinal](adr/0147-effect-matching-by-operation-ordinal.md)
 - [ADR 0148: An open turn's UNAVAILABLE re-runs stop at three starts](adr/0148-bound-an-open-turns-unavailable-reruns.md)
+- [ADR 0149: Host-side turn buffers share the memory limit](adr/0149-bounded-host-buffers-per-turn.md)

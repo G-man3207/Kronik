@@ -333,7 +333,9 @@ impl TurnHost {
     }
 
     fn warn(&self, message: String) {
-        self.logs.push(LogEvent {
+        // A host warning is not worth failing the turn over: drop it when the
+        // guest's own output has spent the budget, instead of trapping here.
+        let _ = self.logs.push(LogEvent {
             level: "warn",
             message,
             fields: Vec::new(),

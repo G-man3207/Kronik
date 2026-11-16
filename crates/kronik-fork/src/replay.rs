@@ -1170,6 +1170,7 @@ impl Runner {
             memory_bytes: size(kl.memory_bytes),
             message_bytes: size(kl.message_bytes),
             state_value_bytes: size(kl.state_value_bytes),
+            host_bytes: size(kl.memory_bytes),
             blob_bytes: kl.blob_bytes_per_actor,
             blob_threshold: kl.blob_threshold(),
         };

@@ -685,6 +685,16 @@ than what is left for the turn is `too-large` for the actor. The per-kind
 limits (`effect_response_bytes`, `message_bytes`, `state_value_bytes`,
 `sql_bytes_per_actor`) apply within it.
 
+What the host buffers for a turn besides its record is bounded too: its
+guest logs and stdout/stderr, state writes, messages and timers share one
+per-turn budget, the kind's memory limit (64 MiB by default, at most 1 GiB),
+counting 128 bytes of bookkeeping for each buffered entry. A turn that
+passes it fails with `TURN_TOO_LARGE` and commits none of its writes,
+messages or timers; the entries logged up to the budget remain for
+diagnosis. Raise the kind's memory limit to raise both budgets, or split
+the work over several turns ([ADR
+0149](../adr/0149-bounded-host-buffers-per-turn.md)).
+
 What a turn's effects record as they happen is bounded per actor type by
 `effect_bytes_per_turn`, 32 MiB by default ([ADR
 0145](../adr/0145-effect-bytes-per-turn.md)). It counts the requests and
@@ -2645,7 +2655,7 @@ operator meets:
 | `UNAVAILABLE` | The node stopped after a storage failure (also `/healthz` 503), or an open turn's re-run could not get its recorded prerequisite on three starts | For a storage failure, the daemon exits and systemd restarts it; check the disk (`kronik doctor`'s `disk` check) and the journal. For the third start, `history` names the turn and a message or timer input is a dead letter: fix what the turn needs, then resend it (an HTTP request needs a new `Idempotency-Key`) |
 | `GATEWAY_TIMEOUT` | A turn took longer than `[gateway] timeout` | The turn still completes; clients that retry with the same `Idempotency-Key` get its response |
 | `PAYLOAD_TOO_LARGE` | A request body over 1 MiB | v0.1's limit |
-| `TURN_TOO_LARGE` | In `history` or a dead letter: a turn needed more than one log record (128 MiB) for its effects, writes, messages, SQL changes and output, so it failed instead of committing; an HTTP client got `TURN_FAILED` | Split the work over several turns; see [record size](#record-size). No limit setting raises it |
+| `TURN_TOO_LARGE` | In `history` or a dead letter: a turn needed more than one log record (128 MiB) for its effects, writes, messages, SQL changes and output, or buffered more host data (guest logs, stdout/stderr, state writes, messages, timers) than the kind's memory limit allows, so it failed instead of committing; an HTTP client got `TURN_FAILED` | Split the work over several turns; see [record size](#record-size). The record limit is fixed, but `kronik limits set <kind> --memory <size>` raises the host-buffer budget (ADR 0149) |
 | `REASON_REQUIRED` | A change without `--reason` | Every mutation is audited and needs a reason. `restore` and `upgrade check` write no log record, so they take no `--reason` |
 | `ENGINE_UPGRADE_DIVERGED` | `kronik upgrade check` found a behavior change | Keep the current binary. The diff is next to the report in `<data-dir>/upgrade/` |
 | `ENGINE_VERSION_MISMATCH` | A new binary started against data written by another engine, without a passing check | Run `kronik upgrade check --window 6h`, or start the recorded engine version. For data from v0.3.0 or older read [Upgrading from v0.3.0 or older](#upgrading-from-v030-or-older) first |

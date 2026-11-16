@@ -6,6 +6,13 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- The host-side buffers one turn fills are bounded: guest logs and
+  stdout/stderr, state writes, messages and timers share a per-turn budget
+  equal to the kind's memory limit (64 MiB by default, at most 1 GiB,
+  128 bytes of bookkeeping per entry). A turn that passes it fails with
+  `TURN_TOO_LARGE` and commits none of its writes, messages or timers,
+  instead of a deployed actor being able to grow the daemon's RSS by
+  gigabytes in one turn (ADR 0149).
 - An open turn whose re-run keeps ending `UNAVAILABLE` is closed as failed on
   the third such start instead of being run at every start for ever. The
   closing record names the starts and keeps the turn's recorded effects; a
