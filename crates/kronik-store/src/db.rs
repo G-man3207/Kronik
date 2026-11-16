@@ -3948,16 +3948,55 @@ enum KvOp {
     },
 }
 
+/// Whether [`CatchupRows`] materializes every row this turn's record writes.
+///
+/// The pattern names every `TurnRecord` field and has no `..`: adding a field
+/// fails the build here until it is classified. A field is either materialized
+/// by [`CatchupRows::push`] (`execution_id`, `actor`, `engine_version`,
+/// `causal_key`, `logical_time_ms`, `outcome`, `writes`, `schema_version`), not
+/// a row of `state.db` (`code_hash`, `random_seed`, `fuel_used`,
+/// `config_epoch`, `memory_peak_bytes`, `duration_us`), or rejected below
+/// because the full apply path materializes it (`input` unless it is a plain
+/// HTTP input, `effects`, `messages`, `timers`, `compensations`, `sql_changes`,
+/// `sql_schema`, `connection_ops`).
+///
+/// `blob_refs` is classified by [`CatchupRows::push`] instead: it rejects every
+/// record that references a blob, wherever the reference is.
 fn simple_http(t: &pb::TurnRecord) -> bool {
-    t.messages.is_empty()
-        && t.connection_ops.is_empty()
-        && t.timers.is_empty()
-        && t.compensations.is_empty()
-        && t.effects.is_empty()
-        && t.sql_changes.is_empty()
-        && t.sql_schema.is_empty()
+    let pb::TurnRecord {
+        execution_id: _,
+        actor: _,
+        code_hash: _,
+        engine_version: _,
+        causal_key: _,
+        logical_time_ms: _,
+        random_seed: _,
+        input,
+        effects,
+        writes: _,
+        messages,
+        timers,
+        outcome: _,
+        fuel_used: _,
+        sql_changes,
+        compensations,
+        sql_schema,
+        blob_refs: _,
+        config_epoch: _,
+        memory_peak_bytes: _,
+        schema_version: _,
+        duration_us: _,
+        connection_ops,
+    } = t;
+    messages.is_empty()
+        && connection_ops.is_empty()
+        && timers.is_empty()
+        && compensations.is_empty()
+        && effects.is_empty()
+        && sql_changes.is_empty()
+        && sql_schema.is_empty()
         && matches!(
-            t.input.as_ref().and_then(|i| i.kind.as_ref()),
+            input.as_ref().and_then(|i| i.kind.as_ref()),
             Some(pb::input::Kind::Http(h)) if h.idempotency_key.is_empty()
         )
 }
@@ -5166,6 +5205,14 @@ mod tests {
             });
             r.logical_time_ms = time;
             r.engine_version = format!("engine-{time}");
+            r.schema_version = time as u32;
+            // Not rows: the two paths must ignore them alike.
+            r.code_hash = vec![time as u8; 32];
+            r.random_seed = vec![time.wrapping_add(1) as u8; 32];
+            r.fuel_used = time;
+            r.config_epoch = 2;
+            r.memory_peak_bytes = time * 2;
+            r.duration_us = time * 3;
             r.writes = writes;
             t
         };
@@ -5197,6 +5244,19 @@ mod tests {
                 at(5, 4, begin("e5", "e5", http_input())),
                 at(6, 4, turn_at("e6", "a", 30, vec![write("n", Some(b"2"))])),
                 at(7, 4, turn_at("e7", "a", 25, vec![write("n", Some(b"3"))])),
+                // A failed turn: its schema version and writes are not state.
+                at(
+                    8,
+                    4,
+                    with_outcome(
+                        turn_at("e8", "a", 40, vec![write("n", Some(b"4"))]),
+                        pb::Outcome {
+                            kind: pb::OutcomeKind::Failed as i32,
+                            error_code: "TURN_FAILED".into(),
+                            ..Default::default()
+                        },
+                    ),
+                ),
             ],
         ];
         let dir = tempfile::tempdir().unwrap();
@@ -5236,8 +5296,92 @@ mod tests {
         ] {
             assert_eq!(rows_of(&bulk, table), rows_of(&normal, table), "{table}");
         }
-        assert_eq!(bulk.applied_lsn().unwrap(), 7);
+        assert_eq!(bulk.applied_lsn().unwrap(), 8);
         assert_eq!(rows_of(&bulk, "open_turns").len(), 1);
+        // The failed turn above changed neither its actor's schema nor `n`.
+        assert_eq!(
+            bulk.conn
+                .query_row(
+                    "SELECT schema_version FROM actors WHERE kind = 'counter' AND key = 'a'",
+                    [],
+                    |r| r.get::<_, u32>(0)
+                )
+                .unwrap(),
+            25
+        );
+        assert_eq!(
+            bulk.kv_get("counter", "a", "n").unwrap(),
+            Some(b"3".to_vec())
+        );
+    }
+
+    /// A record the full apply path materializes must never take the catch-up
+    /// path, which writes no rows for these fields. The exhaustive pattern in
+    /// [`simple_http`] makes a new `TurnRecord` field a build error until it is
+    /// classified here or as materialized by [`CatchupRows::push`].
+    #[test]
+    fn catchup_rejects_a_turn_the_full_apply_materializes() {
+        let base = || match turn("e1", "r1", http_input()) {
+            Record::TurnRecord(t) => t,
+            _ => unreachable!("turn() builds a TurnRecord"),
+        };
+        fn input(kind: pb::input::Kind) -> Option<pb::Input> {
+            Some(pb::Input { kind: Some(kind) })
+        }
+        type Reject = fn(&mut pb::TurnRecord);
+        let rejected: &[(&str, Reject)] = &[
+            ("effects", |t| t.effects.push(pb::EffectRecord::default())),
+            ("messages", |t| {
+                t.messages.push(pb::OutboundMessage::default())
+            }),
+            ("timers", |t| t.timers.push(pb::TimerOp::default())),
+            ("compensations", |t| {
+                t.compensations.push(pb::OutboundMessage::default())
+            }),
+            ("sql_changes", |t| {
+                t.sql_changes.push(pb::SqlChangeset::default())
+            }),
+            ("sql_schema", |t| {
+                t.sql_schema.push(pb::SqlSchemaChange::default())
+            }),
+            ("connection_ops", |t| {
+                t.connection_ops.push(pb::ConnectionOp::default())
+            }),
+            ("blob_refs", |t| {
+                t.blob_refs.push(pb::BlobRefOp {
+                    blob: Some(pb::BlobRef::default()),
+                    ..Default::default()
+                })
+            }),
+            ("HTTP idempotency key", |t| {
+                t.input = input(pb::input::Kind::Http(pb::HttpInput {
+                    idempotency_key: "k".into(),
+                    ..Default::default()
+                }))
+            }),
+            ("message input", |t| t.input = message_input()),
+            ("timer input", |t| {
+                t.input = input(pb::input::Kind::Timer(pb::TimerInput::default()))
+            }),
+            ("connection input", |t| {
+                t.input = input(pb::input::Kind::Connection(pb::ConnectionInput::default()))
+            }),
+            ("migrate input", |t| {
+                t.input = input(pb::input::Kind::Migrate(pb::MigrateInput::default()))
+            }),
+            ("no input", |t| t.input = None),
+        ];
+        let some = [committed(1, Record::TurnRecord(base()))];
+        assert!(CatchupRows::of(&some, 0).unwrap().is_some());
+        for (what, reject) in rejected {
+            let mut t = base();
+            reject(&mut t);
+            let records = [committed(1, Record::TurnRecord(t))];
+            assert!(
+                CatchupRows::of(&records, 0).unwrap().is_none(),
+                "catch-up accepted a turn whose {what} the full path applies"
+            );
+        }
     }
 
     fn tagged(subject: &str, text: &str) -> Option<pb::Sealable> {
