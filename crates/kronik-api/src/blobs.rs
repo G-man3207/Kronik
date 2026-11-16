@@ -1,8 +1,8 @@
 //! The blob endpoints (M25 §15, M26 §12): the store's status, one blob's
 //! inspection and content, and the collector's plan and pass.
 //!
-//! `GET /v1/blobs/{hash}/content` streams (`serve_content`, called by the
-//! server before the buffered routes): the bytes go through the secret
+//! `GET /v1/blobs/{hash}/content` streams (`serve_content`, called by every
+//! transport before the buffered routes): the bytes go through the secret
 //! output matcher of the moment, and a subject's blob needs `pii:read`.
 
 use kronik_core::error::{ApiError, ErrorCode};
@@ -134,11 +134,11 @@ impl Api {
             ("GET", ["v1", "blobs", "gc"]) => self.blob_gc_plan(q, pii).await,
             ("POST", ["v1", "blobs", "gc"]) => self.blob_gc_run(req).await,
             ("GET", ["v1", "blobs", hash]) => self.blob_inspect(hash, q, pii).await,
-            // Streamed by the server; reached only through a path that
-            // buffers (the MCP server, tests), which cannot carry a blob.
+            // Streamed by every API transport; reached only through a path
+            // that buffers (the MCP server, tests), which cannot carry a blob.
             ("GET", ["v1", "blobs", _, "content"]) => Err(ApiError::new(
                 ErrorCode::BadRequest,
-                "blob content is streamed only over the API socket and TCP listener",
+                "blob content is streamed by the API transports, not this buffered route",
             )
             .with_hint("Run: kronik blobs get <hash> -o FILE")),
             _ => return None,

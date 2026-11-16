@@ -204,7 +204,13 @@ async fn browser_request(
     let captured = if protocol {
         browser.capture_protocol_request(&req, api)?
     } else {
-        Some(api.capture(&req)?)
+        let captured = api.capture(&req)?;
+        // The buffered router refuses this streamed GET; serve it as the
+        // API socket and TCP listener do, before reading a body.
+        if kronik_api::server::is_blob_content(&req) {
+            return Ok(kronik_api::server::serve_blob_content(api.clone(), req, captured).await);
+        }
+        Some(captured)
     };
     let read = async {
         tokio::time::timeout(
