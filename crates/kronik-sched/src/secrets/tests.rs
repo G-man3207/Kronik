@@ -1079,10 +1079,9 @@ async fn a_certificate_displaced_at_the_same_epoch_retires_the_publications_take
     // full refresh do when they overlap, and installs a new certificate.
     assert!(node.recertify_cached_secret_inventory().await.unwrap());
     // The publication cannot be admitted any more ...
-    let mut denied = unavailable();
     assert!(
         original
-            .admit(&mut || held.with_current_publication(&mut denied, || Ok(())))
+            .admit(&mut || held.with_current_publication(unavailable, || Ok(())))
             .is_err()
     );
     // ... and it must say so before its holder tries to deliver with it:
@@ -1095,9 +1094,8 @@ async fn a_certificate_displaced_at_the_same_epoch_retires_the_publications_take
     // Preparing again takes a publication from the installed certificate.
     let (_, fresh) = node.native_secret_snapshot_with_publication().unwrap();
     fresh.check_current().unwrap();
-    let mut denied = unavailable();
     original
-        .admit(&mut || fresh.with_current_publication(&mut denied, || Ok(())))
+        .admit(&mut || fresh.with_current_publication(unavailable, || Ok(())))
         .unwrap();
 }
 
@@ -1279,10 +1277,9 @@ async fn configured_hmac_does_not_promote_scrub_only_file_inventory() {
     );
     publication.check_current().unwrap();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-    let mut denied = unavailable();
     original
         .admit(&mut || {
-            publication.with_current_publication(&mut denied, || {
+            publication.with_current_publication(unavailable, || {
                 sender.try_send(expected).map_err(|_| unavailable())?;
                 Ok(())
             })
@@ -2922,19 +2919,23 @@ async fn a_publication_is_denied_in_bounded_time_while_another_thread_holds_the_
     let held = lock(&publication.cache.state);
     let other = publication.clone();
     let outcome = finishes_within(30, move || {
-        let mut denied = ApiError::new(ErrorCode::SecretUnavailable, "denied");
         let mut published = false;
-        let result = other.with_current_publication(&mut denied, || {
-            published = true;
-            Ok(())
-        });
+        let result = other.with_current_publication(
+            || ApiError::new(ErrorCode::SecretUnavailable, "denied"),
+            || {
+                published = true;
+                Ok(())
+            },
+        );
         (result.map_err(|error| error.code), published)
     });
     assert_eq!(outcome, (Err(ErrorCode::SecretUnavailable), false));
     drop(held);
     // The mutex is free again: the same publication goes through.
-    let mut denied = ApiError::new(ErrorCode::SecretUnavailable, "denied");
-    let published = publication.with_current_publication(&mut denied, || Ok(7));
+    let published = publication.with_current_publication(
+        || ApiError::new(ErrorCode::SecretUnavailable, "denied"),
+        || Ok(7),
+    );
     assert_eq!(published.unwrap(), 7);
 }
 
@@ -2943,12 +2944,14 @@ async fn a_publication_of_a_retired_certificate_is_denied_and_publishes_nothing(
     let (_data, node) = node().await;
     let publication = settled_publication(&node).await;
     node.runtime().unwrap().cache.clear_coverage();
-    let mut denied = ApiError::new(ErrorCode::SecretUnavailable, "denied");
     let mut published = false;
-    let result = publication.with_current_publication(&mut denied, || {
-        published = true;
-        Ok(())
-    });
+    let result = publication.with_current_publication(
+        || ApiError::new(ErrorCode::SecretUnavailable, "denied"),
+        || {
+            published = true;
+            Ok(())
+        },
+    );
     assert_eq!(result.unwrap_err().code, ErrorCode::SecretUnavailable);
     assert!(!published);
 }

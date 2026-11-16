@@ -407,19 +407,21 @@ fn admit_model_data(
     publication: &kronik_sched::secrets::SecretSnapshotPublication,
     effect: &mut dyn FnMut() -> Result<(), ApiError>,
 ) -> Result<(), ModelAdmissionDenial> {
-    let mut denied = ApiError {
-        code: ErrorCode::SecretUnavailable,
-        message: String::new(),
-        hint: None,
-    };
     let mut original_entered = false;
     let mut data_entered = false;
     let result = original.admit(&mut || {
         original_entered = true;
-        publication.with_current_publication(&mut denied, || {
-            data_entered = true;
-            effect()
-        })
+        publication.with_current_publication(
+            || ApiError {
+                code: ErrorCode::SecretUnavailable,
+                message: String::new(),
+                hint: None,
+            },
+            || {
+                data_entered = true;
+                effect()
+            },
+        )
     });
     result.map_err(|error| {
         if original_entered && !data_entered {

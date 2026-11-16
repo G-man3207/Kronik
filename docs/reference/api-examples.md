@@ -208,6 +208,12 @@ Resume with the actual saved cursor in `Last-Event-ID`; that standard header
 takes precedence over the query cursor. Do not manufacture a cursor or treat
 an already-open stream as permanent authority after revocation.
 
+A `event: error` frame carries a stable `{"error":{"code",...}}` object and ends
+the stream; it is not an operational event and never advances the resume
+cursor. The daemon reports an early end this way before closing the body, so a
+client that reaches EOF without either that frame or its own cancellation
+should treat the stream as disconnected, not caught up.
+
 ## GET /v1/events/ws
 
 Use a real WebSocket client after a successful authenticated upgrade. This

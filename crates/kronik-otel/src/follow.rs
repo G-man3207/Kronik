@@ -616,9 +616,28 @@ enum Projection {
 pub struct RetainedDisclosure {
     original: AuthLease,
     projection: Projection,
-    denial: Mutex<Option<ApiError>>,
 }
 impl RetainedDisclosure {
+    /// A fresh denial keeps concurrent admissions independent: constructing it
+    /// touches no shared state and only a refused admission pays for its strings.
+    fn denied(&self) -> ApiError {
+        ApiError::new(
+            ErrorCode::Unavailable,
+            match &self.projection {
+                Projection::Checkpoint => "the original native checkpoint admission is unavailable",
+                Projection::Records(..) => {
+                    "the retained native secret snapshot changed before publication"
+                }
+                Projection::Metadata(..) => {
+                    "the captured metadata response secret snapshot changed before publication"
+                }
+                Projection::MetadataRecords(..) => {
+                    "the retained metadata stream or secret snapshot changed before publication"
+                }
+            },
+        )
+    }
+
     /// The snapshot and publication come from ONE native_secret_snapshot_with_publication call.
     pub fn native(
         reader: Arc<ShardReader>,
@@ -629,10 +648,6 @@ impl RetainedDisclosure {
         Arc::new(Self {
             original,
             projection: Projection::Records(reader, snapshot, publication),
-            denial: Mutex::new(Some(ApiError::new(
-                ErrorCode::Unavailable,
-                "the retained native secret snapshot changed before publication",
-            ))),
         })
     }
 
@@ -645,10 +660,6 @@ impl RetainedDisclosure {
         Arc::new(Self {
             original,
             projection: Projection::Metadata(snapshot, publication),
-            denial: Mutex::new(Some(ApiError::new(
-                ErrorCode::Unavailable,
-                "the captured metadata response secret snapshot changed before publication",
-            ))),
         })
     }
 
@@ -657,10 +668,6 @@ impl RetainedDisclosure {
         Arc::new(Self {
             original,
             projection: Projection::Checkpoint,
-            denial: Mutex::new(Some(ApiError::new(
-                ErrorCode::Unavailable,
-                "the original native checkpoint admission is unavailable",
-            ))),
         })
     }
 }
@@ -674,10 +681,6 @@ pub fn metadata_records(
     Arc::new(RetainedDisclosure {
         original,
         projection: Projection::MetadataRecords(stream.clone(), snapshot, publication),
-        denial: Mutex::new(Some(ApiError::new(
-            ErrorCode::Unavailable,
-            "the retained metadata stream or secret snapshot changed before publication",
-        ))),
     })
 }
 
@@ -717,56 +720,35 @@ impl Authority for RetainedDisclosure {
         }
     }
     fn admit(&self, effect: &mut dyn FnMut() -> Result<(), ApiError>) -> Result<(), ApiError> {
-        let mut denial = self
-            .denial
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .ok_or_else(|| {
-                ApiError::new(
-                    ErrorCode::Unavailable,
-                    "the retained disclosure admission is already in progress",
-                )
-            })?;
-        let result = self.original.admit(&mut || match &self.projection {
+        self.original.admit(&mut || match &self.projection {
             Projection::Checkpoint => effect(),
             Projection::Records(reader, _snapshot, publication) => {
                 if !reader.data_is_live_under_publication() {
-                    return Err(ApiError {
-                        code: denial.code,
-                        message: std::mem::take(&mut denial.message),
-                        hint: denial.hint.take(),
-                    });
+                    return Err(self.denied());
                 }
-                publication.with_current_publication(&mut denial, &mut *effect)
+                publication.with_current_publication(|| self.denied(), &mut *effect)
             }
             Projection::Metadata(_snapshot, publication) => {
-                publication.with_current_publication(&mut denial, &mut *effect)
+                publication.with_current_publication(|| self.denied(), &mut *effect)
             }
             Projection::MetadataRecords(stream, _snapshot, publication) => {
-                let published = publication.with_current_publication(&mut denial, || {
-                    if stream.is_stopping() {
-                        return Ok(false);
-                    }
-                    effect()?;
-                    Ok(true)
-                })?;
+                let published = publication.with_current_publication(
+                    || self.denied(),
+                    || {
+                        if stream.is_stopping() {
+                            return Ok(false);
+                        }
+                        effect()?;
+                        Ok(true)
+                    },
+                )?;
                 if published {
                     Ok(())
                 } else {
-                    Err(ApiError {
-                        code: denial.code,
-                        message: std::mem::take(&mut denial.message),
-                        hint: denial.hint.take(),
-                    })
+                    Err(self.denied())
                 }
             }
-        });
-        *self
-            .denial
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(denial);
-        result
+        })
     }
 }
 
@@ -1022,6 +1004,68 @@ mod retained_file_tests {
         assert_eq!(denied.unwrap_err().code, ErrorCode::SecretUnavailable);
         drop(owned);
         assert!(held.upgrade().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_disclosures_wait_for_admission_instead_of_denying_the_stream() {
+        // The event SSE body admits one queued frame while its pump admits the
+        // next. Both share this retained lease; the second must defer to the
+        // original publication fence, not fail with a spurious UNAVAILABLE.
+        let data = tempfile::tempdir().unwrap();
+        let node = kronik_sched::start_local(
+            Env::real(tokio::runtime::Handle::current()),
+            data.path(),
+            kronik_sched::NodeConfig::default(),
+        )
+        .await
+        .unwrap();
+        let guarded =
+            RetainedDisclosure::native_checkpoint(node.local_operator_authority().unwrap());
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (second, second_rx) = std::sync::mpsc::channel();
+        let first_guard = guarded.clone();
+        let first = std::thread::spawn(move || {
+            let mut called = false;
+            let result = first_guard.admit(&mut || {
+                called = true;
+                entered.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            });
+            (result, called)
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first admission never entered its publication fence");
+        let second_guard = guarded.clone();
+        let waiter = std::thread::spawn(move || {
+            let mut called = false;
+            let result = second_guard.admit(&mut || {
+                called = true;
+                Ok(())
+            });
+            second
+                .send((result.map_err(|error| error.code), called))
+                .unwrap();
+        });
+        // The old take-one-denial-slot guard returned here at once. A serialized
+        // admission can only return after the first effect leaves its fence.
+        let early = second_rx.recv_timeout(Duration::from_millis(250));
+        release.send(()).unwrap();
+        let (result, called) = first.join().unwrap();
+        result.unwrap();
+        assert!(called);
+        if let Ok(outcome) = early {
+            waiter.join().unwrap();
+            panic!("a concurrent disclosure admission was denied instead of waiting: {outcome:?}");
+        }
+        let (result, called) = second_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the second admission never completed");
+        assert_eq!(result, Ok(()));
+        assert!(called, "the second admission returned without its effect");
+        waiter.join().unwrap();
     }
 
     #[tokio::test]
