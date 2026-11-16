@@ -42,9 +42,13 @@ hostile, and limits what each of them can do. Kronik is pre-alpha and its
 interfaces may still change, but the controls below are implemented and in
 the released versions. The
 [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
-lists the tracks that are still absent or partial, among them the cluster,
-microVM isolation, the rootless daemon, fuzzing and an external security
-review.
+lists the tracks that are still absent or partial: the cluster (M16–M19), the
+remaining WASI 0.3 work (M22), the UI, fleet and hardening tracks (M27 and
+M29–M34), fuzzing and an independent external security review. Isolation is
+not on that list: since v0.5.0 the nonroot service (M21) and the microVM level
+(M20) are shipped, opt-in levels, and the root service remains the default.
+The [security guide](docs/guides/security.md) covers each protection and its
+known gaps.
 
 - **Actors** run in a Wasm sandbox with a fresh instance per turn, default-deny
   capabilities, and fuel and memory limits.
@@ -62,9 +66,26 @@ review.
   it.
 - **The API** listens on a Unix socket protected by file permissions; TCP
   access requires a token, and external traffic uses TLS.
-- **Root.** The daemon and `runsc` run as root under systemd, with the
-  hardening that systemd allows. A rootless daemon (M21) is not implemented
-  yet.
+- **Root and isolation.** By default the daemon and `runsc` run as root under
+  systemd, with the hardening that systemd allows
+  ([ADR 0027](docs/adr/0027-systemd-unit-hardening.md)). The root service
+  remains the default.
+  `kronik serve --init --rootless` installs the opt-in nonroot service
+  instead (M21; [ADR 0060](docs/adr/0060-non-root-daemon-user-namespace.md),
+  [ADR 0062](docs/adr/0062-non-root-systemd-units.md)): the daemon runs as
+  the `kronik` user, and `runsc`/`runc` run as namespace root inside a user
+  namespace that user owns, not as host root
+  ([ADR 0061](docs/adr/0061-runsc-in-the-kronik-user-namespace.md)). This is
+  not `runsc --rootless`, which cannot run Kronik's sandbox network or
+  checkpoints. The installed proofs passed on 2026-11-14 on GitHub-hosted
+  Ubuntu 24.04 runners, once with the distribution's AppArmor restriction on
+  unprivileged user namespaces active and once with it lifted; they have not
+  run on other distributions or on hardware. The opt-in microVM level (M20)
+  runs a foreign actor under a Firecracker VMM. The VMM runs as the daemon's
+  host identity with every capability cleared and a PID namespace of its own
+  ([ADR 0095](docs/adr/0095-pinned-firecracker-guest.md)). Both levels refuse
+  an actor with a typed error when its host prerequisites are missing, instead
+  of falling back to a weaker runtime.
 
 **The data directory and the log are sensitive.** The log contains the whole
 history of the system, including the random seeds that can recreate tokens

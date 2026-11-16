@@ -278,5 +278,149 @@ class DocumentationSurfaceTest(unittest.TestCase):
         self.assertEqual(declared, actual)
 
 
+class ReleaseStatusTest(unittest.TestCase):
+    README = """Kronik is pre-alpha.
+
+The latest release is **v0.5.0** (15 November 2026), the "Isolation,
+standards and web" line: WebSocket and SSE connections, streaming bodies and
+blob storage, external secret backends, and the opt-in nonroot and microVM
+levels.
+"""
+
+    CHANGELOG = """# Changelog
+
+## Unreleased
+
+- **Isolation, opt-in (M27):** a future level.
+
+## v0.5.0 — 2026-11-15
+
+- **Isolation, opt-in (M20, M21):** the nonroot daemon and the microVM level,
+  both proven on disposable hosted runners.
+
+## v0.4.1 — 2026-11-01
+
+- A patch release.
+"""
+
+    SECURITY = """# Security Policy
+
+## Security model
+
+The status page lists the tracks that are still absent or partial: the
+cluster (M16–M19), the UI, fleet and hardening tracks, fuzzing and an
+independent external security review. Isolation is not on that list: since
+v0.5.0 the nonroot service (M21) and the microVM level (M20) are shipped,
+opt-in levels.
+
+- **Root and isolation.** The root service remains the default.
+  `kronik serve --init --rootless` installs the opt-in nonroot service
+  instead. The opt-in microVM level (M20) runs a foreign actor under a VMM.
+"""
+
+    OLD_SECURITY = """# Security Policy
+
+## Security model
+
+The controls below are implemented. The project status page lists the tracks
+that are still absent or partial, among them the cluster, microVM isolation,
+the rootless daemon, fuzzing and an external security review.
+
+- **Root.** The daemon and `runsc` run as root under systemd, with the
+  hardening that systemd allows. A rootless daemon (M21) is not implemented
+  yet.
+"""
+
+    def test_released_opt_in_levels_must_not_be_absent_or_unimplemented(self):
+        problems = SURFACE["release_status"](
+            self.README, self.OLD_SECURITY, self.CHANGELOG
+        )
+        self.assertTrue(any("nonroot" in problem for problem in problems), problems)
+        self.assertTrue(any("microVM" in problem for problem in problems), problems)
+        for problem in problems:
+            self.assertIn("absent or not implemented", problem)
+
+    def test_a_shipped_opt_in_level_must_say_so(self):
+        security = """# Security Policy
+
+## Security model
+
+The status page lists the tracks that are still absent or partial: the
+cluster, fuzzing and an external security review.
+
+- **Root and isolation.** The root service remains the default. The nonroot
+  service and the microVM level exist.
+"""
+        problems = SURFACE["release_status"](self.README, security, self.CHANGELOG)
+        self.assertTrue(any("opt-in" in problem for problem in problems), problems)
+
+    def test_unreleased_changelog_entries_do_not_count_as_shipped(self):
+        self.assertEqual(
+            {"nonroot", "microVM"},
+            SURFACE["shipped_isolation_levels"](self.CHANGELOG),
+        )
+        unreleased = """# Changelog
+
+## Unreleased
+
+- **Isolation, opt-in (M20, M21):** the nonroot daemon and the microVM level.
+
+## v0.5.0 — 2026-11-15
+
+- A release without isolation changes.
+"""
+        self.assertEqual(set(), SURFACE["shipped_isolation_levels"](unreleased))
+
+    def test_an_unimplemented_bullet_is_a_failure_without_an_absent_list(self):
+        security = """# Security Policy
+
+## Security model
+
+The root service remains the default.
+
+- **Root.** The daemon runs as root under systemd. A rootless daemon (M21) is
+  not implemented yet.
+- **MicroVM.** The microVM level is shipped and opt-in.
+"""
+        problems = SURFACE["release_status"](self.README, security, self.CHANGELOG)
+        self.assertTrue(
+            any("nonroot" in problem and "absent or not implemented" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_a_qualified_negation_is_not_an_absence_claim(self):
+        security = """# Security Policy
+
+## Security model
+
+- **Root and isolation.** The root service remains the default. The nonroot
+  service and the microVM level are shipped, opt-in levels; the nonroot
+  service is not shipped as the default.
+"""
+        self.assertEqual(
+            [], SURFACE["release_status"](self.README, security, self.CHANGELOG)
+        )
+
+    def test_a_missing_security_model_is_a_failure(self):
+        with self.assertRaisesRegex(SURFACE["InvalidSurface"], "Security model"):
+            SURFACE["release_status"](self.README, "# Security Policy\n", self.CHANGELOG)
+
+    def test_a_missing_release_section_is_a_failure(self):
+        problems = SURFACE["release_status"](
+            self.README.replace("v0.5.0", "v0.6.0"), self.SECURITY, self.CHANGELOG
+        )
+        self.assertTrue(any("v0.6.0" in problem for problem in problems), problems)
+
+    def test_the_repository_security_model_matches_its_releases(self):
+        root = Path(__file__).resolve().parents[2]
+        problems = SURFACE["release_status"](
+            (root / "README.md").read_text(),
+            (root / "SECURITY.md").read_text(),
+            (root / "CHANGELOG.md").read_text(),
+        )
+        self.assertEqual([], problems)
+
+
 if __name__ == "__main__":
     unittest.main()
