@@ -618,6 +618,93 @@ stays the same when it is replayed again.
 | `max_hold` | `"0s"` | Retention ignores the audit hold once it is older (`"0s"`: no cap) | |
 | `hold_release` | `"2x"` | Retention ignores the hold below this much free disk: a multiple of `[log] disk_reserve`, or a size. With a sink it must be above `disk_reserve` unless `max_hold` is set (so `disk_reserve = "0B"` needs a size here) | |
 
+### [fleet]
+
+Outbound enrollment with a fleet controller (M29, [ADR
+0105](../adr/0105-fleet-ordinary-authority.md)); off when the table is absent.
+`kronik fleet enroll` uses this section and refuses a `<URL>` argument other
+than `url`. The controller cannot replace the CA, identity or scopes in a
+reply: they are pinned here and in the durable enrollment plan. While the
+table is absent, `kronik fleet status` answers `configured: false` and
+`kronik fleet enroll` and `kronik fleet revoke` answer `UNAVAILABLE`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `url` | required | The controller's canonical origin, `https://host[:port]`: no path, user info, query, fragment or trailing slash. The `<URL>` of `kronik fleet enroll` must be this exact string, or the command refuses it |
+| `ca_file` | required | An absolute path to the PEM CA bundle that verifies the controller's server certificate. It is read as a private file: a singly linked regular file owned by the daemon's effective user with no group or other permissions (for example `0600`), not a symbolic link. Its SHA-256 is part of the enrollment plan |
+| `installation` | required | The installation identity in the plan, at most 256 ASCII letters, digits, `-`, `_`, `.` and `:`. On a node without a durable installation identity, the first start records this value; afterwards it must equal the durable one |
+| `node` | none | The node identity in the plan, with the same characters and bound as `installation` |
+| `cluster` | none | The cluster identity in the plan, with the same characters and bound as `installation` |
+| `scopes` | required | The ordinary scopes the enrollment asks for, as a TOML array such as `["read", "fork", "propose"]`: `read`, `fork`, `propose`, `approve`, `promote`, `operate`, `pii:read` and/or `admin`, at least one. The daemon sorts and de-duplicates them. The controller cannot add one, and the enrolled bearer gets no more than these |
+
+`kronik fleet enroll` does not edit this file: edit the section, restart, and
+run the command with a one-time credential. The enrollment itself is durable
+in the log; changing a pinned value after it is active does not silently
+re-enroll the node, so revoke first and then enroll with the new values.
+
+```toml
+[fleet]
+url = "https://controller.example.com:7443"
+ca_file = "/etc/kronik/fleet-controller-ca.pem"
+installation = "acme-prod"
+node = "node-1"
+cluster = "payments"
+scopes = ["read", "fork", "propose"]
+```
+
+### [events]
+
+Operational event webhooks (M30, [ADR
+0106](../adr/0106-operational-events.md)). They deliver the same committed
+records as `GET /v1/events` and `kronik events tail`, through the M28
+follower and cursor. The feed itself is served without entries: `webhook`
+defaults to `[]`, which configures no delivery.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `webhook` | `[]` | The webhook targets, at most 64, each an `[[events.webhook]]` table (not `[events.webhook]`) |
+
+Each `[[events.webhook]]` entry has these keys:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `name` | required | The target's name: a lowercase letter, then up to 62 lowercase letters, digits and dashes, unique in the file. `kronik events webhooks status` and `replay` use it |
+| `url` | required | Where each event is POSTed: `https://…`, or `http://…` only on a loopback address. User info (`user@`) and fragments (`#…`) are refused |
+| `secret` | required | The M23 secret's name, whose value is the HMAC-SHA256 key; never the value itself. It may live in the built-in store or an external backend |
+| `version` | required | The secret's immutable version to pin, a positive integer. `kronik secret list` shows the current version. To rotate the signing key, set the new version here and restart; an event already prepared for a retry keeps the old version until it is acknowledged |
+
+Startup resolves every `secret` and `version` through the M23 registry and
+fails if one is missing or no longer served. Each POST carries one
+`kronik.event/v1` envelope as `application/json`, the same envelope
+`GET /v1/events` returns and `GET /v1/events/schemas` publishes (a copy is
+[`events.schema.json`](../reference/events.schema.json)). The signature is
+HMAC-SHA256 over
+
+```text
+kronik.webhook/v1\n<kronik-timestamp-ms>\n<kronik-event-id>\n<body>
+```
+
+where each `\n` is one LF byte and `<body>` is the exact POST body.
+`Kronik-Signature-Version: v1`; `Kronik-Signature` is `v1=` followed by
+lowercase hex; `Kronik-Timestamp-Ms` and `Kronik-Event-Id` are the values
+that were signed; and `Idempotency-Key` equals the event id. Delivery is at
+least once: a non-2xx answer or a transport failure keeps the prepared event
+and retries it with bounded backoff, and only an acknowledged delivery
+advances the durable cursor. A lost acknowledgement can therefore produce a
+duplicate with the same `Kronik-Event-Id` and `Idempotency-Key`.
+
+`kronik events webhooks status` shows each target's cursor, last error and
+gaps. `kronik events webhooks replay` rewinds one with a reason and the
+ordinary audit and authorization.
+
+```toml
+[[events.webhook]]
+name = "billing-events"
+url = "https://hooks.example.com/kronik"
+secret = "billing-webhook-signing-key"
+version = 1
+```
+
 ### Other settings of kronik serve
 
 | Flag | Default | Meaning |

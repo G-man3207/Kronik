@@ -2964,7 +2964,9 @@ docs:  kronik explain UNAUTHENTICATED
 Asks the local daemon to enroll with a fleet controller, through the ordinary
 authenticated `POST /v1/fleet/enroll` API. Local operator configuration pins the
 controller's server trust, canonical origin, installation identity and exact
-ordinary scopes. Before the first request the daemon durably creates its owned
+ordinary scopes; see `[fleet]` in the [operations
+guide](../guides/operations.md#fleet). Before the first request the daemon
+durably creates its owned
 private leaf key and CSR; normal bootstrap does not require a manually supplied
 client certificate. The trusted issuer's returned certificate must match that
 exact request and CSR. No private key is sent to the controller or generated
@@ -3128,7 +3130,9 @@ kronik events schemas
 `kronik events webhooks status`
 
 Reads `GET /v1/events/webhooks`, showing delivery status for configured webhook
-names. It does not expose webhook signing secrets.
+names. It does not expose webhook signing secrets. The names are the
+`[[events.webhook]]` entries configured in the [operations
+guide](../guides/operations.md#events).
 
 ```sh
 kronik events webhooks status

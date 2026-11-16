@@ -437,6 +437,47 @@ def ui_asset_api(root):
     return operations
 
 
+def config_fields(text):
+    """The top-level TOML tables of the server's `Config` struct.
+
+    A field's name is its table: `events: Events` is `[events]`. The body is
+    read with the Rust delimiter layout, so braces in comments and literals
+    cannot move its end.
+    """
+    code, layout = rust_views(text)
+    declaration = re.search(r"\bpub\s+struct\s+Config\s*\{", layout)
+    if declaration is None:
+        raise InvalidSurface("no server Config struct")
+    body = code[declaration.end():delimited_end(layout, declaration.end() - 1)]
+    fields = re.findall(r"^\s*(?:pub\s+)?([a-z][a-z0-9_]*)\s*:", body, re.MULTILINE)
+    if not fields or len(fields) != len(set(fields)):
+        raise InvalidSurface("invalid or empty server Config field inventory")
+    return fields
+
+
+def config_tables(guide):
+    """The `[table]` headings of the guide's `kronik.toml` reference."""
+    body = sections(guide).get("kronik.toml")
+    if body is None:
+        raise InvalidSurface("operations guide has no kronik.toml section")
+    tables = set()
+    for title in sections(body, level=3):
+        match = re.match(r"\[([A-Za-z][A-Za-z0-9_.-]*)\]", title)
+        if match:
+            tables.add(match.group(1))
+    if not tables:
+        raise InvalidSurface("kronik.toml reference documents no tables")
+    return tables
+
+
+def undocumented_config(source, guide):
+    """The `Config` fields without a `[field]` or `[field.sub]` reference table."""
+    documented = config_tables(guide)
+    return [field for field in config_fields(source)
+            if not any(table == field or table.startswith(field + ".")
+                       for table in documented)]
+
+
 def actual_api(root):
     source_root = root / "crates/kronik-api/src"
     operations = set()
@@ -498,6 +539,12 @@ def check(root, binary):
         (root / "README.md").read_text(),
         (root / "SECURITY.md").read_text(),
         (root / "CHANGELOG.md").read_text(),
+    ))
+    # The operations guide makes every key below applied: an undocumented
+    # top-level table is an unknown key that stops the start.
+    missing.extend("kronik.toml table: " + field for field in undocumented_config(
+        (root / "crates/kronik/src/config.rs").read_text(),
+        (root / "docs/guides/operations.md").read_text(),
     ))
     cli_doc = sections((root / "docs/reference/cli.md").read_text())
     cli = cli_leaves(binary, root)
