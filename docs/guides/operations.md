@@ -27,10 +27,10 @@ kronik doctor
 sets up a host in six steps:
 
 1. It writes `/etc/kronik/kronik.toml` (mode 0644, in `/etc/kronik` mode
-   0755, under any umask). With `--domain` (which
-   can be repeated) the gateway listens on `0.0.0.0:443` with a certificate
-   from Let's Encrypt. Without it, the gateway listens on `0.0.0.0:80`
-   without TLS.
+   0755, under any umask), or the file `--config` names. With `--domain`
+   (which can be repeated) the gateway listens on `0.0.0.0:443` with a
+   certificate from Let's Encrypt. Without it, the gateway listens on
+   `0.0.0.0:80` without TLS.
 2. It creates the data directory `/var/lib/kronik` (mode 0700).
 3. It creates or loads the master key through `[keys] source`. The default
    is `/etc/kronik/master.key` (mode 0600); a KMS source stores only a
@@ -46,25 +46,26 @@ sets up a host in six steps:
    and run `--init` again, or use `--rootless`, whose unit hands the file to
    the daemon as a credential.
 4. It creates the system group `kronik`.
-5. It installs `/etc/systemd/system/kronik.service`, whose `ExecStart`
-   points at the binary you ran and which is otherwise the unit of v0.4.1,
-   byte for byte: running `--init` again on a host that v0.4.1 set up changes
-   nothing (v0.4.0's unit differs in one comment line, which it rewrites).
+5. It installs `/etc/systemd/system/kronik.service`, whose `ExecStart` and
+   `ExecStopPost` point at the binary you ran and the configuration file,
+   and which is otherwise the unit of v0.4.1, byte for byte: running
+   `--init` again on a host that v0.4.1 set up changes nothing (v0.4.0's
+   unit differs in one comment line, which it rewrites). With the default
+   configuration path, the installed unit is v0.4.1's exactly.
 6. It runs `systemctl daemon-reload` and `systemctl enable --now
    kronik.service`, waits for the service to answer, and runs `kronik doctor`
    against it (see [what the install proves](#what-the-install-proves)).
 
 Every step checks before it acts, so running `--init` again changes nothing
 that is already in place, and it never overwrites an existing config file
-or key. Edit `/etc/kronik/kronik.toml` afterwards and run `systemctl restart
+or key. Edit the configuration file afterwards and run `systemctl restart
 kronik`. `--root` names this service explicitly. `--dry-run` shows the plan,
 as text or with `--json` (`{dry_run, mode, steps}`), and changes nothing.
 
-The directory `/etc/kronik` is created with mode 0755 explicitly, whatever
+The configuration's directory is created with mode 0755 explicitly, whatever
 the caller's umask is, and an older one is brought to 0755: the nonroot
 service reads the file inside it as `kronik`, so a hardened `umask 077` must
-not leave a root-only directory behind. The same applies to the directory
-`--config` names.
+not leave a root-only directory behind.
 
 The configuration flags of `serve` - `--data-dir`, `--api-socket`,
 `--http-listen`, `--admin-listen`, `--api-listen`, `--gateway-timeout-ms`,
@@ -743,8 +744,11 @@ input).
 
 `kronik serve --init` installs `deploy/systemd/kronik-root.service` in the
 source as `kronik.service`: the unit of v0.1 to v0.4, unchanged, with no
-delegated cgroup and no key credential, and `--config
-/etc/kronik/kronik.toml` written in as in v0.4.0. A microVM needs a delegated
+delegated cgroup and no key credential, and `--config` naming the
+configuration this installation writes (`/etc/kronik/kronik.toml` by
+default, as in v0.4.0). A custom `--config` reaches `ExecStart` and
+`ExecStopPost`, so the service reads the file the installer wrote; with the
+default path the unit is v0.4.1's byte for byte. A microVM needs a delegated
 cgroup, which a drop-in adds (see [MicroVM actors on the root
 service](#microvm-actors-on-the-root-service)). `kronik serve --init
 --rootless` installs the nonroot

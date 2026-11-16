@@ -6,6 +6,12 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- `kronik serve --init` writes the configuration path `--config` names into
+  both `ExecStart` and `ExecStopPost` of the installed root
+  `kronik.service`; before, the root unit kept
+  `/etc/kronik/kronik.toml`, so a custom path was written but never read by
+  the service. The default path still renders the unit of v0.4.1 byte for
+  byte, and a v0.4.1 installation is left unchanged (ADR 0150).
 - The host-side buffers one turn fills are bounded: guest logs and
   stdout/stderr, state writes, messages and timers share a per-turn budget
   equal to the kind's memory limit (64 MiB by default, at most 1 GiB,

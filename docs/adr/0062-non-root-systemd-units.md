@@ -1,6 +1,6 @@
 # 0062. Stable-user systemd units and source-aware credentials
 
-- **Status:** Accepted (2026-11-13). Implemented; the installed fixture passed on 2026-11-14 (see Doctor and proof).
+- **Status:** Accepted (2026-11-13). Implemented; the installed fixture passed on 2026-11-14 (see Doctor and proof). Amended by ADR 0150 for the root template's configuration placeholder.
 - **Date:** 2026-11-07
 - **Amends:** ADR 0027 for the stable-user installation; the root service keeps its separate template, which is the unit of v0.4.1 byte for byte (a test pins its digest; v0.4.0's differs in one comment line), and ADR 0027's constraints.
 
@@ -18,7 +18,7 @@ Which service `kronik serve --init` installs without a flag is one constant, `DE
 
 ## Credential rendering interface
 
-The nonroot template uses `@KRONIK@`, `@CONFIG@`, `@KEY_CREDENTIAL@` and `@KEY_ARGUMENT@`; the root template uses only `@KRONIK@`, as v0.4.0's does, and carries no key path or credential (the root daemon reads the file named by `[keys] master_key_file` itself, so `--init --root` refuses a `--master-key-file` that differs from the configured one). Init renders the last two only for the nonroot unit and only for the selected **file** custody source:
+The nonroot template uses `@KRONIK@`, `@CONFIG@`, `@KEY_CREDENTIAL@` and `@KEY_ARGUMENT@`; the root template uses `@KRONIK@` and, since ADR 0150, `@CONFIG@`, as v0.4.0's does for the binary, and carries no key path or credential (the root daemon reads the file named by `[keys] master_key_file` itself, so `--init --root` refuses a `--master-key-file` that differs from the configured one). Rendering `@CONFIG@` with the default path leaves the root unit of v0.4.1 byte for byte. Init renders the last two only for the nonroot unit and only for the selected **file** custody source:
 
 - `LoadCredential=master-key:<selected source file>`;
 - an ExecStart suffix ` --master-key-file %d/master-key`.

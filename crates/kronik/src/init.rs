@@ -1755,27 +1755,86 @@ mod tests {
 
     /// The root service's unit is the one of v0.4.1 and nothing else: no
     /// delegated cgroup (it would move where an existing installation's
-    /// sandboxes get theirs), no key credential, no placeholder but the
-    /// binary's path.
+    /// sandboxes get theirs), no key credential, and for the default
+    /// configuration path the bytes of v0.4.1.
     #[test]
-    fn the_root_template_is_the_v041_unit_byte_for_byte() {
+    fn the_root_template_is_the_v041_unit_byte_for_byte_by_default() {
+        use super::*;
         use sha2::Digest as _;
-        let digest = sha2::Sha256::digest(super::ROOT_UNIT.as_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let units = dir.path().join("units");
+        std::fs::create_dir(&units).unwrap();
+        let host = host(&units, None);
+        let default = unit(
+            ROOT_UNIT,
+            &host,
+            Path::new(DEFAULT_PATH),
+            &Config::default(),
+            0,
+        )
+        .unwrap();
+        let exe = host.exe.to_string_lossy();
+        let normalized = default.replace(exe.as_ref(), "@KRONIK@");
+        let digest = sha2::Sha256::digest(normalized.as_bytes());
         let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(hex, V041_UNIT_SHA256);
-        for absent in ["Delegate", "LoadCredential", "@CONFIG@", "@KEY_"] {
-            assert!(!super::ROOT_UNIT.contains(absent), "{absent}");
+        for absent in ["Delegate", "LoadCredential", "@KEY_"] {
+            assert!(!default.contains(absent), "{absent}");
         }
+        assert_eq!(default.matches(DEFAULT_PATH).count(), 2);
         assert_eq!(super::ROOT_UNIT.matches("@KRONIK@").count(), 2);
+        assert_eq!(super::ROOT_UNIT.matches("@CONFIG@").count(), 2);
+    }
+
+    /// The configuration is written to the path `--config` names, so the unit
+    /// that starts the daemon and cleans up after it must name that path too.
+    #[test]
+    fn the_root_unit_names_the_configuration_path_init_was_given() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let units = dir.path().join("units");
+        std::fs::create_dir(&units).unwrap();
+        let config = dir.path().join("etc/kronik.toml");
+        let host = host(&units, None);
+        let (_, steps) = plan(&root_args(), &config, &host).unwrap();
+        let written = steps
+            .iter()
+            .find_map(|step| match step {
+                Step::Install { path, contents, .. } if *path == host.unit() => Some(contents),
+                _ => None,
+            })
+            .expect("the plan installs the root unit");
+        // The dry run and the run apply this same plan; neither may name one
+        // configuration in the unit and another in the file it writes.
+        let mut applied_args = root_args();
+        applied_args.dry_run = false;
+        let (_, applied_steps) = plan(&applied_args, &config, &host).unwrap();
         assert_eq!(
-            super::ROOT_UNIT.matches('@').count(),
-            4,
-            "no placeholder but the binary's path"
+            written,
+            applied_steps
+                .iter()
+                .find_map(|step| match step {
+                    Step::Install { path, contents, .. } if *path == host.unit() => Some(contents),
+                    _ => None,
+                })
+                .expect("the plan installs the root unit")
         );
+        let exe = host.exe.to_string_lossy();
+        let config = config.to_str().unwrap();
+        for line in [
+            format!("ExecStart={exe} serve --config {config}"),
+            format!("ExecStopPost=-{exe} foreign cleanup --config {config}"),
+        ] {
+            assert!(
+                written.lines().any(|written| written == line),
+                "{line}: {written}"
+            );
+        }
+        assert!(!written.contains(DEFAULT_PATH), "{written}");
     }
 
     #[test]
-    fn init_root_changes_nothing_on_a_host_that_v041_set_up() {
+    fn init_root_keeps_the_unit_it_wrote() {
         use super::*;
         let dir = tempfile::tempdir().unwrap();
         let units = dir.path().join("units");
@@ -1787,8 +1846,11 @@ mod tests {
         )
         .unwrap();
         let host = host(&units, None);
-        // What v0.4.1's `serve --init` wrote: its template with the binary's path.
-        let written = ROOT_UNIT.replace("@KRONIK@", &host.exe.to_string_lossy());
+        // What this installation wrote: its template with the binary's path
+        // and the configuration's path.
+        let written = ROOT_UNIT
+            .replace("@KRONIK@", &host.exe.to_string_lossy())
+            .replace("@CONFIG@", config.to_str().unwrap());
         std::fs::write(host.unit(), &written).unwrap();
         let (_, steps) = plan(&root_args(), &config, &host).unwrap();
         let unit = steps
