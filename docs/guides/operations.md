@@ -2642,7 +2642,7 @@ operator meets:
 | `BAD_REQUEST` at start | `kronik.toml` has an unknown key or a bad value | Fix the line the message names (`kronik doctor` checks the file too) |
 | `CERTIFICATE_INVALID` | The TLS certificate has expired, cannot be parsed, or its files cannot be read (`kronik doctor`'s `tls` or `dns01_hook` check) | Renew it, or fix the path and permissions of the PEM files; see [TLS](#tls) |
 | `STORAGE_CORRUPT` | The data directory is inconsistent: `state.db` is ahead of the log, a log record can't be read, an applied record in the active segment is damaged (nothing is truncated), or an open turn's begin is in a deleted segment. "state is at lsn N, but the log starts at M (compacted)": see [A start that stops at the log's start](#a-start-that-stops-at-the-logs-start). "state.db has applied lsn N, but the log ends at M": see [record size](#record-size) | Keep a copy of the data directory and look at the message. `state.db` is materialized from the log and can be rebuilt by moving it away and starting again; the log itself must not be edited |
-| `UNAVAILABLE` | The node stopped after a storage failure (also `/healthz` 503) | The daemon exits and systemd restarts it; check the disk (`kronik doctor`'s `disk` check) and the journal |
+| `UNAVAILABLE` | The node stopped after a storage failure (also `/healthz` 503), or an open turn's re-run could not get its recorded prerequisite on three starts | For a storage failure, the daemon exits and systemd restarts it; check the disk (`kronik doctor`'s `disk` check) and the journal. For the third start, `history` names the turn and a message or timer input is a dead letter: fix what the turn needs, then resend it (an HTTP request needs a new `Idempotency-Key`) |
 | `GATEWAY_TIMEOUT` | A turn took longer than `[gateway] timeout` | The turn still completes; clients that retry with the same `Idempotency-Key` get its response |
 | `PAYLOAD_TOO_LARGE` | A request body over 1 MiB | v0.1's limit |
 | `TURN_TOO_LARGE` | In `history` or a dead letter: a turn needed more than one log record (128 MiB) for its effects, writes, messages, SQL changes and output, so it failed instead of committing; an HTTP client got `TURN_FAILED` | Split the work over several turns; see [record size](#record-size). No limit setting raises it |
@@ -2714,9 +2714,20 @@ what holds the log:
   `history`. A re-run that waits for what it needs (a secret version whose
   backend does not answer: `kronik_secret_recovery_stalled`, and the log's
   `the re-run of an open turn is waiting for what it needs` with the same
-  execution id) ends when that is back. A turn that does not end and does
-  not wait is a defect: keep a copy of the data directory and report it
-  with the execution id and the log around it.
+  execution id) ends when that is back. If the re-run ends `UNAVAILABLE`
+  instead, the daemon retries it twelve times (about 36 s) and then logs
+  `the re-run of an open turn is still UNAVAILABLE after this start's
+  retries`; the next start tries again. It does that on three starts in
+  all. On the third it logs `... after its last allowed start: the turn is
+  closed as failed`, and the closing record is in `kronik history` as a
+  failed `UNAVAILABLE` turn, with its input and recorded effects. A message
+  or timer input other than a `call`'s is then in `kronik dead-letters
+  list`: fix what the turn needs and resend it. An HTTP input keeps its
+  `Idempotency-Key`; use a new key for a new attempt. A `SECRET_UNAVAILABLE`
+  wait is not counted and not closed this way; it lasts as long as its
+  backend does. A turn that does not end and does not wait is a defect: keep
+  a copy of the data directory and report it with the execution id and the
+  log around it.
 - `snapshot`: a kept snapshot was taken while a turn was open, and a start
   from it would run that turn again; the turn itself may have ended long
   since. Retention keeps the segment until the snapshot is deleted, which

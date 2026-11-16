@@ -1342,6 +1342,8 @@ From a replay (a proposal, `kronik replay`, a preview, a message into a fork) or
 
 As the outcome of an actor's call turn (input source `CALL`) that a start wrote, it means the daemon stopped while the call waited for its callee, after its caller had timed out: the call never ran. Its caller had already failed or gone on without the answer. A compensation the call carried is not sent, and nothing is orphaned. If the change still matters, send it again.
 
+As the outcome of an open turn's re-run, on three starts, it means the prerequisite the turn recorded did not become available during any start's retries. The host closed the turn as failed under its own execution id, with the effects it had recorded, instead of running it ahead of that actor's inputs at every start and keeping its begin's log segment from retention. The failed turn's message counts the starts. A message or timer input other than a call's is in dead letters; an HTTP input is recorded under its `Idempotency-Key`. Fix what the turn needs, then resend the dead letter (a new root input) or make the HTTP request with a new key. A recorded secret value that is still unavailable (`SECRET_UNAVAILABLE`) is not closed this way: the turn waits for it without bound, because the value is part of its record.
+
 ## UPLOAD_TOO_SLOW
 
 HTTP status 408, milestone M25. The request body arrived too slowly.

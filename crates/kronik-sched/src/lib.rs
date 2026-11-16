@@ -151,6 +151,12 @@ pub struct NodeConfig {
     /// (`record_budget`) without 128 MiB turns.
     #[doc(hidden)]
     pub test_max_record_bytes: Option<u32>,
+    /// Test hook: how many `UNAVAILABLE` attempts one start gives the re-run
+    /// of an open turn before it ends the start (default
+    /// `secrets::recovery::RERUN_UNAVAILABLE_ATTEMPTS`). `Some(0)` lets a
+    /// fixture reach the cross-start bound without the in-start backoff.
+    #[doc(hidden)]
+    pub test_rerun_unavailable_attempts: Option<u32>,
     /// `[connections]` (M24): the hub's caps and transport settings.
     pub connections: connections::ConnectionsConfig,
     /// Deliberate bug, for mutation testing of the DST harness (M24 §14,
@@ -283,6 +289,7 @@ impl Default for NodeConfig {
             startup_apply_batch: 131_072,
             startup_decode_width: None,
             test_max_record_bytes: None,
+            test_rerun_unavailable_attempts: None,
             connections: connections::ConnectionsConfig::default(),
             mutation_deliver_before_fsync: false,
             blobs: None,

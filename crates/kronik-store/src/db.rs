@@ -379,6 +379,11 @@ fn i(v: u64) -> i64 {
     v as i64
 }
 
+/// The `meta` key behind [`StateDb::rerun_unavailable_starts`].
+fn rerun_unavailable_key(branch: &str, execution_id: &str) -> String {
+    format!("rerun-unavailable:{branch}:{execution_id}")
+}
+
 impl StateDb {
     /// Prepares `conn` (WAL, NORMAL) and creates the schema.
     pub fn open(conn: Connection) -> Result<StateDb, StoreError> {
@@ -2039,6 +2044,90 @@ impl StateDb {
             out.push(decode(&row?, "open effect")?);
         }
         Ok(out)
+    }
+
+    /// How many starts the re-run of the open turn `execution_id` has ended
+    /// with `UNAVAILABLE`.
+    ///
+    /// It is bookkeeping for the start bound, not materialized state: a
+    /// `state.db` rebuilt from the log starts at zero, and the `meta` table
+    /// keeps it out of the state hash. Keys are per branch, so a fork's copy
+    /// of `state.db` does not spend its parent's starts.
+    pub fn rerun_unavailable_starts(
+        &self,
+        branch: &str,
+        execution_id: &str,
+    ) -> Result<u32, StoreError> {
+        let row: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT v FROM meta WHERE k = ?1")?
+            .query_row([rerun_unavailable_key(branch, execution_id)], |r| r.get(0))
+            .optional()?;
+        Ok(row.unwrap_or(0).clamp(0, i64::from(u32::MAX)) as u32)
+    }
+
+    /// Counts this start's exhausted `UNAVAILABLE` re-run of the open turn
+    /// `execution_id` and returns how many starts have now ended that way.
+    pub fn note_rerun_unavailable(
+        &self,
+        branch: &str,
+        execution_id: &str,
+    ) -> Result<u32, StoreError> {
+        self.conn
+            .prepare_cached(
+                "INSERT INTO meta (k, v) VALUES (?1, 1) \
+                 ON CONFLICT(k) DO UPDATE SET v = v + 1",
+            )?
+            .execute([rerun_unavailable_key(branch, execution_id)])?;
+        self.rerun_unavailable_starts(branch, execution_id)
+    }
+
+    /// Drops the start count of an open turn that ended (committed or failed).
+    pub fn clear_rerun_unavailable(
+        &self,
+        branch: &str,
+        execution_id: &str,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .prepare_cached("DELETE FROM meta WHERE k = ?1")?
+            .execute([rerun_unavailable_key(branch, execution_id)])?;
+        Ok(())
+    }
+
+    /// Drops this branch's start counts of turns that are no longer open
+    /// (the turn ended after its count was written, or its last process
+    /// stopped before the cleanup ran). Called once at a start.
+    pub fn clear_stale_rerun_unavailable(&self, branch: &str) -> Result<(), StoreError> {
+        let prefix = format!("rerun-unavailable:{branch}:");
+        let open: std::collections::HashSet<String> = self
+            .open_turns()?
+            .into_iter()
+            .map(|turn| turn.execution_id)
+            .collect();
+        // `substr`, not `LIKE`: a branch name is not a pattern.
+        let mut st = self
+            .conn
+            .prepare("SELECT k FROM meta WHERE substr(k, 1, ?1) = ?2")?;
+        let keys: Vec<String> = st
+            .query_map(
+                params![
+                    i64::try_from(prefix.len()).unwrap_or(i64::MAX),
+                    prefix.as_str()
+                ],
+                |r| r.get(0),
+            )?
+            .collect::<Result<_, _>>()?;
+        drop(st);
+        let mut del = self.conn.prepare_cached("DELETE FROM meta WHERE k = ?1")?;
+        for key in keys {
+            if key
+                .strip_prefix(&prefix)
+                .is_none_or(|execution_id| !open.contains(execution_id))
+            {
+                del.execute([key])?;
+            }
+        }
+        Ok(())
     }
 
     /// The saved outcome of the call turn that consumed `message_id`.

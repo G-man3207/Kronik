@@ -225,6 +225,22 @@ The input of an open turn is not delivered again: its mailbox entry and
 its ingress key belong to the re-run (an HTTP retry with the same
 `Idempotency-Key` joins the re-run).
 
+A re-run that ends `UNAVAILABLE` is tried again in the same start, with
+the backoff above, for a recorded prerequisite that the applier or a
+call's callee may still supply. If the start's retries end that way, the
+start counts; on the third such start the turn is closed as failed with
+`UNAVAILABLE`, under its own execution id, with the latest recorded
+effects (`close_open_turn`). A message or timer input other than a `call`'s
+then becomes a dead letter: fix the prerequisite, then resend it; an HTTP
+client sends a new request with a new `Idempotency-Key`, since the failed
+outcome is now recorded for the old one (ADR 0148). The count lives in
+`state.db`'s `meta` table, per branch, not in the log: a rebuilt state starts
+it over.
+`SECRET_UNAVAILABLE` is not counted and waits without bound, because the
+recorded value itself is what is missing (design m23 §5.3), and a start
+whose node failed does not count either: the next start has to run the
+turn.
+
 ## 5. `call`, compensations and orphans
 
 - **Message id** `= message_id(caller causal key, ordinal)`; the callee's
