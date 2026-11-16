@@ -225,7 +225,7 @@ cargo build -p kronik
 scripts/ci.sh
 ```
 
-`scripts/ci.sh` runs the same 16 checks as CI; `scripts/ci.sh clippy test` runs
+`scripts/ci.sh` runs the same 17 checks as CI; `scripts/ci.sh clippy test` runs
 a subset. It needs rustup with the pinned toolchain, `cargo-deny`, Node.js 22.20
 or later and the pinned Python test runtime from
 [CONTRIBUTING.md](CONTRIBUTING.md), which also has the conventions.

@@ -28,7 +28,7 @@ env:
 
 jobs:
   lint:
-    name: fmt, clippy, hygiene, docs, book, deny
+    name: fmt, clippy, keyhelper, hygiene, docs, book, deny
     runs-on: ubuntu-24.04
     steps:
       # The runner's preinstalled SDKs that this job does not use, for disk.
@@ -61,6 +61,8 @@ jobs:
         run: scripts/ci.sh fmt
       - name: clippy
         run: scripts/ci.sh clippy
+      - name: keyhelper
+        run: scripts/ci.sh keyhelper
       - name: hygiene
         run: scripts/ci.sh hygiene
       - name: docs

@@ -48,10 +48,9 @@ fn with_context(
         if info.manufacturer_id() == request.manufacturer.as_ref()
             && info.model() == request.model.as_ref()
             && info.serial_number() == request.serial.as_ref()
+            && selected.replace(slot).is_some()
         {
-            if selected.replace(slot).is_some() {
-                return Err(Error::Token);
-            }
+            return Err(Error::Token);
         }
     }
     let slot = selected.ok_or(Error::Token)?;
@@ -190,6 +189,8 @@ fn operate(session: &Session, request: &Request<'_>) -> Result<ResultBytes, Erro
     }
 }
 
+// Not daemon code and has no Env: the AES-GCM nonce comes from the OS CSPRNG.
+#[allow(clippy::disallowed_methods)]
 fn encrypt(
     session: &Session,
     key: ObjectHandle,

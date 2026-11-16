@@ -42,7 +42,7 @@ step. These are development dependencies, not daemon/runtime requirements.
 Run the same checks as CI before you push:
 
 ```sh
-scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, s3, identity and action
+scripts/ci.sh                # fmt, clippy, keyhelper, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, s3, identity and action
 scripts/ci.sh clippy test    # selected steps
 ```
 
@@ -219,8 +219,8 @@ public acceptance requirements are in `examples/github-flow/README.md`.
 - **Logging.** Use `tracing` in the daemon, never `println!`.
 - **Dependencies.** Justify every new dependency in the commit message. Avoid C
   dependencies beyond SQLite, which is bundled through `rusqlite`. Every
-  dependency must pass `cargo deny check`; extend the license allowlist in
-  `deny.toml` only when a new dependency needs it.
+  dependency must pass `cargo deny --all-features check`; extend the license
+  allowlist in `deny.toml` only when a new dependency needs it.
 - **Formats are versioned.** A change to a format (the Protobuf log schema, the
   diff schema or CLI JSON) requires a version bump and a compatibility fixture.
 - **Functional core, imperative shell.** tokio handles I/O in the shell. The
