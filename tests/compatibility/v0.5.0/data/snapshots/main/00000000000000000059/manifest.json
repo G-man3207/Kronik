@@ -1,0 +1,40 @@
+{
+  "format": 1,
+  "id": "main-00000000000000000059",
+  "branch": "main",
+  "lsn": 59,
+  "engine_version": "kronik-0.5.0+wasmtime-50.0.1",
+  "created_wall_ms": 1794861386510,
+  "logical_time_ms": 1794861386480,
+  "segments": [
+    "00000000000000000001.seg"
+  ],
+  "files": [
+    {
+      "path": "state.db",
+      "size": 217088,
+      "blake3": "ca0bcba3fd3feabc7ed1238494c2535379620e2355ad69ffff653c2a6f49f396"
+    },
+    {
+      "path": "sql/df/notes~a-df924404.db",
+      "size": 16384,
+      "blake3": "65fee847376a4b83c8423e1ae3434664c849f76fb7bf6d295e062d56b7200ba5"
+    },
+    {
+      "path": "secrets.db",
+      "size": 24576,
+      "blake3": "b500a24962664d5c03c2875d4d08428eb7d2cef845a85bba5d304b6fbeb640cf"
+    },
+    {
+      "path": "blobs.idx",
+      "size": 204,
+      "blake3": "c025e02f0fc13a81556b5b8e1ece7466bb4ae91238d7ae23b98fbbb596ca2d60"
+    }
+  ],
+  "state_hash": "b3:81b2a4f023e61a083be34b72c4645e4e68d2408b1ad5cb67ba4540070883f10f",
+  "reason": "manual",
+  "blobs": {
+    "count": 3,
+    "bytes": 270000
+  }
+}

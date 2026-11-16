@@ -4,7 +4,8 @@
     "v0.1.0",
     "v0.3.0",
     "v0.4.0",
-    "v0.4.1"
+    "v0.4.1",
+    "v0.5.0"
   ],
   "releases": [
     {
@@ -234,6 +235,78 @@
           "git_blob": "c3147d12ffc2f3838809b3e20cf8dab8948f7216",
           "sha256": "250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423",
           "bytes": 76877
+        }
+      ]
+    },
+    {
+      "release": "v0.5.0",
+      "producer_revision": "fcc5bf5a3eaa2dd68bc3bf3bdd0ef64b0cf5bf75",
+      "producer_binary_sha256": "d8995ed9b7219dcb4ae1d7932c111a56ff3fd9d4e9e255555f25d356eebfc215",
+      "manifest": "v0.5.0/manifest.json",
+      "manifest_sha256": "593e14c88e40d0291288977429e914e285576cd84dad55e7aac8c791f7be3a9f",
+      "root_inputs": 32,
+      "contracts": {
+        "api": {
+          "path": "v0.5.0/contracts/openapi.json",
+          "source_path": "docs/reference/openapi.json",
+          "git_blob": "2389d9371f8f1bbc84c6253f2c9cf4fa61b7c113",
+          "sha256": "cbe7f2c29b328ff8b7b8d9b7036a32a0df1471b5e63bd84309f03f33b7804630",
+          "bytes": 479155
+        },
+        "cli": {
+          "path": "v0.5.0/contracts/cli-json.txt",
+          "source_path": "docs/reference/json.md",
+          "git_blob": "b280b9034506130706dfd52f2d8402667b3001b8",
+          "sha256": "003982aa1e365958ea7ad84ea82b82f3054fa186027d1fd0306ba8fd064f01e3",
+          "bytes": 203158
+        },
+        "diff": {
+          "path": "v0.5.0/contracts/diff-v1.schema.json",
+          "source_path": "docs/reference/diff-v1.schema.json",
+          "git_blob": "95549f1d142a6ef83f995a48b014897c52ed677a",
+          "sha256": "5095d94e5642d8fda28f8bc389048d7bb6d370b1d9efa01705a7e840f581fee2",
+          "bytes": 56841
+        },
+        "wit": {
+          "path": "v0.5.0/contracts/actor.wit",
+          "source_path": "wit/kronik-actor.wit",
+          "git_blob": "a40f76211f751809e627898e0882f5ab36b46314",
+          "sha256": "2bddb507bbde2537b9555e83e572e886da7297f1a503e75c7b973d1bcdb11c0a",
+          "bytes": 12540
+        }
+      },
+      "components": [
+        {
+          "role": "counter",
+          "path": "components/747c8630dfe34766b8b29f81787145b0c5061acef875be5c2c04c8da4ea70fb5.wasm",
+          "source_path": "tests/guests/counter.wasm",
+          "git_blob": "51bb8c5b672d056de9f651081bfc6c037793c2c7",
+          "sha256": "747c8630dfe34766b8b29f81787145b0c5061acef875be5c2c04c8da4ea70fb5",
+          "bytes": 109079
+        },
+        {
+          "role": "notes",
+          "path": "components/250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423.wasm",
+          "source_path": "tests/guests/notes.wasm",
+          "git_blob": "c3147d12ffc2f3838809b3e20cf8dab8948f7216",
+          "sha256": "250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423",
+          "bytes": 76877
+        },
+        {
+          "role": "media",
+          "path": "components/ed8c73e8908b872b54161ea8a9df816a8d91dde578db68dda840db6acab52f87.wasm",
+          "source_path": "tests/guests/media.wasm",
+          "git_blob": "95c5106fb22802acda738e3d4f9d9c9813d4bcb2",
+          "sha256": "ed8c73e8908b872b54161ea8a9df816a8d91dde578db68dda840db6acab52f87",
+          "bytes": 104821
+        },
+        {
+          "role": "room",
+          "path": "components/547d04560ecebb58b3e1fe7b1b3f32d8eb22b763b79a4732e0aac8baf1ff038d.wasm",
+          "source_path": "tests/guests/room.wasm",
+          "git_blob": "e3f2622737f3a39344d64e69c0c4b7471753c460",
+          "sha256": "547d04560ecebb58b3e1fe7b1b3f32d8eb22b763b79a4732e0aac8baf1ff038d",
+          "bytes": 108112
         }
       ]
     }

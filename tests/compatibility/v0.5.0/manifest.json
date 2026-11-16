@@ -1,0 +1,677 @@
+{
+  "format": "kronik.compatibility-corpus/v1",
+  "release": "v0.5.0",
+  "producer_revision": "fcc5bf5a3eaa2dd68bc3bf3bdd0ef64b0cf5bf75",
+  "producer_binary_sha256": "d8995ed9b7219dcb4ae1d7932c111a56ff3fd9d4e9e255555f25d356eebfc215",
+  "producer_version": "kronik 0.5.0\nwasmtime 50.0.1\nengine kronik-0.5.0+wasmtime-50.0.1\n",
+  "engine": "kronik-0.5.0+wasmtime-50.0.1",
+  "dummy_master_key": "4444444444444444444444444444444444444444444444444444444444444444",
+  "stable_lsn": 12,
+  "integrity": {
+    "applied_lsn": 61,
+    "state_hash": "b3:81b2a4f023e61a083be34b72c4645e4e68d2408b1ad5cb67ba4540070883f10f",
+    "log_first_lsn": 1,
+    "log_hash": "b3:9573f287e49bb5b3fc832f59ac4385c768100d3b9eb6da24d169cf9d9eb695d1",
+    "through_lsn": 61,
+    "retention_history_ms": 604800000,
+    "newest_logical_time_ms": 1794861386480,
+    "retention_cutoff_ms": 1794256586480,
+    "keys_missing": []
+  },
+  "observations": {
+    "counter": {
+      "actor": {
+        "kind": "counter",
+        "key": "a",
+        "schema_version": 0,
+        "turns": 7,
+        "last_turn_id": "main:24",
+        "sql": false
+      },
+      "state": [
+        {
+          "key": "n",
+          "text": "6",
+          "base64": "Ng==",
+          "subject": null,
+          "lsn": 24
+        }
+      ],
+      "sql": null,
+      "blobs": {
+        "held": 0,
+        "bytes": 0
+      }
+    },
+    "notes": {
+      "actor": {
+        "kind": "notes",
+        "key": "a",
+        "schema_version": 1,
+        "turns": 3,
+        "last_turn_id": "main:20",
+        "sql": true
+      },
+      "state": [],
+      "sql": {
+        "tables": [
+          {
+            "name": "notes",
+            "rows": 2
+          }
+        ]
+      },
+      "blobs": {
+        "held": 0,
+        "bytes": 0
+      }
+    },
+    "sink": {
+      "actor": {
+        "kind": "counter",
+        "key": "sink",
+        "schema_version": 0,
+        "turns": 1,
+        "last_turn_id": "main:25",
+        "sql": false
+      },
+      "state": [
+        {
+          "key": "n",
+          "text": "1",
+          "base64": "MQ==",
+          "subject": null,
+          "lsn": 25
+        }
+      ],
+      "sql": null,
+      "blobs": {
+        "held": 0,
+        "bytes": 0
+      }
+    },
+    "hmac": "0c5be0aaef6ecbed3227d381df9702c16ae4cd2aa7d205669db45fdfc7c3099b",
+    "roots": {
+      "counter": 7,
+      "notes": 2,
+      "media": 9,
+      "room": 14
+    },
+    "blobs": {
+      "blobs": {
+        "upload": {
+          "hash": "b3:e2e404de7142d5e97f483d3c44210a856ef7ee47912ca7fe3a52ff3804d64195",
+          "size": 200000,
+          "sha256": "cc9b0fcefb6733d38ad0d1456ed2aff8f79828911c66f32299b22246b760c8e0",
+          "roots": [
+            {
+              "kind": "log",
+              "lsn": 26
+            }
+          ]
+        },
+        "fetched": {
+          "hash": "b3:bee23871dbe75859f52773370b6b709d5d6460ee05f94e68af559ab391f01d52",
+          "size": 150000,
+          "sha256": "bffe2c5442f525d40ecf9d14757b8a40fe2a126fbf264dada9446faa0ab565ca",
+          "roots": [
+            {
+              "kind": "log",
+              "lsn": 29
+            }
+          ]
+        },
+        "written": {
+          "hash": "b3:b037c69ca74d85e4f24217652dc0db43a4e398a88b1a2510e2089ad1e77a779c",
+          "size": 120000,
+          "sha256": "9785ecd887b491cd7c377b76f87b25ae1e74a72cee73440947d979342d6f72e0",
+          "roots": [
+            {
+              "kind": "log",
+              "lsn": 30
+            }
+          ]
+        },
+        "put": {
+          "hash": "b3:844111e0ee661d166e7e16ddb59fb5bb594837fe2258bc4a84852ded824309a2",
+          "size": 100000,
+          "sha256": "08d042cceab8034d08c870e707f331cac9f42321044406bcccd156c7258229ab",
+          "roots": [
+            {
+              "kind": "held",
+              "actor": "media/r",
+              "lsn": 33
+            },
+            {
+              "kind": "log",
+              "lsn": 34
+            },
+            {
+              "kind": "snapshot",
+              "lsn": 59
+            }
+          ]
+        },
+        "timer": {
+          "hash": "b3:f9ae8c035f7e0f0da546faa39cf32ce429baf089a661801bc254367860124e48",
+          "size": 90000,
+          "sha256": "2ed30fda0f391644758ade0d5715aa944b4e6a49ebc0f92b4658749ff5b34660",
+          "roots": [
+            {
+              "kind": "log",
+              "lsn": 36
+            },
+            {
+              "kind": "pin",
+              "lsn": 36,
+              "source": "timer",
+              "owner": "media/t/-4483325593418174480"
+            },
+            {
+              "kind": "snapshot",
+              "lsn": 59
+            }
+          ]
+        },
+        "reply": {
+          "hash": "b3:50e8bbd18476b39a481645089aceacc1f65c1bf056df39014ab7df03ddac15dc",
+          "size": 80000,
+          "sha256": "7faac2667e3dff65bb044947b0f7f9776ec1f23bb21ff2c17a9dec56daa22c49",
+          "roots": [
+            {
+              "kind": "held",
+              "actor": "media/k",
+              "lsn": 40
+            },
+            {
+              "kind": "log",
+              "lsn": 40
+            },
+            {
+              "kind": "pin",
+              "lsn": 38,
+              "source": "saved-call",
+              "owner": "187294f5094d3ba19aa31a4bd67e6488"
+            },
+            {
+              "kind": "snapshot",
+              "lsn": 59
+            }
+          ]
+        }
+      },
+      "holds": {
+        "media/c": [],
+        "media/f": [],
+        "media/h": [],
+        "media/k": [
+          {
+            "hash": "b3:50e8bbd18476b39a481645089aceacc1f65c1bf056df39014ab7df03ddac15dc",
+            "size": 80000,
+            "subject": null,
+            "lsn": 40
+          }
+        ],
+        "media/r": [
+          {
+            "hash": "b3:844111e0ee661d166e7e16ddb59fb5bb594837fe2258bc4a84852ded824309a2",
+            "size": 100000,
+            "subject": null,
+            "lsn": 33
+          }
+        ],
+        "media/t": [],
+        "media/u": [],
+        "media/w": []
+      },
+      "timers": {
+        "media/t": [
+          {
+            "id": "13963418480291377136",
+            "due_ms": 3371661386211,
+            "name": "sum"
+          }
+        ]
+      }
+    },
+    "connections": {
+      "transcripts": {
+        "member-7": {
+          "connection": "c-c5755ba1e473a49fa35006bc604a0af0",
+          "path": "/room/compat/ws?user=7",
+          "sent": [
+            "say released corpus hello",
+            "echo released corpus echo",
+            "stream 3"
+          ],
+          "received": [
+            "{\"type\":\"welcome\",\"connection\":\"c-c5755ba1e473a49fa35006bc604a0af0\",\"members\":1,\"last\":0}",
+            "{\"type\":\"joined\",\"user\":\"anon\"}",
+            "{\"type\":\"joined\",\"user\":\"anon\"}",
+            "{\"type\":\"message\",\"seq\":1,\"user\":\"7\",\"text\":\"released corpus hello\"}",
+            "released corpus echo",
+            "tok 0",
+            "tok 1",
+            "tok 2",
+            "done 3",
+            "{\"type\":\"left\",\"user\":\"anon\"}",
+            "{\"type\":\"left\",\"user\":\"anon\"}"
+          ],
+          "close": {
+            "initiator": "client",
+            "cause": "client",
+            "code": 1000
+          }
+        },
+        "member-anonymous": {
+          "connection": "c-4409b1fe172d8b35c444ea4f0e3b1798",
+          "path": "/room/compat/ws",
+          "sent": [
+            "echo anonymous echo",
+            "bye"
+          ],
+          "received": [
+            "{\"type\":\"welcome\",\"connection\":\"c-4409b1fe172d8b35c444ea4f0e3b1798\",\"members\":2,\"last\":0}",
+            "{\"type\":\"joined\",\"user\":\"anon\"}",
+            "{\"type\":\"message\",\"seq\":1,\"user\":\"7\",\"text\":\"released corpus hello\"}",
+            "anonymous echo"
+          ],
+          "close": {
+            "initiator": "actor",
+            "cause": "actor",
+            "code": 1000
+          }
+        },
+        "follower": {
+          "connection": "c-f58fcac55a5e518ecaa7c03cada0ee84",
+          "path": "/room/compat/events",
+          "sent": [],
+          "received": [
+            [
+              "message",
+              "1",
+              "{\"type\":\"message\",\"seq\":1,\"user\":\"7\",\"text\":\"released corpus hello\"}"
+            ],
+            [
+              "message",
+              "",
+              "{\"type\":\"left\",\"user\":\"anon\"}"
+            ]
+          ],
+          "close": {
+            "initiator": "host",
+            "cause": "operator",
+            "code": 1000
+          }
+        }
+      },
+      "send_now": 3,
+      "room": {
+        "messages": "1 7 released corpus hello\n",
+        "closes": "c-4409b1fe172d8b35c444ea4f0e3b1798 actor 1000 bye\nc-c5755ba1e473a49fa35006bc604a0af0 client 1000 done\nc-f58fcac55a5e518ecaa7c03cada0ee84 host 1000 operator\n",
+        "seq": "1"
+      },
+      "connections": [
+        {
+          "id": "c-4409b1fe172d8b35c444ea4f0e3b1798",
+          "actor": "room/compat",
+          "protocol": "websocket",
+          "route": "/room/{key}/ws",
+          "state": "closed",
+          "opened": {
+            "turn_id": "main:42"
+          },
+          "closed": {
+            "turn_id": "main:53",
+            "initiator": "actor",
+            "cause": "actor",
+            "code": 1000
+          },
+          "frames": {
+            "in": 2,
+            "out": 4,
+            "written": 4,
+            "queued": 0,
+            "dropped": 0,
+            "unknown": 0
+          },
+          "subject": null
+        },
+        {
+          "id": "c-c5755ba1e473a49fa35006bc604a0af0",
+          "actor": "room/compat",
+          "protocol": "websocket",
+          "route": "/room/{key}/ws",
+          "state": "closed",
+          "opened": {
+            "turn_id": "main:41"
+          },
+          "closed": {
+            "turn_id": "main:56",
+            "initiator": "client",
+            "cause": "client",
+            "code": 1000
+          },
+          "frames": {
+            "in": 3,
+            "out": 11,
+            "written": 11,
+            "queued": 0,
+            "dropped": 0,
+            "unknown": 0
+          },
+          "subject": "user:7"
+        },
+        {
+          "id": "c-f58fcac55a5e518ecaa7c03cada0ee84",
+          "actor": "room/compat",
+          "protocol": "sse",
+          "route": "/room/{key}/events",
+          "state": "closed",
+          "opened": {
+            "turn_id": "main:43"
+          },
+          "closed": {
+            "turn_id": "main:55",
+            "initiator": "host",
+            "cause": "operator",
+            "code": 1000
+          },
+          "frames": {
+            "in": 0,
+            "out": 2,
+            "written": 2,
+            "queued": 0,
+            "dropped": 0,
+            "unknown": 0
+          },
+          "subject": null
+        }
+      ]
+    }
+  },
+  "components": [
+    {
+      "filename": "counter.wasm",
+      "sha256": "747c8630dfe34766b8b29f81787145b0c5061acef875be5c2c04c8da4ea70fb5",
+      "deployment": {
+        "dry_run": false,
+        "unchanged": false,
+        "deployment": {
+          "epoch": 1,
+          "lsn": 3,
+          "kind": "counter",
+          "code_hash": "b3:b310bc634637",
+          "schema_version": 0,
+          "routes": [
+            {
+              "method": "POST",
+              "pattern": "/counter/{key}/{op}"
+            },
+            {
+              "method": "GET",
+              "pattern": "/counter/{key}"
+            }
+          ],
+          "capabilities": []
+        },
+        "warnings": []
+      }
+    },
+    {
+      "filename": "notes.wasm",
+      "sha256": "250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423",
+      "deployment": {
+        "dry_run": false,
+        "unchanged": false,
+        "deployment": {
+          "epoch": 2,
+          "lsn": 4,
+          "kind": "notes",
+          "code_hash": "b3:c0c6b06edd01",
+          "schema_version": 1,
+          "routes": [
+            {
+              "method": "POST",
+              "pattern": "/notes/{key}"
+            },
+            {
+              "method": "GET",
+              "pattern": "/notes/{key}"
+            }
+          ],
+          "capabilities": []
+        },
+        "warnings": []
+      }
+    },
+    {
+      "filename": "media.wasm",
+      "sha256": "ed8c73e8908b872b54161ea8a9df816a8d91dde578db68dda840db6acab52f87",
+      "deployment": {
+        "dry_run": false,
+        "unchanged": false,
+        "deployment": {
+          "epoch": 3,
+          "lsn": 5,
+          "kind": "media",
+          "code_hash": "b3:4997c836bdaf",
+          "schema_version": 0,
+          "routes": [
+            {
+              "method": "POST",
+              "pattern": "/media/{key}/{op}"
+            },
+            {
+              "method": "GET",
+              "pattern": "/media/{key}/{op}"
+            }
+          ],
+          "capabilities": [
+            "http:*"
+          ]
+        },
+        "warnings": [
+          "capability http:* is not granted; run: kronik grant media http:* --reason '...'"
+        ]
+      }
+    },
+    {
+      "filename": "room.wasm",
+      "sha256": "547d04560ecebb58b3e1fe7b1b3f32d8eb22b763b79a4732e0aac8baf1ff038d",
+      "deployment": {
+        "dry_run": false,
+        "unchanged": false,
+        "deployment": {
+          "epoch": 4,
+          "lsn": 6,
+          "kind": "room",
+          "code_hash": "b3:334416259477",
+          "schema_version": 0,
+          "routes": [
+            {
+              "method": "WEBSOCKET",
+              "pattern": "/room/{key}/ws"
+            },
+            {
+              "method": "SSE",
+              "pattern": "/room/{key}/events"
+            },
+            {
+              "method": "GET",
+              "pattern": "/room/{key}/{op}"
+            },
+            {
+              "method": "POST",
+              "pattern": "/room/{key}/say"
+            }
+          ],
+          "capabilities": [
+            "connection:send-now"
+          ]
+        },
+        "warnings": [
+          "capability connection:send-now is not granted; run: kronik grant room connection:send-now --reason '...'"
+        ]
+      }
+    }
+  ],
+  "files": [
+    {
+      "path": "blobs/objects/50/b3-50e8bbd18476b39a481645089aceacc1f65c1bf056df39014ab7df03ddac15dc",
+      "bytes": 80520,
+      "sha256": "dfe0d16bf6a957eb306ffe6db1eed3460ab21df41cc3834066e7f9080f0f44fc"
+    },
+    {
+      "path": "blobs/objects/84/b3-844111e0ee661d166e7e16ddb59fb5bb594837fe2258bc4a84852ded824309a2",
+      "bytes": 100520,
+      "sha256": "a65aa7d5c61a37d625dc18358d2552af7d81085916633b8815f9e0eb1b6f8dfd"
+    },
+    {
+      "path": "blobs/objects/b0/b3-b037c69ca74d85e4f24217652dc0db43a4e398a88b1a2510e2089ad1e77a779c",
+      "bytes": 120520,
+      "sha256": "effa7d98a7e74bd02a6fa9a484e72b84c39a721c0c61cf19e30d6bd82cf06580"
+    },
+    {
+      "path": "blobs/objects/be/b3-bee23871dbe75859f52773370b6b709d5d6460ee05f94e68af559ab391f01d52",
+      "bytes": 150524,
+      "sha256": "700c2dae37d95b7a0b366db72b555c6fce1951ec48f6def5546d539cfeb80553"
+    },
+    {
+      "path": "blobs/objects/e2/b3-e2e404de7142d5e97f483d3c44210a856ef7ee47912ca7fe3a52ff3804d64195",
+      "bytes": 200528,
+      "sha256": "fc24673920fb9f211c3c8a596b7cf9bfb34570bea9ac7abba56b699a3475038e"
+    },
+    {
+      "path": "blobs/objects/f9/b3-f9ae8c035f7e0f0da546faa39cf32ce429baf089a661801bc254367860124e48",
+      "bytes": 90520,
+      "sha256": "2d46b739ee309398d32ee50dd74fc259690df37b9a8c7c0143e5c33373591ed1"
+    },
+    {
+      "path": "branches/main/log/00000000000000000001.seg",
+      "bytes": 26736,
+      "sha256": "fc9bfae5542f8a5f0748d99d4168c08723f3254e1f655305b71eca693ab12461"
+    },
+    {
+      "path": "branches/main/sql/df/notes~a-df924404.db",
+      "bytes": 4096,
+      "sha256": "2e96884c16791c7d4bde90a6db2c9da33c2a2aab3e52088adc148c368552a423"
+    },
+    {
+      "path": "branches/main/sql/df/notes~a-df924404.db-wal",
+      "bytes": 61832,
+      "sha256": "70ed8b51d45f5d9d68a690bece326825bdc8e537db03379eec515d15c74ba7e9"
+    },
+    {
+      "path": "branches/main/state.db",
+      "bytes": 217088,
+      "sha256": "0675f9f13a6fcb23c5a0304bb2b2a9ffafb510d2ecbe6698f7f8a435dedf9763"
+    },
+    {
+      "path": "code/33441625947775faee3f7d790566f8b3b1c9c702168da1aa0d3c37be11d3796c.wasm",
+      "bytes": 108112,
+      "sha256": "547d04560ecebb58b3e1fe7b1b3f32d8eb22b763b79a4732e0aac8baf1ff038d"
+    },
+    {
+      "path": "code/4997c836bdaff5fa0c09cc00f698533489b5c0a711ea23748c3148c7f26bf9ab.wasm",
+      "bytes": 104821,
+      "sha256": "ed8c73e8908b872b54161ea8a9df816a8d91dde578db68dda840db6acab52f87"
+    },
+    {
+      "path": "code/b310bc634637383f31f8c82ab9adcbf27a8736c874e70bb5b47d4a461e8a4498.wasm",
+      "bytes": 109079,
+      "sha256": "747c8630dfe34766b8b29f81787145b0c5061acef875be5c2c04c8da4ea70fb5"
+    },
+    {
+      "path": "code/c0c6b06edd0178d0868b760e4a5a76c10f7c78598077cc127f0d9370043106f9.wasm",
+      "bytes": 76877,
+      "sha256": "250c31c09afb11e12985e433ae2ca1fc2022a5357394c7c59334a912c43f2423"
+    },
+    {
+      "path": "foreign/actors/.layout",
+      "bytes": 35,
+      "sha256": "39e7fab288799d5ac38ab2c5c9372f92dcacbd0ac3248b55a7b36b414658bbd7"
+    },
+    {
+      "path": "keys/keystore.db",
+      "bytes": 20480,
+      "sha256": "414d96ca77ec4a80f53d6effcac6a4dfc22611a7928421655f685b0bc19a0cea"
+    },
+    {
+      "path": "keys/secrets.db",
+      "bytes": 24576,
+      "sha256": "7c00a99e9862eaa53a3536985eb2a998e8bf4ec5478d9a3c0513fce702786e56"
+    },
+    {
+      "path": "keys/tokens.db",
+      "bytes": 12288,
+      "sha256": "f5996a6cdc6f9b54cc90941af32c386fcfe87075ddf5ebe8737e31c9258be44e"
+    },
+    {
+      "path": "privacy/keystore_retention_ms",
+      "bytes": 10,
+      "sha256": "8961f1920779b1680abb30edb239ec4823c6694f6eb4db43e865c07936f2eeca"
+    },
+    {
+      "path": "secret-coverage.json",
+      "bytes": 243,
+      "sha256": "5a7f5c9d02d79a9e81cf4a0bef015234d3dedca5b9eee6e9cbf272abdf58c263"
+    },
+    {
+      "path": "snapshots/main/00000000000000000059/blobs.idx",
+      "bytes": 204,
+      "sha256": "8d7caf8d6b87971f39a1a3e5c04953b97a959f132543c79758977213b71a873d"
+    },
+    {
+      "path": "snapshots/main/00000000000000000059/manifest.json",
+      "bytes": 1035,
+      "sha256": "811fc74c400059dc5d895f622e08afce833f64b761bf606fad2a0432d9d04d88"
+    },
+    {
+      "path": "snapshots/main/00000000000000000059/secrets.db",
+      "bytes": 24576,
+      "sha256": "5bf2c37a2ae89e9590bbcc95085bb4daca704b041a0f528090541b7c4db08d47"
+    },
+    {
+      "path": "snapshots/main/00000000000000000059/sql/df/notes~a-df924404.db",
+      "bytes": 16384,
+      "sha256": "01382c0c3696ade6e447b2705dd655dfed568181d0c40a299c0320c83941a861"
+    },
+    {
+      "path": "snapshots/main/00000000000000000059/state.db",
+      "bytes": 217088,
+      "sha256": "8bca45f170db47035ba3cb961981de877a2e56b7b9d2554060cb30ae34b164da"
+    },
+    {
+      "path": "snapshots/main/00000000000000000061/blobs.idx",
+      "bytes": 204,
+      "sha256": "8d7caf8d6b87971f39a1a3e5c04953b97a959f132543c79758977213b71a873d"
+    },
+    {
+      "path": "snapshots/main/00000000000000000061/manifest.json",
+      "bytes": 1037,
+      "sha256": "c499e3740c1eee77b26b1ac52d411106eba3b068257a25d9aa0e554d12c60635"
+    },
+    {
+      "path": "snapshots/main/00000000000000000061/secrets.db",
+      "bytes": 24576,
+      "sha256": "5bf2c37a2ae89e9590bbcc95085bb4daca704b041a0f528090541b7c4db08d47"
+    },
+    {
+      "path": "snapshots/main/00000000000000000061/sql/df/notes~a-df924404.db",
+      "bytes": 16384,
+      "sha256": "01382c0c3696ade6e447b2705dd655dfed568181d0c40a299c0320c83941a861"
+    },
+    {
+      "path": "snapshots/main/00000000000000000061/state.db",
+      "bytes": 217088,
+      "sha256": "c9237747f673aa67540cb117f49519e875afcd94af74af3000faff113bad8cfb"
+    }
+  ],
+  "scenarios": [
+    "counter",
+    "notes",
+    "blobs",
+    "connections"
+  ]
+}
