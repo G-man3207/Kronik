@@ -328,6 +328,7 @@ def restart():
         check(report, out["reconnect_max_ms"] <= 30000, "every reconnect within 30 s")
         check(report, out["close_codes"].get("1012", 0) == clients, "the graceful restart closed every client with 1012")
         check(report, out["close_reasons"].get("1012") == "kronik: restart", "with the reason kronik: restart")
+        check(report, out["close_codes"].get("1006", 0) == clients, "the SIGKILL closed every client abnormally (1006)")
         time.sleep(3)
 
         def restart_closes():
