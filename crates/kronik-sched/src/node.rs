@@ -865,6 +865,10 @@ impl Node {
                 db.erasure_records()?,
             )
         };
+        // Counts of starts whose `UNAVAILABLE` re-run was given up on are
+        // bookkeeping, not state: only an open turn can use one, and a turn
+        // this start removes may leave the last count behind.
+        store.db().clear_stale_rerun_unavailable(&config.branch)?;
         // Erasures the keystore made but the log has no record of yet (a stop
         // between the two steps; recover_erasures commits the record below):
         // until then, every value of the subject that was read back predates
@@ -1475,15 +1479,21 @@ impl Node {
                 )
                 .await;
             if let Some(begin) = retry_begin {
+                let execution_id = begin.execution_id.clone();
+                let unavailable_attempts = self
+                    .cfg
+                    .test_rerun_unavailable_attempts
+                    .unwrap_or(crate::secrets::recovery::RERUN_UNAVAILABLE_ATTEMPTS);
                 let mut delay = crate::secrets::recovery::RETRY_INITIAL;
                 let mut stalled = None;
                 let mut waits = 0u32;
                 let mut transient = 0u32;
                 while let Err(error) = &result {
-                    if !crate::secrets::recovery::rerun_waits(
+                    if !crate::secrets::recovery::rerun_waits_with_limit(
                         error.code,
                         transient,
                         self.fatal().is_some(),
+                        unavailable_attempts,
                     ) {
                         break;
                     }
@@ -1534,6 +1544,32 @@ impl Node {
                             born,
                         )
                         .await;
+                }
+                // A prerequisite that is still unavailable after this
+                // start's retries is not retried at every later start for
+                // ever: once its starts are spent, the turn is closed
+                // failed, with its recorded effects, and a message or timer
+                // input becomes a dead letter. The node's own failure is not
+                // a prerequisite, so a failed node keeps the turn open.
+                if self.fatal().is_none()
+                    && matches!(&result, Err(error) if error.code == ErrorCode::Unavailable)
+                {
+                    match Box::pin(self.close_exhausted_unavailable_rerun(begin, born)).await {
+                        Ok(Some(closed)) => result = Ok(closed),
+                        Ok(None) => {}
+                        Err(error) => result = Err(error),
+                    }
+                } else if result.is_ok()
+                    && let Err(error) = self
+                        .store
+                        .db()
+                        .clear_rerun_unavailable(&self.cfg.branch, &execution_id)
+                {
+                    tracing::warn!(
+                        %error,
+                        execution_id = %execution_id,
+                        "clearing an open turn's start count failed"
+                    );
                 }
             }
             if let Some(again) = blob_retry {

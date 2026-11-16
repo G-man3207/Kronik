@@ -6,6 +6,13 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- An open turn whose re-run keeps ending `UNAVAILABLE` is closed as failed on
+  the third such start instead of being run at every start for ever. The
+  closing record names the starts and keeps the turn's recorded effects; a
+  message or timer input other than a call's becomes a dead letter, and the
+  daemon logs a warning on each start it leaves open. `SECRET_UNAVAILABLE`
+  keeps its unbounded wait: a recorded secret value is part of the turn's
+  record.
 - A replay request for more isolated workers than the daemon's one Wasmtime
   instance pool has room for, with each worker's call chain, is clamped to
   that room instead of stopping with `UNAVAILABLE` when a replayed turn finds

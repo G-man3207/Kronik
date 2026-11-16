@@ -22,31 +22,49 @@ pub(crate) const RETRY_MAX: Duration = Duration::from_secs(5);
 /// How many times a re-run that meets `Unavailable` (not a secret) is tried
 /// again by the worker: about 36 s at the backoff above.
 pub(crate) const RERUN_UNAVAILABLE_ATTEMPTS: u32 = 12;
+/// How many starts a re-run may end with `Unavailable` before the turn is
+/// closed as failed. A condition that survives two starts has not cleared in
+/// the in-start wait either, so the third is the last one that runs it.
+pub(crate) const RERUN_UNAVAILABLE_STARTS: u32 = 3;
 /// A waiting re-run says so on its first wait and then every this many.
 pub(crate) const RERUN_WARN_EVERY: u32 = 12;
 
 /// Whether the worker waits and tries a re-run again after it failed with
 /// `code`; `unavailable_waits` is how often it has waited for a plain
-/// `Unavailable` already.
+/// `Unavailable` already, and `unavailable_attempts` is this start's
+/// allowance for those waits.
 ///
 /// A re-run must not end open while what it waits for can still come: a
 /// secret, without bound (the recorded value is needed again, design m23
 /// 5.3), and a prerequisite that is unavailable for a while, for a few
 /// attempts. The latter is the call machinery and the recorded call results,
-/// which can also be permanent (a record that cannot be projected): the
-/// actor must not be held for ever behind one of those, so after
-/// `RERUN_UNAVAILABLE_ATTEMPTS` the job ends, as before, and the next start
-/// runs the turn again. Nothing is retried on a node that has failed. An
+/// which can also be permanent (an erased subject, a record that cannot be
+/// projected): the actor must not be held for ever behind one of those, so
+/// after `RERUN_UNAVAILABLE_ATTEMPTS` the job ends, as before, and the next
+/// start runs the turn again. [`RERUN_UNAVAILABLE_STARTS`] bounds those
+/// starts. Nothing is retried on a node that has failed. The recovery
+/// fixture passes zero attempts to reach the cross-start bound at once. An
 /// erased subject's value is never waited for: a callee's answer of one is
 /// the call error `SUBJECT_ERASED` (`effects::map_call_outcome`), and a
 /// re-run whose recorded results hold one is closed with that code before
 /// its guest runs (`Node::recorded_erased`).
-pub(crate) fn rerun_waits(code: ErrorCode, unavailable_waits: u32, node_failed: bool) -> bool {
+pub(crate) fn rerun_waits_with_limit(
+    code: ErrorCode,
+    unavailable_waits: u32,
+    node_failed: bool,
+    unavailable_attempts: u32,
+) -> bool {
     match code {
         ErrorCode::SecretUnavailable => true,
-        ErrorCode::Unavailable => unavailable_waits < RERUN_UNAVAILABLE_ATTEMPTS && !node_failed,
+        ErrorCode::Unavailable => unavailable_waits < unavailable_attempts && !node_failed,
         _ => false,
     }
+}
+
+/// Whether a re-run that has ended `UNAVAILABLE` on `starts` starts is closed
+/// as failed instead of being run again at the next start.
+pub(crate) fn rerun_unavailable_exhausted(starts: u32) -> bool {
+    starts >= RERUN_UNAVAILABLE_STARTS
 }
 const STALL_METRIC: &str = "kronik_secret_recovery_stalled";
 static STALLED: Mutex<u64> = Mutex::new(0);
@@ -259,6 +277,82 @@ impl Node {
             born,
         )
         .await
+    }
+
+    /// Counts a start whose re-run of `begin` ended `UNAVAILABLE`, and closes
+    /// the turn failed when it has used [`RERUN_UNAVAILABLE_STARTS`]. Returns
+    /// `None` while the turn is left open for another start.
+    ///
+    /// Only `UNAVAILABLE` is bounded here. `SECRET_UNAVAILABLE` says the
+    /// recorded value itself cannot be fetched yet, and the turn waits for it
+    /// without bound (design m23 5.3). A start with a different failure either
+    /// closed the turn already or did not get far enough to spend a start.
+    pub(crate) async fn close_exhausted_unavailable_rerun(
+        &self,
+        begin: pb::TurnBegin,
+        born: Born,
+    ) -> Result<Option<TurnResult>, ApiError> {
+        let starts = self
+            .store()
+            .db()
+            .note_rerun_unavailable(&self.cfg.branch, &begin.execution_id)
+            .map_err(crate::node::store_err)?;
+        let execution_id = begin.execution_id.clone();
+        let actor = begin.actor.as_ref();
+        let (kind, key) = actor
+            .map(|a| (a.kind.as_str(), a.key.as_str()))
+            .unwrap_or_default();
+        if !rerun_unavailable_exhausted(starts) {
+            tracing::warn!(
+                kind,
+                key,
+                execution_id = %execution_id,
+                starts,
+                limit = RERUN_UNAVAILABLE_STARTS,
+                "the re-run of an open turn is still UNAVAILABLE after this start's retries; \
+                 the turn is re-run at the next start"
+            );
+            return Ok(None);
+        }
+        tracing::warn!(
+            kind,
+            key,
+            execution_id = %execution_id,
+            starts,
+            limit = RERUN_UNAVAILABLE_STARTS,
+            "the re-run of an open turn is still UNAVAILABLE after its last allowed start: \
+             the turn is closed as failed, and a message or timer input other than a call's \
+             is a dead letter"
+        );
+        let recorded = self
+            .store()
+            .db()
+            .open_effects(&execution_id)
+            .map_err(crate::node::store_err)?;
+        let result = self
+            .close_open_turn(
+                begin,
+                recorded,
+                ErrorCode::Unavailable,
+                format!(
+                    "the re-run of this open turn was UNAVAILABLE on {starts} starts, so it was \
+                     closed as failed instead of running again; a message or timer input other \
+                     than a call's is a dead letter: fix what the turn needs, then resend it"
+                ),
+                false,
+                born,
+            )
+            .await?;
+        // The open row is gone. A failure to drop the count only costs one
+        // row until the next start sweeps the counts no open turn owns.
+        if let Err(error) = self
+            .store()
+            .db()
+            .clear_rerun_unavailable(&self.cfg.branch, &execution_id)
+        {
+            tracing::warn!(%error, execution_id = %execution_id, "clearing an open turn's start count failed");
+        }
+        Ok(Some(result))
     }
 
     /// Closes the open turn of `begin` as failed with `code`, without running

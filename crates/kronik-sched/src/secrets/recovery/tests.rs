@@ -1540,30 +1540,42 @@ fn a_crash_before_the_result_of_an_unsafe_fetch_ends_as_outcome_unknown_whatever
 
 #[test]
 fn a_re_run_waits_for_a_secret_for_ever_and_for_other_unavailability_a_few_times() {
-    use super::{RERUN_UNAVAILABLE_ATTEMPTS, rerun_waits};
+    use super::{RERUN_UNAVAILABLE_ATTEMPTS, rerun_waits_with_limit};
+    let waits = |code, waited, failed| {
+        rerun_waits_with_limit(code, waited, failed, RERUN_UNAVAILABLE_ATTEMPTS)
+    };
     for waited in [0, 1, 1_000, u32::MAX] {
-        assert!(rerun_waits(ErrorCode::SecretUnavailable, waited, false));
+        assert!(waits(ErrorCode::SecretUnavailable, waited, false));
+        // The recovery fixture's zero attempts reach the cross-start bound
+        // at once; it never bounds the secret wait.
+        assert!(rerun_waits_with_limit(
+            ErrorCode::SecretUnavailable,
+            waited,
+            false,
+            0
+        ));
     }
-    assert!(rerun_waits(ErrorCode::Unavailable, 0, false));
-    assert!(rerun_waits(
+    assert!(!rerun_waits_with_limit(ErrorCode::Unavailable, 0, false, 0));
+    assert!(waits(ErrorCode::Unavailable, 0, false));
+    assert!(waits(
         ErrorCode::Unavailable,
         RERUN_UNAVAILABLE_ATTEMPTS - 1,
         false
     ));
-    assert!(!rerun_waits(
+    assert!(!waits(
         ErrorCode::Unavailable,
         RERUN_UNAVAILABLE_ATTEMPTS,
         false
     ));
     // A node that has failed is not waited for; nothing else is retried.
-    assert!(!rerun_waits(ErrorCode::Unavailable, 0, true));
+    assert!(!waits(ErrorCode::Unavailable, 0, true));
     for code in [
         ErrorCode::SecretVersionGone,
         ErrorCode::StorageCorrupt,
         ErrorCode::Internal,
         ErrorCode::SubjectErased,
     ] {
-        assert!(!rerun_waits(code, 0, false), "{code}");
+        assert!(!waits(code, 0, false), "{code}");
     }
 }
 
@@ -1896,4 +1908,174 @@ fn an_open_turn_that_cannot_run_again_is_closed_once() {
             );
         });
     }
+}
+
+/// Issue #76: a re-run that ends `UNAVAILABLE` at every start was left open
+/// for ever: each start spent its retries on it, its actor's later inputs
+/// waited behind it, and retention kept its begin's segment. It is now
+/// closed as failed on the third such start, under its own execution id,
+/// with its recorded effects; a message input becomes a dead letter. A
+/// fourth start runs nothing, and a start that succeeds clears the count.
+#[test]
+fn an_open_turn_is_closed_after_three_starts_whose_rerun_is_unavailable() {
+    let data = tempfile::tempdir().unwrap();
+    let execution_id = "abababababababababababababababab";
+    {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let node = crate::start_local(env(), data.path(), config())
+                .await
+                .unwrap();
+            counter_with_grants(&node).await;
+            let begin = unavailable_rerun_begin(&node, execution_id);
+            let effect = unprojectable_call(&begin, 0);
+            persist(&node, &begin, std::slice::from_ref(&effect)).await;
+            assert_eq!(node.store().db().open_turns().unwrap().len(), 1);
+        });
+    }
+
+    let mut config = config();
+    // The fixture reaches the cross-start bound, not the in-start backoff.
+    config.test_rerun_unavailable_attempts = Some(0);
+    for start in 1..=super::RERUN_UNAVAILABLE_STARTS {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let node = crate::start_local(env(), data.path(), config.clone())
+                .await
+                .unwrap();
+            let open = || node.store().db().open_turns().unwrap();
+            let letters = || node.store().db().dead_letters(0, 10).unwrap();
+            if start < super::RERUN_UNAVAILABLE_STARTS {
+                node.env
+                    .timeout(Duration::from_secs(30), async {
+                        while node
+                            .store()
+                            .db()
+                            .rerun_unavailable_starts("main", execution_id)
+                            .unwrap()
+                            < start
+                        {
+                            node.env.clock.sleep(Duration::from_millis(2)).await;
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|_| panic!("start {start}: the failed re-run was not counted"));
+                assert_eq!(open().len(), 1, "start {start}: closed early");
+                assert!(letters().is_empty(), "start {start}: {:?}", letters());
+            } else {
+                node.env
+                    .timeout(Duration::from_secs(30), async {
+                        while !open().is_empty() || letters().is_empty() {
+                            node.env.clock.sleep(Duration::from_millis(2)).await;
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|_| panic!("start {start}: {:?} {:?}", open(), letters()));
+                assert_eq!(letters().len(), 1, "start {start}");
+                let letter = &letters()[0];
+                assert_eq!(letter.error_code, "UNAVAILABLE");
+                assert_eq!(letter.actor.to_string(), "counter/a");
+                assert!(
+                    letter.message.contains("UNAVAILABLE on 3 starts"),
+                    "{letter:?}"
+                );
+                let closed = last_turn_of(&node, "counter", "a").await;
+                assert_eq!(closed.execution_id, execution_id);
+                let outcome = closed.outcome.as_ref().unwrap();
+                assert_eq!(outcome.kind, pb::OutcomeKind::Failed as i32);
+                assert_eq!(outcome.error_code, "UNAVAILABLE");
+                assert!(outcome.message.contains("UNAVAILABLE on 3 starts"));
+                assert_eq!(closed.effects.len(), 1, "{closed:?}");
+                assert_eq!(closed.effects[0].kind, "actor.call");
+                assert_eq!(
+                    node.store()
+                        .db()
+                        .rerun_unavailable_starts("main", execution_id)
+                        .unwrap(),
+                    0
+                );
+            }
+        });
+    }
+
+    // The closed turn is not run again, and no second dead letter is added.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let node = crate::start_local(env(), data.path(), config)
+            .await
+            .unwrap();
+        node.env.clock.sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            node.probe.turns_run.load(Ordering::Relaxed),
+            0,
+            "a start ran the closed turn again"
+        );
+        assert_eq!(node.store().db().dead_letters(0, 10).unwrap().len(), 1);
+        assert!(node.store().db().open_turns().unwrap().is_empty());
+    });
+}
+
+/// A recorded successful call a re-run cannot hand to the guest: the reply's
+/// body is not plain (the gate answers `UNAVAILABLE`, `prepare_call_outcome`).
+fn unprojectable_call(begin: &pb::TurnBegin, ordinal: u32) -> pb::EffectRecord {
+    let mut effect = call(begin, ordinal, true);
+    effect.status = pb::EffectStatus::HostRedactionFailure as i32;
+    effect.callee_source = Some(pb::ActorSource {
+        shard: None,
+        lsn: 7,
+        branch: "main".into(),
+    });
+    effect.observed_callee_status = Some(pb::EffectStatus::Ok as i32);
+    let bytes = match effect
+        .request
+        .as_ref()
+        .and_then(|request| request.value.as_ref())
+    {
+        Some(pb::sealable::Value::Plain(bytes)) => bytes.clone(),
+        _ => panic!("the fixture's call request is not plain"),
+    };
+    let mut request = pb::CallEffectRequest::decode(bytes.as_slice()).unwrap();
+    // A successful call with a compensation recorded before fingerprint
+    // version 2 is one a re-run cannot make again: `effects::Gate::call`
+    // answers UNAVAILABLE, whatever the current code and grants are.
+    request.fingerprint_version = 1;
+    effect.request = plain(request.encode_to_vec());
+    effect
+}
+
+fn unavailable_rerun_begin(node: &Node, execution_id: &str) -> pb::TurnBegin {
+    let mut begin = message_begin(node);
+    begin.execution_id = execution_id.into();
+    begin.actor = Some(ActorRef::parse("counter/a").unwrap().to_pb());
+    begin.code_hash = node.store().db().kinds().unwrap()[0]
+        .version
+        .code_hash
+        .clone();
+    begin.causal_key = Some(causal::root(execution_id.into()));
+    begin.logical_time_ms = 29;
+    begin.input = Some(pb::Input {
+        kind: Some(pb::input::Kind::Message(pb::MessageInput {
+            source: pb::MessageSource::Operator as i32,
+            msg: Some(text_message("call", "counter/callee increment")),
+            message_id: execution_id.into(),
+            sent_logical_time_ms: begin.logical_time_ms,
+            ..Default::default()
+        })),
+    });
+    begin
+}
+
+/// The last turn record of `kind/key`, as `history` reads it.
+async fn last_turn_of(node: &Node, kind: &str, key: &str) -> pb::TurnRecord {
+    let last = node
+        .store()
+        .db()
+        .actor(kind, key)
+        .unwrap()
+        .expect("the actor")
+        .last_lsn;
+    let Record::TurnRecord(turn) = record(node, last).await else {
+        panic!("the last record of the actor is not a turn");
+    };
+    turn
 }
