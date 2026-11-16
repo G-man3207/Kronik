@@ -295,7 +295,12 @@ next pass deletes.
 As built (M26 slice B14): `prune_blob_pins(floor)` also deletes the pins of
 rows that paths other than the applier's usual ones removed (an erasure's
 dead letters and saved responses, the cap on connection dead letters), by
-checking each pin's row; step 2 runs there too. An erased blob's row stays
+checking each pin's row; step 2 runs there too. Each source probes its row
+by the owner it stores: `timers`, `ingress_keys` and `dead_letters` carry a
+generated `owner` column (`kind`, `key` and id separated by the unit
+separator, or the LSN as text) with an index, added on open to a database of
+an earlier build, so the pass costs one lookup per pin and does not scan a
+source table per pin. An erased blob's row stays
 while `ship-blobs.db` still lists its object, so that privacy status can
 name the subject of every object left in the bucket.
 

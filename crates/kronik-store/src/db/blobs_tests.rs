@@ -843,3 +843,170 @@ fn an_actors_charge_is_its_holds_timers_messages_and_dead_letters() {
         .unwrap();
     assert_eq!(pending, 0, "settled at media/a's turn");
 }
+
+/// The retention pass probes each pin's row through the owner index of its
+/// source: 500 pins against 200 000 saved responses stay bounded by the pins,
+/// not by the pins times the table.
+#[test]
+#[allow(clippy::disallowed_methods)] // the bound is wall time, not logical time
+fn orphan_pin_pruning_probes_each_source_by_its_owner() {
+    use std::time::{Duration, Instant};
+
+    let mut db = db();
+    db.conn
+        .execute_batch(
+            "INSERT INTO mailbox (message_id, to_kind, to_key, lsn, ordinal, input, causal) \
+             VALUES ('m1', 'counter', 'a', 1, 0, x'', x'');
+             INSERT INTO timers (kind, key, timer_id, due_ms, msg, causal, lsn) \
+             VALUES ('counter', 'a', 7, 0, x'', x'', 1);
+             INSERT INTO dead_letters \
+               (lsn, kind, key, input, error_code, message, resent_as, subject) \
+             VALUES (2, 'counter', 'a', x'', 'X', '', NULL, NULL);
+             INSERT INTO ingress_keys \
+               (kind, key, idem_key, request_hash, lsn, logical_time_ms, outcome, subject) \
+             VALUES ('counter', 'a', 'idem', x'', 1, 0, x'', NULL);
+             INSERT INTO deliveries (message_id, lsn, outcome, subject) \
+             VALUES ('d1', 1, x'', NULL);",
+        )
+        .unwrap();
+    for (hash, source, owner) in [
+        ("h1", source::MAILBOX, "m1".to_owned()),
+        ("h2", source::TIMER, timer_owner("counter", "a", 7)),
+        ("h3", source::DEAD_LETTER, 2i64.to_string()),
+        (
+            "h4",
+            source::INGRESS_KEY,
+            ingress_owner("counter", "a", "idem"),
+        ),
+        ("h5", source::DELIVERY, "d1".to_owned()),
+    ] {
+        db.conn
+            .execute(
+                "INSERT INTO blob_pins (hash, source, owner, lsn, charged) \
+                 VALUES (?1, ?2, ?3, 1, NULL)",
+                rusqlite::params![hash, source, owner],
+            )
+            .unwrap();
+    }
+    let tx = db.conn.transaction().unwrap();
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO ingress_keys \
+                 (kind, key, idem_key, request_hash, lsn, logical_time_ms, outcome) \
+                 VALUES ('counter', 'a', ?1, x'', ?2, 0, x'')",
+            )
+            .unwrap();
+        for n in 0..200_000i64 {
+            insert
+                .execute(rusqlite::params![format!("saved-{n}"), n])
+                .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    let tx = db.conn.transaction().unwrap();
+    {
+        let mut insert = tx
+            .prepare("INSERT INTO blob_pins (hash, source, owner, lsn) VALUES (?1, ?2, ?3, ?4)")
+            .unwrap();
+        for n in 0..500i64 {
+            insert
+                .execute(rusqlite::params![
+                    format!("b3:{n:064x}"),
+                    source::INGRESS_KEY,
+                    format!("counter\u{1f}a\u{1f}missing-{n}"),
+                    n + 2
+                ])
+                .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+
+    for source in [
+        source::MAILBOX,
+        source::TIMER,
+        source::DEAD_LETTER,
+        source::INGRESS_KEY,
+        source::DELIVERY,
+    ] {
+        let exists = pin_source_exists(source).unwrap();
+        let mut statement = db
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN DELETE FROM blob_pins WHERE source = ?1 AND NOT {exists}"
+            ))
+            .unwrap();
+        let plan: Vec<String> = statement
+            .query_map([source], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|detail| detail.starts_with("SEARCH ")),
+            "source {source} has no indexed lookup: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|detail| !detail.starts_with("SCAN ") || detail.contains("blob_pins")),
+            "source {source} scans its table once per pin: {plan:?}"
+        );
+    }
+
+    let started = Instant::now();
+    let deleted = db.prune_blob_pins(0).unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(deleted, 500, "the orphan pins, and only they");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "500 pins over 200 000 saved responses took {elapsed:?}"
+    );
+    assert_eq!(db.blob_pins("h4").unwrap().len(), 1, "the live pin went");
+}
+
+/// The owner columns of the source tables are added to databases of an
+/// earlier development build, filled from their rows, and indexed.
+#[test]
+fn source_owner_columns_migrate_old_databases() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE deliveries (
+           message_id TEXT PRIMARY KEY, lsn INTEGER NOT NULL, outcome BLOB) WITHOUT ROWID;
+         CREATE TABLE ingress_keys (
+           kind TEXT NOT NULL, key TEXT NOT NULL, idem_key TEXT NOT NULL,
+           request_hash BLOB NOT NULL, lsn INTEGER NOT NULL, logical_time_ms INTEGER NOT NULL,
+           outcome BLOB NOT NULL,
+           PRIMARY KEY (kind, key, idem_key)) WITHOUT ROWID;
+         CREATE TABLE dead_letters (
+           lsn INTEGER PRIMARY KEY, kind TEXT NOT NULL, key TEXT NOT NULL, input BLOB NOT NULL,
+           error_code TEXT NOT NULL, message TEXT NOT NULL, resent_as INTEGER);
+         CREATE TABLE timers (
+           kind TEXT NOT NULL, key TEXT NOT NULL, timer_id INTEGER NOT NULL,
+           due_ms INTEGER NOT NULL, msg BLOB NOT NULL, causal BLOB NOT NULL, lsn INTEGER NOT NULL,
+           PRIMARY KEY (kind, key, timer_id)) WITHOUT ROWID;
+         INSERT INTO timers VALUES ('counter', 'a', 7, 0, x'', x'', 1);
+         INSERT INTO ingress_keys VALUES ('counter', 'a', 'idem', x'', 1, 0, x'');
+         INSERT INTO dead_letters VALUES (3, 'counter', 'a', x'', 'X', '', NULL);",
+    )
+    .unwrap();
+    let db = StateDb::open(conn).unwrap();
+    for (table, owner) in [
+        ("timers", "counter\u{1f}a\u{1f}7"),
+        ("ingress_keys", "counter\u{1f}a\u{1f}idem"),
+        ("dead_letters", "3"),
+    ] {
+        let stored: String = db
+            .conn
+            .query_row(&format!("SELECT owner FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, owner, "{table}");
+        let indexed: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [format!("{table}_owner")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1, "{table}_owner");
+    }
+}

@@ -41,10 +41,12 @@ CREATE TABLE IF NOT EXISTS ingress_keys (
   kind TEXT NOT NULL, key TEXT NOT NULL, idem_key TEXT NOT NULL,
   request_hash BLOB NOT NULL, lsn INTEGER NOT NULL, logical_time_ms INTEGER NOT NULL,
   outcome BLOB NOT NULL, subject TEXT,
+  owner TEXT GENERATED ALWAYS AS (kind || char(31) || key || char(31) || idem_key) VIRTUAL,
   PRIMARY KEY (kind, key, idem_key)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS dead_letters (
   lsn INTEGER PRIMARY KEY, kind TEXT NOT NULL, key TEXT NOT NULL, input BLOB NOT NULL,
-  error_code TEXT NOT NULL, message TEXT NOT NULL, resent_as INTEGER, subject TEXT);
+  error_code TEXT NOT NULL, message TEXT NOT NULL, resent_as INTEGER, subject TEXT,
+  owner TEXT GENERATED ALWAYS AS (CAST(lsn AS TEXT)) VIRTUAL);
 CREATE TABLE IF NOT EXISTS deployments (
   epoch INTEGER PRIMARY KEY, lsn INTEGER NOT NULL, record BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS config_records (
@@ -58,6 +60,7 @@ CREATE TABLE IF NOT EXISTS open_effects (
 CREATE TABLE IF NOT EXISTS timers (
   kind TEXT NOT NULL, key TEXT NOT NULL, timer_id INTEGER NOT NULL, due_ms INTEGER NOT NULL,
   msg BLOB NOT NULL, causal BLOB NOT NULL, lsn INTEGER NOT NULL,
+  owner TEXT GENERATED ALWAYS AS (kind || char(31) || key || char(31) || timer_id) VIRTUAL,
   PRIMARY KEY (kind, key, timer_id)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS timers_due ON timers (due_ms);
 CREATE TABLE IF NOT EXISTS orphans (
@@ -3699,7 +3702,8 @@ fn apply_secret_link(
 }
 
 /// Copies the rows of `table` matching `filter` from `src` into `dst` (same
-/// schema), replacing rows with the same key.
+/// schema), replacing rows with the same key. Generated columns are computed
+/// by `dst` and are neither read nor inserted.
 fn copy_rows(
     src: &Connection,
     dst: &Connection,
@@ -3707,10 +3711,17 @@ fn copy_rows(
     filter: &str,
     args: impl rusqlite::Params,
 ) -> Result<(), StoreError> {
-    let mut read = src.prepare(&format!("SELECT * FROM {table} WHERE {filter}"))?;
+    let cols: Vec<String> = src
+        .prepare("SELECT name FROM pragma_table_xinfo(?1) WHERE hidden = 0 ORDER BY cid")?
+        .query_map([table], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let cols = cols.join(", ");
+    let mut read = src.prepare(&format!("SELECT {cols} FROM {table} WHERE {filter}"))?;
     let n = read.column_count();
     let marks = vec!["?"; n].join(", ");
-    let mut write = dst.prepare(&format!("INSERT OR REPLACE INTO {table} VALUES ({marks})"))?;
+    let mut write = dst.prepare(&format!(
+        "INSERT OR REPLACE INTO {table} ({cols}) VALUES ({marks})"
+    ))?;
     let mut rows = read.query(args)?;
     while let Some(row) = rows.next()? {
         let values = (0..n)
