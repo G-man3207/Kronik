@@ -86,7 +86,7 @@ pub enum EventsCommand {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=256))]
         limit: Option<u64>,
     },
-    /// Follow the live SSE stream until Ctrl-C, or until --limit actual events.
+    /// Follow the live SSE stream until Ctrl-C, --limit actual events, or a reported failure.
     Tail {
         /// Follow one actual source; omission keeps the API's all-source stream.
         #[arg(long, value_name = "SOURCE")]

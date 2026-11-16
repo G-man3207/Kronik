@@ -3058,8 +3058,12 @@ Opens the actual long-lived `GET /v1/events/stream` SSE response over the same
 Unix socket or verified TLS transport as every other API command. It does not
 poll JSON pages. With no limit it follows until Ctrl-C, which exits normally;
 a positive `--limit` exits successfully only after that many complete operational
-events. Heartbeats and cursor-only frames do not count. EOF before completion,
-malformed or oversized frames, disconnects and explicit gaps fail visibly.
+events. Heartbeats and cursor-only frames do not count. An SSE `error` frame is
+the daemon reporting a failure: it exits non-zero with that stable code and
+message rather than pretending the catch-up completed. EOF before completion,
+malformed or oversized frames, disconnects and explicit gaps likewise fail
+visibly. A clean exit therefore means Ctrl-C or the requested `--limit`, never a
+silently truncated catch-up.
 Startup API failures retain their stable error codes.
 Omitting `--source` follows all configured sources without inventing an order
 between them. Selecting a source preserves the original full typed cursor.
