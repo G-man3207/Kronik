@@ -38,7 +38,10 @@ class CompatibilityIndexTest(unittest.TestCase):
         cases = self.load()
         self.assertTrue(cases)
         for case in cases:
-            self.assertEqual({"counter", "notes"}, {item["role"] for item in case["components"]})
+            self.assertEqual(VERIFY["component_roles"](case["release"]),
+                             {item["role"] for item in case["components"]})
+        self.assertEqual({"counter", "notes", "media", "room"},
+                         {item["role"] for item in cases[-1]["components"]})
 
     def test_changed_manifest_bytes_require_new_explicit_provenance(self):
         manifest = self.root / self.index["releases"][0]["manifest"]
@@ -77,57 +80,40 @@ class CompatibilityIndexTest(unittest.TestCase):
         case["components"].append({"role": role, "path": relative, "sha256": sha256, "bytes": len(payload),
                                    "git_blob": "0" * 40, "source_path": f"tests/guests/{role}.wasm"})
 
-    def add_v0_5_0(self, roles=("media", "room"), manifest_change=None):
-        """A synthetic v0.5.0 case: the v0.4.1 case's contracts and data under
-        a manifest that says it recorded blobs and connections, and the media
-        and room components."""
-        case = copy.deepcopy(self.index["releases"][-1])
-        case["release"] = "v0.5.0"
-        for contract in case["contracts"].values():
-            relative = contract["path"].replace(f"{self.index['releases'][-1]['release']}/", "v0.5.0/", 1)
-            (self.root / relative).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(self.root / contract["path"], self.root / relative)
-            contract["path"] = relative
-        manifest = json.loads((self.root / case["manifest"]).read_text())
-        manifest["release"] = "v0.5.0"
-        manifest["scenarios"] = VERIFY["corpus"].SCENARIOS
-        manifest["observations"].update(roots={}, blobs={}, connections={})
-        if manifest_change:
-            manifest_change(manifest)
-        case["manifest"] = "v0.5.0/manifest.json"
-        (self.root / case["manifest"]).write_text(json.dumps(manifest))
-        case["manifest_sha256"] = VERIFY["corpus"].digest(self.root / case["manifest"])
-        for role in roles:
-            self.add_component(case, role)
-        self.index["releases"].append(case)
-        self.index["published_releases"].append("v0.5.0")
-        return case
+    def case(self, release):
+        return next(case for case in self.index["releases"] if case["release"] == release)
 
     def test_from_v0_5_0_a_release_has_its_media_and_room_components(self):
-        self.add_v0_5_0()
         loaded = self.load()
         self.assertEqual({"counter", "notes", "media", "room"}, {item["role"] for item in loaded[-1]["components"]})
         self.assertEqual("v0.5.0", loaded[-1]["release"])
 
     def test_the_blob_and_connection_guests_come_together(self):
-        self.add_v0_5_0(roles=("media",))
+        case = self.case("v0.5.0")
+        case["components"] = [item for item in case["components"] if item["role"] != "room"]
         with self.assertRaisesRegex(VERIFY["Violation"], "media and room components"):
             self.load()
 
     def test_a_role_is_not_listed_twice(self):
-        case = self.add_v0_5_0()
-        case["components"][3] = copy.deepcopy(case["components"][2])
+        case = self.case("v0.5.0")
+        case["components"].append(copy.deepcopy(case["components"][2]))
         with self.assertRaisesRegex(VERIFY["Violation"], "media and room components"):
             self.load()
 
     def test_a_release_before_v0_5_0_has_no_media_or_room_component(self):
+        case = self.case("v0.4.1")
         for role in ("media", "room"):
-            self.add_component(self.index["releases"][-1], role)
+            self.add_component(case, role)
         with self.assertRaisesRegex(VERIFY["Violation"], "media and room components"):
             self.load()
 
     def test_a_v0_5_0_manifest_says_what_its_blobs_and_connections_were(self):
-        self.add_v0_5_0(manifest_change=lambda manifest: manifest["observations"].pop("blobs"))
+        case = self.case("v0.5.0")
+        manifest_path = self.root / case["manifest"]
+        manifest = json.loads(manifest_path.read_text())
+        manifest["observations"].pop("blobs")
+        manifest_path.write_text(json.dumps(manifest))
+        case["manifest_sha256"] = VERIFY["corpus"].digest(manifest_path)
         with self.assertRaisesRegex(VERIFY["Violation"], "records blobs and connections"):
             self.load()
 
@@ -187,6 +173,36 @@ class CompatibilityIndexTest(unittest.TestCase):
             target.update(change)
             with self.subTest(change=change), self.assertRaisesRegex(VERIFY["Violation"], "edited contract"):
                 self.load(index)
+
+
+class ReleaseTagCoverageTest(unittest.TestCase):
+    """The declared catalog is checked against the repository's release tags."""
+
+    def setUp(self):
+        self.cases = VERIFY["load_index"](FIXTURES / "releases.json")
+        self.revisions = {case["release"]: case["producer_revision"] for case in self.cases}
+
+    def test_a_published_release_tag_needs_a_corpus_case(self):
+        revisions = {**self.revisions, "v0.6.0": "f" * 40}
+        with self.assertRaisesRegex(VERIFY["Violation"], "v0\\.6\\.0 has no corpus case"):
+            VERIFY["check_release_tags"](self.cases, revisions)
+
+    def test_a_corpus_case_needs_a_published_release_tag(self):
+        revisions = dict(self.revisions)
+        del revisions["v0.5.0"]
+        with self.assertRaisesRegex(VERIFY["Violation"], "v0\\.5\\.0 is not a published release tag"):
+            VERIFY["check_release_tags"](self.cases, revisions)
+
+    def test_a_case_pins_its_release_tags_commit(self):
+        revisions = {**self.revisions, "v0.5.0": "f" * 40}
+        with self.assertRaisesRegex(VERIFY["Violation"], "v0\\.5\\.0 corpus case"):
+            VERIFY["check_release_tags"](self.cases, revisions)
+
+    def test_the_checked_in_catalog_matches_the_release_tags(self):
+        revisions = VERIFY["release_tag_revisions"](FIXTURES)
+        if revisions is None:
+            self.skipTest("release tags are not available in this checkout")
+        VERIFY["check_release_tags"](self.cases, revisions)
 
 
 class ContractLineageTest(unittest.TestCase):

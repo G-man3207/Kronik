@@ -44,6 +44,45 @@ def fixture_file(root, relative):
     return path
 
 
+def release_tag_revisions(repository):
+    """The commit each v0.x release tag names, or None outside a Git checkout."""
+    try:
+        inside = subprocess.run(["git", "-C", str(repository), "rev-parse", "--is-inside-work-tree"],
+                                capture_output=True, text=True, timeout=60, check=False)
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return None
+        listed = subprocess.run(["git", "-C", str(repository), "tag", "--list", "v0.*"],
+                                capture_output=True, text=True, timeout=60, check=False)
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    if listed.returncode != 0:
+        raise Violation("cannot read the repository's release tags")
+    revisions = {}
+    for tag in listed.stdout.split():
+        if not re.fullmatch(r"v0\.[0-9]+\.[0-9]+", tag):
+            continue
+        commit = subprocess.run(["git", "-C", str(repository), "rev-parse", "--verify", "--quiet", tag + "^{commit}"],
+                                capture_output=True, text=True, timeout=60, check=False)
+        if commit.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", commit.stdout.strip()):
+            raise Violation(f"release tag {tag} does not name a commit")
+        revisions[tag] = commit.stdout.strip()
+    return revisions
+
+
+def check_release_tags(cases, revisions):
+    """The corpus covers exactly the published release tags, at their commits."""
+    covered = {case["release"]: case["producer_revision"] for case in cases}
+    missing = sorted(set(revisions) - set(covered))
+    if missing:
+        raise Violation(f"published release tag {missing[0]} has no corpus case")
+    extra = sorted(set(covered) - set(revisions))
+    if extra:
+        raise Violation(f"corpus case {extra[0]} is not a published release tag")
+    for release, revision in covered.items():
+        if revisions[release] != revision:
+            raise Violation(f"the {release} corpus case does not pin its release tag's commit")
+
+
 def load_index(path):
     if path.stat().st_size > 1 << 20:
         raise Violation("compatibility index exceeds 1 MiB")
@@ -123,6 +162,9 @@ def load_index(path):
                 raise Violation("released component payload differs from source evidence")
     if seen != set(published):
         raise Violation("published release coverage is incomplete")
+    revisions = release_tag_revisions(path.parent)
+    if revisions is not None:
+        check_release_tags(cases, revisions)
     return cases
 
 
