@@ -3,8 +3,10 @@ name: nightly
 # The Definition of done's long checks. They are too slow, and too expensive
 # in hosted-runner minutes, to start on a schedule or on every pull request
 # (a manual CI run uses DST with 200 seeds): the crash test for 1,000 cycles
-# (scripts/chaos.sh), DST with 10,000 seeds over every scenario, over the
-# rebuild workload and over the webhook workload with webhook-relay-ts
+# (scripts/chaos.sh), the crash test under retention
+# (scripts/chaos-retention.py), the runbook drills
+# (scripts/runbook-drills.py), DST with 10,000 seeds over every scenario, over
+# the rebuild workload and over the webhook workload with webhook-relay-ts
 # (scripts/dst.sh), and a DST run of 1,000,000 steps. Also the release
 # build (scripts/release.sh, static musl binaries for x86_64 and aarch64),
 # which no ordinary CI job compiles. Each also runs locally with the same
@@ -48,6 +50,73 @@ jobs:
         with:
           name: chaos
           path: ${{ runner.temp }}/chaos
+          retention-days: 14
+
+  chaos-retention:
+    name: crash test under retention, 60 cycles
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build kronik
+        run: cargo build --locked --release -p kronik
+      # The script's own config is a 4 s history, 1 s segments and a snapshot
+      # every second, so retention compacts within seconds. A real disk, not
+      # tmpfs: the test is about recovery after the log was compacted.
+      - name: Crash test under retention
+        run: >
+          scripts/chaos-retention.py
+          --bin "$PWD/target/release/kronik"
+          --dir "$RUNNER_TEMP/chaos-retention"
+          --cycles 60
+      # The work directory of the violation: data dir, config and daemon log.
+      - name: Keep the work directory
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: chaos-retention
+          path: ${{ runner.temp }}/chaos-retention
+          retention-days: 14
+
+  runbook-drills:
+    name: runbook drills
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build kronik
+        run: cargo build --locked --release -p kronik
+      # A fresh owned work directory and a same-host file:// ship bucket:
+      # no credentials, no external service. The proof records that this is
+      # a format/flow drill, not off-host backup availability.
+      - name: Backup, restore, crash recovery and dummy rotation
+        run: |
+          scripts/runbook-drills.py \
+            --binary "$PWD/target/release/kronik" \
+            --counter tests/guests/counter.wasm \
+            --notes tests/guests/notes.wasm \
+            --revision "$(git rev-parse HEAD)" \
+            --workdir "$RUNNER_TEMP/runbook-drills" \
+            --port 47832
+      - name: Keep the drill proof
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runbook-drills
+          path: ${{ runner.temp }}/runbook-drills/proof.json
+          if-no-files-found: ignore
           retention-days: 14
 
   dst-seeds:
