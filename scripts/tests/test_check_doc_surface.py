@@ -17,6 +17,77 @@ class DocumentationSurfaceTest(unittest.TestCase):
         self.assertIn("usage", result["state"])
         self.assertNotIn("next", result["state"])
 
+    def test_config_inventory_reads_exact_top_level_fields(self):
+        source = '''
+        /// pub struct Config { hidden: bool }
+        pub struct Config {
+            /// pub documented: Docs,
+            pub server: Server,
+            #[serde(deserialize_with = "events")]
+            pub events: Events,
+            fleet: Option<Fleet>,
+        }
+        pub struct ConfigError {
+            pub message: String,
+        }
+        '''
+        self.assertEqual(
+            ["server", "events", "fleet"],
+            SURFACE["config_fields"](source),
+        )
+
+    def test_config_inventory_fails_closed_without_fields(self):
+        for source in ("pub struct ConfigError { message: String }",
+                       "pub struct Config { }"):
+            with self.subTest(source=source), self.assertRaises(SURFACE["InvalidSurface"]):
+                SURFACE["config_fields"](source)
+
+    def test_config_reference_reads_only_tables_of_the_config_section(self):
+        guide = '''
+## kronik.toml
+
+### [server]
+### [oidc] and the embedded UI
+#### [ignored.nested]
+### [simulators.model]
+### Memory
+
+## systemd
+
+### [not-config]
+'''
+        self.assertEqual(
+            {"server", "oidc", "simulators.model"},
+            SURFACE["config_tables"](guide),
+        )
+
+    def test_config_reference_fails_closed_without_tables(self):
+        for guide in ("## systemd\n", "## kronik.toml\n### Memory\n"):
+            with self.subTest(guide=guide), self.assertRaises(SURFACE["InvalidSurface"]):
+                SURFACE["config_tables"](guide)
+
+    def test_new_top_level_config_table_requires_a_reference_table(self):
+        source = '''
+        pub struct Config {
+            pub server: Server,
+            pub simulators: Simulators,
+            pub fleet: Option<Fleet>,
+            pub events: Events,
+        }
+        '''
+        guide = "## kronik.toml\n### [server]\n### [simulators.model]\n"
+        self.assertEqual(
+            ["fleet", "events"],
+            SURFACE["undocumented_config"](source, guide),
+        )
+
+    def test_operations_guide_documents_every_top_level_config_table(self):
+        root = Path(__file__).resolve().parents[2]
+        self.assertEqual([], SURFACE["undocumented_config"](
+            (root / "crates/kronik/src/config.rs").read_text(),
+            (root / "docs/guides/operations.md").read_text(),
+        ))
+
     def test_markdown_output_heading_inside_example_does_not_cut_real_section(self):
         text = "## kronik diff show\n```text\n$ kronik diff show sample\n## Responses\nchanged\n```\n## next\n"
         body = SURFACE["sections"](text)["kronik diff show"]
