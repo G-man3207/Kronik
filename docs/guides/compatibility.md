@@ -116,23 +116,33 @@ establish the complete M33 release corpus or all future interfaces.
 `tests/compatibility/releases.json` is the versioned
 `kronik.compatibility-index/v2` inventory. Its separately declared
 `published_releases` set must exactly match its covered cases. It pins the actual
-published v0.1.0, v0.3.0, v0.4.0 and v0.4.1 producer binary digests, source commits,
-immutable exported manifest digests, original root counts, genuine counter/SQL
-component bytes, and the API, CLI JSON, diff and WIT source snapshots of those
-tags. Every snapshot is its tag's bytes except the CLI-JSON snapshots of v0.1.0,
-v0.3.0 and v0.4.0: the public-release preparation edited one word of their
-introduction's prose (253fa961), and their index entries say so, with the Git
-blob each tag has (`producer_git_blob`) and the edit (`edit`). Their schemas are
-the tags'. `scripts/verify-compatibility.py` compares every snapshot with its
-source file at the producer revision and refuses a difference the index does not
-declare; it needs those revisions in the clone and says so when it cannot compare
-(a shallow clone or a source archive). There was no published v0.2.0 artifact in
-the inspected release set; do not invent one. The v0.1.0 artifact actually
-reports `kronik 0.1.0-dev` and
-records Wasmtime 50.0.0; its real identity is retained rather than rewritten.
-The v0.4.0 artifact reports `kronik 0.4.0` and records Wasmtime 50.0.1.
-The v0.4.1 artifact reports `kronik 0.4.1`, records Wasmtime 50.0.1 and names
-engine `kronik-0.4.1+wasmtime-50.0.1`; it is a patch release on the v0.4.0 line.
+published v0.1.0, v0.3.0, v0.4.0, v0.4.1 and v0.5.0 producer binary digests, source
+commits, immutable exported manifest digests, original root counts, genuine
+counter/SQL component bytes - and from v0.5.0 the media/room component bytes too -
+and the API, CLI JSON, diff and WIT source snapshots of those tags. Every snapshot
+is its tag's bytes except the CLI-JSON snapshots of v0.1.0, v0.3.0 and v0.4.0: the
+public-release preparation edited one word of their introduction's prose
+(253fa961), and their index entries say so, with the Git blob each tag has
+(`producer_git_blob`) and the edit (`edit`). Their schemas are the tags'.
+`scripts/verify-compatibility.py` compares every snapshot with its source file at
+the producer revision and refuses a difference the index does not declare; it
+needs those revisions in the clone and says so when it cannot compare (a shallow
+clone or a source archive).
+
+When the index is read from a Git checkout, the verifier also requires the catalog
+to match the repository's release tags: every `v0.x.y` tag has exactly one case
+whose producer revision is that tag's commit, and a case without such a tag is
+refused. A missing tag is therefore a red gate rather than an omission the index
+declares complete about itself. A source archive has no tags and skips that
+comparison; a shallow clone must fetch them (`git fetch --tags --unshallow`).
+There was no published v0.2.0 artifact in the inspected release set; do not invent
+one. The v0.1.0 artifact actually reports `kronik 0.1.0-dev` and records Wasmtime
+50.0.0; its real identity is retained rather than rewritten. The v0.4.0 artifact
+reports `kronik 0.4.0` and records Wasmtime 50.0.1. The v0.4.1 artifact reports
+`kronik 0.4.1`, records Wasmtime 50.0.1 and names engine
+`kronik-0.4.1+wasmtime-50.0.1`; it is a patch release on the v0.4.0 line.
+The v0.5.0 artifact reports `kronik 0.5.0`, records Wasmtime 50.0.1 and names
+engine `kronik-0.5.0+wasmtime-50.0.1`.
 
 The saved logs were produced by those binaries running the maintained test
 applications. Their embedded component bytes remain exactly as recorded.
@@ -160,6 +170,17 @@ Its API and CLI-JSON snapshots are the v0.4.1 bytes the tag carries: the
 `info.version` moves to 0.4.1. The case is pinned to the ELF digest in the tagged
 `reproducibility.json`, not to a build of this checkout.
 
+The v0.5.0 case is the first from a release that added long-lived connections and
+blobs, and the first with four released components: the maintained counter and
+notes guests plus that tag's media and room guests. Its 32 original roots are 7
+counter, 2 notes, 9 media and 14 room inputs; its manifest declares the
+`counter`, `notes`, `blobs` and `connections` scenarios and records the blob,
+hold, timer, transcript, room and closed-connection observations of those
+inputs. Its API and CLI-JSON snapshots are the v0.5.0 tag's bytes, and its diff
+and WIT snapshots are the tag's versions of those new record kinds and
+interfaces. As before, the case is pinned to the ELF digest in the tagged
+`reproducibility.json`, not to a build of this checkout.
+
 Run the existing public-binary consumer from a clean candidate checkout:
 
 ```sh
@@ -175,13 +196,15 @@ python3 scripts/verify-compatibility.py \
 The work directory must not exist. The command copies, never upgrades in
 place, each immutable corpus; runs real `upgrade check`; compares the original
 state/log integrity hashes; requires **every original root** (nine in each
-case before v0.5.0), not merely a positive root count, in the upgrade check
-and isolated/continuous identity replays; and verifies the historical
-key-backed result. It also deploys each release's genuine old counter and SQL
-components into a fresh fixture, checks committed state transitions, replays
-their five real inputs in both modes, consumes the public versioned diff, and
-runs the versioned public policy semantic cases. Any mismatch exits nonzero.
-The existing CI caller uses the already-built candidate; it must never
+case before v0.5.0, 32 in v0.5.0), not merely a positive root count, in the
+upgrade check and isolated/continuous identity replays; and verifies the
+historical key-backed result. It also deploys each release's genuine old
+counter and SQL components into a fresh fixture, checks committed state
+transitions, replays their five real inputs in both modes, consumes the public
+versioned diff, and runs the versioned public policy semantic cases. The v0.5.0
+case additionally replays its nine blob and 14 connection roots through the
+released media and room components and checks their answers. Any mismatch exits
+nonzero. The existing CI caller uses the already-built candidate; it must never
 regenerate producer output during CI.
 
 A corpus from v0.5.0 on also holds the record kinds that release added,
@@ -329,13 +352,16 @@ producer data/manifest, the observed original root count, genuine tagged
 components, and exact tagged contract source bytes with Git-blob and SHA-256
 identities. Do not delete a published release to make the matrix green, rewrite
 old bytes for a new engine, or replace a tagged component with a new build.
-The currently retained v0.1.0/v0.3.0/v0.4.0/v0.4.1 snapshots were read directly from
-source commits `f4d9d9e2cccf515cb5cc4952c0e8a3f643372e34`,
+The currently retained v0.1.0/v0.3.0/v0.4.0/v0.4.1/v0.5.0 snapshots were read
+directly from source commits `f4d9d9e2cccf515cb5cc4952c0e8a3f643372e34`,
 `d9d460bc89f6ae30962ef16238b8fcaa6485a8de`,
-`90e0c92194514ad141a6273f26fc99f34145acff` and
-`34f0a8ce4251f10c44b243d337cbf0e9a203cdfc`, apart from the declared edit of
-three CLI-JSON snapshots above. A later edit of a snapshot declares itself the
-same way, or the verifier refuses it.
+`90e0c92194514ad141a6273f26fc99f34145acff`,
+`34f0a8ce4251f10c44b243d337cbf0e9a203cdfc` and
+`fcc5bf5a3eaa2dd68bc3bf3bdd0ef64b0cf5bf75`, apart from the declared edit of
+three CLI-JSON snapshots above. Each is the commit its release tag names; the
+verifier refuses a catalog that adds, omits or moves a case across the
+repository's `v0.x` tags. A later edit of a snapshot declares itself the same
+way, or the verifier refuses it.
 
 The case is produced from the published binary, never from a build or from the
 candidate:
