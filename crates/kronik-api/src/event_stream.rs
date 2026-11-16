@@ -35,19 +35,79 @@ impl AsRef<[u8]> for RetainedFrameBytes {
     }
 }
 
-fn body_frame((bytes, disclosure): QueuedFrame) -> Option<Result<Frame<Bytes>, Infallible>> {
-    let mut prepared = Some(Frame::data(bytes));
+fn failure_bytes(error: &ApiError, sse: bool) -> Vec<u8> {
+    // The stable code is sufficient; never repeat a failed payload or secrets.
+    let data = serde_json::json!({"error":{"code":error.code.as_str(),"message":"event stream unavailable","hint":"Reconnect with the last acknowledged cursor after resolving the failure."}});
+    if sse {
+        format!("event: error\ndata: {data}\n\n").into_bytes()
+    } else {
+        data.to_string().into_bytes()
+    }
+}
+
+fn failure_frame(error: &ApiError) -> Frame<Bytes> {
+    Frame::data(Bytes::from(failure_bytes(error, true)))
+}
+
+fn admitted_frame((bytes, disclosure): QueuedFrame) -> Result<Frame<Bytes>, ApiError> {
+    let mut prepared = Some(bytes);
     let mut published = None;
-    disclosure
-        .admit(&mut || {
-            let frame = prepared.take().ok_or_else(|| {
-                ApiError::new(ErrorCode::Internal, "event body frame was already admitted")
-            })?;
-            published = Some(frame);
-            Ok(())
-        })
-        .ok()?;
-    published.map(Ok)
+    disclosure.admit(&mut || {
+        let bytes = prepared.take().ok_or_else(|| {
+            ApiError::new(ErrorCode::Internal, "event body frame was already admitted")
+        })?;
+        published = Some(Frame::data(bytes));
+        Ok(())
+    })?;
+    published.ok_or_else(|| ApiError::new(ErrorCode::Internal, "event body frame was not admitted"))
+}
+
+fn body_frame(frame: QueuedFrame) -> Option<Result<Frame<Bytes>, Infallible>> {
+    admitted_frame(frame).ok().map(Ok)
+}
+
+/// One SSE body over the pump's bounded queue. A frame that cannot be admitted
+/// is never published; the body reports that stable failure instead of closing
+/// as if the daemon had finished the catch-up. A silent pump exit likewise
+/// becomes one error frame, so a client only after the last event never sees an
+/// empty close.
+fn body_stream(
+    mut receive: tokio::sync::mpsc::Receiver<QueuedFrame>,
+) -> impl futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>> {
+    let mut ended = false;
+    let mut reported = false;
+    futures_util::stream::poll_fn(move |cx| {
+        if ended {
+            return std::task::Poll::Ready(None);
+        }
+        match receive.poll_recv(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(Some(frame)) => match admitted_frame(frame) {
+                Ok(frame) => {
+                    reported |= frame
+                        .data_ref()
+                        .is_some_and(|data| data.starts_with(b"event: error\n"));
+                    std::task::Poll::Ready(Some(Ok(frame)))
+                }
+                Err(error) => {
+                    ended = true;
+                    std::task::Poll::Ready(Some(Ok(failure_frame(&error))))
+                }
+            },
+            std::task::Poll::Ready(None) => {
+                ended = true;
+                if reported {
+                    std::task::Poll::Ready(None)
+                } else {
+                    let error = ApiError::new(
+                        ErrorCode::Unavailable,
+                        "the event stream ended before the daemon stopped it",
+                    );
+                    std::task::Poll::Ready(Some(Ok(failure_frame(&error))))
+                }
+            }
+        }
+    })
 }
 
 type EventSocket =
@@ -291,12 +351,8 @@ pub(crate) async fn serve_captured(
         Ok(page) => page,
         Err(error) => return response(error),
     };
-    let (send, mut receive) = tokio::sync::mpsc::channel::<QueuedFrame>(1);
-    let stream = futures_util::stream::poll_fn(move |cx| {
-        receive
-            .poll_recv(cx)
-            .map(|frame| frame.and_then(body_frame))
-    });
+    let (send, receive) = tokio::sync::mpsc::channel::<QueuedFrame>(1);
+    let stream = body_stream(receive);
     let mut result = hyper::Response::new(http_body_util::BodyExt::boxed(StreamBody::new(stream)));
     result.headers_mut().insert(
         hyper::header::CONTENT_TYPE,
@@ -399,13 +455,7 @@ async fn pump(
             let (page, disclosure) = match page {
                 Ok(page) => page,
                 Err(error) => {
-                    // The stable code is sufficient; no failed payload or secret inventory text.
-                    let data = serde_json::json!({"error":{"code":error.code.as_str(),"message":"event stream unavailable","hint":"Reconnect with the last acknowledged cursor after resolving the failure."}});
-                    let frame = if sse {
-                        format!("event: error\ndata: {data}\n\n").into_bytes()
-                    } else {
-                        data.to_string().into_bytes()
-                    };
+                    let frame = failure_bytes(&error, sse);
                     let _ = send(&env, &authority, &output, frame).await;
                     return;
                 }
@@ -931,6 +981,189 @@ mod tests {
             .unwrap();
         assert_eq!(delivered, expected);
     }
+
+    struct Denied;
+    impl kronik_core::authority::Authority for Denied {
+        fn check(&self) -> Result<(), kronik_core::error::ApiError> {
+            Err(kronik_core::error::ApiError::new(
+                kronik_core::error::ErrorCode::Unauthenticated,
+                "the fixture authority was revoked",
+            ))
+        }
+        fn cancelled(&self) -> kronik_core::env::BoxFuture<'static, ()> {
+            Box::pin(std::future::pending())
+        }
+        fn admit(
+            &self,
+            _: &mut dyn FnMut() -> Result<(), kronik_core::error::ApiError>,
+        ) -> Result<(), kronik_core::error::ApiError> {
+            self.check()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_denied_sse_frame_reports_its_code_instead_of_closing_empty() {
+        use futures_util::StreamExt as _;
+        let (send, receive) = tokio::sync::mpsc::channel(1);
+        send.send((
+            bytes::Bytes::from_static(b"private-event-bytes"),
+            std::sync::Arc::new(Denied) as kronik_core::authority::AuthLease,
+        ))
+        .await
+        .unwrap();
+        drop(send);
+        let body = super::body_stream(receive);
+        futures_util::pin_mut!(body);
+        let frame = body.next().await.unwrap().unwrap().into_data().unwrap();
+        let frame = std::str::from_utf8(&frame).unwrap();
+        assert!(frame.starts_with("event: error\ndata: "), "{frame}");
+        assert!(frame.contains("\"code\":\"UNAUTHENTICATED\""), "{frame}");
+        assert!(!frame.contains("private-event-bytes"), "{frame}");
+        assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_silently_stopped_sse_pump_reports_a_stable_unavailable() {
+        use futures_util::StreamExt as _;
+        let (send, receive) = tokio::sync::mpsc::channel::<super::QueuedFrame>(1);
+        drop(send);
+        let body = super::body_stream(receive);
+        futures_util::pin_mut!(body);
+        let frame = body.next().await.unwrap().unwrap().into_data().unwrap();
+        let frame = std::str::from_utf8(&frame).unwrap();
+        assert!(frame.starts_with("event: error\ndata: "), "{frame}");
+        assert!(frame.contains("\"code\":\"UNAVAILABLE\""), "{frame}");
+        assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_admitted_terminal_error_is_not_followed_by_a_second_one() {
+        use futures_util::StreamExt as _;
+        struct Allowed;
+        impl kronik_core::authority::Authority for Allowed {
+            fn check(&self) -> Result<(), kronik_core::error::ApiError> {
+                Ok(())
+            }
+            fn cancelled(&self) -> kronik_core::env::BoxFuture<'static, ()> {
+                Box::pin(std::future::pending())
+            }
+            fn admit(
+                &self,
+                effect: &mut dyn FnMut() -> Result<(), kronik_core::error::ApiError>,
+            ) -> Result<(), kronik_core::error::ApiError> {
+                effect()
+            }
+        }
+        let (send, receive) = tokio::sync::mpsc::channel(1);
+        send.send((
+            bytes::Bytes::from(super::failure_bytes(
+                &kronik_core::error::ApiError::new(
+                    kronik_core::error::ErrorCode::Unavailable,
+                    "the fixture source stopped",
+                ),
+                true,
+            )),
+            std::sync::Arc::new(Allowed) as kronik_core::authority::AuthLease,
+        ))
+        .await
+        .unwrap();
+        drop(send);
+        let body = super::body_stream(receive);
+        futures_util::pin_mut!(body);
+        let frame = body.next().await.unwrap().unwrap().into_data().unwrap();
+        assert!(frame.starts_with(b"event: error\n"));
+        assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fifty_catch_up_runs_deliver_every_admitted_frame() {
+        let data = tempfile::tempdir().unwrap();
+        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+        let node = kronik_sched::start_local(
+            env.clone(),
+            data.path(),
+            kronik_sched::NodeConfig::default(),
+        )
+        .await
+        .unwrap();
+        let api = crate::Api::new(node.clone());
+        let request = crate::ApiRequest {
+            method: "GET".into(),
+            path: "/v1/events/stream".into(),
+            query: String::new(),
+            body: Vec::new(),
+            token_id: "unix:uid=0".into(),
+            bearer: None,
+        };
+        let captured = api.capture(&request).unwrap();
+        published_inventory(&node).await;
+        let original = node.local_operator_authority().unwrap();
+        for index in 0..3 {
+            node.record_audit_event_authorized(
+                "test.catch-up",
+                "fixture",
+                Default::default(),
+                kronik_proto::log::v1::Audit {
+                    token_id: "unix:uid=0".into(),
+                    reason: format!("catch-up frame {index}"),
+                    wall_time_ms: env.clock.wall_ms(),
+                },
+                original.clone(),
+            )
+            .await
+            .unwrap();
+        }
+        let identity = Identity {
+            installation: "11".repeat(32),
+            branch: node.branch().to_owned(),
+        };
+        let feed = std::sync::Arc::new(
+            crate::events::Events::native(identity.clone(), node.clone()).unwrap(),
+        );
+        let cursor = kronik_fleet::events::ResumeCursor::new(identity);
+        let (page, disclosure) =
+            page_after_publication(&node, &feed, &cursor, captured.authority(), None)
+                .await
+                .unwrap();
+        assert!(page.events.len() >= 3, "{:?}", page.events.len());
+        for run in 0..50 {
+            let (send, mut receive) = tokio::sync::mpsc::channel(1);
+            let running = env.spawn(
+                "events-catch-up",
+                super::pump(
+                    env.clone(),
+                    feed.clone(),
+                    cursor.clone(),
+                    captured.authority().clone(),
+                    None,
+                    send,
+                    true,
+                    (page.clone(), disclosure.clone()),
+                ),
+            );
+            for index in 0..page.events.len() {
+                let frame = env
+                    .timeout(std::time::Duration::from_secs(2), receive.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("run {run} frame {index}: the pump stalled"))
+                    .unwrap_or_else(|| panic!("run {run} frame {index}: the pump ended early"));
+                let frame = super::admitted_frame(frame).unwrap_or_else(|error| {
+                    panic!("run {run} frame {index}: admission failed with {error:?}")
+                });
+                assert!(
+                    frame
+                        .data_ref()
+                        .is_some_and(|data| data.starts_with(b"id: ")),
+                    "run {run} frame {index}: unexpected SSE frame"
+                );
+            }
+            drop(receive);
+            env.timeout(std::time::Duration::from_secs(2), running)
+                .await
+                .expect("the pump ignored its closed body");
+        }
+    }
+
     #[tokio::test]
     async fn public_http_entry_captures_the_actual_stream_route_and_denies_read_only_tokens() {
         use crate::auth::Scope;
