@@ -1849,8 +1849,8 @@ M18:
 ## 18. Acceptance plan
 
 The four M24 criteria, each with its proof. Everything except criterion 1
-runs in CI (`test` and `ts` steps) and locally. Criterion 1 runs on the
-test VPS: 2 vCPUs, about 4 GiB of RAM, no KVM.
+runs in CI (`test`, `dst` and `ts` steps) and locally. Criterion 1 runs on
+the test VPS: 2 vCPUs, about 4 GiB of RAM, no KVM.
 
 ### Criterion 1: `chat-ts` handles 1,000 concurrent WebSocket clients on the test VPS
 
@@ -1944,7 +1944,8 @@ the maintainers to confirm this workload as the meaning of "handles".
    - the origins are the frame inputs;
    - the diff validates against the schema.
 
-**End to end,** in the `ts` step: `scripts/acceptance-m24.sh replay`
+**End to end,** in the `ts` step (`scripts/ci.sh ts`; the `sdk-chain`
+job of `.github/workflows/ci.yml`): `scripts/acceptance-m24.sh replay`
 drives `chat-ts` on a real daemon with real WebSocket and SSE clients.
 These are Python's standard library plus a minimal client in
 `scripts/m24_ws.py`. Then:
@@ -1989,38 +1990,45 @@ DST property C5 covers it under random crashes.
 
 ### Criterion 4: connections broken by a restart are closed with a dedicated reason, and the clients can reconnect
 
-**`crates/kronik/tests/connections_restart.rs`** (a real daemon, real
-sockets), with 20 WebSocket clients and 5 SSE followers on the room guest:
+**In `cargo test`.** The real daemon and sockets are covered by the tests
+that own each fact:
 
-1. **SIGTERM:**
-   - every WebSocket client receives a close frame with code 1012 and the
-     reason `kronik: restart`;
-   - every SSE stream receives `retry:` and ends.
-2. **Restart:**
-   - every old connection has a close input (cause `RESTART`, initiator
-     host, code 1012, reason `restart`), recorded before the first new
-     open of its actor;
-   - `kronik connections list --state open` is empty before the clients
-     return;
-   - the clients reconnect with backoff, every reconnect is accepted, and
-     `GET /room/<key>/members` equals the reconnected set (no stale
-     member).
-3. **SIGKILL:** the same, except that the clients see an abnormal closure
-   (1006) instead of 1012, and the restart closes have
-   `frames_written_known = false` and `restart_after_lsn` set.
-4. **A crash inside an open turn:** the client opens with `?call=1`, so
-   the open turn makes a `call` and has a `TurnBegin`. `serve
-   --test-hold-after-call` (the M2 hold) parks it after the callee commits,
-   and the harness SIGKILLs the daemon. After the restart, the re-run
-   accepts, the hub closes the connection with the reason `restart`, and
-   the client, which never got its 101, reconnects.
+- `crates/kronik/tests/connections.rs` stops the real daemon with SIGTERM
+  while a WebSocket client is open: the client receives 1012 `kronik:
+  restart`; after the restart the room sees the old connection's host close
+  input (`restart`, 1012), its state is intact, and new connections open.
+- `crates/kronik-sched/tests/connections.rs`
+  (`a_restart_closes_every_connection_the_last_process_held`) drops the
+  runtime: every connection still open in `state.db` gets its restart close
+  (cause `RESTART`, host, 1012, `frames_written` unknown,
+  `restart_after_lsn` at the start's LSN, a committed close turn that keeps
+  the subject) before the restarted node takes new inputs.
+- `crates/kronik-gateway/tests/websocket.rs` and `tests/sse.rs` run the
+  wire end of a graceful stop through the hyper server: a WebSocket client
+  receives 1012 `kronik: restart`; an SSE stream receives a `retry:` of 2
+  to 8 s and then ends. The WebSocket test checks that the stop leaves the
+  close input to the next start.
+- `crates/kronik/tests/kill_connections.rs` SIGKILLs a daemon after a
+  `send-now` frame was written and checks that the old connection gets the
+  restart close (criterion 3).
+- DST's connections workload opens with `?call=1` (15% of opens, so the
+  open turn makes a `call` and has a `TurnBegin`) and crashes the node at
+  random points, including inside the open turn. Property C1 checks
+  exactly one close input per accepted connection across crashes and
+  graceful stops, including after the final restart; C7 checks the
+  recovered `connections` and `connection_history` tables against a
+  rebuild from the log. A session retries its open while the node is down
+  or starting, so the workload crosses the restart boundary.
 
-**End to end:** `scripts/acceptance-m24.sh restart` runs `loadgen chat
---clients 200 --reconnect` against `chat-ts`. It restarts the daemon once
-gracefully and once with SIGKILL. All 200 clients must be connected again
-within 30 s, the room sequences must stay gap-free after each client's
-resynchronization (`GET /chat/{key}/messages?after=`), and there must be
-no dead letters.
+**End to end,** in the `ts` step (`scripts/ci.sh ts`; the `sdk-chain` job
+of `.github/workflows/ci.yml`): `scripts/acceptance-m24.sh restart` runs
+`loadgen chat --clients 200 --reconnect` against `chat-ts`. It restarts the
+daemon once gracefully and once with SIGKILL. All 200 clients must be
+connected again within 30 s, the room sequences must stay gap-free after
+each client's resynchronization (`GET /chat/{key}/messages?after=`), and
+there must be no dead letters. The graceful restart must close every
+client with 1012 `kronik: restart` and leave a host close input with cause
+`restart`; the SIGKILL must be an abnormal closure (1006).
 
 ## 19. Implementation plan
 
@@ -2042,7 +2050,7 @@ unchanged. "M25" below means the M25/M26 work (ADRs 0117 to 0122).
 | 10 | **API, CLI, MCP and errors.** `/v1/connections`, the operator close, history fields and fates, the `?connection=` filter, the dead-letter views; `kronik connections ...`; `list_connections`; the three error codes; explain topics; glossary; OpenAPI, CLI and JSON references regenerated; `AGENT_GUIDE.md`. | `kronik-api`, `kronik` (cli), `kronik-mcp`, `kronik-core` (error, explain), `docs/` generated files | API tests; schema tests; `scripts/ci.sh docs`; the doc-surface check | **Conflicts** on generated files (`openapi.json`, `errors.md`, `cli.md`, `json.md`). Regenerate after rebase, never hand-merge. |
 | 11 | **DST.** The `connections` workload, `SimTransport`, C1 to C9, the mutation, CI wiring. | `kronik-sim`, `scripts/ci.sh` (dst seeds) | 200 seeds green; the mutation is caught; nightly 10,000 | Parallel. |
 | 12 | **SDKs.** TypeScript (API, `kronik build` world and shim, test kit, `.d.ts` regenerated), Rust, Python, Go (bindings regenerated); `docs/guides/actors.md`. | `sdk/*`, `crates/kronik/src/project/build.rs` | The SDKs' unit tests; `scripts/ci.sh ts sdks`; the import check (`IMPORT_NOT_ALLOWED` test of components) | **Conflicts** with M26's SDK slice (the same files). Serialize. |
-| 13 | **`chat-ts` and acceptance.** The example, `step2`, tests; `loadgen chat`; `scripts/acceptance-m24.sh` (load, replay, restart); `scripts/m24_ws.py`; identity-examples entry; `docs/guides/connections.md`; operations and security guide sections; the VPS run and `docs/perf.md`. | `examples/chat-ts`, `tools/loadgen`, `scripts/`, `docs/` | Criteria 1, 2 (end to end) and 4 (end to end) | Parallel. |
+| 13 | **`chat-ts` and acceptance.** The example, `step2`, tests; `loadgen chat`; `scripts/acceptance-m24.sh` (load, replay, restart); `scripts/m24_ws.py`; identity-examples entry; `docs/guides/connections.md`; operations and security guide sections; the VPS run and `docs/perf.md`. | `examples/chat-ts`, `tools/loadgen`, `scripts/`, `docs/` | Criteria 2 and 4 end to end in the `ts` step; criterion 1's load on the test VPS | Parallel. |
 | 14 | **Rebase and the release corpus.** The M13 switch closes connections (§7.7); the `m24-connections` compatibility fixture; the release-corpus entry at v0.5.0. | `kronik-sched` (`rebase.rs`), `tests/compatibility/` | The rebase test with live connections; the corpus test | Parallel. |
 
 Slices 4 to 11 can be split among people once 1 to 3 have landed. The
