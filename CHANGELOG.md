@@ -50,9 +50,13 @@ until the v1.0 compatibility promise takes effect.
 - A promote's `Deployment.unverified_inputs` counts the root inputs the
   switch actually made unverified: the node now takes the count under the
   switch gate, over main's log through the switch, instead of using the
-  proposal's earlier read. Root inputs that committed while promote waited
-  to switch (and ran the old code) are no longer missing from the gap.
-  `kronik promote --dry-run` reports the same projection and still stores
+  proposal's earlier read. From before the count until the Deployment is
+  in the log it holds the turn-commit gate, so a turn append that is
+  already under way lands below the Deployment and is counted, while one
+  that reaches the gate later lands above it. A turn cannot append between
+  the count and the record, but a running turn is not made to finish: an
+  open turn keeps its re-run. `kronik promote --dry-run` takes the same
+  commit gate and barrier and reports the same projection; it still stores
   nothing.
 - A fork's live allowlist admits an unrecorded GET only when the matching
   grant's effective delivery class is `replay-safe`: `unsafe` and

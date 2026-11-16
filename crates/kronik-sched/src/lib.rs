@@ -318,6 +318,13 @@ pub struct SwitchHold {
     pub park_resend: std::sync::atomic::AtomicBool,
     pub resend_parked: std::sync::atomic::AtomicUsize,
     pub resend_release: tokio::sync::Semaphore,
+    /// With this set, a turn's `TurnRecord` parks before it is appended,
+    /// while the turn holds the turn-commit read lock and still runs, and
+    /// goes on one permit of `turn_commit_release`; `turn_commit_parked`
+    /// counts them.
+    pub park_turn_commit: std::sync::atomic::AtomicBool,
+    pub turn_commit_parked: std::sync::atomic::AtomicUsize,
+    pub turn_commit_release: tokio::sync::Semaphore,
 }
 
 impl Default for SwitchHold {
@@ -329,6 +336,9 @@ impl Default for SwitchHold {
             park_resend: Default::default(),
             resend_parked: Default::default(),
             resend_release: tokio::sync::Semaphore::new(0),
+            park_turn_commit: Default::default(),
+            turn_commit_parked: Default::default(),
+            turn_commit_release: tokio::sync::Semaphore::new(0),
         }
     }
 }

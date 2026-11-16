@@ -184,7 +184,8 @@ pub struct CodeSwitch {
     pub pinned: Vec<pb::KindVersion>,
     pub cause: pb::DeploymentCause,
     /// The last main LSN a promote verified; it counts the root inputs
-    /// after it itself, when it holds the switch gate. Other causes ignore it.
+    /// after it itself, once it holds the switch gate and the turn-commit
+    /// gate. Other causes ignore it.
     pub verified_through_lsn: Lsn,
     pub proposal_id: String,
     pub rollback_of_epoch: u64,
@@ -1950,11 +1951,13 @@ impl Node {
     }
 
     /// Commits a switch's record and installs its code on a task of its
-    /// own that holds `held` (the deploy lock or the rebase pause) and
-    /// `gate`, the switch gate held for writing: a caller that goes away
-    /// (a client disconnect) never leaves a switch committed but not
-    /// installed. `hold`: park on `test_hold_switch` before the install. A rebase switch then reloads the queues and timers; when
-    /// that fails after the commit the node goes fatal.
+    /// own that holds `held` (the deploy lock or the rebase pause), `gate`,
+    /// the switch gate held for writing, and `commit`, a promote's turn-commit
+    /// lock until the record is in the log: a caller that goes away (a client
+    /// disconnect) never leaves a switch committed but not installed.
+    /// `hold`: park on `test_hold_switch` before the install. A rebase switch
+    /// then reloads the queues and timers; when that fails after the commit
+    /// the node goes fatal.
     // A code switch's admission carries the held locks, gate and deployment
     // state: one call site, no struct worth its own name.
     #[allow(clippy::too_many_arguments)]
@@ -1962,6 +1965,7 @@ impl Node {
         &self,
         held: H,
         gate: tokio::sync::OwnedRwLockWriteGuard<()>,
+        commit: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
         record: Record,
         installs: Vec<(pb::KindVersion, Arc<Program>, CodeHash)>,
         epoch: u64,
@@ -1987,6 +1991,8 @@ impl Node {
                 _ => None,
             };
             let lsn = node.commit_origin(record, origin).await?;
+            // The Deployment has its LSN: later turn appends are above it.
+            drop(commit);
             if let Some(deployment) = deployment {
                 lock(&node.config).push(Record::Deployment(deployment));
             }
@@ -3382,6 +3388,24 @@ impl Node {
         );
     }
 
+    /// Test hook (`SwitchHold::park_turn_commit`, issue #126): parks a turn
+    /// that is about to append its record, while it holds the turn-commit
+    /// read lock, so a test can start a switch in the window the switch must
+    /// wait out.
+    async fn hold_turn_commit(&self, record: &Record) {
+        let Some(hold) = &self.cfg.test_hold_switch else {
+            return;
+        };
+        if !matches!(record, Record::TurnRecord(_)) || !hold.park_turn_commit.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        hold.turn_commit_parked.fetch_add(1, Ordering::SeqCst);
+        if let Ok(permit) = hold.turn_commit_release.acquire().await {
+            permit.forget();
+        }
+    }
+
     pub(crate) async fn commit(&self, mut record: Record) -> Result<Lsn, ApiError> {
         self.seal(&mut record)?;
         self.decodable(&record)?;
@@ -3395,6 +3419,11 @@ impl Node {
                 turn.outcome.as_ref(),
             );
         }
+        let commit = match &record {
+            Record::TurnRecord(_) => Some(self.gate.commit().await),
+            _ => None,
+        };
+        self.hold_turn_commit(&record).await;
         let lsn = match self.log.append(record).await {
             Ok(lsn) => lsn,
             Err(e) if e.is_refusal() => return Err(refused(&e)),
@@ -3403,6 +3432,9 @@ impl Node {
                 return Err(ApiError::new(ErrorCode::Unavailable, e.to_string()));
             }
         };
+        // The switch may append its Deployment from here on: this record's
+        // LSN is assigned and no switch can slot one in before it.
+        drop(commit);
         tokio::select! {
             biased;
             () = self.store.applied.wait(lsn) => {}
@@ -3454,6 +3486,11 @@ impl Node {
     ) -> Result<Lsn, ApiError> {
         let record = self.seal_authorized(record, authority.clone()).await?;
         let erased_blobs = self.refs_erased_blobs(&record);
+        let commit = match &record {
+            Record::TurnRecord(_) => Some(self.gate.commit().await),
+            _ => None,
+        };
+        self.hold_turn_commit(&record).await;
         let lsn = match self.log.append_authorized(record, authority).await {
             Ok(lsn) => lsn,
             Err(kronik_log::AuthorizedAppendError::Authority(error)) => return Err(error),
@@ -3465,6 +3502,9 @@ impl Node {
                 return Err(ApiError::new(ErrorCode::Unavailable, error.to_string()));
             }
         };
+        // The switch may append its Deployment from here on: this record's
+        // LSN is assigned and no switch can slot one in before it.
+        drop(commit);
         tokio::select! {
             biased;
             () = self.store.applied.wait(lsn) => {}
@@ -4565,6 +4605,7 @@ impl Node {
             .finish_switch(
                 guard,
                 gate,
+                None,
                 Record::Deployment(record),
                 vec![(version, program, hash)],
                 epoch,
@@ -4718,9 +4759,11 @@ impl Node {
     /// rollback): one epoch and one LSN for the whole set. Turns that start
     /// after it run the new code of every kind in the set, running turns
     /// finish with the old. Returns `(epoch, lsn, unverified_inputs)`; `lsn`
-    /// is 0 for a dry run, whose count is a projection through main's committed
-    /// head. A promote counts the root inputs in `(verified_through_lsn, lsn]`
-    /// under the switch gate; other causes count none.
+    /// is 0 for a dry run, whose count is a projection over main's state at
+    /// that point. A promote counts the root inputs in
+    /// `(verified_through_lsn, lsn]` under the switch gate and orders every
+    /// turn-commit append below or above its own Deployment; other causes
+    /// count none.
     pub async fn switch_code(
         &self,
         switch: CodeSwitch,
@@ -4806,13 +4849,41 @@ impl Node {
         Ok(roots)
     }
 
-    /// The root inputs a promote of `switch` switched over: none for any
-    /// other cause.
-    async fn unverified_inputs(&self, switch: &CodeSwitch) -> Result<u64, ApiError> {
+    /// The turn-commit half of a promote, giving up when the request that
+    /// asked for it goes away: no turn appends its record while this is held,
+    /// so the barrier after it covers every turn that reached the log first.
+    async fn hold_turn_commits(
+        &self,
+        origin: &OperationOrigin,
+    ) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, ApiError> {
+        match origin {
+            OperationOrigin::Internal => Ok(self.gate.switch_commits().await),
+            OperationOrigin::Request(authority) => tokio::select! {
+                biased;
+                () = authority.cancelled() => Err(ApiError::new(
+                    ErrorCode::Unauthenticated,
+                    "promote request revoked while waiting for turn appends",
+                )),
+                held = self.gate.switch_commits() => Ok(held),
+            },
+        }
+    }
+
+    /// The last LSN every append queued before this has. Writes nothing; the
+    /// caller serializes the appends it wants behind it.
+    async fn log_barrier(&self) -> Result<Lsn, ApiError> {
+        self.log.barrier().await.map_err(|e| {
+            self.fatal.set(e.to_string());
+            ApiError::new(ErrorCode::Unavailable, e.to_string())
+        })
+    }
+
+    /// The root inputs a promote of `switch` leaves behind through
+    /// `through`: none for any other cause.
+    async fn unverified_inputs(&self, switch: &CodeSwitch, through: Lsn) -> Result<u64, ApiError> {
         if switch.cause != pb::DeploymentCause::Promote {
             return Ok(0);
         }
-        let through = self.committed_head();
         self.root_inputs_between(switch.verified_through_lsn, through)
             .await
     }
@@ -4846,15 +4917,36 @@ impl Node {
         }
         let epoch = self.epoch.load(Ordering::Acquire) + 1;
         if dry_run {
-            let unverified_inputs = self.unverified_inputs(&switch).await?;
+            if switch.cause != pb::DeploymentCause::Promote {
+                return Ok((epoch, 0, 0));
+            }
+            // The same barrier the switch would take, so for the same state
+            // this projects what the Deployment would record.
+            let commits = self.hold_turn_commits(&origin).await?;
+            let through = self.log_barrier().await?;
+            let unverified_inputs = self.unverified_inputs(&switch, through).await?;
+            drop(commits);
             return Ok((epoch, 0, unverified_inputs));
         }
         let gate = match &origin {
             OperationOrigin::Internal => self.gate.switch().await,
             OperationOrigin::Request(authority) => self.switch_authorized(authority).await?,
         };
-        // Under the gate: no promote count is minted before the switch waits.
-        let unverified_inputs = self.unverified_inputs(&switch).await?;
+        // A promote is ordered against record appends, not running turns: an
+        // append already under way gets its LSN and is counted, and one that
+        // arrives later gets its LSN above the Deployment (issue #126). The
+        // gate is what keeps a new turn from starting here.
+        let commits = if switch.cause == pb::DeploymentCause::Promote {
+            Some(self.hold_turn_commits(&origin).await?)
+        } else {
+            None
+        };
+        let unverified_inputs = if commits.is_some() {
+            let through = self.log_barrier().await?;
+            self.unverified_inputs(&switch, through).await?
+        } else {
+            0
+        };
         let record = pb::Deployment {
             epoch,
             kinds: switch.kinds,
@@ -4870,6 +4962,7 @@ impl Node {
             .finish_switch(
                 guard,
                 gate,
+                commits,
                 Record::Deployment(record),
                 installs,
                 epoch,
