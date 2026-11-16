@@ -1,167 +1,90 @@
 # Kronik
 
-> Don't deploy code you hope works. See what it would have done with
-> yesterday's traffic.
+![Kronik: don't deploy code you hope works. See what it would have done with yesterday's traffic.](docs/media/kronik-banner.png)
 
-https://github.com/user-attachments/assets/5c42b6b8-a40e-42d4-a994-31848284a324
+> Don't deploy code you hope works. See what it would have done with yesterday's
+> traffic.
 
-<sub>The video shows the v1.0 target; see <a href="#status">Status</a> for what works today.</sub>
+Kronik is a source-available runtime in which a system is a **deterministic
+function of its history**. Every input, every effect result and every state
+change is written to an append-only log before a turn is applied, delivered or
+answered, so a change can be replayed against real production traffic and
+reviewed as a **behavior diff** before it goes live.
 
-Kronik is a source-available runtime in which a system is a deterministic
-function of its history. Every input, every effect result and every state
-change is recorded in an append-only log, and a turn is applied, delivered and
-answered only after its record is fsynced. A change can therefore be replayed
-against real production traffic and reviewed as a behavior diff before it goes
-live.
+The runtime is one `kronik` binary. It runs actors: Wasm components with
+built-in key-value state and their own SQLite database, written in TypeScript,
+Rust, Python or Go, or Linux programs from OCI images in gVisor. The CLI, the
+JSON API and the MCP server are the primary interfaces; the embedded admin UI is
+partial and unreleased.
 
-The runtime is a single `kronik` binary. It runs actors: Wasm components with
-built-in key-value state and their own SQLite database. Actors are written in
-TypeScript, Rust, Python or Go, or run as Linux programs from OCI images in
-gVisor. The CLI, the JSON API and the MCP server are the primary surface; the
-embedded admin UI (M27) is served on the admin listener and is partial and
-unreleased.
+[Website](https://www.kronik.se/) · [Quickstart](docs/guides/quickstart.md) ·
+[Documentation](docs/introduction.md) ·
+[Project status](https://github.com/G-man3207/Kronik/wiki/Project-status) ·
+[Build brief](https://github.com/G-man3207/Kronik/wiki/Build-Brief)
 
-## Status
+> **Status: pre-alpha.** Kronik is not ready for production, and interfaces may
+> change between releases. See [Status](#status).
 
-Kronik is pre-alpha. It is not ready for production, and interfaces may still
-change between releases.
+## Why Kronik
 
-| Release | Contents |
-| --- | --- |
-| [`v0.1.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.1.0) | Durable turns, effects and capabilities, fork, replay and behavior diff with policy and approvals, proposals that span several actors, the TypeScript and Rust SDKs, the JSON API and MCP server, operations on a VPS, foreign actors in gVisor, privacy mode |
-| [`v0.3.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.3.0) | Python and Go SDKs, the CLI against a remote API, watch and preview forks, effect simulators, rollback via replay, foreign actors copied into forks |
-| [`v0.4.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.4.0) | Standard `fetch` through `wasi:http`, OpenTelemetry traces with a complete verifiable audit export, KMS-wrapped master key (OpenBao/AWS/GCP/Azure), Wasmtime 50.0.1, and crash-path hardening: atomic secret-catalogue publication, paced rate windows, restart-safe custody |
-| [`v0.4.1`](https://github.com/G-man3207/Kronik/releases/tag/v0.4.1) | Patch release: `kronik restore` validates the manifest paths and the component names it takes from the snapshot bucket; restarts no longer grow with the log, nor stop on one whose retention compacted past an idle SQL actor; erasure no longer strands scrubbed reads at 503; the audit export and its followers recover at once from an overtaking configuration commit. Engine `kronik-0.4.1+wasmtime-50.0.1` |
-| [`v0.5.0`](https://github.com/G-man3207/Kronik/releases/tag/v0.5.0) | The "Isolation, standards and web" release (M20–M26): long-lived connections (WebSocket, SSE, `send-now`, replay and diff, the SDKs and `chat-ts`), streaming bodies and app blob storage (blobs above a threshold, holds, a collector, erasure and reseal, shipping and restore, `media-ts`), external secret backends, the nonroot daemon and the microVM level (opt-in), and durability fixes across the log, snapshots and reseal. WIT `kronik:actor@0.1.1`; engine `kronik-0.5.0+wasmtime-50.0.1` |
+Assistants and agents write code faster than anyone can read it. Tests pass and
+staging is green, but neither shows what a change will do to the traffic a
+system actually gets. Kronik records what a running system does — each request,
+each outside answer, each state change — before it answers. A proposed change
+can then run through yesterday's recorded traffic, with the outside world
+answering as it did, and the result is a behavior diff: what would answer
+differently, what would change, and what it would cost.
 
-`v0.5.0` is the latest release: the brief's "Isolation, standards and web"
-line (M20–M26), engine `kronik-0.5.0+wasmtime-50.0.1`. Its archives are
-static musl binaries for x86_64 and aarch64 with `install.sh`, checksums,
-CycloneDX SBOMs and two-build byte-equality evidence (`reproducibility.json`);
-`install.sh` verifies each archive's Sigstore attestation and refuses
-unsigned ones.
+The idea in full, told from the beginning for readers who do not want to start
+with the code, is at [kronik.se](https://www.kronik.se/). Kronik is for the
+agents that write and change software at machine pace, the people who review
+their work without time to read all the code, and small teams that want safe
+deploys on a VPS without Kubernetes.
 
-`v0.4.1` was a patch on the line `v0.4.0` opened. It fixes a security issue in
-`kronik restore` (the manifest paths and the component names it takes from the
-snapshot bucket are now validated, see the
-[advisory](https://github.com/G-man3207/Kronik/security/advisories/GHSA-f9xv-7cmm-95v6))
-and the defects found since `v0.4.0` in restart, retention, secret handling and
-the audit export; the engine is `kronik-0.4.1+wasmtime-50.0.1`. `v0.3.0` and
-`v0.1.0` are the historical unsigned releases.
+## How it works
 
-`main` is the unreleased `0.6.0-dev` line; the [changelog](CHANGELOG.md) lists
-what changed since `v0.4.1`. In `v0.5.0`:
+![Every request is a turn, and every change is a proposal: admit, run, record, apply; fork, replay, diff, decide.](docs/media/kronik-how-it-works.jpg)
 
-- **External secret backends (M23 B2–B6):** secret names linked to OpenBao or
-  Vault, AWS Secrets Manager, GCP Secret Manager or Azure Key Vault, read
-  through a cache with outage handling, and a PKCS#11 helper. They ran against
-  pinned services, emulators and SoftHSM2, not against a real cloud or a
-  physical HSM.
-- **Long-lived connections (M24):** `WEBSOCKET` and `SSE` routes, whose
-  owner actor accepts, sends and closes in recorded turns, with the
-  `kronik:actor@0.1.1` WIT that keeps `0.1.0` components running; `send-now`,
-  the replay and diff of connections, their API, CLI and MCP surface, and
-  support in the four SDKs. The 1,000-client run of `chat-ts` passed on the
-  test machine confined to two CPUs, standing in for the 2-vCPU test VPS.
-- **Streaming bodies and blobs (M25, M26):** request bodies and `fetch`
-  responses above a kind's blob threshold (1 MiB by default) stream into a
-  content-addressed blob store and reach the actor as blobs, also through
-  `wasi:http`; actors hold blobs, send them on messages, timers, calls and
-  replies within a per-actor quota, and a collector deletes what nothing
-  keeps. Blobs are sealed, erased and resealed with their subject, shipped
-  and restored with the log, read by forks and previews, supported by the
-  four SDKs and shown by the `media-ts` example; they are always on. The
-  constant-memory runs at the brief's sizes (a 300 MB upload, a 40 MB fetch,
-  a 1 GB response) passed on the development machine and on the test
-  machine confined to two CPUs and 4 GiB, not on the test VPS itself, and
-  blob shipping ran against directory buckets and a local S3 server, not a
-  cloud store.
-- **The nonroot daemon (M21, opt-in):** the nonroot service of `kronik serve
-  --init --rootless` passed its installed proofs (ADR 0064) on 2026-11-14 on
-  GitHub-hosted Ubuntu 24.04 runners (virtual machines on AMD and Intel
-  hosts), once with AppArmor's restriction on unprivileged user namespaces
-  (R1) active and once with it lifted; it has not run on other
-  distributions. The root
-  service stays the default. Its decisions, ADRs 0060–0065, were accepted on
-  2026-11-13.
-- **The microVM level (M20, opt-in; gVisor stays the default):**
-  `isolation = "microvm"` passed its proofs on the same kind of runner, with
-  nested KVM, on an AMD host and on an Intel host; neither has run on bare
-  metal. Its decisions, ADRs 0095 and 0096, were accepted on 2026-11-14.
+Every request is a **turn**. It is admitted by the gateway or the JSON API, runs
+`handle` in a fresh Wasm instance with fuel and memory limits, a host-provided
+clock and seed, and a host-side effect gate. Before its first outside effect or
+actor call, the turn's start (`TurnBegin`) is fsynced; each effect result is
+recorded as it returns, so a crash can rerun the turn with the recorded answers.
+The turn's record — input, outcome, state writes, SQL changes and effect
+results — is then fsynced as one record and applied in LSN order; nothing is
+delivered or answered before that.
 
-The manual `isolation` workflow runs those proofs on disposable hosted runners
-and keeps their evidence. Absent or partial: the cluster (M16–M19), the WASI
-0.3 remainder (M22), and the UI, fleet and hardening tracks (M27 and M29–M34).
-See the [project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
-for the state of each milestone, the open questions and the known gaps, and the
-[compliance audit](https://github.com/G-man3207/Kronik/wiki/Compliance-audit)
-for how the brief maps to the tree.
+Every change is a **proposal**. `kronik propose` forks the log at an LSN and
+replays main's recorded root inputs through the new component, with the recorded
+effect results. The outcome, writes and effects are compared with what main
+actually did; a policy allows the change, asks for an approval, or denies it;
+`promote` and `rollback` move code forward and back.
 
-## What works today
+[Architecture](docs/concepts/architecture.md) and the
+[concepts](docs/concepts/glossary.md) cover the model in detail.
 
-- **Durable turns.** A turn's state writes, SQL changes and outgoing messages
-  commit together or not at all, and nothing is applied or answered until the
-  turn's record is fsynced. Recovery from the log is exercised by a crash
-  test of 1,000 `kill -9` cycles (`scripts/chaos.sh`, also the manual nightly
-  workflow).
-- **Deterministic replay.** Time, randomness and SQL functions such as
-  `random()` derive from values recorded with the turn, so running a turn again
-  gives the same outcome. A deterministic simulation of the whole daemon, with
-  injected crashes, runs in the CI checks (`scripts/ci.sh`).
-- **Effects and capabilities.** Outgoing HTTP, actor-to-actor calls, timers and
-  host-side cryptography with secret handles. Every effect is denied until the
-  operator grants a capability, and each result is recorded and returned on
-  re-execution.
-- **Fork, replay and diff.** `kronik propose` forks history, replays recorded
-  traffic through the new code and writes a behavior diff. Policy rules decide
-  whether a change is allowed, needs an approval, or is denied; `promote` and
-  `rollback` move code forward and back. Effect simulators stand in for
-  external services during a replay, `watch` rolls a promotion back when a
-  guard breaks, and preview forks take new requests on unproposed code.
-- **Operations.** TLS from certificate files or ACME, a systemd unit,
-  snapshots, shipping to object storage, `kronik restore`, `kronik upgrade
-  check`, `kronik doctor`, `keys status|wrap|rewrap` and `/metrics`.
-  Master-key custody supports file/env or OpenBao/AWS/GCP/Azure KMS, and
-  secrets can live in OpenBao or Vault, AWS Secrets Manager, GCP Secret
-  Manager or Azure Key Vault; both are checked against free emulators, not
-  production cloud IAM. ACME is tested against Pebble, not a public
-  certificate authority.
-- **Long-lived connections.** WebSocket and server-sent-events routes: the
-  actor that accepts a connection owns it, its frames are recorded with the
-  turns that send them and go out after those commit, and a restart closes
-  every open connection with a dedicated reason so that clients reconnect.
-- **Large bodies as blobs.** Uploads and `fetch` responses above a kind's
-  blob threshold stream through a content-addressed blob store with
-  constant memory, and the log keeps only their hash and size. An actor
-  holds the blobs it keeps and passes them on messages, timers and calls; a
-  hash alone grants nothing. A collector deletes what nothing keeps, and a
-  subject's blobs are sealed with its key and erased with it.
-- **Privacy mode.** Values with a subject can be sealed, erased and resealed,
-  and forks replay without personal data unless a token carries `pii:read`.
-- **Foreign actors.** Linux programs from OCI images run in gVisor behind the
-  same recorded boundary, and can be copied into a fork from a checkpoint.
-- **Agent interface.** The JSON API is described by OpenAPI, and `kronik mcp`
-  serves the same operations as MCP tools with token scopes.
-- **Observability.** Turns become OpenTelemetry traces over OTLP, metrics are
-  served for Prometheus and sent over OTLP, and the audit export writes every
-  mutation to files, object storage or a webhook; `kronik audit verify`
-  checks a file or object-storage sink against the log.
+## The behavior diff
+
+![A behavior diff from kronik diff show: proposal p-7h3k2c9a, 36,214 requests replayed, 224 divergent turns, 35,990 effects exact and 224 approximate, and the responses and charges that would change.](docs/media/kronik-behavior-diff.jpg)
+
+`kronik diff show <proposal> --md` answers the review question: what changes?
+It reports the responses, state and effects that differ, what the new code
+costs to run, and how well each outside answer is grounded in the record.
+A change that touches payments can require a human approval, with a reason, on
+the record; `kronik promote` then moves it live, and `kronik rollback` can take
+the state back too.
 
 ## Getting started
 
-The [installation guide](docs/guides/install.md) describes the signed-release
-contract and standalone curl-pipe installer. `v0.5.0`, `v0.4.1` and `v0.4.0`
-are attested: the installer verifies each archive's Sigstore attestation, and
-historical `v0.3.0` and `v0.1.0` remain unsigned, so current consumers
-intentionally refuse their archives. To run the latest release:
+Install the latest release on Linux (x86_64 or aarch64):
 
 ```sh
 curl -fsSL https://github.com/G-man3207/Kronik/releases/download/v0.5.0/install.sh | sh
 kronik doctor
 ```
 
-To build current `main` instead, from a trusted checkout with the
-prerequisites in [CONTRIBUTING.md](CONTRIBUTING.md):
+To build current `main` instead, from a trusted checkout with the prerequisites
+in [CONTRIBUTING.md](CONTRIBUTING.md):
 
 ```sh
 cargo build --locked --release -p kronik
@@ -178,83 +101,118 @@ kronik serve \
   --api-socket /var/tmp/kronik/api.sock
 ```
 
-In another terminal, point the CLI at that socket and deploy a first actor.
-The TypeScript template needs Node.js 22.20 or later; Ubuntu 24.04 ships 18,
-so take Node.js 24 from NodeSource first:
+In another terminal, point the CLI at that socket, deploy a first actor, change
+it and propose the change:
 
 ```sh
-curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
-apt-get install -y nodejs
-
 export KRONIK_API_SOCKET=/var/tmp/kronik/api.sock
 
 kronik init --lang ts billing
 cd billing && npm install && npm test && kronik build
 kronik deploy dist/billing.wasm --reason 'first deploy'
 curl -s -X POST http://127.0.0.1:8080/billing/acme/increment
-```
 
-Change the actor, build it again, and propose it:
-
-```sh
+# change the counter to step by 2, rebuild, and propose it
+sed -i 's/?? 0) + 1;/?? 0) + 2;/' src/actor.ts
+kronik build
 kronik propose dist/billing.wasm --window 1h --reason 'count in steps of 2'
 kronik diff show <proposal> --md
 ```
 
-`--lang rust`, `python` and `go` produce the same counter in the other SDKs;
-Python and Go need the toolchains that `scripts/install-sdk-tools.sh` installs.
-Foreign actors need gVisor's `runsc`, which `install.sh` offers.
+The TypeScript template needs Node.js 22.20 or later; `--lang rust`, `python`
+and `go` build the same counter in the other SDKs. The
+[quickstart](docs/guides/quickstart.md) walks the full path from an empty
+machine to a verified deploy, rollback and restore; [installing](docs/guides/install.md)
+covers release contents and the SDK toolchains.
 
-[The quickstart](docs/guides/quickstart.md) walks the full path from an empty
-machine to a verified deploy, rollback and restore, including what to do
-without a public DNS name or an object store, and then live updates over
-SSE and WebSocket and large files as blobs.
-[Installing](docs/guides/install.md) covers the release contents and the SDK
-toolchains.
+## What works today
 
-## How it works
+- **Durable, deterministic turns.** State writes, SQL changes and outgoing
+  messages commit together or not at all, and nothing is applied, delivered or
+  answered until the turn's record is fsynced. Time, randomness and SQL
+  functions such as `random()` come from values recorded with the turn, so a
+  re-run gives the same outcome; a deterministic simulation of the daemon with
+  injected crashes runs in CI, and a 1,000-cycle `kill -9` crash test runs in
+  the manual nightly workflow.
+- **Effects and capabilities.** Outgoing HTTP, actor-to-actor calls, timers and
+  host-side cryptography with secret handles; every effect is denied until the
+  operator grants a capability, and each result is recorded and returned on
+  re-execution.
+- **Fork, replay and diff.** `propose`, `approve`, `promote` and `rollback`,
+  policy rules, effect simulators, `watch` (which rolls a promotion back when a
+  guard breaks) and preview forks that take new requests on unproposed code.
+- **Operations and observability.** TLS from files or ACME, a systemd unit,
+  snapshots, shipping, `restore`, `upgrade check`, `doctor`, master-key
+  wrapping (`keys`) and `/metrics`; turns become OpenTelemetry traces, metrics
+  go to Prometheus and OTLP, and `kronik audit verify` checks the audit export
+  against the log.
+- **Long-lived connections and blobs.** WebSocket and server-sent events (SSE)
+  routes whose frames are recorded with the turns that send them; uploads and
+  `fetch` responses above a kind's threshold stream through a
+  content-addressed blob store with constant memory, held by the actor and, in
+  privacy mode, sealed with its subject's key.
+- **Privacy mode.** Values with a subject can be sealed, erased and resealed;
+  a fork requested by a token without `pii:read` replays personal text and blob
+  values as pseudonyms. The [privacy guide](docs/guides/privacy.md) has the
+  details and limits.
+- **Foreign actors.** Linux programs from OCI images run in gVisor behind the
+  same recorded boundary, and can be copied into a fork from a checkpoint; the
+  microVM level is opt-in.
+- **Agent interface.** The JSON API is described by OpenAPI, and `kronik mcp`
+  serves the same operations as MCP tools with token scopes.
 
-1. The gateway or the JSON API admits an input. The scheduler queues it in the
-   actor's mailbox.
-2. The runtime runs `handle` in a fresh Wasm instance, with fuel and memory
-   limits, a host-provided clock and seed, and a host-side effect gate.
-3. The turn's input, outcome, state writes and SQL changes are fsynced to the
-   log as one record, and applied in LSN order. A turn that reaches the outside
-   world first records what it is about to do, so a crash can rerun it with the
-   recorded results.
-4. A proposal forks the log at an LSN, replays the recorded inputs through the
-   new component with the recorded effect results, and diffs the outcomes,
-   writes and effects against what main actually did.
+## Status
 
-[Architecture](docs/concepts/architecture.md) describes the parts, the disk
-layout and the decisions behind them.
+Kronik is pre-alpha and single-node: it is not ready for production, and
+interfaces may change between releases.
 
-## Repository layout
+The latest release is **v0.5.0** (15 November 2026,
+[release notes](https://github.com/G-man3207/Kronik/releases/tag/v0.5.0)), the
+"Isolation, standards and web" line (M20–M26): WebSocket and SSE connections,
+streaming bodies and blob storage, external secret backends, and the opt-in
+nonroot and microVM levels. Earlier attested releases are **v0.4.1** and
+**v0.4.0**; the historical **v0.3.0** and **v0.1.0** remain unsigned, and
+current consumers refuse their unsigned artifacts. `v0.5.0` ships static musl
+binaries for x86_64 and aarch64 with `install.sh`, checksums, CycloneDX SBOMs
+and two-build byte-equality evidence; `install.sh` verifies each archive's
+Sigstore attestation.
+
+`main` is the unreleased `0.6.0-dev` line; the [changelog](CHANGELOG.md) lists
+what changed since `v0.5.0`. As of `v0.5.0`, 140 of the 196 criteria in the
+[build brief](https://github.com/G-man3207/Kronik/wiki/Build-Brief) are
+implemented; the
+[compliance audit](https://github.com/G-man3207/Kronik/wiki/Compliance-audit)
+maps each one to the tree, and the
+[project status page](https://github.com/G-man3207/Kronik/wiki/Project-status)
+tracks the milestones, the open questions and the known gaps.
+
+Some claims were checked against pinned emulators and disposable hosted
+runners, not production: ACME against Pebble rather than a public certificate
+authority, the KMS and secret backends against emulators, blob shipping against
+directory buckets and a local S3 server, and the nonroot and microVM levels on
+GitHub-hosted Ubuntu 24.04 runners. There has been no independent external
+security review, production pilot or three-node soak, and the cluster (M16–M19),
+the WASI 0.3 remainder (M22), and the UI, fleet and hardening tracks (M27 and
+M29–M34) are partial or absent.
+
+## Repository and documentation
 
 | Path | Contents |
 | --- | --- |
-| `crates/` | The daemon and its libraries: gateway, JSON API, scheduler, runtime, log, state, fork engine, MCP server, policy, privacy, shipping, admin UI, fleet API and OpenTelemetry/audit export |
-| `ui/` | The dependency-free admin UI source embedded into the binary by `kronik-ui` |
-| `sdk/` | The TypeScript, Rust, Python and Go SDKs; `kronik init` vendors one into a project |
-| `examples/` | Example actors and apps in all four languages |
-| `docs/` | The book: concepts, guides, reference, design notes and ADRs, indexed by `docs/SUMMARY.md` |
-| `deploy/`, `action/` | The systemd unit and the GitHub Action |
-| `scripts/`, `demo/` | `ci.sh`, release, acceptance, simulation and chaos scripts, and end-to-end demos |
+| `crates/` | The daemon and its libraries: gateway, JSON API, scheduler, runtime, log, state, blob store, fork engine, MCP server, policy, privacy, shipping, admin UI, fleet API and OpenTelemetry/audit export |
+| `sdk/`, `examples/` | The TypeScript, Rust, Python and Go SDKs, and example actors in all four languages, plus app examples and foreign Linux programs |
+| `docs/` | The book: concepts, guides, reference, design notes and ADRs, indexed by [`docs/SUMMARY.md`](docs/SUMMARY.md) |
+| `ui/`, `deploy/`, `action/` | The dependency-free admin UI source, the systemd unit and the GitHub Action |
+| `scripts/`, `demo/` | CI, release, acceptance, simulation and chaos scripts, and end-to-end demos |
 
-## Documentation
-
-- [Introduction](docs/introduction.md): what Kronik is and the five concepts it
-  is built from.
-- [Quickstart](docs/guides/quickstart.md): install to verified deploy.
-- [Writing actors](docs/guides/actors.md): `kronik init`, the SDKs and the WIT
-  interface.
-- [CLI reference](docs/reference/cli.md) and [error codes](docs/errors.md).
-- [Operating Kronik](docs/guides/operations.md) and the
-  [security model](docs/guides/security.md).
-- [Kronik for agents](docs/AGENT_GUIDE.md): the same text as `kronik explain agent`.
-- [Performance](docs/perf.md) and the [ADRs](docs/adr).
-
-The book is built from `docs/` with mdBook by `scripts/ci.sh book`.
+The [introduction](docs/introduction.md) explains the five concepts;
+[writing actors](docs/guides/actors.md) covers `kronik init`, the SDKs and the
+WIT interface; [operating Kronik](docs/guides/operations.md) and the
+[security model](docs/guides/security.md) cover running it; the
+[CLI reference](docs/reference/cli.md) and [error codes](docs/errors.md) cover
+the interface; [Kronik for agents](docs/AGENT_GUIDE.md) is the same text as
+`kronik explain agent`. The book is built from `docs/` with mdBook by
+`scripts/ci.sh book`.
 
 ## Development
 
@@ -267,35 +225,24 @@ cargo build -p kronik
 scripts/ci.sh
 ```
 
-`scripts/ci.sh` runs the same checks as CI: formatting, clippy, repository
-hygiene, tests, docs, the book, the examples, the SDK tests, deterministic
-simulation, dependency policy, foreign and identity tests, and the GitHub
-Action. It needs `cargo-deny`, Node.js 22.20 or later and the pinned Python
-test runtime from [`CONTRIBUTING.md`](CONTRIBUTING.md); [`AGENTS.md`](AGENTS.md)
-lists what each step needs. A missing tool fails its step, except that
-`foreign` is skipped with a message without root and gVisor's `runsc`, and
-`identity` skips one example without libfaketime. Pass step names to run a
-subset, for example `scripts/ci.sh clippy test`.
+`scripts/ci.sh` runs the same 16 checks as CI; `scripts/ci.sh clippy test` runs
+a subset. It needs rustup with the pinned toolchain, `cargo-deny`, Node.js 22.20
+or later and the pinned Python test runtime from
+[CONTRIBUTING.md](CONTRIBUTING.md), which also has the conventions.
+[AGENTS.md](AGENTS.md) lists what each step needs and is the guide for automated
+and human contributors. A missing prerequisite normally fails its step;
+`foreign` without root and gVisor's `runsc`, and `s3` without Docker, skip with
+a message instead.
 
-The CI and nightly GitHub workflows start only when someone runs them
-(`workflow_dispatch`). A push or pull request does not. The nightly workflow
-adds what is too slow for an ordinary CI run: a crash test of 1,000 `kill -9`
-cycles, deterministic simulation with 10,000 seeds over every workload and a
-million-step run, and the release build. One manual run starts every one of
-those jobs; the same commands run locally.
-
-An informational job in that workflow, which never turns the run red, also
-reports whether the upstream conditions for WASI 0.3 are met yet
-(`scripts/check-wasi-p3-gate.py`, [ADR 0070](docs/adr/0070-wasi-http-outgoing-handler.md)).
-
-[`CONTRIBUTING.md`](CONTRIBUTING.md) has the conventions, and
-[`AGENTS.md`](AGENTS.md) is the guide for automated and human contributors.
+CI, nightly, isolation and release workflows start only when someone runs them
+(`workflow_dispatch`); only the GitHub Action demo runs on push and pull
+request. The nightly adds the 1,000-crash test, deterministic simulation with
+10,000 seeds and the release build.
 
 ## Security
 
-Do not report vulnerabilities in public issues. See
-[`SECURITY.md`](SECURITY.md) for the private reporting process and the
-security model.
+Do not report vulnerabilities in public issues. See [`SECURITY.md`](SECURITY.md)
+for the private reporting process and the security model.
 
 ## License
 
