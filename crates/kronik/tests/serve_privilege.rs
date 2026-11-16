@@ -181,13 +181,38 @@ fn serve_without_rootless_keeps_the_process_as_before() {
 #[test]
 fn serve_rootless_refuses_to_run_as_root() {
     if !kronik_foreign::sys::is_root() {
+        assert!(
+            std::env::var("KRONIK_FOREIGN_TESTS").as_deref() != Ok("require"),
+            "KRONIK_FOREIGN_TESTS=require, but showing the rootless refusal needs root"
+        );
         eprintln!("skipped: only root can show the refusal");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let out = serve(dir.path(), &["--rootless"]).output().unwrap();
-    assert!(!out.status.success(), "{out:?}");
-    let text = String::from_utf8_lossy(&out.stderr);
+    // A file, not a pipe: a daemon that started despite the refusal may fork
+    // an acceptor that inherits stderr, and a pipe would keep the read open
+    // after the direct child is gone.
+    let log = dir.path().join("serve.stderr");
+    let mut child = serve(dir.path(), &["--rootless"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+        .spawn()
+        .unwrap();
+    // Bound the wait: a missing refusal would otherwise serve forever and
+    // hang CI instead of failing it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            panic!("serve --rootless did not refuse as root within 30 s: {text}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "{status:?}");
+    let text = std::fs::read_to_string(&log).unwrap();
     assert!(text.contains("ROOTLESS_UNAVAILABLE"), "{text}");
     assert!(text.contains("unprivileged service user"), "{text}");
     // Refused before anything was created or bound.
