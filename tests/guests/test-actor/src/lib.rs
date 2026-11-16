@@ -381,6 +381,50 @@ fn run(op: &str, body: &[u8]) -> Result<String, HandlerError> {
         "get" => Ok(counter().to_string()),
         #[cfg(feature = "fetch-extra")]
         "read" => Ok(state::get("s").map(|v| v.len()).unwrap_or(0).to_string()),
+        #[cfg(feature = "budget")]
+        "budget" => {
+            let mut parts = text.split_whitespace();
+            let what = parts.next().unwrap_or("log");
+            let n: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let size: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(64);
+            let chunk = "x".repeat(size);
+            for i in 0..n {
+                match what {
+                    "log" => log::emit(log::Level::Info, &chunk, &[]),
+                    "stdout" => println!("{chunk}"),
+                    "state" => state::set(&format!("budget-{i}"), chunk.as_bytes()),
+                    "send" => messaging::send(
+                        &ActorRef {
+                            kind: "counter".to_string(),
+                            key: "sink".to_string(),
+                        },
+                        &Message {
+                            name: "store".to_string(),
+                            content_type: "text/plain".to_string(),
+                            body: chunk.as_bytes().to_vec(),
+                            blobs: Vec::new(),
+                        },
+                    ),
+                    "timer" => {
+                        timers::schedule(
+                            0,
+                            &Message {
+                                name: "expire".to_string(),
+                                content_type: "text/plain".to_string(),
+                                body: chunk.as_bytes().to_vec(),
+                                blobs: Vec::new(),
+                            },
+                        );
+                    }
+                    other => {
+                        return Err(HandlerError::Rejected(format!(
+                            "unknown budget mode {other}"
+                        )));
+                    }
+                }
+            }
+            Ok(format!("{n} {}", chunk.len()))
+        }
         "fanout" => {
             let n = increment();
             let count: u32 = text.trim().parse().unwrap_or(0);

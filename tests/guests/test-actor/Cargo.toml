@@ -47,6 +47,9 @@ sql-call = []
 # Fork tests of erasures (ADR 0109): with `notes`, the migration also
 # creates a table without `_subject`.
 untagged = []
+# Host-buffer regression: `budget` loops guest logs, stdout, state writes,
+# messages or timers, for the per-turn host budget's boundary.
+budget = []
 # Standard fetch (M22): `wfetch*` operations through wasi:http directly.
 wasi-http = ["dep:wasip2"]
 # Blob bodies through wasi:http (M25 §7.6): `wbig`, and `bprobe`, which

@@ -7,6 +7,7 @@
 //! buffered and only leave the turn through [`crate::turn::TurnOutput`].
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chacha20::ChaCha20Rng;
@@ -96,6 +97,10 @@ pub struct TurnLimits {
     pub memory_bytes: usize,
     pub message_bytes: usize,
     pub state_value_bytes: usize,
+    /// The bytes one turn may buffer on the host: its guest logs, state
+    /// writes, messages and timers together. Configured by the kind's memory
+    /// limit (64 MiB by default), and at most 1 GiB (`HostBudget`).
+    pub host_bytes: usize,
     /// The bytes one turn may write into blobs (`blob_bytes_per_actor`,
     /// M25/M26): a `write` past it is `quota-exceeded`.
     pub blob_bytes: u64,
@@ -112,6 +117,7 @@ impl Default for TurnLimits {
             memory_bytes: crate::engine::DEFAULT_MEMORY_BYTES,
             message_bytes: 1 << 20,
             state_value_bytes: 1 << 20,
+            host_bytes: crate::engine::DEFAULT_MEMORY_BYTES,
             blob_bytes: 1 << 30,
             blob_threshold: 1 << 20,
         }
@@ -397,16 +403,89 @@ pub struct LogEvent {
     pub fields: Vec<(String, String)>,
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct Logs(Arc<Mutex<Vec<LogEvent>>>);
+/// What one buffered entry costs besides its bytes: the slot and the structs
+/// that hold them.
+const HOST_ENTRY_BYTES: usize = 128;
+/// The most host memory one turn may buffer, however high its kind's memory
+/// limit is set.
+const MAX_HOST_BYTES: usize = 1 << 30;
+
+/// The bytes one turn has copied into host-side buffers (logs, state writes,
+/// messages and timers). Refused growth traps the turn with `TURN_TOO_LARGE`
+/// before it can grow the daemon's RSS without bound.
+#[derive(Clone)]
+pub(crate) struct HostBudget {
+    used: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+impl HostBudget {
+    fn new(limit: usize) -> HostBudget {
+        HostBudget {
+            used: Arc::new(AtomicUsize::new(0)),
+            limit: limit.min(MAX_HOST_BYTES),
+        }
+    }
+
+    fn charge(&self, bytes: usize, what: &str) -> wasmtime::Result<()> {
+        let mut used = self.used.load(Ordering::Relaxed);
+        loop {
+            let next = used.saturating_add(bytes);
+            if next > self.limit {
+                return Err(wasmtime::Error::new(TurnTooLarge(format!(
+                    "the turn's {what} would hold more than the {}-byte host budget; \
+                     split the work over several turns",
+                    self.limit
+                ))));
+            }
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return Ok(()),
+                Err(actual) => used = actual,
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Logs {
+    events: Arc<Mutex<Vec<LogEvent>>>,
+    budget: HostBudget,
+}
 
 impl Logs {
-    fn push(&self, e: LogEvent) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(e);
+    fn new(budget: HostBudget) -> Logs {
+        Logs {
+            events: Arc::new(Mutex::new(Vec::new())),
+            budget,
+        }
     }
+
+    fn push(&self, e: LogEvent) -> wasmtime::Result<()> {
+        self.budget.charge(log_event_bytes(&e), "log output")?;
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(e);
+        Ok(())
+    }
+
     pub(crate) fn take(&self) -> Vec<LogEvent> {
-        std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
+        std::mem::take(&mut *self.events.lock().unwrap_or_else(|e| e.into_inner()))
     }
+}
+
+fn log_event_bytes(e: &LogEvent) -> usize {
+    let mut bytes = HOST_ENTRY_BYTES.saturating_add(e.message.len());
+    for (name, value) in &e.fields {
+        bytes = bytes
+            .saturating_add(2 * HOST_ENTRY_BYTES)
+            .saturating_add(name.len())
+            .saturating_add(value.len());
+    }
+    bytes
 }
 
 /// Caps the total linear memory of all memories in the instance. A refused
@@ -455,6 +534,7 @@ pub struct TurnHost {
     table: ResourceTable,
     pub(crate) limiter: MemoryLimiter,
     pub(crate) logs: Logs,
+    host_bytes: HostBudget,
     describe_only: bool,
     actor: ActorRef,
     causal_key: pb::CausalKey,
@@ -505,7 +585,8 @@ pub(crate) struct HostInit {
 
 impl TurnHost {
     pub(crate) fn new(init: HostInit) -> TurnHost {
-        let logs = Logs::default();
+        let host_bytes = HostBudget::new(init.limits.host_bytes);
+        let logs = Logs::new(host_bytes.clone());
         // Empty environment, no args, no preopens, no network, empty stdin;
         // stdout/stderr become log events.
         let wasi = WasiCtxBuilder::new()
@@ -530,6 +611,7 @@ impl TurnHost {
                 hit: false,
             },
             logs,
+            host_bytes,
             describe_only: init.describe_only,
             causal_id: causal::causal_id(&init.causal_key),
             actor: init.actor,
@@ -598,6 +680,11 @@ impl TurnHost {
                 self.limits.state_value_bytes
             );
         }
+        let bytes = HOST_ENTRY_BYTES
+            .saturating_add(key.len())
+            .saturating_add(value.len())
+            .saturating_add(subject.as_ref().map_or(0, |s| s.len()));
+        self.host_bytes.charge(bytes, "state writes")?;
         self.writes.insert(key, Some((value, subject)));
         Ok(())
     }
@@ -654,6 +741,20 @@ impl TurnHost {
             );
         }
         Ok(())
+    }
+
+    /// Charges a message the turn buffers to its host budget.
+    fn admit_message(&mut self, msg: &types::Message, what: &str) -> wasmtime::Result<()> {
+        self.check_message(msg)?;
+        let mut bytes = HOST_ENTRY_BYTES
+            .saturating_add(msg.name.len())
+            .saturating_add(msg.content_type.len())
+            .saturating_add(msg.body.len())
+            .saturating_add(msg.blobs.len().saturating_mul(HOST_ENTRY_BYTES));
+        for blob in &msg.blobs {
+            bytes = bytes.saturating_add(blob.hash.len());
+        }
+        self.host_bytes.charge(bytes, what)
     }
 
     /// The complete references of a message's blobs (M26 §3): each must be
@@ -717,6 +818,8 @@ impl state::Host for TurnHost {
 
     async fn delete(&mut self, key: String) -> wasmtime::Result<()> {
         self.deny_in_describe("state")?;
+        let bytes = HOST_ENTRY_BYTES.saturating_add(key.len());
+        self.host_bytes.charge(bytes, "state writes")?;
         self.writes.insert(key, None);
         Ok(())
     }
@@ -838,7 +941,7 @@ impl messaging::Host for TurnHost {
             Ok(a) => a,
             Err(e) => bail!("messaging.send: {e}"),
         };
-        self.check_message(&msg)?;
+        self.admit_message(&msg, "messages")?;
         let blobs = self.complete_message_blobs(&msg)?;
         self.charge_edge(&blobs)?;
         let ordinal = self.ordinal();
@@ -910,7 +1013,7 @@ impl messaging::Host for TurnHost {
 impl timers::Host for TurnHost {
     async fn schedule(&mut self, delay_ms: u64, msg: types::Message) -> wasmtime::Result<u64> {
         self.deny_in_describe("timers")?;
-        self.check_message(&msg)?;
+        self.admit_message(&msg, "timers")?;
         let blobs = self.complete_message_blobs(&msg)?;
         self.charge_edge(&blobs)?;
         let ordinal = self.ordinal();
@@ -937,6 +1040,7 @@ impl timers::Host for TurnHost {
             }
         };
         if pending {
+            self.host_bytes.charge(HOST_ENTRY_BYTES, "timers")?;
             self.timers.push(pb::TimerOp {
                 kind: pb::TimerOpKind::Cancel as i32,
                 timer_id: id,
@@ -1109,8 +1213,7 @@ impl log::Host for TurnHost {
             level,
             message,
             fields,
-        });
-        Ok(())
+        })
     }
 }
 
@@ -1270,12 +1373,13 @@ impl Pollable for LogOutput {
 
 impl OutputStream for LogOutput {
     fn write(&mut self, bytes: bytes::Bytes) -> StreamResult<()> {
-        self.logs.push(LogEvent {
-            level: self.level,
-            message: String::from_utf8_lossy(&bytes).into_owned(),
-            fields: Vec::new(),
-        });
-        Ok(())
+        self.logs
+            .push(LogEvent {
+                level: self.level,
+                message: String::from_utf8_lossy(&bytes).into_owned(),
+                fields: Vec::new(),
+            })
+            .map_err(wasmtime_wasi::p2::StreamError::Trap)
     }
 
     fn flush(&mut self) -> StreamResult<()> {
@@ -1327,4 +1431,39 @@ pub(crate) fn build_linker(
     cli::terminal_stdout::add_to_linker::<TurnHost, WasiCli>(&mut l, TurnHost::cli)?;
     cli::terminal_stderr::add_to_linker::<TurnHost, WasiCli>(&mut l, TurnHost::cli)?;
     Ok(l)
+}
+
+#[cfg(test)]
+mod host_budget_tests {
+    use super::{HostBudget, LogEvent, MAX_HOST_BYTES, log_event_bytes};
+
+    #[test]
+    fn the_limit_is_capped_at_one_gib() {
+        let budget = HostBudget::new(usize::MAX);
+        budget.charge(MAX_HOST_BYTES, "test").unwrap();
+        assert!(budget.charge(1, "test").is_err());
+    }
+
+    #[test]
+    fn a_log_entry_is_charged_for_its_fields_too() {
+        let plain = LogEvent {
+            level: "info",
+            message: "x".into(),
+            fields: Vec::new(),
+        };
+        let fields = LogEvent {
+            fields: vec![("key".into(), "value".into())],
+            ..plain.clone()
+        };
+        assert!(log_event_bytes(&fields) > log_event_bytes(&plain) + 5);
+    }
+
+    #[test]
+    fn charges_accumulate_and_a_refused_one_keeps_the_total() {
+        let budget = HostBudget::new(100);
+        budget.charge(60, "test").unwrap();
+        assert!(budget.charge(41, "test").is_err());
+        budget.charge(40, "test").unwrap();
+        assert!(budget.charge(1, "test").is_err());
+    }
 }

@@ -1123,7 +1123,7 @@ configuration epoch. The output shows every limit in force afterwards.
 | Option | Limit | Default |
 | --- | --- | --- |
 | `--fuel` | Fuel per turn | 50000000 |
-| `--memory` | Memory per instance | 64 MiB |
+| `--memory` | Memory per instance, and the host bytes one turn may buffer (guest logs, stdout/stderr, state writes, messages and timers; ADR 0149) | 64 MiB |
 | `--message-size` | Largest message body | 1 MiB |
 | `--state-value-size` | Largest state value | 1 MiB |
 | `--sql-size` | Largest SQL database per actor | 1 GiB |

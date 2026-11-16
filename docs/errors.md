@@ -104,7 +104,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`TOKEN_NOT_FOUND`](#token_not_found) | 404 | M5 | No API token with that name |
 | [`TURN_FAILED`](#turn_failed) | 500 | M1 | The turn failed |
 | [`TURN_NOT_FOUND`](#turn_not_found) | 404 | M1 | No turn with that id |
-| [`TURN_TOO_LARGE`](#turn_too_large) | 500 | M1 | The turn's record would not fit in one log record |
+| [`TURN_TOO_LARGE`](#turn_too_large) | 500 | M1 | The turn's record or host buffers would not fit its limits |
 | [`UNAUTHENTICATED`](#unauthenticated) | 401 | M5 | No valid token |
 | [`UNAVAILABLE`](#unavailable) | 503 | M1 | The daemon is not accepting requests |
 | [`UPLOAD_TOO_SLOW`](#upload_too_slow) | 408 | M25 | The request body arrived too slowly |
@@ -1293,11 +1293,13 @@ See also: [`turn-id`](concepts/glossary.md#turn-id), [`lsn`](concepts/glossary.m
 
 ## TURN_TOO_LARGE
 
-HTTP status 500, milestone M1. The turn's record would not fit in one log record.
+HTTP status 500, milestone M1. The turn's record or host buffers would not fit its limits.
 
 Default hint: Split the work over several turns, or fetch and write less in one turn; see `kronik history <kind/key>`.
 
 Everything a turn records must fit in one log record of at most 128 MiB: its input, the request and result of every external effect and `call`, its state writes, messages, timers, SQL changes and schema changes, compensations and its output. This turn would have needed more, so it failed instead of writing a record that later reads could not accept. Nothing it buffered was committed (state writes, SQL changes, messages, timers), compensation messages for successful calls are delivered unless this turn began before this release and its budget does not hold them, and external effects that already happened stand and are recorded. A failed message or timer is in dead letters. This code is the error code of the failed turn in `history` and in dead letters; an HTTP client gets `TURN_FAILED`, as for `FUEL_EXHAUSTED`. When the turn also had an effect whose outcome is unknown, its code is `EFFECT_OUTCOME_UNKNOWN` instead and its message says that the record was too large. The limit is the same on every node, so the same input fails the same way again.
+
+A turn also buffers data outside its record: what it logs or writes to stdout/stderr, its state writes, messages and timers. Those buffers share one per-turn budget, the kind's memory limit (64 MiB by default, at most 1 GiB, and set with `kronik limits set <kind> --memory <size>`), counting 128 bytes for each buffered entry. A turn that passes it fails with this code before the daemon's memory grows further; nothing it buffered is committed, and the log entries it wrote up to the budget remain for diagnosis. Raise the kind's memory limit for code that legitimately buffers more, or split the work over several turns.
 
 A turn that an earlier release began and that was still open when this release started can have an input or recorded compensations that this release's budget does not hold. It is not run again: its re-run closes it with this code, under its own execution id, so that it does not stay open. The closing record keeps the input and leaves out, in order, its effects' requests and responses, its compensations (a call whose callee committed is left uncompensated, and listed as an orphan when its effect stays in the closing record), and its effects. If the input alone is over the turn budget the record is still written when the log's own 128 MiB limit holds it; if the input alone is over that limit, no record of this format can close the turn, and it stays open.
 

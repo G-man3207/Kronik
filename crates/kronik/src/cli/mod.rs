@@ -531,7 +531,9 @@ pub struct LimitsSetArgs {
     /// Fuel per turn, e.g. 100000000 or 100M.
     #[arg(long, value_name = "N", value_parser = units::parse_count)]
     fuel: Option<u64>,
-    /// Memory per instance, e.g. 128Mi.
+    /// Memory per instance, and the host bytes one turn may buffer
+    /// (guest logs, stdout/stderr, state writes, messages, timers), e.g.
+    /// 128Mi.
     #[arg(long, value_name = "SIZE", value_parser = units::parse_size)]
     memory: Option<u64>,
     /// Largest message body, e.g. 2Mi.

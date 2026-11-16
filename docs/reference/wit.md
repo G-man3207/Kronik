@@ -651,6 +651,7 @@ host either records it or derives it from what it recorded (I1, I2):
 | --- | --- | --- |
 | Fuel per turn | 50,000,000 | The turn fails with `FUEL_EXHAUSTED` |
 | Memory per instance (all linear memories together) | 64 MiB, at most 1 GiB | `memory.grow` returns -1; a trap that follows fails the turn with `TURN_FAILED` |
+| Host buffers per turn (guest logs and stdout/stderr, state writes, messages, timers), 128 bytes of bookkeeping per entry | the memory limit, 64 MiB by default, at most 1 GiB | Traps; the turn fails with `TURN_TOO_LARGE` and commits none of its writes, messages or timers (ADR 0149) |
 | Message body | 1 MiB | Traps in a turn; `PAYLOAD_TOO_LARGE` at the API and the gateway |
 | State value | 1 MiB | Traps |
 | `random-bytes` request | 1 MiB | Traps |
@@ -664,8 +665,9 @@ host either records it or derives it from what it recorded (I1, I2):
 | Blob bytes a turn reads and writes (M25), reads counted in whole 64 KiB frames | 64 per unit of the fuel limit | The turn fails with `FUEL_EXHAUSTED` |
 | Blob writers open at once in one turn (M25) | 64 | Constructing another traps |
 
-Fuel, memory, message and state value size, SQL size per actor, effect
-timeout and effect response size can be set per kind from M2
+Fuel, memory (which also sets the host-buffer budget), message and state
+value size, SQL size per actor, effect timeout and effect response size can
+be set per kind from M2
 (`kronik limits set`); a turn uses the limits of its configuration epoch.
 Fuel is charged for bulk memory instructions in proportion to their length,
 so with the defaults a turn runs out of fuel before it can touch all of its
