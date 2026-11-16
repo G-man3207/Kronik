@@ -404,6 +404,24 @@ step_foreign() {
     # A root client's refusal of a swapped API socket in a directory that
     # another user owns: it needs root and a second uid.
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --bin kronik cli::http::tests::root_
+    # `serve --rootless` fails closed as root, which docs/guides/security.md
+    # and ADR 0060 rely on. Its test skips on a non-root host, so run it here
+    # and fail when libtest did not run it: a filter that matches nothing
+    # exits 0.
+    local privilege_log
+    privilege_log="$(mktemp)"
+    if ! KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik \
+        --test serve_privilege serve_rootless_refuses_to_run_as_root \
+        -- --test-threads=1 2>&1 | tee "$privilege_log"; then
+        rm -f "$privilege_log"
+        return 1
+    fi
+    if ! grep -Eq '^test serve_rootless_refuses_to_run_as_root \.\.\. ok$' "$privilege_log"; then
+        rm -f "$privilege_log"
+        echo "error: serve_rootless_refuses_to_run_as_root did not run" >&2
+        return 1
+    fi
+    rm -f "$privilege_log"
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik-privacy --lib key_source::tests
     # `kronik restore` as root into the nonroot service's directory, with the
     # real drop of privileges: it needs root, a second uid and a private
