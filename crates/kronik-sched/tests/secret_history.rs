@@ -174,16 +174,20 @@ async fn held_native_publication_cannot_enqueue_after_same_content_recertificati
         .await
         .unwrap();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-    let mut denied = ApiError::new(
-        ErrorCode::SecretUnavailable,
-        "the captured publication is no longer current",
-    );
     let error = original
         .admit(&mut || {
-            held.with_current_publication(&mut denied, || {
-                sender.try_send(before.fingerprint).unwrap();
-                Ok(())
-            })
+            held.with_current_publication(
+                || {
+                    ApiError::new(
+                        ErrorCode::SecretUnavailable,
+                        "the captured publication is no longer current",
+                    )
+                },
+                || {
+                    sender.try_send(before.fingerprint).unwrap();
+                    Ok(())
+                },
+            )
         })
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::SecretUnavailable);
@@ -191,16 +195,20 @@ async fn held_native_publication_cannot_enqueue_after_same_content_recertificati
         receiver.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
-    let mut denied = ApiError::new(
-        ErrorCode::SecretUnavailable,
-        "the captured publication is no longer current",
-    );
     original
         .admit(&mut || {
-            current.with_current_publication(&mut denied, || {
-                sender.try_send(after.fingerprint).unwrap();
-                Ok(())
-            })
+            current.with_current_publication(
+                || {
+                    ApiError::new(
+                        ErrorCode::SecretUnavailable,
+                        "the captured publication is no longer current",
+                    )
+                },
+                || {
+                    sender.try_send(after.fingerprint).unwrap();
+                    Ok(())
+                },
+            )
         })
         .unwrap();
     assert_eq!(receiver.recv().await.unwrap(), after.fingerprint);

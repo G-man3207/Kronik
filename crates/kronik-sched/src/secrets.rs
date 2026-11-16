@@ -362,15 +362,11 @@ impl SecretSnapshotPublication {
     /// denied at once.
     pub fn with_current_publication<T>(
         &self,
-        denied: &mut ApiError,
+        denied: impl FnOnce() -> ApiError,
         publish: impl FnOnce() -> Result<T, ApiError>,
     ) -> Result<T, ApiError> {
         let Some(publication) = self.lock_cache(|_| ()) else {
-            return Err(ApiError {
-                code: denied.code,
-                message: std::mem::take(&mut denied.message),
-                hint: denied.hint.take(),
-            });
+            return Err(denied());
         };
         if publication.native_current.is_pending()
             || !self.data_is_current_under_publication()
@@ -387,11 +383,8 @@ impl SecretSnapshotPublication {
                 .as_ref()
                 .is_none_or(|live| !Arc::ptr_eq(live, &self.live))
         {
-            return Err(ApiError {
-                code: denied.code,
-                message: std::mem::take(&mut denied.message),
-                hint: denied.hint.take(),
-            });
+            drop(publication);
+            return Err(denied());
         }
         publish()
     }
