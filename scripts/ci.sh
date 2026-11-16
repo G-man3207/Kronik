@@ -3,7 +3,8 @@
 # commands. Exits non-zero as soon as a step fails.
 #
 # Usage: scripts/ci.sh [STEP...]
-# Steps: fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny,
+# Steps: fmt, clippy, keyhelper, hygiene, test, docs, book, examples, ts, sdks,
+# dst, deny,
 # musl (the release target, linked against the release's zig and musl),
 # foreign (needs root and runsc; skipped with a message otherwise, a failure
 # with KRONIK_FOREIGN_TESTS=require),
@@ -28,6 +29,19 @@ step_fmt() {
 
 step_clippy() {
     cargo clippy --workspace --all-targets --locked -- -D warnings
+}
+
+# The optional GNU/Linux PKCS#11 key helper is a separate binary behind the
+# `pkcs11` feature, outside the daemon's dependency graph. The workspace clippy
+# and test steps do not build it, and a plain `cargo deny check` does not see
+# its `cryptoki` tree; releases ship it when selected (ADR 0093, ADR 0100).
+step_keyhelper() {
+    if [ "$(uname -s)" != Linux ]; then
+        echo "skipped: the PKCS#11 key helper is built for Linux GNU only"
+        return 0
+    fi
+    cargo clippy --locked -p kronik-keyhelper --features pkcs11 --all-targets -- -D warnings
+    cargo test --locked -p kronik-keyhelper --features pkcs11
 }
 
 # ADR 0004 §3: only the binary, the hyper servers (kronik-gateway,
@@ -347,7 +361,7 @@ step_deny() {
         echo "error: cargo-deny is not installed; install it with: cargo install --locked cargo-deny" >&2
         return 1
     fi
-    cargo deny --locked check
+    cargo deny --locked --all-features check
     # The examples (with the Rust SDK) have a lockfile of their own, and their
     # few dependencies use only some of the licenses deny.toml allows.
     cargo deny --manifest-path examples/Cargo.toml --locked check -A license-not-encountered
@@ -507,14 +521,14 @@ step_action() {
 }
 
 if [ "$#" -eq 0 ]; then
-    set -- fmt clippy hygiene test docs book examples ts sdks dst deny musl foreign s3 identity action
+    set -- fmt clippy keyhelper hygiene test docs book examples ts sdks dst deny musl foreign s3 identity action
 fi
 
 for step in "$@"; do
     case "$step" in
-        fmt | clippy | hygiene | test | docs | book | examples | ts | sdks | dst | deny | musl | foreign | s3 | identity | action) ;;
+        fmt | clippy | keyhelper | hygiene | test | docs | book | examples | ts | sdks | dst | deny | musl | foreign | s3 | identity | action) ;;
         *)
-            echo "error: unknown step '$step'; expected fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, s3, identity or action" >&2
+            echo "error: unknown step '$step'; expected fmt, clippy, keyhelper, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, s3, identity or action" >&2
             exit 2
             ;;
     esac

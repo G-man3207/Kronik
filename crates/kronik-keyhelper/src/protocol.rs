@@ -87,7 +87,7 @@ pub fn parse(input: &[u8]) -> Result<Request<'_>, Error> {
         || !text(&request.key_version, 128)
         || request.key_id.is_empty()
         || request.key_id.len() > 128
-        || request.key_id.len() % 2 != 0
+        || !request.key_id.len().is_multiple_of(2)
         || !is_hex(request.key_id, request.key_id.len() / 2)
     {
         return Err(Error::Protocol);
@@ -123,11 +123,12 @@ pub fn parse(input: &[u8]) -> Result<Request<'_>, Error> {
 }
 
 pub fn decode(value: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
-    if value.len() % 2 != 0 || !is_hex(value, value.len() / 2) {
+    if !value.len().is_multiple_of(2) || !is_hex(value, value.len() / 2) {
         return Err(Error::Protocol);
     }
     let mut bytes = Zeroizing::new(vec![0; value.len() / 2]);
-    for (out, pair) in bytes.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+    let (pairs, _) = value.as_bytes().as_chunks::<2>();
+    for (out, pair) in bytes.iter_mut().zip(pairs) {
         let nibble = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
         *out = nibble(pair[0]) * 16 + nibble(pair[1]);
     }

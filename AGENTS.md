@@ -92,7 +92,7 @@ The full list is in `CONTRIBUTING.md`. In short:
 ## Running CI locally
 
 ```sh
-scripts/ci.sh                # fmt, clippy, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, s3, identity and action, as in CI
+scripts/ci.sh                # fmt, clippy, keyhelper, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, s3, identity and action, as in CI
 scripts/ci.sh clippy test    # selected steps
 ```
 
