@@ -8,12 +8,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=@KRONIK@ serve --config /etc/kronik/kronik.toml
+ExecStart=@KRONIK@ serve --config @CONFIG@
 # Also after a crash or SIGKILL: foreign actors' sandboxes leave the
 # service's cgroup, so systemd would not stop them, and their config.json
 # holds secret values (docs/design/m7-foreign.md §5). "-": never blocks a
 # restart.
-ExecStopPost=-@KRONIK@ foreign cleanup --config /etc/kronik/kronik.toml
+ExecStopPost=-@KRONIK@ foreign cleanup --config @CONFIG@
 # Root is the default; no User=root on purpose. With an explicit User= and
 # any seccomp-based setting below, systemd drops CAP_SETUID from the daemon,
 # and NoNewPrivileges keeps runsc from getting it back: no sandbox starts
