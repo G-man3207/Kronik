@@ -268,7 +268,11 @@ Concretely:
      while a turn that began before its record was applied still runs.
    - A fork never creates a key version for an erased subject: what it
      writes of one (its log, its samples, the turns a rebase stages into
-     main's log) is the erasure's tombstone.
+     main's log) is the erasure's tombstone. Sealing a fork's record takes
+     the same fence, from before the tombstone check until the record is
+     written (a rebase's until main applies it): an erasure that begins
+     meanwhile waits, so the key version the seal creates is already
+     tombstoned or is one the erasure deletes.
    A subject can come back after its erasure: a value that arrives after the
    erasure began is new data, sealed under a new key version (§2).
 

@@ -246,7 +246,7 @@ impl Proposals {
             }
             this.write_log(&id, &mut live).await?;
             this.save(&meta, Some(&bytes))?;
-            this.save_samples(&id, &live, &d)?;
+            this.save_samples(&id, &live, &d).await?;
             this.entries.lock().await.insert(
                 id,
                 Entry {
@@ -553,7 +553,7 @@ impl Proposals {
             if !dry_run {
                 meta.status = "rejected".into();
                 self.save(meta, Some(&bytes))?;
-                self.save_samples(id, live, &d)?;
+                self.save_samples(id, live, &d).await?;
             }
             return Err(ApiError::new(
                 ErrorCode::PolicyDenied,
@@ -568,7 +568,7 @@ impl Proposals {
         if !approved {
             if !dry_run {
                 self.save(meta, Some(&bytes))?;
-                self.save_samples(id, live, &d)?;
+                self.save_samples(id, live, &d).await?;
             }
             return Err(ApiError::new(
                 ErrorCode::ApprovalRequired,
@@ -634,7 +634,7 @@ impl Proposals {
         // What is approved and shown is the diff just built, also when the
         // switch below gives up.
         self.save(meta, Some(&bytes))?;
-        self.save_samples(id, live, &d)?;
+        self.save_samples(id, live, &d).await?;
         // 3. Staging while main runs, then the pause and the last round.
         self.node
             .rebase_prepare(id, fork_lsn, authority.clone())
@@ -726,7 +726,7 @@ impl Proposals {
             ..info
         });
         self.save(meta, Some(&bytes))?;
-        self.save_samples(id, live, &d)?;
+        self.save_samples(id, live, &d).await?;
         self.node.snapshot_after_rebase().await;
         Ok(PromoteResult {
             epoch,

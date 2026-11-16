@@ -79,6 +79,13 @@ until the v1.0 compatibility promise takes effect.
   caller that cannot supply provenance refuses instead of sealing an erased
   subject. The fork log's own leading records and a turn the fork computes
   itself take its current generation.
+- A fork's seal takes the node's erasure fence from before its tombstone
+  check until the record is written (a rebased turn: until main applies it).
+  An erasure that began between the check and the sealing key's creation
+  could delete the subject's keys first and let the fork seal a copy of the
+  pre-erasure plaintext under a newer key version; now one side waits for
+  the other, and a fork still never creates a key version for a subject
+  already erased.
 - A sampled proposal's promote re-samples the whole window on every catch-up
   round instead of appending a fresh sample of that round's roots. A promote
   after a restart therefore returns the same isolated trees, summary and

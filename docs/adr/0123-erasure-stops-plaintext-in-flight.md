@@ -1,6 +1,6 @@
 # 0123. An erasure stops the plaintext already in flight
 
-- **Status:** Accepted (2026-11-14), amended 2026-11-15
+- **Status:** Accepted (2026-11-14), amended 2026-11-16
 - **Date:** 2026-11-13
 
 ## Context
@@ -88,9 +88,12 @@ running turns: it must not depend on how long other work takes.
    and while a turn that began before it was applied still runs.
 7. **Forks.** A fork seals what it writes without creating a key version
    for an erased subject - its log, its samples, and the turns a rebase
-   stages into main's log: such a value becomes the erasure's tombstone. A
-   rebase that resumes compares its fresh replay with its log with those
-   values as tombstones on both sides.
+   stages into main's log: such a value becomes the erasure's tombstone. The
+   fork's seal takes the same fence, from before the tombstone check until
+   the record is written (a rebase's until main applies it), so an erasure
+   that begins meanwhile waits and then covers the version the seal
+   created. A rebase that resumes compares its fresh replay with its log
+   with those values as tombstones on both sides.
 8. **SQL of a running turn.** A turn runs its SQL inside a savepoint, and
    its end rolls the savepoint back (its changeset is applied from its
    record). An erasure applied to an actor database while one of the

@@ -594,20 +594,26 @@ impl Proposals {
     /// Persists the isolated trees the diff names (samples, causes, changed
     /// responses, effects, errors) to `branches/<id>/isolated.jsonl`, so
     /// `kronik trace` finds `<fork>:r<root>.<n>` turns after a restart.
-    fn save_samples(&self, id: &str, live: &Live, d: &diff::Diff) -> Result<(), ApiError> {
+    async fn save_samples(&self, id: &str, live: &Live, d: &diff::Diff) -> Result<(), ApiError> {
         let roots: BTreeSet<Lsn> = sample_ids(d)
             .iter()
             .filter_map(|t| isolated_id(t).map(|(fork, root, _)| (fork.to_owned(), root)))
             .filter(|(fork, _)| fork == id)
             .map(|(_, root)| root)
             .collect();
+        // One fence for the samples, held until they are written: an erasure
+        // cannot delete the subject's keys between the tombstone check and
+        // the key version a sample's seal creates (ADR 0123 §7).
+        let fence = self.node.fork_seal_fence().await;
         let mut out = Vec::new();
         for tree in live.trees.iter().filter(|t| roots.contains(&t.root_lsn)) {
             for t in &tree.turns {
                 // Sealed like production's log: the fork's turns hold the
                 // values it revealed (m8-privacy §5).
                 let mut record = Record::TurnRecord(shown_record(t));
-                self.node.seal_fork_record(&mut record, self.fork_born(t))?;
+                self.node
+                    .seal_fork_record_fenced(&fence, &mut record, self.fork_born(t))
+                    .await?;
                 let line = serde_json::json!({
                     "id": t.id,
                     "root_lsn": tree.root_lsn,
@@ -620,7 +626,9 @@ impl Proposals {
                 out.push(b'\n');
             }
         }
-        write_atomic(&self.dir(id).join("isolated.jsonl"), &out)
+        write_atomic(&self.dir(id).join("isolated.jsonl"), &out)?;
+        drop(fence);
+        Ok(())
     }
 
     /// A fork turn by id (`<fork>:<lsn>` from the fork's log,
@@ -1144,15 +1152,9 @@ impl Proposals {
                 .filter(|t| t.lsn > live.logged_to)
                 .map(|t| (Record::TurnRecord(shown_record(t)), self.fork_born(t))),
         );
-        // Sealed like production's log: the fork holds revealed values. An
-        // erased subject's values become tombstones, never a new key version.
-        for (r, born) in &mut records {
-            self.node.seal_fork_record(r, *born)?;
-        }
         if records.is_empty() {
             return Ok(());
         }
-        let records: Vec<Record> = records.into_iter().map(|(r, _)| r).collect();
         let mut cfg = kronik_log::LogConfig::new(dir, id);
         cfg.group_commit_window = self.node.group_commit_window();
         cfg.first_lsn = live.index.fork_lsn + 1;
@@ -1172,9 +1174,18 @@ impl Proposals {
                 opened.next_lsn
             )));
         }
+        // Sealed like production's log: the fork holds revealed values. An
+        // erased subject's values become tombstones, never a new key version.
+        // The fence spans the seal and the append (ADR 0123 §7).
+        let fence = self.node.fork_seal_fence().await;
+        for (r, born) in &mut records {
+            self.node.seal_fork_record_fenced(&fence, r, *born).await?;
+        }
+        let records: Vec<Record> = records.into_iter().map(|(r, _)| r).collect();
         if let Some(last) = log.append_all(records).await.map_err(internal)? {
             live.logged_to = last;
         }
+        drop(fence);
         Ok(())
     }
 
@@ -1589,7 +1600,7 @@ impl Proposals {
         }
         self.write_log(id, &mut live).await?;
         self.save(&meta, Some(&bytes))?;
-        self.save_samples(id, &live, &d)?;
+        self.save_samples(id, &live, &d).await?;
         self.entries.lock().await.insert(
             id.clone(),
             Entry {
@@ -2017,7 +2028,7 @@ impl Proposals {
             if !dry_run {
                 meta.status = "rejected".into();
                 self.save(meta, Some(&bytes))?;
-                self.save_samples(id, live, &d)?;
+                self.save_samples(id, live, &d).await?;
                 copies::retire(entry.live.take()).await;
             }
             return Err(ApiError::new(
@@ -2032,7 +2043,7 @@ impl Proposals {
             if !ok {
                 if !dry_run {
                     self.save(meta, Some(&bytes))?;
-                    self.save_samples(id, live, &d)?;
+                    self.save_samples(id, live, &d).await?;
                 }
                 return Err(ApiError::new(
                     ErrorCode::ApprovalRequired,
@@ -2078,7 +2089,7 @@ impl Proposals {
             meta.status = "promoted".into();
             meta.promoted = Some(Promoted { epoch, lsn });
             self.save(meta, Some(&bytes))?;
-            self.save_samples(id, live, &d)?;
+            self.save_samples(id, live, &d).await?;
             copies::retire(entry.live.take()).await;
         }
         let warnings = connection_warnings(&self.node, &kinds);
@@ -2409,7 +2420,7 @@ impl Proposals {
                 entry.meta.sampled = Some(live.sampled());
                 entry.meta.options = options;
                 this.save(&entry.meta, Some(&bytes))?;
-                this.save_samples(&name, &live, &d)?;
+                this.save_samples(&name, &live, &d).await?;
                 entry.live = Some(live);
                 Ok(entry.meta.clone())
             })
