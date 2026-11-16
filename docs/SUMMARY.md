@@ -149,3 +149,4 @@
 - [ADR 0148: An open turn's UNAVAILABLE re-runs stop at three starts](adr/0148-bound-an-open-turns-unavailable-reruns.md)
 - [ADR 0149: Host-side turn buffers share the memory limit](adr/0149-bounded-host-buffers-per-turn.md)
 - [ADR 0150: The root unit renders the configuration path `--init` was given](adr/0150-root-init-renders-the-configuration-path.md)
+- [ADR 0151: A promote orders turn appends against its gap](adr/0151-promote-orders-turn-appends.md)
