@@ -116,7 +116,10 @@ component consumers. A newly routed operation or error code requires the
 regenerated reference and usage examples in the same change; results from an
 earlier revision are not evidence for the integrated build. Compatibility
 failures retain their fresh, printed fixture directory; success removes only
-that step's temporary parent directory. See
+that step's temporary parent directory. The same step builds `loadgen` and
+runs the M24 criteria 2 and 4 acceptance (`scripts/acceptance-m24.sh replay`,
+then `restart`) against `chat-ts`; its default ports 47510 and 47511 must be
+free, so two `ts` runs on one machine collide. See
 [compatibility](docs/guides/compatibility.md) and [performance](docs/perf.md)
 for the historical results and remaining physical gates.
 `hygiene` checks every argument of literal workflow `ci.sh` calls against

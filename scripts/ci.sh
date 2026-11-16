@@ -257,7 +257,11 @@ step_examples() {
 # the deploy allowlist; their imports are listed with the same check as the
 # Rust examples', and their tests run them in test hosts. Last, new projects
 # from kronik init, in both languages, pass their own tests and build
-# (scripts/e2e-init.sh). The binary is a release build: a debug build's
+# (scripts/e2e-init.sh). Also in this step, M24's criteria 2 and 4 run end to
+# end (docs/design/m24-connections.md §18): identity replay of a recorded
+# chat-ts WebSocket and SSE session, and reconnecting clients across a
+# graceful restart and a SIGKILL. Criterion 1's 1,000 clients are the test
+# VPS run, not this step. The binary is a release build: a debug build's
 # Cranelift takes a minute to compile a JavaScript component for a test
 # host, and the release dependencies are shared with the dst step. Needs
 # Node.js 22.20 or later and network access.
@@ -281,6 +285,12 @@ step_ts() {
     rm -rf -- "$compatibility_root"
     cargo run --quiet --locked -p kronik-runtime --example check_imports -- examples/dist/*-ts*.wasm
     (cd examples && KRONIK_BIN="$kronik" npm test --workspaces)
+    # M24 criteria 2 and 4 end to end (docs/design/m24-connections.md §18).
+    # NO_BUILD: the release binary and both chat-ts components are above, and
+    # loadgen is the only other artifact the driver needs.
+    cargo build --locked --release --manifest-path tools/loadgen/Cargo.toml
+    KRONIK_BIN="$kronik" NO_BUILD=1 scripts/acceptance-m24.sh replay
+    KRONIK_BIN="$kronik" NO_BUILD=1 scripts/acceptance-m24.sh restart
     KRONIK_BIN="$kronik" E2E_INIT_LANGS="ts rust" scripts/e2e-init.sh
 }
 

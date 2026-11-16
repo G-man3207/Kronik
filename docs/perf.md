@@ -534,12 +534,13 @@ at most 2.9 MiB.
 The Definition of done asks for a crash test of 1 000 `kill -9` cycles and
 for DST over 10 000 seeds plus a long run of at least 1 000 000 steps,
 all without violations. `.github/workflows/nightly.yml` is started by hand
-and runs these with the commands below. It does not run on a schedule.
+and runs these checks, the retention crash test and the runbook drills with
+the commands below. It does not run on a schedule.
 
 ### Method
 
-- **Crash test:** `scripts/chaos.sh [CYCLES] [WORKDIR]`. The defaults are
-  1 000 cycles in `/var/tmp/kronik-chaos`, on a real disk.
+- **Crash test:** the `chaos` job runs `scripts/chaos.sh [CYCLES] [WORKDIR]`.
+  The defaults are 1 000 cycles in `/var/tmp/kronik-chaos`, on a real disk.
   - Each cycle, 12 clients send 40 to 200 HTTP requests with an
     `Idempotency-Key`, and retry them until acknowledged. The requests go to
     four counters and four `notes` actors (SQL).
@@ -567,8 +568,9 @@ and runs these with the commands below. It does not run on a schedule.
     (it reads the whole log), and the recovered state must equal the state
     rebuilt from the log.
   - The details are in `scripts/chaos.py`.
-- **Crash test under retention:** `scripts/chaos-retention.py --bin PATH
-  --dir WORKDIR [--cycles 60]`. `chaos.py` keeps every actor busy and the log
+- **Crash test under retention:** the `chaos-retention` job runs
+  `scripts/chaos-retention.py --bin PATH --dir WORKDIR [--cycles 60]` with the
+  release binary. `chaos.py` keeps every actor busy and the log
   whole, so it cannot meet an actor with an SQL database that has not changed
   for longer than `[retention] history`. This script runs the daemon with a
   history of 4 s, 1 s segments and a snapshot every second, writes a dozen
@@ -581,8 +583,9 @@ and runs these with the commands below. It does not run on a schedule.
   `chaos.py`; `--read-retry-budget SECONDS` lets a run against an older
   release retry it that long and counts the retries. About three minutes for
   60 cycles.
-- **DST:** `scripts/dst.sh [SEEDS] [JOBS] [harness options]` runs
-  kronik-sim's harness over a range of seeds, split across processes.
+- **DST:** the `dst-seeds` and `dst-relay-ts` jobs run
+  `scripts/dst.sh [SEEDS] [JOBS] [harness options]`; it drives kronik-sim's
+  harness over a range of seeds, split across processes.
   - `--twice` runs every seed twice and compares the traces.
   - With `--scenario webhook` and
     `KRONIK_DST_RELAY=examples/dist/webhook-relay-ts.wasm`, the webhook
@@ -591,10 +594,23 @@ and runs these with the commands below. It does not run on a schedule.
     (`--mutation blob-skip-ensure-durable`, `blob-sweep-ignores-leases`,
     `blob-sweep-ignores-touches`) must each make some seed fail.
   - `KRONIK_DST_TRACE=1` prints every line of a seed's trace as it happens.
-- **DST long run:**
+- **DST long run:** the `dst-long` job runs
   `cargo test --release -p kronik-sim --test dst -- --long 1000000 --twice`.
   This runs the counter workload as one run of at least 1 000 000 executor
   steps, with a crash about every 0.3 to 1 s of virtual time.
+- **Runbook drills:** the `runbook-drills` job runs
+  `scripts/runbook-drills.py --binary PATH --counter tests/guests/counter.wasm
+  --notes tests/guests/notes.wasm --revision REVISION --workdir WORKDIR
+  --port PORT` with the release binary. It follows the
+  [backup](runbooks/backup.md) and [restore](runbooks/restore.md) procedures
+  on a disposable fixture: known key-value and SQL state, a `SIGKILL` and
+  restart, a dummy key-backed secret and reader-token rotation (the old token
+  must be refused), a snapshot shipped to a same-host `file://` bucket,
+  refusal of a wrong master key, and a restore whose `integrity` state and log
+  hashes and known state match the source through the snapshot's LSN. It
+  writes `WORKDIR/proof.json`, which the job keeps as an artifact. The file
+  target proves the format flow, not off-host availability, cross-node
+  revocation or cluster node loss; the proof records those limits.
 
 ### Results (development machine, 2026-10-25)
 
