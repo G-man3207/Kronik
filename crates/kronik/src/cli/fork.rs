@@ -121,7 +121,8 @@ pub struct ReplayOptionArgs {
     /// ($.a.b[*].c); repeat for more.
     #[arg(long = "ignore-json-path", value_name = "PATH")]
     ignore_json_paths: Vec<String>,
-    /// Isolated replay workers [default: the machine's cores, at most 16].
+    /// Isolated replay workers [default: the machine's cores, at most 16;
+    /// clamped to the daemon's instance pool's room].
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     threads: Option<u16>,
     /// Canned answers for effects without a recording, which count as
@@ -375,7 +376,8 @@ pub struct RollbackArgs {
     /// replay to the diff).
     #[arg(long, requires = "by_replay", value_name = "MODE")]
     mode: Option<String>,
-    /// With --by-replay and `--mode both`: isolated replay workers.
+    /// With --by-replay and `--mode both`: isolated replay workers, clamped
+    /// to the daemon's instance pool's room.
     #[arg(long, requires = "by_replay")]
     threads: Option<usize>,
     #[command(flatten)]

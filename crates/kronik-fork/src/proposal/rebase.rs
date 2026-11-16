@@ -191,7 +191,7 @@ impl Proposals {
             crate::ensure_fork_retained(&this.node, &this.data, base_lsn).await?;
             let head = this.node.applied_lsn();
             let id = format!("r-{}", &random_id(this.node.env())[..12]);
-            let workers = req.workers.unwrap_or(this.workers).clamp(1, 64);
+            let workers = this.replay_workers(req.workers);
             let mut live = this
                 .replay(
                     &id,

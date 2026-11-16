@@ -1279,6 +1279,19 @@ impl Node {
         &self.env
     }
 
+    /// The size of the one Wasmtime instance pool this node runs: its turns
+    /// and the forks, replays and previews that share it
+    /// ([`crate::pool::node_instances`]).
+    pub fn instance_pool(&self) -> usize {
+        crate::pool::node_instances(self.cfg.concurrency, crate::pool::available_cpus())
+    }
+
+    /// The isolated replay workers the node's instance pool has room for,
+    /// each with its calls (F5).
+    pub fn replay_worker_limit(&self) -> usize {
+        crate::pool::replay_workers_in(self.instance_pool())
+    }
+
     pub fn applied_lsn(&self) -> Lsn {
         self.store.applied.get()
     }

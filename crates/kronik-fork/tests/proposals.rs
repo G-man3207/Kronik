@@ -78,6 +78,63 @@ fn a_default_window_still_covers_the_newest_root_after_an_idle_stretch() {
     );
 }
 
+/// Issue #75: a replay asking for more workers than the node's one instance
+/// pool has room for is clamped to that room rather than run at 64 and answer
+/// `UNAVAILABLE` when a chain of calls finds no instance.
+#[test]
+fn a_replay_asking_for_more_workers_than_the_pool_holds_is_clamped() {
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    for i in 0..64 {
+        let out = p.send(
+            &format!("counter/c{i}"),
+            "call",
+            &format!("counter/b{i} call"),
+        );
+        assert!(out.committed(), "counter/c{i}: {:?}", out.outcome);
+    }
+    p.settle();
+    assert!(
+        p.node.replay_worker_limit() < 64,
+        "the test needs a pool with less than 64 workers' room, it has {}",
+        p.node.replay_worker_limit()
+    );
+    let limit = p.node.replay_worker_limit();
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    assert_eq!(props.replay_workers(Some(64)), limit);
+    assert_eq!(props.replay_workers(Some(usize::MAX)), limit);
+    assert_eq!(props.replay_workers(Some(0)), 1);
+    assert_eq!(props.replay_workers(Some(1)), 1);
+    assert_eq!(
+        props.replay_workers(None),
+        kronik_sched::pool::replay_workers_for(kronik_sched::pool::available_cpus()).min(limit)
+    );
+    let (prop, dry) =
+        p.rt.block_on(props.propose(
+            ProposeRequest {
+                wasm: vec![std::fs::read(guest("counter-step2")).unwrap()],
+                names: Vec::new(),
+                window_ms: None,
+                at: None,
+                options: DiffOptions::default(),
+                workers: Some(64),
+                audit: audit(),
+                dry_run: false,
+            },
+            p.owner(),
+        ))
+        .unwrap();
+    assert!(!dry);
+    assert_eq!(prop.status, "evaluated", "{:?}", prop.error);
+    assert_eq!(
+        prop.summary["root_inputs"].as_u64(),
+        Some(64),
+        "{}",
+        prop.summary
+    );
+    assert!(prop.error.is_none(), "{:?}", prop.error);
+}
+
 #[test]
 fn promote_runs_catch_up_switches_code_and_rollback_restores_it() {
     let dir = tempdir();

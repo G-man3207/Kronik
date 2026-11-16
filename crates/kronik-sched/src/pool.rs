@@ -39,6 +39,22 @@ pub fn replay_instances(workers: usize, cpus: usize) -> usize {
         .max(concurrency_for(cpus))
 }
 
+/// The most isolated replay workers a pool of `instances` instances has
+/// room for: every worker may hold [`REPLAY_INSTANCES_PER_TASK`] for its
+/// turn and the calls that turn makes, so one worker per that many instances.
+pub fn replay_workers_in(instances: usize) -> usize {
+    (instances / REPLAY_INSTANCES_PER_TASK).max(1)
+}
+
+/// The isolated replay workers to run when `workers` were asked for and the
+/// node's pool has `instances` instances: at least one, and at most
+/// [`replay_workers_in`]. A replay's result does not depend on its worker
+/// count, so an over-large request is clamped to what the pool can run
+/// rather than left to meet a full pool and answer `UNAVAILABLE`.
+pub fn replay_workers(workers: usize, instances: usize) -> usize {
+    workers.clamp(1, replay_workers_in(instances))
+}
+
 /// The instances the pool of a daemon running `concurrency` turns at once
 /// on `cpus` CPUs has room for. Its turns hold at most `concurrency` (one
 /// per worker permit; a caller waiting for its callee keeps its permit).
@@ -73,6 +89,24 @@ mod tests {
                 assert!(n >= concurrency_for(cpus), "{workers} {cpus}");
             }
         }
+    }
+
+    /// A replay request is clamped to the room its pool has for the
+    /// workers and their calls, and never below one worker.
+    #[test]
+    fn a_replay_request_is_clamped_to_its_pools_room() {
+        for instances in [8, 16, 64, 128, 1_024] {
+            let room = replay_workers_in(instances);
+            assert!(room >= 1);
+            assert!(room * REPLAY_INSTANCES_PER_TASK <= instances);
+            assert_eq!(replay_workers(1, instances), 1);
+            assert_eq!(replay_workers(room, instances), room);
+            assert_eq!(replay_workers(room + 1, instances), room);
+            assert_eq!(replay_workers(usize::MAX, instances), room);
+        }
+        assert_eq!(replay_workers(0, 128), 1);
+        assert_eq!(replay_workers(0, 1), 1);
+        assert_eq!(replay_workers_in(1), 1);
     }
 
     /// At the default concurrency of 2 to 8 CPUs the daemon's pool is what
