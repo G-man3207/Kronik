@@ -437,8 +437,10 @@ impl Node {
         for (mut record, born) in records {
             // A rebased turn is a fork's: what it holds of an erased subject
             // is the erasure's tombstone, never a value under a new key
-            // version (docs/design/m8-privacy.md §6.8).
-            self.seal_fork_record(&mut record, born)?;
+            // version (docs/design/m8-privacy.md §6.8). The fence stays
+            // until the record is applied, so the erasure's record cannot
+            // land between this seal and main's append (ADR 0123 §7).
+            let fence = self.seal_fork_record(&mut record, born).await?;
             if let Some(pause) = pause {
                 if pause.expired() {
                     return Err(stale(
@@ -466,6 +468,7 @@ impl Node {
             } else {
                 self.commit_authorized(record, authority.clone()).await?;
             }
+            drop(fence);
         }
         self.rebase_refresh(id, authority).await?;
         let staged = self.rebase_staged_to(id);

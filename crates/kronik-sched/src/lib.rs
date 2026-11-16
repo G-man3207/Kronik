@@ -121,6 +121,11 @@ pub struct NodeConfig {
     /// until the hold releases it (ADR 0013, 0018).
     #[doc(hidden)]
     pub test_hold_switch: Option<Arc<SwitchHold>>,
+    /// Test hook: a fork's seal parks after its erasure checks and before it
+    /// loads a sealing key, while it holds the erasure fence (ADR 0123 §7).
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub test_hold_fork_seal: Option<Arc<ForkSealHold>>,
     /// `privacy.keystore_backup_retention` (default 30 days). Erasure
     /// completion and keystore backup expiry use this window.
     pub keystore_backup_retention: Duration,
@@ -282,6 +287,8 @@ impl Default for NodeConfig {
             test_hold_after_send_now: false,
             test_hold: None,
             test_hold_switch: None,
+            #[cfg(test)]
+            test_hold_fork_seal: None,
             keystore_backup_retention: Duration::from_secs(30 * 86_400),
             sql_bytes_per_actor: 1 << 30,
             disk_reserve: 0,
@@ -322,6 +329,27 @@ impl Default for SwitchHold {
             park_resend: Default::default(),
             resend_parked: Default::default(),
             resend_release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+/// Test hook for [`NodeConfig::test_hold_fork_seal`]: counts the fork seals
+/// that parked after their erasure checks, and lets each go on one permit of
+/// `release`.
+#[cfg(test)]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ForkSealHold {
+    pub arrived: std::sync::atomic::AtomicUsize,
+    pub release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl Default for ForkSealHold {
+    fn default() -> Self {
+        ForkSealHold {
+            arrived: Default::default(),
+            release: tokio::sync::Semaphore::new(0),
         }
     }
 }

@@ -13,7 +13,7 @@ use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use prost::Message as _;
 
-use crate::{Born, Node, NodeConfig};
+use crate::{Born, ForkSealHold, Node, NodeConfig};
 
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -80,8 +80,11 @@ async fn a_copied_value_of_a_come_back_subject_is_the_tombstone() {
     // A fork computes a new value before the subject has come back: it is
     // still the erasure's tombstone, and creates no key version.
     let mut computed = copied(b"FORK-COMPUTED");
-    node.seal_fork_record(&mut computed, node.born_now())
-        .unwrap();
+    drop(
+        node.seal_fork_record(&mut computed, node.born_now())
+            .await
+            .unwrap(),
+    );
     let Record::TurnRecord(t) = &computed else {
         unreachable!()
     };
@@ -117,8 +120,11 @@ async fn a_copied_value_of_a_come_back_subject_is_the_tombstone() {
     // Written before the erasure: it becomes the erasure's tombstone even
     // though version 1 exists now.
     let mut before = copied(b"NEEDLE");
-    node.seal_fork_record(&mut before, Born::Lsn(erased_lsn - 1))
-        .unwrap();
+    drop(
+        node.seal_fork_record(&mut before, Born::Lsn(erased_lsn - 1))
+            .await
+            .unwrap(),
+    );
     let Record::TurnRecord(t) = &before else {
         unreachable!()
     };
@@ -137,8 +143,11 @@ async fn a_copied_value_of_a_come_back_subject_is_the_tombstone() {
     // The control: a genuinely new post-erasure value seals under version 1
     // and opens.
     let mut after = copied(b"NEEDLE-AFTER");
-    node.seal_fork_record(&mut after, Born::Lsn(erased_lsn + 1))
-        .unwrap();
+    drop(
+        node.seal_fork_record(&mut after, Born::Lsn(erased_lsn + 1))
+            .await
+            .unwrap(),
+    );
     let Record::TurnRecord(t) = &after else {
         unreachable!()
     };
@@ -151,6 +160,119 @@ async fn a_copied_value_of_a_come_back_subject_is_the_tombstone() {
         node.sealer().open(value).into_owned().as_deref(),
         Some(&b"NEEDLE-AFTER"[..])
     );
+}
+
+/// Issue #125: a fork's seal takes the erasure fence before its tombstone
+/// check and key-version creation. An erasure that begins while the seal is
+/// between them waits for the seal instead of deleting the keys first, so
+/// the key the seal creates is one the erasure removes: the value is never
+/// sealed under a version above the erasure's floor and left readable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_seal_in_flight_is_not_outrun_by_an_erasure() {
+    let dir = tempfile::tempdir().unwrap();
+    let hold = Arc::new(ForkSealHold::default());
+    let node = crate::start_local(
+        Env::real(tokio::runtime::Handle::current()),
+        dir.path(),
+        NodeConfig {
+            test_hold_fork_seal: Some(hold.clone()),
+            ..NodeConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let authority = node.local_operator_authority().unwrap();
+    node.set_privacy_mode(pb::PrivacyState::On, audit(), false, authority.clone())
+        .await
+        .unwrap();
+    let born = node.born_now();
+    let mut record = Record::TurnRecord(pb::TurnRecord {
+        writes: vec![pb::StateWrite {
+            key: "n".into(),
+            op: pb::StateOp::Set as i32,
+            value: Some(pb::Sealable {
+                subject: Some("user:1".into()),
+                value: Some(pb::sealable::Value::Plain(b"FORK-NEEDLE".to_vec())),
+            }),
+        }],
+        ..Default::default()
+    });
+    let sealing = {
+        let node = node.clone();
+        tokio::spawn(async move {
+            let _fence = node.seal_fork_record(&mut record, born).await.unwrap();
+            record
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while hold.arrived.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // The seal holds the read side of the fence at the hook. A write guard
+    // here would mean the erasure could delete the keys first, and the seal
+    // then create a key version above its floor.
+    assert!(
+        node.erase_lock.try_write().is_err(),
+        "the fork seal does not hold the erasure fence between its check and its key"
+    );
+    // The seal has passed its erasure checks and holds the read side of the
+    // fence. An erasure must wait, not delete the keys before the seal loads
+    // them.
+    let mut erasing = tokio::spawn({
+        let node = node.clone();
+        let authority = authority.clone();
+        async move {
+            node.erase_subject("user:1", audit(), false, authority)
+                .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut erasing)
+            .await
+            .is_err(),
+        "an erasure ran between the fork's check and its sealing key"
+    );
+    hold.release.add_permits(1);
+    let record = sealing.await.unwrap();
+    let erased = erasing.await.unwrap().unwrap();
+    // The fork created key version 1 while it held the fence; the erasure
+    // that followed deleted it through that version, so no version at or
+    // above the floor is left readable.
+    assert_eq!(
+        erased.key_version, 1,
+        "the erasure did not cover the fork's sealing key"
+    );
+    assert_eq!(
+        node.sealer()
+            .keystore()
+            .unwrap()
+            .newest_version("user:1")
+            .unwrap(),
+        None,
+        "a key version of the erased subject survived"
+    );
+    let Record::TurnRecord(t) = &record else {
+        unreachable!()
+    };
+    let value = t.writes[0].value.as_ref().unwrap();
+    assert!(
+        matches!(
+            value.value.as_ref(),
+            Some(pb::sealable::Value::Sealed(s)) if s.key_version == 1
+        ),
+        "the fork sealed under another key version: {value:?}"
+    );
+    assert!(
+        matches!(
+            node.sealer().open(value),
+            kronik_privacy::sealer::Opened::Erased { ref subject } if subject == "user:1"
+        ),
+        "the fork's pre-erasure plaintext opened after the erasure"
+    );
+    assert_eq!(node.pending_erasures().await.unwrap(), 0);
 }
 
 /// An HTTP server on an ephemeral port that answers its first request only

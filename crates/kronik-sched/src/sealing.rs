@@ -105,9 +105,43 @@ impl Node {
     /// turns hold what it revealed or computed; none of it may bring an
     /// erased subject back (docs/design/m8-privacy.md §6.8).
     ///
+    /// Takes the erasure fence before the tombstone check and returns it:
+    /// no erasure begins between that check and the key version this seal
+    /// creates (ADR 0123 §7). Hold the guard until the record is written;
+    /// for a turn a rebase stages into main's log, until it is applied.
+    /// Whoever seals several records takes [`Node::fork_seal_fence`] once
+    /// and calls [`Node::seal_fork_record_fenced`], because acquiring a
+    /// second read guard behind a waiting erasure would deadlock (the lock
+    /// is write-preferring).
+    ///
     /// A copied production turn passes its production LSN; a fork-computed
     /// turn passes [`Node::born_now`].
-    pub fn seal_fork_record(&self, record: &mut Record, born: Born) -> Result<(), ApiError> {
+    pub async fn seal_fork_record(
+        &self,
+        record: &mut Record,
+        born: Born,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, ApiError> {
+        let fence = self.fork_seal_fence().await;
+        self.seal_fork_record_fenced(&fence, record, born).await?;
+        Ok(fence)
+    }
+
+    /// The erasure fence [`Node::seal_fork_record`] takes: an erasure waits
+    /// until every fork record sealed and written under it is done (ADR
+    /// 0123 §7).
+    pub async fn fork_seal_fence(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.erase_lock.read().await
+    }
+
+    /// [`Node::seal_fork_record`] for a caller that already holds the
+    /// erasure fence `_fence`: one fence covers a batch, so sealing does not
+    /// acquire a second read guard behind a waiting erasure (deadlock).
+    pub async fn seal_fork_record_fenced(
+        &self,
+        _fence: &tokio::sync::RwLockReadGuard<'_, ()>,
+        record: &mut Record,
+        born: Born,
+    ) -> Result<(), ApiError> {
         if !self.sealer.is_on() {
             return Ok(());
         }
@@ -115,7 +149,23 @@ impl Node {
         self.sealer
             .keep_erased_without_keys(record)
             .map_err(|e| ApiError::new(ErrorCode::Internal, format!("sealing: {e}")))?;
+        #[cfg(test)]
+        self.hold_fork_seal().await;
         self.seal(record)
+    }
+
+    /// The test hook `NodeConfig::test_hold_fork_seal`: parks a fork's seal
+    /// after its erasure checks and before it loads a sealing key, while it
+    /// holds the erasure fence.
+    #[cfg(test)]
+    async fn hold_fork_seal(&self) {
+        if let Some(hold) = &self.cfg.test_hold_fork_seal {
+            hold.arrived
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(permit) = hold.release.acquire().await {
+                permit.forget();
+            }
+        }
     }
 
     /// The error of a turn whose input cannot be unsealed.
