@@ -232,7 +232,9 @@ pub struct ProposeRequest {
     /// An explicit fork point instead of the window.
     pub at: Option<Lsn>,
     pub options: DiffOptions,
-    /// Isolated replay workers (default: available cores, at most 16).
+    /// Isolated replay workers (default: available cores, at most 16),
+    /// clamped to the room the node's instance pool has for them and their
+    /// calls.
     pub workers: Option<usize>,
     pub audit: pb::Audit,
     pub dry_run: bool,
@@ -524,6 +526,18 @@ impl Proposals {
     pub fn with_test_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Proposals {
         self.gate = Some(gate);
         self
+    }
+
+    /// A replay's isolated workers: what was asked for (or the default),
+    /// clamped to the room the node's one instance pool has for the workers
+    /// and their calls. The result does not depend on the count, so an
+    /// over-large request runs with fewer workers instead of answering
+    /// `UNAVAILABLE` when the pool has no instance left.
+    pub fn replay_workers(&self, requested: Option<usize>) -> usize {
+        kronik_sched::pool::replay_workers(
+            requested.unwrap_or(self.workers),
+            self.node.instance_pool(),
+        )
     }
 
     /// `[fork] live_allowlist`: hosts whose unrecorded replay-safe GETs
@@ -1506,7 +1520,7 @@ impl Proposals {
         }
         self.node.check_set_routes(&kinds)?;
         let id = format!("p-{}", &random_id(self.node.env())[..12]);
-        let workers = req.workers.unwrap_or(self.workers).clamp(1, 64);
+        let workers = self.replay_workers(req.workers);
         Ok(Prepared {
             id,
             fork_lsn,
@@ -2369,7 +2383,7 @@ impl Proposals {
                     ));
                 }
                 let kinds = entry.meta.kind_versions()?;
-                let workers = workers.unwrap_or(this.workers).clamp(1, 64);
+                let workers = this.replay_workers(workers);
                 // The old copies stop before the new ones start (review H11).
                 copies::retire(entry.live.take()).await;
                 let mut live = this

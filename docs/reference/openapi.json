@@ -7104,7 +7104,7 @@
           },
           "threads": {
             "default": null,
-            "description": "Isolated replay workers (default: the machine's cores, at most 16).",
+            "description": "Isolated replay workers (default: the machine's cores, at most 16).\nA count above the room the daemon's instance pool has for the workers\nand their calls is clamped to that room; the diff does not depend on it.",
             "format": "uint",
             "minimum": 0,
             "type": [
@@ -7170,7 +7170,7 @@
           },
           "threads": {
             "default": null,
-            "description": "Isolated replay workers, for `both`.",
+            "description": "Isolated replay workers, for `both`; clamped like a replay's.",
             "format": "uint",
             "minimum": 0,
             "type": [
@@ -7310,7 +7310,7 @@
           },
           "threads": {
             "default": null,
-            "description": "Isolated replay workers (default: the machine's cores, at most 16).",
+            "description": "Isolated replay workers (default: the machine's cores, at most 16).\nA count above the room the daemon's instance pool has for the workers\nand their calls is clamped to that room; the diff does not depend on it.",
             "format": "uint",
             "minimum": 0,
             "type": [

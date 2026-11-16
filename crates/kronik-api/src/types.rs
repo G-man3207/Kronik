@@ -971,6 +971,8 @@ pub struct ReplayOptions {
     #[serde(default)]
     pub ignore_json_paths: Vec<String>,
     /// Isolated replay workers (default: the machine's cores, at most 16).
+    /// A count above the room the daemon's instance pool has for the workers
+    /// and their calls is clamped to that room; the diff does not depend on it.
     #[serde(default)]
     pub threads: Option<usize>,
     /// Canned answers for effects without a recording (synthetic
@@ -1226,7 +1228,7 @@ pub struct RebaseRequest {
     /// `continuous` (default) or `both`; the switch needs continuous replay.
     #[serde(default)]
     pub mode: Option<String>,
-    /// Isolated replay workers, for `both`.
+    /// Isolated replay workers, for `both`; clamped like a replay's.
     #[serde(default)]
     pub threads: Option<usize>,
     /// Required: missing or blank answers REASON_REQUIRED.

@@ -1504,7 +1504,10 @@ lets the fork's state evolve under the new code; `--mode` picks one. When
 `--mode` is omitted, the value is `[replay] default_mode` in the
 configuration file (`$KRONIK_CONFIG`, else `/etc/kronik/kronik.toml` if it
 exists), and `both` when that file is absent or leaves the key at its
-default. `--sample` replays a share of the root inputs in isolated
+default. `--threads` above the room the daemon's instance pool has for
+replay workers and their calls is clamped to that room: the diff does not
+depend on the worker count, so the replay runs instead of answering
+`UNAVAILABLE`. `--sample` replays a share of the root inputs in isolated
 mode, as a percentage (`10%`) or a fraction (`0.1`), the same share every
 time for the same fork. An omitted `--sample` is `[replay] sample` from
 that file, `100%` by default. `--ignore-header` and `--ignore-json-path`
@@ -1969,8 +1972,10 @@ required) and `kronik promote` switch main to that state and the old code
 in one `StateRebase` record, holding new requests for at most `[rebase]
 max_pause`. Main's history stays. Creating it needs `propose` and `pii:read` (the
 rebase replays on full data), and below `[log] disk_reserve` neither the
-creation nor its promote is allowed (use plain `kronik rollback`). Only
-main's newest deployment can be
+creation nor its promote is allowed (use plain `kronik rollback`). With
+`--mode both`, `--threads` above the room the daemon's instance pool has
+for replay workers and their calls is clamped to that room. Only main's
+newest deployment can be
 rolled back this way, and only when every kind of it existed before;
 `--mode isolated` alone is refused. Needs `propose`; the promote needs
 `promote`.

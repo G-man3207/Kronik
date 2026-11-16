@@ -93,7 +93,10 @@ the root id).
   trees' first records.
   Results are merged in LSN order. Each root input's result depends only
   on (state at its LSN, its input, the fork's code, the recordings), so the
-  diff is byte-identical with 1, 4 or 16 workers.
+  diff is byte-identical with 1, 4 or 16 workers. A request for more workers
+  than the daemon's one instance pool has room for, with each worker's
+  call chain, is clamped to that room rather than run until a turn finds no
+  instance (`UNAVAILABLE`).
 
 ### 3.4 Continuous replay
 

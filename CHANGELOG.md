@@ -6,6 +6,11 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- A replay request for more isolated workers than the daemon's one Wasmtime
+  instance pool has room for, with each worker's call chain, is clamped to
+  that room instead of stopping with `UNAVAILABLE` when a replayed turn finds
+  no instance. The diff does not depend on the worker count, so `kronik replay`,
+  `kronik propose` and `kronik rollback --by-replay` still compare the window.
 - An open turn begun before v0.5 whose recorded call compensations, not just
   its input, exceed the turn budget is closed as `TURN_TOO_LARGE` at the next
   start instead of being re-run at every start and pinning its log segment
