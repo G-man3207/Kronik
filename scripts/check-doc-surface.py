@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Require examples for the actual CLI, routed API, WIT and error catalog."""
+"""Require examples for the actual CLI, routed API, WIT and error catalog, and
+that the security model matches the released opt-in isolation levels."""
 import argparse
 import json
 from pathlib import Path
@@ -45,6 +46,105 @@ def sections(text, level=2):
 def fences(text):
     return [(match.group(1).strip(), match.group(2))
             for match in re.finditer(r"^```([^\n]*)\n(.*?)^```\s*$", text, re.MULTILINE | re.DOTALL)]
+
+
+# The isolation levels that a release can ship as an opt-in, and the words a
+# page may use for each. A level added here is checked in every release whose
+# changelog records it.
+ISOLATION_LEVELS = {
+    "nonroot": ("nonroot", "non-root", "rootless"),
+    "microVM": ("microvm",),
+}
+
+
+def release_sections(changelog):
+    """The released changelog sections by version, from `## vX.Y.Z` headings."""
+    return {
+        match.group(1): match.group(2)
+        for match in re.finditer(
+            r"^## v([0-9]+\.[0-9]+\.[0-9]+)\b[^\n]*\n(.*?)(?=^## |\Z)",
+            changelog,
+            re.MULTILINE | re.DOTALL,
+        )
+    }
+
+
+def shipped_isolation_levels(changelog):
+    """The opt-in isolation levels that a released changelog section records."""
+    shipped = set()
+    for body in release_sections(changelog).values():
+        lowered = body.lower()
+        if "opt-in" not in lowered or "isolation" not in lowered:
+            continue
+        for name, aliases in ISOLATION_LEVELS.items():
+            if any(alias in lowered for alias in aliases):
+                shipped.add(name)
+    return shipped
+
+
+def statements(text):
+    """The paragraphs and top-level bullets of `text`."""
+    result = []
+    for paragraph in re.split(r"\n[ \t]*\n", text):
+        block = []
+        for line in paragraph.splitlines():
+            if block and re.match(r"^[-*+]\s+", line):
+                result.append("\n".join(block))
+                block = []
+            block.append(line)
+        if block:
+            result.append("\n".join(block))
+    return [block for block in result if block.strip()]
+
+
+def sentences(text):
+    """The sentences of `text`, with its line breaks unfolded."""
+    flat = " ".join(line.strip() for line in text.splitlines())
+    return [sentence for sentence in re.split(r"(?<=[.!?])\s+", flat) if sentence.strip()]
+
+
+def release_status(readme, security, changelog):
+    """Why the security model contradicts the released isolation levels.
+
+    A released level that the changelog records as opt-in must be described as
+    shipped and opt-in in `SECURITY.md`, not listed among the absent or partial
+    tracks or as "not implemented yet".
+    """
+    problems = []
+    latest = re.search(r"The latest release is \*\*v([0-9]+\.[0-9]+\.[0-9]+)\*\*", readme)
+    released = release_sections(changelog)
+    if latest is None:
+        problems.append("README names no latest release")
+    elif latest.group(1) not in released:
+        problems.append(f"CHANGELOG has no section for README's latest release v{latest.group(1)}")
+    model = sections(security).get("Security model")
+    if model is None:
+        raise InvalidSurface("SECURITY.md has no 'Security model' section")
+    shipped = shipped_isolation_levels(changelog)
+    absent = re.compile(
+        r"\babsent or partial\b"
+        r"|\b(?:is|are|remains?|was|were)\s+(?:still\s+)?not\s+(?:yet\s+)?"
+        r"(?:implemented|shipped|released)\b(?!\s+(?:as|by|for|in|on|to|with|unless)\b)",
+        re.IGNORECASE,
+    )
+    for name, aliases in ISOLATION_LEVELS.items():
+        if name not in shipped:
+            continue
+        matching = [block for block in statements(model)
+                    if any(alias in block.lower() for alias in aliases)]
+        if not matching:
+            problems.append(f"Security model does not state the shipped {name} isolation level")
+        elif any(absent.search(sentence)
+                 for block in matching
+                 for sentence in sentences(block)
+                 if any(alias in sentence.lower() for alias in aliases)):
+            problems.append(
+                f"Security model lists the shipped {name} isolation level as absent or not implemented"
+            )
+        elif not any(re.search(r"\bopt[- ]in\b|\bshipped\b", block, re.IGNORECASE)
+                     for block in matching):
+            problems.append(f"Security model does not say the {name} isolation level is opt-in")
+    return problems
 
 
 def help_output(binary, arguments):
@@ -394,6 +494,11 @@ def api_example(body, method, path):
 
 def check(root, binary):
     missing = []
+    missing.extend(release_status(
+        (root / "README.md").read_text(),
+        (root / "SECURITY.md").read_text(),
+        (root / "CHANGELOG.md").read_text(),
+    ))
     cli_doc = sections((root / "docs/reference/cli.md").read_text())
     cli = cli_leaves(binary, root)
     examples = set()
