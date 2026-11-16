@@ -52,10 +52,12 @@ CREATE TABLE IF NOT EXISTS blob_charge_releases (
   PRIMARY KEY (actor, hash)) WITHOUT ROWID;
 ";
 
-/// Brings the blob tables of an earlier development build up to date:
+/// Brings the blob index of an earlier development build up to date:
 /// `blob_pins.charged` (the actor a pin counts against, ADR 0119 as amended
-/// 2026-11-14) and its index, and `blobs.erased_lsn` (when a row became
-/// erased; none: before the column, which the quota reads as LSN 0).
+/// 2026-11-14) and its index, `blobs.erased_lsn` (when a row became erased;
+/// none: before the column, which the quota reads as LSN 0), and the
+/// generated `owner` column and its index on the pin sources that
+/// [`prune_orphan_pins`] probes.
 pub(super) fn migrate(conn: &Connection) -> Result<(), StoreError> {
     let has_erased_lsn: bool = conn.query_row(
         "SELECT count(*) > 0 FROM pragma_table_info('blobs') WHERE name = 'erased_lsn'",
@@ -77,6 +79,38 @@ pub(super) fn migrate(conn: &Connection) -> Result<(), StoreError> {
         "CREATE INDEX IF NOT EXISTS blob_pins_charged ON blob_pins (charged) \
          WHERE charged IS NOT NULL;",
     )?;
+    // The owner a pin looks for, indexed on the row it mirrors: pruning
+    // probes one owner per pin instead of scanning a source table per pin.
+    add_owner(
+        conn,
+        "timers",
+        "kind || char(31) || key || char(31) || timer_id",
+    )?;
+    add_owner(
+        conn,
+        "ingress_keys",
+        "kind || char(31) || key || char(31) || idem_key",
+    )?;
+    add_owner(conn, "dead_letters", "CAST(lsn AS TEXT)")?;
+    Ok(())
+}
+
+/// Gives `table`, from an earlier development build, its generated `owner`
+/// column (the expression a pin of it stores) and the index of that column.
+fn add_owner(conn: &Connection, table: &str, expr: &str) -> Result<(), StoreError> {
+    let has: bool = conn.query_row(
+        "SELECT count(*) > 0 FROM pragma_table_xinfo(?1) WHERE name = 'owner'",
+        [table],
+        |r| r.get(0),
+    )?;
+    if !has {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN owner TEXT GENERATED ALWAYS AS ({expr}) VIRTUAL;"
+        ))?;
+    }
+    conn.execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS {table}_owner ON {table} (owner);"
+    ))?;
     Ok(())
 }
 
@@ -309,29 +343,17 @@ pub(super) fn settle_charges(
 /// rebase switch). Each source's rows by their owner. In a record's
 /// application (`lsn`), a pin that counted against an actor's quota keeps
 /// counting until that actor's next turn, as [`unpin`] does.
+///
+/// A source's owner is a generated column on the row it mirrors (or its
+/// primary key), indexed, so the probe is one lookup per pin rather than a
+/// scan of the source table per pin while the caller holds `state.db`.
 pub(super) fn prune_orphan_pins(
     tx: &Connection,
     source: i64,
     lsn: Option<Lsn>,
 ) -> Result<u64, StoreError> {
-    let exists = match source {
-        source::MAILBOX => "EXISTS (SELECT 1 FROM mailbox m WHERE m.message_id = blob_pins.owner)",
-        source::TIMER => {
-            "EXISTS (SELECT 1 FROM timers t WHERE t.kind || char(31) || t.key || char(31) || \
-             t.timer_id = blob_pins.owner)"
-        }
-        source::DEAD_LETTER => {
-            "EXISTS (SELECT 1 FROM dead_letters d WHERE CAST(d.lsn AS TEXT) = blob_pins.owner \
-             AND d.resent_as IS NULL)"
-        }
-        source::INGRESS_KEY => {
-            "EXISTS (SELECT 1 FROM ingress_keys k WHERE k.kind || char(31) || k.key || char(31) \
-             || k.idem_key = blob_pins.owner)"
-        }
-        source::DELIVERY => {
-            "EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = blob_pins.owner)"
-        }
-        _ => return Ok(0),
+    let Some(exists) = pin_source_exists(source) else {
+        return Ok(0);
     };
     if let Some(lsn) = lsn.filter(|_| charges(source)) {
         tx.execute(
@@ -350,6 +372,26 @@ pub(super) fn prune_orphan_pins(
         [source],
     )?;
     Ok(deleted as u64)
+}
+
+/// The condition that a pin of `source` still mirrors its row. The
+/// source's owner is indexed on that row ([`migrate`]).
+fn pin_source_exists(source: i64) -> Option<&'static str> {
+    Some(match source {
+        source::MAILBOX => "EXISTS (SELECT 1 FROM mailbox m WHERE m.message_id = blob_pins.owner)",
+        source::TIMER => "EXISTS (SELECT 1 FROM timers t WHERE t.owner = blob_pins.owner)",
+        source::DEAD_LETTER => {
+            "EXISTS (SELECT 1 FROM dead_letters d WHERE d.owner = blob_pins.owner \
+             AND d.resent_as IS NULL)"
+        }
+        source::INGRESS_KEY => {
+            "EXISTS (SELECT 1 FROM ingress_keys k WHERE k.owner = blob_pins.owner)"
+        }
+        source::DELIVERY => {
+            "EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = blob_pins.owner)"
+        }
+        _ => return None,
+    })
 }
 
 /// The holds of a committed turn (M26 §3, §4): `RETAIN` adds the actor's

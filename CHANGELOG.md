@@ -6,6 +6,12 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- The retention pass's orphan-pin sweep now probes each pin's source row by
+  an indexed generated `owner` column on `timers`, `ingress_keys` and
+  `dead_letters` (added on open to an existing `state.db`) instead of
+  scanning the source table once per pin while holding the store's writer.
+  A pass with 500 pins over 200 000 saved responses is bounded by the pins
+  rather than their product with the table.
 - The TLS admin listener serves `GET /v1/blobs/{hash}/content` with the
   same streamed bytes, length and headers as the Unix socket and TCP
   listeners. It forwarded every `/v1` request to the buffered router, which
