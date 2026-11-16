@@ -839,7 +839,9 @@ pub struct Opened {
 }
 
 struct Append {
-    record: Record,
+    /// None: a barrier, which is answered with the log's head but written
+    /// nowhere.
+    record: Option<Record>,
     done: oneshot::Sender<Result<Lsn, String>>,
     _admission: AppendAdmission,
 }
@@ -1108,7 +1110,7 @@ impl Log {
             let (done, rx) = oneshot::channel();
             self.tx
                 .send(Append {
-                    record,
+                    record: Some(record),
                     done,
                     _admission: AppendAdmission::System,
                 })
@@ -1133,7 +1135,24 @@ impl Log {
         let (done, rx) = oneshot::channel();
         self.tx
             .send(Append {
-                record,
+                record: Some(record),
+                done,
+                _admission: AppendAdmission::System,
+            })
+            .map_err(|_| LogError::Stopped("writer task ended".into()))?;
+        rx.await
+            .map_err(|_| LogError::Stopped("writer task ended".into()))?
+            .map_err(LogError::Stopped)
+    }
+
+    /// Waits for every append queued before it and resolves with the log's
+    /// last LSN, writing nothing. The caller already serializes the appends
+    /// it wants behind it.
+    pub async fn barrier(&self) -> Result<Lsn, LogError> {
+        let (done, rx) = oneshot::channel();
+        self.tx
+            .send(Append {
+                record: None,
                 done,
                 _admission: AppendAdmission::System,
             })
@@ -1160,7 +1179,7 @@ impl Log {
         };
         let (done, receive) = oneshot::channel();
         let mut pending = Some(Append {
-            record,
+            record: Some(record),
             done,
             _admission: AppendAdmission::Authorized {
                 _authority: authority.clone(),
@@ -1259,8 +1278,9 @@ async fn write_footer(seg: &Segment) -> Result<(), LogError> {
     Ok(())
 }
 
-/// Writes and fsyncs `batch` and hands every append its LSN, which leaves
-/// `batch` empty. On an error the appends not yet handed over stay in it.
+/// Writes and fsyncs `batch`'s records and answers its barriers with the last
+/// LSN written before each, which leaves `batch` empty. On an error every
+/// append still in the batch is answered with it.
 async fn write_batch(
     env: &Env,
     cfg: &LogConfig,
@@ -1269,6 +1289,13 @@ async fn write_batch(
     batch: &mut Vec<Append>,
     committed: &mpsc::UnboundedSender<Committed>,
 ) -> Result<(), String> {
+    if !batch.iter().any(|a| a.record.is_some()) {
+        let head = next_lsn.saturating_sub(1);
+        for a in batch.drain(..) {
+            let _ = a.done.send(Ok(head));
+        }
+        return Ok(());
+    }
     let has_entries = *next_lsn > seg.start_lsn;
     let age = env.clock.monotonic().saturating_sub(seg.opened_at);
     if has_entries && (seg.offset >= cfg.segment_max_bytes || age >= cfg.segment_max_age) {
@@ -1280,23 +1307,43 @@ async fn write_batch(
             Err(e) => return Err(format!("segment roll failed: {e}")),
         }
     }
+    let first_lsn = *next_lsn;
+    let mut lsn = first_lsn;
     let mut buf = Vec::new();
     let mut offsets = Vec::with_capacity(batch.len());
-    for (i, a) in batch.iter().enumerate() {
-        let at = seg.offset + buf.len() as u64;
-        offsets.push(at);
-        remember_turn(&mut seg.index, &a.record, at);
-        encode_entry(*next_lsn + i as u64, &a.record, &mut buf);
+    let mut records = Vec::with_capacity(batch.len());
+    let mut barriers = Vec::new();
+    for a in batch.drain(..) {
+        let Append {
+            record,
+            done,
+            _admission,
+        } = a;
+        match record {
+            Some(record) => {
+                let at = seg.offset + buf.len() as u64;
+                offsets.push(at);
+                remember_turn(&mut seg.index, &record, at);
+                encode_entry(lsn, &record, &mut buf);
+                lsn += 1;
+                records.push(Append {
+                    record: Some(record),
+                    done,
+                    _admission,
+                });
+            }
+            None => barriers.push((done, lsn.saturating_sub(1))),
+        }
     }
     let len = buf.len() as u64;
-    let first_lsn = *next_lsn;
+    let written = records.len() as u64;
     let mut res = seg.file.write_at(seg.offset, Bytes::from(buf)).await;
     if cfg.mutation_ack_before_fsync && res.is_ok() {
         deliver(
             seg.start_lsn,
             first_lsn,
             &offsets,
-            batch.drain(..),
+            records.drain(..),
             committed,
         );
     }
@@ -1310,22 +1357,28 @@ async fn write_batch(
         );
     }
     if let Err(e) = res {
-        return Err(format!("log write/fsync failed: {e}"));
+        let message = format!("log write/fsync failed: {e}");
+        for a in records.drain(..) {
+            let _ = a.done.send(Err(message.clone()));
+        }
+        for (done, _) in barriers.drain(..) {
+            let _ = done.send(Err(message.clone()));
+        }
+        return Err(message);
     }
     seg.offset += len;
-    *next_lsn += offsets.len() as u64;
-    kronik_metrics::add(
-        "kronik_log_records_appended_total",
-        &[],
-        offsets.len() as u64,
-    );
+    *next_lsn += written;
+    kronik_metrics::add("kronik_log_records_appended_total", &[], written);
     deliver(
         seg.start_lsn,
         first_lsn,
         &offsets,
-        batch.drain(..),
+        records.into_iter(),
         committed,
     );
+    for (done, head) in barriers {
+        let _ = done.send(Ok(head));
+    }
     Ok(())
 }
 
@@ -1338,14 +1391,16 @@ fn deliver(
 ) {
     for (i, a) in batch.enumerate() {
         let lsn = first_lsn + i as u64;
-        let _ = committed.send(Committed {
-            lsn,
-            pos: Position {
-                segment,
-                offset: offsets[i],
-            },
-            record: a.record,
-        });
+        if let Some(record) = a.record {
+            let _ = committed.send(Committed {
+                lsn,
+                pos: Position {
+                    segment,
+                    offset: offsets[i],
+                },
+                record,
+            });
+        }
         let _ = a.done.send(Ok(lsn));
     }
 }

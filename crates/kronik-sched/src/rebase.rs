@@ -622,6 +622,7 @@ impl Node {
             .finish_switch(
                 pause,
                 gate,
+                None,
                 record,
                 installs,
                 epoch,

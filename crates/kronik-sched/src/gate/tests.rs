@@ -712,6 +712,150 @@ async fn a_promote_counts_the_root_inputs_that_committed_while_it_waited() {
     assert_eq!(roots, unverified);
 }
 
+/// Issue #126: a turn that started before the switch and is still running
+/// commits before the promote counts, so its root input is in the gap. The
+/// switch waits for it instead of taking the count without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_promote_waits_for_a_running_turn_and_counts_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, hold) = node(dir.path()).await;
+    let verified = node.applied_lsn();
+    let version = node.deployed("counter").unwrap();
+
+    hold.park_turn_commit.store(true, Ordering::SeqCst);
+    let send = {
+        let node = node.clone();
+        tokio::spawn(async move {
+            node.send(
+                ActorRef::parse("counter/a").unwrap(),
+                pb::Message {
+                    name: "increment".into(),
+                    ..Default::default()
+                },
+                audit(),
+                false,
+                common::lease(),
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while hold.turn_commit_parked.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // The switch itself is not what holds the promote: its Deployment may
+    // install as soon as this promote gets that far.
+    hold.release.add_permits(1);
+    let mut promote = {
+        let node = node.clone();
+        tokio::spawn(async move {
+            node.switch_code(
+                crate::CodeSwitch {
+                    kinds: vec![version],
+                    pinned: Vec::new(),
+                    cause: pb::DeploymentCause::Promote,
+                    verified_through_lsn: verified,
+                    proposal_id: "p-issue-126".into(),
+                    rollback_of_epoch: 0,
+                },
+                audit(),
+                false,
+                common::lease(),
+            )
+            .await
+        })
+    };
+    // The running turn has not committed: the switch must not finish.
+    let early = tokio::time::timeout(Duration::from_millis(500), &mut promote).await;
+    assert!(
+        early.is_err(),
+        "the switch counted before the running turn committed"
+    );
+
+    hold.park_turn_commit.store(false, Ordering::SeqCst);
+    hold.turn_commit_release.add_permits(1);
+    let sent = send.await.unwrap().unwrap().unwrap();
+    let (epoch, lsn, unverified) = promote.await.unwrap().unwrap();
+    assert_eq!(node.epoch(), epoch);
+    assert!(
+        sent.turn_id.lsn < lsn,
+        "the turn committed before the switch: {} >= {lsn}",
+        sent.turn_id.lsn
+    );
+    assert_eq!(
+        unverified, 1,
+        "the turn that was running when the switch took its gate"
+    );
+    let (deployed, deployment) = node.store().db().deployments().unwrap().pop().unwrap();
+    assert_eq!(deployed, lsn);
+    assert_eq!(deployment.unverified_inputs, unverified);
+    // The number is the log's: every root input in the gap, no other turn.
+    let mut roots = 0u64;
+    node.reader()
+        .read(verified + 1, lsn, |c| {
+            if let kronik_proto::Record::TurnRecord(t) = &c.record
+                && kronik_core::causal::is_root_input(t)
+            {
+                roots += 1;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(roots, unverified);
+}
+
+/// Issue #126: the dry-run projection is taken under the same pause and gate
+/// as the real count, so the same state projects what the promote records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_promote_dry_run_projects_the_recorded_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, hold) = node(dir.path()).await;
+    let verified = node.applied_lsn();
+    let version = node.deployed("counter").unwrap().clone();
+    for key in ["a", "b"] {
+        node.send(
+            ActorRef::parse(&format!("counter/{key}")).unwrap(),
+            pb::Message {
+                name: "increment".into(),
+                ..Default::default()
+            },
+            audit(),
+            false,
+            common::lease(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    let switch = crate::CodeSwitch {
+        kinds: vec![version],
+        pinned: Vec::new(),
+        cause: pb::DeploymentCause::Promote,
+        verified_through_lsn: verified,
+        proposal_id: "p-issue-126".into(),
+        rollback_of_epoch: 0,
+    };
+    let (_, dry_lsn, projected) = node
+        .switch_code(switch.clone(), audit(), true, common::lease())
+        .await
+        .unwrap();
+    assert_eq!(dry_lsn, 0);
+    hold.release.add_permits(1);
+    let (_, lsn, recorded) = node
+        .switch_code(switch, audit(), false, common::lease())
+        .await
+        .unwrap();
+    assert_eq!(projected, recorded);
+    assert_eq!(recorded, 2);
+    let (_, deployment) = node.store().db().deployments().unwrap().pop().unwrap();
+    assert_eq!((deployment.unverified_inputs, lsn), (recorded, lsn));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn fixed_watch_switch_rejects_arbitrary_ordinary_metadata() {
     let dir = tempfile::tempdir().unwrap();

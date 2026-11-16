@@ -664,23 +664,26 @@ fn inputs_inside_the_promote_gap_stay_unverified() {
     let (_, d) = last_deployment(&p);
     assert_eq!(d.unverified_inputs, r.unverified_inputs);
     assert_eq!(d.verified_through_lsn, r.verified_through_lsn);
-    // What stayed unverified are the turns applied between the verified
-    // head and the switch.
-    let mut turns = 0;
+    // The count is the log's: every main root input applied between the
+    // verified head and the switch, including a turn that was still running
+    // when the switch took its gate (#126).
+    let mut roots = 0;
     p.rt.block_on(
         p.node
             .reader()
             .read(r.verified_through_lsn + 1, r.lsn, |c| {
-                if matches!(&c.record, Record::TurnRecord(_)) {
-                    turns += 1;
+                if let Record::TurnRecord(t) = &c.record
+                    && kronik_core::causal::is_root_input(t)
+                {
+                    roots += 1;
                 }
                 Ok(())
             }),
     )
     .unwrap();
-    assert!(
-        r.unverified_inputs <= turns,
-        "unverified {} but only {turns} turns in the gap",
+    assert_eq!(
+        r.unverified_inputs, roots,
+        "unverified {} but {roots} root inputs in the gap",
         r.unverified_inputs
     );
     // Main switched to the new code (the deployment is the promote).
