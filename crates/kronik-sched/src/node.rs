@@ -2132,6 +2132,7 @@ impl Node {
                 // it finds in the queues, but a resend that checked its dead
                 // letter before the switch can be queued after it: it runs
                 // only if the state it runs on still has the dead letter.
+                // A connection resend is checked the same way below.
                 if m.source == pb::MessageSource::DeadLetterResend as i32
                     && let Some(of) = TurnId::parse(&m.resend_of)
                     && self
@@ -2156,6 +2157,20 @@ impl Node {
                     "timer {} is no longer pending",
                     t.timer_id
                 )));
+            }
+            // A connection resend queued after the switch (m13-rebase §3):
+            // the same re-check as a message resend, before the turn starts.
+            Some(pb::input::Kind::Connection(c))
+                if rerun.is_none()
+                    && let Some(of) = TurnId::parse(&c.resend_of)
+                    && self
+                        .store
+                        .db()
+                        .dead_letter(of.lsn)
+                        .map_err(store_err)?
+                        .is_none() =>
+            {
+                return Err(dead_letter_gone(of.lsn));
             }
             _ => {}
         }
