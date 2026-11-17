@@ -1901,8 +1901,9 @@ impl StateDb {
     /// (`turns`, by LSN; a rebased turn of a `StateRebase` record too) still
     /// own, in one transaction: `kv` values, queued timer and message bodies
     /// (`timers`, `mailbox`), saved ingress and call responses, dead-letter
-    /// inputs. A row is updated only when its `lsn` is still the turn's, so
-    /// a later write is left; rows an erasure deleted or tombstoned stay so.
+    /// inputs, including a failed connection frame or close. A row is
+    /// updated only when its `lsn` is still the turn's, so a later write is
+    /// left; rows an erasure deleted or tombstoned stay so.
     /// `effects`: the rewritten effect results (execution id, effect), whose
     /// copies in `open_effects` a turn still open would hand to its guest
     /// on a re-run.
@@ -2023,7 +2024,11 @@ impl StateDb {
                         params![outcome.encode_to_vec(), m.message_id, lsn],
                     )?;
                 }
-                Some(pb::input::Kind::Message(_) | pb::input::Kind::Timer(_)) => {
+                Some(
+                    pb::input::Kind::Message(_)
+                    | pb::input::Kind::Timer(_)
+                    | pb::input::Kind::Connection(_),
+                ) => {
                     tx.execute(
                         "UPDATE dead_letters SET input = ?1 WHERE lsn = ?2",
                         params![input.encode_to_vec(), lsn],
@@ -5748,6 +5753,99 @@ mod tests {
             matches!(opened, kronik_privacy::sealer::Opened::Erased { .. }),
             "{opened:?}"
         );
+    }
+
+    /// Issue #188: a failed connection frame or close is stored in
+    /// `dead_letters` with its input. Reseal rewrites that input to the
+    /// sealed record, so `plain_subjects` (what `privacy status` counts in
+    /// `state.db`) no longer names the subject for that row alone.
+    #[test]
+    fn connection_dead_letters_are_resealed() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut db = StateDb::open(conn).unwrap();
+        let failed = pb::Outcome {
+            kind: pb::OutcomeKind::Failed as i32,
+            error_code: "TURN_FAILED".into(),
+            ..Default::default()
+        };
+        let connection = |subject: &str, event: pb::connection_input::Event| pb::Input {
+            kind: Some(pb::input::Kind::Connection(pb::ConnectionInput {
+                connection: format!("c-{subject}"),
+                event: Some(event),
+                ..Default::default()
+            })),
+        };
+        let frame = connection(
+            "user:1",
+            pb::connection_input::Event::Frame(pb::ConnectionFrame {
+                seq: 0,
+                frame: Some(pb::Frame {
+                    data: tagged("user:1", "FRAMEPLAIN"),
+                    ..Default::default()
+                }),
+            }),
+        );
+        let close = connection(
+            "user:2",
+            pb::connection_input::Event::Close(pb::ConnectionClose {
+                cause: pb::CloseCause::Client as i32,
+                reason: tagged("user:2", "CLOSEPLAIN"),
+                ..Default::default()
+            }),
+        );
+        let turn_of = |exec: &str, input: pb::Input| match with_outcome(
+            turn(exec, exec, Some(input)),
+            failed.clone(),
+        ) {
+            Record::TurnRecord(t) => t,
+            _ => unreachable!("turn() builds a TurnRecord"),
+        };
+        let frame_turn = turn_of("e1", frame);
+        let close_turn = turn_of("e2", close);
+        db.apply(&[
+            committed(1, Record::TurnRecord(frame_turn.clone())),
+            committed(2, Record::TurnRecord(close_turn.clone())),
+        ])
+        .unwrap();
+        let plain = |db: &StateDb| plain_subjects(&db.conn).unwrap();
+        assert_eq!(
+            plain(&db),
+            ["user:1".to_owned(), "user:2".to_owned()].into()
+        );
+        let sealed = pb::Sealed {
+            key_version: 1,
+            nonce: vec![1; 24],
+            ciphertext: vec![2; 8],
+        };
+        let reseal = |mut t: pb::TurnRecord| {
+            kronik_proto::sealables::turn_mut(&mut t, &mut |s| {
+                if s.subject.is_some() {
+                    s.value = Some(pb::sealable::Value::Sealed(sealed.clone()));
+                }
+            });
+            t
+        };
+        let resealed_frame = reseal(frame_turn);
+        let resealed_close = reseal(close_turn);
+        let stored = |db: &StateDb, lsn| db.dead_letter(lsn).unwrap().unwrap().input;
+        let close_before = stored(&db, 2);
+        db.fix_reseal(0, &[], &[(1, resealed_frame.clone())], &[])
+            .unwrap();
+        assert_eq!(
+            stored(&db, 1),
+            resealed_frame.input.clone().unwrap(),
+            "the frame dead letter is not the resealed record"
+        );
+        assert_eq!(
+            stored(&db, 2),
+            close_before,
+            "the close was rewritten early"
+        );
+        assert_eq!(plain(&db), ["user:2".to_owned()].into());
+        db.fix_reseal(0, &[], &[(2, resealed_close.clone())], &[])
+            .unwrap();
+        assert_eq!(stored(&db, 2), resealed_close.input.clone().unwrap());
+        assert!(plain(&db).is_empty(), "{:?}", plain(&db));
     }
 
     /// Issue #72: the recorded effects of a turn still open hold a plain

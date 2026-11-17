@@ -5,6 +5,11 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- `privacy reseal` rewrites a failed connection frame or close in
+  `state.db` to the sealed copy, as it already did for a message or timer
+  dead letter. Those rows stayed plain, so `privacy status` counted the
+  subject pending after the log was sealed, and a restart left the
+  plaintext in place while the applied LSN was current.
 - Subject erasure of a SQL table whose name contains `"` deletes that
   subject's rows and leaves the node running. The name was interpolated
   into `DELETE FROM "{name}"` without escaping the quote, so the statement

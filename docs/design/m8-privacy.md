@@ -596,10 +596,11 @@ Where the code differs from the sections above:
   and the rows the rewritten turns (a rebased turn of a `StateRebase`
   record too) still own (`kv` values, the bodies of their pending timers
   and undelivered messages, saved ingress and call responses, dead-letter
-  inputs; a row a later turn replaced is left), are fixed in one
-  `state.db` transaction, followed by a WAL checkpoint (issue #31: a timer
-  scheduled in `off` mode kept its plain body after a reseal and was
-  handed to its guest after the subject's erasure). Rows of an erased
+  inputs, including a failed connection frame or close; a row a later turn
+  replaced is left), are fixed in one `state.db` transaction, followed by
+  a WAL checkpoint (issue #31: a timer scheduled in `off` mode kept its
+  plain body after a reseal and was handed to its guest after the subject's
+  erasure). Rows of an erased
   subject are already gone or tombstoned by its `Erasure`; a value of it
   in a row that remains becomes a tombstone. Then the journal entry is
   removed. A reseal that stopped after the rename and before the fix is
@@ -731,7 +732,8 @@ Where the code differs from the sections above:
   for the subject's plain values and wrapped key, and checks its saved
   idempotent response and dead letter are gone;
   `kronik-api/tests/reseal.rs` checks a resealed dead letter, and
-  `kronik-store/src/db.rs` the erasure of these rows and the migration.
+  `kronik-store/src/db.rs` the erasure of these rows, a resealed connection
+  dead letter, and the migration.
 - **Overhead (§13):** `scripts/bench-privacy.sh` with the three workloads
   (the gateway with half the requests carrying a subject, the API's send
   with a subject, an SQL actor with `_subject`); results in
