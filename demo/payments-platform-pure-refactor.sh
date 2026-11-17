@@ -102,6 +102,11 @@ for w in "$billing" "$ledger"; do
 done
 api POST /v1/grants "{\"kind\":\"$billing_kind\",\"capability\":\"foreign:payments.internal\",\"delivery\":\"idempotency-keyed\",\"reason\":\"dogfood\"}" >/dev/null
 api POST /v1/grants "{\"kind\":\"$billing_kind\",\"capability\":\"secret:$secret\",\"reason\":\"dogfood\"}" >/dev/null
+fork_lsn=$(field "$(api GET /v1/health)" 'v["applied_lsn"]')
+
+step "fork before traffic"
+r=$(api POST /v1/forks "{\"at\":$fork_lsn,\"name\":\"refactor\",\"reason\":\"dogfood scenario 1\"}")
+[ "$(field "$r" 'v["fork"]["name"]')" = refactor ] || fail "fork: $r"
 
 step "record billing traffic"
 for c in se-1:SE de-1:DE us-1:US; do
@@ -110,11 +115,8 @@ for c in se-1:SE de-1:DE us-1:US; do
 done
 out=$(invoice declined-1 SE inv-1)
 [ "${out%% *}" = 500 ] || fail "declined card must fail the turn: $out"
-fork_lsn=$(field "$(api GET /v1/health)" 'v["applied_lsn"]')
 
-step "fork, deploy refactor build, replay"
-r=$(api POST /v1/forks "{\"at\":$fork_lsn,\"name\":\"refactor\",\"reason\":\"dogfood scenario 1\"}")
-[ "$(field "$r" 'v["fork"]["name"]')" = refactor ] || fail "fork: $r"
+step "deploy refactor build on fork, replay"
 api POST /v1/forks/refactor/deployments "{\"wasm_base64\":\"$(b64 "$refactor")\",\"reason\":\"dogfood\"}" >/dev/null
 r=$(api POST /v1/forks/refactor/replay '{"reason":"dogfood"}')
 [ "$(field "$r" 'v["summary"]["divergent_turns"]')" = 0 ] || fail "refactor replay diverged: $r"

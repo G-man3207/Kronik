@@ -6,6 +6,13 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- `demo/payments-platform-pure-refactor.sh` forks before it records traffic so
+  fork replay actually re-runs the invoices (it forked at the tip before).
+- `examples/payments-platform` adds dogfood scenario 2: billing-ts with EU
+  VAT diverges on the German and US finalize turns only and propose hits
+  `payments-must-be-exact` (`require_approval`). `demo/payments-platform-eu-vat.sh`
+  exercises it; the `foreign` CI step also runs scenarios 1 and 2 when root
+  and gVisor are available.
 - `examples/payments-platform` adds dogfood scenario 1: a refactor-only
   `billing-ts-refactor.wasm` must replay with zero divergent turns and
   propose with policy `allow`. `demo/payments-platform-pure-refactor.sh`
