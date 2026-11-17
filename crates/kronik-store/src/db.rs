@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS ingress_keys (
   outcome BLOB NOT NULL, subject TEXT,
   owner TEXT GENERATED ALWAYS AS (kind || char(31) || key || char(31) || idem_key) VIRTUAL,
   PRIMARY KEY (kind, key, idem_key)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ingress_keys_time ON ingress_keys (logical_time_ms);
 CREATE TABLE IF NOT EXISTS dead_letters (
   lsn INTEGER PRIMARY KEY, kind TEXT NOT NULL, key TEXT NOT NULL, input BLOB NOT NULL,
   error_code TEXT NOT NULL, message TEXT NOT NULL, resent_as INTEGER, subject TEXT,
@@ -82,6 +83,7 @@ CREATE TABLE IF NOT EXISTS approvals (
 CREATE INDEX IF NOT EXISTS approvals_proposal ON approvals (proposal_id);
 CREATE TABLE IF NOT EXISTS trees (
   root TEXT NOT NULL, lsn INTEGER NOT NULL, PRIMARY KEY (root, lsn)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS trees_lsn ON trees (lsn);
 CREATE TABLE IF NOT EXISTS segments (
   start INTEGER PRIMARY KEY, last_lsn INTEGER NOT NULL, last_time_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS erasures (
@@ -389,6 +391,13 @@ fn rerun_unavailable_key(branch: &str, execution_id: &str) -> String {
     format!("rerun-unavailable:{branch}:{execution_id}")
 }
 
+/// Deletes [`StateDb::compact`] runs under the store lock, and the probe
+/// that decides whether the hourly pass must run them. Tests explain these,
+/// so a scan cannot return unnoticed (#162).
+const COMPACT_TREES: &str = "DELETE FROM trees WHERE lsn < ?1";
+const COMPACT_INGRESS: &str = "DELETE FROM ingress_keys WHERE logical_time_ms < ?1";
+const INGRESS_BEFORE: &str = "SELECT 1 FROM ingress_keys WHERE logical_time_ms < ?1 LIMIT 1";
+
 impl StateDb {
     /// Prepares `conn` (WAL, NORMAL) and creates the schema.
     pub fn open(conn: Connection) -> Result<StateDb, StoreError> {
@@ -640,6 +649,10 @@ impl StateDb {
                  DROP TABLE trees_stage;",
             )?;
         }
+        // A rebuild of `trees` drops `trees_lsn`. Retention's delete by LSN
+        // needs it (#162).
+        self.conn
+            .execute_batch("CREATE INDEX IF NOT EXISTS trees_lsn ON trees (lsn);")?;
         let _ = self.conn.cache_flush();
         self.restore_journal()?;
         crate::snapshot::remove_bulk_marker(std::path::Path::new(&path))
@@ -1783,16 +1796,28 @@ impl StateDb {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Whether an ingress key is older than `before_ms`. `ingress_keys_time`
+    /// makes this a search, not a scan (#162).
+    pub fn has_ingress_before(&self, before_ms: u64) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .prepare_cached(INGRESS_BEFORE)?
+            .query_row([i(before_ms)], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
     /// Compaction (m6-storage §5): forgets index rows of LSNs below
     /// `first_lsn` (their segments are gone) and ingress keys older than
-    /// `ingress_before_ms`.
+    /// `ingress_before_ms`. The `trees` and `ingress_keys` deletes use
+    /// `trees_lsn` and `ingress_keys_time`, not a table scan (#162).
     pub fn compact(&mut self, first_lsn: Lsn, ingress_before_ms: u64) -> Result<(), StoreError> {
         let tx = self.conn.savepoint()?;
         tx.execute(
             "DELETE FROM turn_index WHERE lsn < ?1",
             params![i(first_lsn)],
         )?;
-        tx.execute("DELETE FROM trees WHERE lsn < ?1", params![i(first_lsn)])?;
+        tx.execute(COMPACT_TREES, params![i(first_lsn)])?;
         // M24: closed connections whose close is below the retention base
         // (ADR 0114, amended); turns never read them, so this changes no
         // turn's outcome, and the live `connections` stay.
@@ -1804,10 +1829,7 @@ impl StateDb {
             "DELETE FROM segments WHERE last_lsn < ?1",
             params![i(first_lsn)],
         )?;
-        tx.execute(
-            "DELETE FROM ingress_keys WHERE logical_time_ms < ?1",
-            params![i(ingress_before_ms)],
-        )?;
+        tx.execute(COMPACT_INGRESS, params![i(ingress_before_ms)])?;
         tx.commit()?;
         Ok(())
     }
@@ -5883,6 +5905,23 @@ mod tests {
         );
     }
 
+    fn assert_search_at(conn: &Connection, sql: &str, arg: i64) {
+        let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan: Vec<String> = st
+            .query_map([arg], |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|d| d.starts_with("SEARCH ")),
+            "{sql} has no indexed lookup: {plan:?}"
+        );
+        assert!(
+            plan.iter().all(|d| !d.starts_with("SCAN ")),
+            "{sql} scans: {plan:?}"
+        );
+    }
+
     /// Issue #161: subject deletes and queued-body tombstones use an index.
     /// A large unrelated kv table and mailbox are not scanned to erase one
     /// subject.
@@ -6114,5 +6153,91 @@ mod tests {
         assert_eq!((timer, mail), ("user:9".into(), "user:9".into()));
         assert_search(&db.conn, super::TIMER_SUBJECT_PROBE);
         assert_search(&db.conn, super::MAILBOX_SUBJECT_PROBE);
+    }
+    /// Issue #162: the retention deletes search, and they delete only the
+    /// rows below the bound.
+    #[test]
+    fn compaction_range_deletes_search_and_keep_newer_rows() {
+        let mut db = StateDb::open(Connection::open_in_memory().unwrap()).unwrap();
+        for sql in [
+            super::COMPACT_TREES,
+            super::COMPACT_INGRESS,
+            super::INGRESS_BEFORE,
+        ] {
+            assert_search_at(&db.conn, sql, 1);
+        }
+        db.conn
+            .execute_batch(
+                "INSERT INTO trees (root, lsn) VALUES ('a', 1), ('a', 5), ('b', 9);
+                 INSERT INTO ingress_keys
+                   (kind, key, idem_key, request_hash, lsn, logical_time_ms, outcome)
+                 VALUES ('counter', 'a', 'old', x'', 1, 10, x''),
+                        ('counter', 'a', 'new', x'', 2, 100, x'');",
+            )
+            .unwrap();
+        assert!(db.has_ingress_before(50).unwrap());
+        assert!(!db.has_ingress_before(10).unwrap());
+        db.compact(5, 50).unwrap();
+        let lsns: Vec<i64> = db
+            .conn
+            .prepare("SELECT lsn FROM trees ORDER BY lsn")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(lsns, [5, 9]);
+        let times: Vec<i64> = db
+            .conn
+            .prepare("SELECT logical_time_ms FROM ingress_keys")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(times, [100]);
+    }
+
+    /// An existing database gains the compaction indexes on open.
+    #[test]
+    fn open_adds_compaction_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let db = StateDb::open(Connection::open(&path).unwrap()).unwrap();
+            db.conn
+                .execute_batch("DROP INDEX trees_lsn; DROP INDEX ingress_keys_time;")
+                .unwrap();
+        }
+        let db = StateDb::open(Connection::open(&path).unwrap()).unwrap();
+        for sql in [
+            super::COMPACT_TREES,
+            super::COMPACT_INGRESS,
+            super::INGRESS_BEFORE,
+        ] {
+            assert_search_at(&db.conn, sql, 1);
+        }
+    }
+
+    /// Replacing `trees` during catch-up drops `trees_lsn`; the index is
+    /// created again before the applier resumes.
+    #[test]
+    fn bulk_replay_rebuild_keeps_the_trees_lsn_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = StateDb::open(Connection::open(dir.path().join("state.db")).unwrap()).unwrap();
+        db.begin_bulk_replay().unwrap();
+        let records = [
+            committed(1, begin("e1", "r1", http_input())),
+            committed(2, turn("e1", "r1", http_input())),
+        ];
+        let rows = CatchupRows::of(&records, 0).unwrap().expect("simple http");
+        db.apply_rows(rows).unwrap();
+        db.end_bulk_replay().unwrap();
+        let n: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM trees", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the rebuild had a row to copy");
+        assert_search_at(&db.conn, super::COMPACT_TREES, 1);
     }
 }

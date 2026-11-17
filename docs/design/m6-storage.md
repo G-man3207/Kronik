@@ -253,7 +253,11 @@ before anything moves into place.
 - **Index compaction.** Rows of `turn_index` and `trees` for deleted LSNs
   are deleted; `history` and `trace` end at the oldest retained LSN.
   Dead letters keep their input (they don't need the segment); ingress
-  keys past their TTL are deleted in the same pass.
+  keys past their TTL are deleted in the same pass. `DELETE FROM trees
+  WHERE lsn < ?` and `DELETE FROM ingress_keys WHERE logical_time_ms < ?`
+  use `trees_lsn` and `ingress_keys_time`, so they search rather than scan
+  under the store lock. A pass that deletes no segment and has no ingress
+  key past TTL does not run them.
 - Reseal for privacy mode rides on compaction in M8.
 
 ## 6. Restore

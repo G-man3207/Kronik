@@ -744,6 +744,120 @@ fn the_audit_hold_gives_way_between_snapshot_passes() {
     assert!(ran <= 1, "the index rows were compacted {ran} times");
 }
 
+/// Issue #162: the hourly pass (`compact`, which retention calls) does not
+/// delete `trees` or ingress keys when no segment went and no ingress key
+/// is past TTL. `db_compactions` increments only immediately before that
+/// locked delete, so an unchanged count means the state.db mutex was not
+/// held for a scan of the large `trees` table. The delete's plan on that
+/// table is a search, not a scan.
+#[test]
+fn a_noop_hourly_retention_does_not_scan_trees_under_the_store_lock() {
+    let dir = tempdir();
+    let p = start(dir.path(), 2);
+    const ROWS: i64 = 20_000;
+    {
+        let db = p.node.store().db();
+        let tx = db.conn().unchecked_transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO trees (root, lsn) VALUES (?1, ?2)")
+                .unwrap();
+            for n in 1..=ROWS {
+                insert.execute((format!("r{n}"), n)).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let mut plan = db
+            .conn()
+            .prepare("EXPLAIN QUERY PLAN DELETE FROM trees WHERE lsn < ?1")
+            .unwrap();
+        let detail: Vec<String> = plan
+            .query_map([1i64], |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            detail.iter().any(|d| d.starts_with("SEARCH ")),
+            "trees delete has no indexed lookup: {detail:?}"
+        );
+        assert!(
+            detail.iter().all(|d| !d.starts_with("SCAN ")),
+            "trees delete scans: {detail:?}"
+        );
+    }
+    let storage = p.node.storage_config().unwrap().clone();
+    let before = p.node.db_compactions();
+    assert_eq!(p.node.compact(&storage).unwrap(), 1);
+    assert_eq!(
+        p.node.db_compactions(),
+        before,
+        "a no-op pass held the store lock for the index deletes"
+    );
+    let left: i64 = p
+        .node
+        .store()
+        .db()
+        .conn()
+        .query_row("SELECT count(*) FROM trees", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, ROWS);
+}
+
+/// An ingress key past TTL is still deleted when no segment went. A key at
+/// the high-water mark, and a `trees` row at or above the log's first LSN,
+/// stay. A row below the first LSN goes with the indexed delete.
+#[test]
+fn hourly_retention_deletes_an_ingress_key_past_ttl_without_a_segment() {
+    let dir = tempdir();
+    let p = start(dir.path(), 2);
+    // A thousand days past the default 24h TTL. The kept key is at the mark.
+    const HWM: i64 = 1_000 * 24 * 3600 * 1000;
+    {
+        let db = p.node.store().db();
+        db.conn()
+            .execute("UPDATE meta SET v = ?1 WHERE k = 'time_hwm'", [HWM])
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO ingress_keys
+                   (kind, key, idem_key, request_hash, lsn, logical_time_ms, outcome)
+                 VALUES ('counter', 'a', 'old', x'', 1, 1, x''),
+                        ('counter', 'a', 'new', x'', 2, ?1, x'')",
+                [HWM],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO trees (root, lsn) VALUES ('gone', 0), ('kept', 5)",
+                [],
+            )
+            .unwrap();
+    }
+    let storage = p.node.storage_config().unwrap().clone();
+    let before = p.node.db_compactions();
+    assert_eq!(p.node.compact(&storage).unwrap(), 1);
+    assert_eq!(p.node.db_compactions(), before + 1);
+    let db = p.node.store().db();
+    let keys: Vec<String> = db
+        .conn()
+        .prepare("SELECT idem_key FROM ingress_keys ORDER BY idem_key")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(keys, ["new"]);
+    let roots: Vec<String> = db
+        .conn()
+        .prepare("SELECT root FROM trees ORDER BY root")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(roots, ["kept"]);
+}
+
 /// A rewind during delivery holds its cut until matching durable completion.
 #[test]
 fn a_rewind_holds_retention_past_a_batch_in_flight() {
