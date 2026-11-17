@@ -395,11 +395,12 @@ can pass, and the first is a decision for the project, not an upstream event.
    versions of `clocks`, `random` and `cli` [INFERENCE], so the allowlist and
    the linker need a p3 subset of those, not only of `wasi:http`.
 4. **Security fixes.** The banner says that fixes limited to wasip3 get no
-   patch releases, and `deny.toml` keeps `ignore = []`, so every advisory has
-   to be fixed by upgrading. Once Kronik links `p3`, a p3-only advisory could
-   be fixed only by the next major Wasmtime: a new engine id and a `kronik
-   upgrade check` (ADR 0001 §3), with `cargo deny` failing until then
-   [INFERENCE]. This is why part (a) matters beyond maturity.
+   patch releases, and `deny.toml` does not ignore vulnerability advisories
+   (ADR 0154 records only the unmaintained chrono and humantime exceptions),
+   so every advisory has to be fixed by upgrading. Once Kronik links `p3`, a
+   p3-only advisory could be fixed only by the next major Wasmtime: a new
+   engine id and a `kronik upgrade check` (ADR 0001 §3), with `cargo deny`
+   failing until then [INFERENCE]. This is why part (a) matters beyond maturity.
 
 ### The vehicle for the criterion
 

@@ -371,10 +371,56 @@ step_deny() {
         echo "error: cargo-deny is not installed; install it with: cargo install --locked cargo-deny" >&2
         return 1
     fi
+    # Both unmaintained exceptions must be recorded with a reason. A bare id,
+    # or an exception for only one of the two, is not enough (ADR 0154).
+    python3 - <<'PY'
+import pathlib, re, sys
+text = pathlib.Path("deny.toml").read_text()
+if not re.search(r'^unmaintained\s*=\s*"all"', text, re.M):
+    sys.exit("error: deny.toml must keep unmaintained = \"all\"")
+for advisory in ("RUSTSEC-2026-0542", "RUSTSEC-2026-0543"):
+    match = re.search(
+        r'\{\s*id\s*=\s*"' + advisory + r'"\s*,\s*reason\s*=\s*"([^"]+)"',
+        text,
+    )
+    if not match or len(match.group(1).strip()) < 20:
+        sys.exit(f"error: deny.toml has no reasoned exception for {advisory}")
+PY
     cargo deny --locked --all-features check
     # The examples (with the Rust SDK) have a lockfile of their own, and their
-    # few dependencies use only some of the licenses deny.toml allows.
-    cargo deny --manifest-path examples/Cargo.toml --locked check -A license-not-encountered
+    # few dependencies use only some of the licenses deny.toml allows. They
+    # also do not resolve chrono or humantime, so the exceptions above are
+    # unused in that graph.
+    cargo deny --manifest-path examples/Cargo.toml --locked check \
+        -A license-not-encountered -A advisory-not-detected
+    # The same graph with an empty ignore list must still fail both
+    # advisories. Reintroducing either crate without its exception fails
+    # this step.
+    local stripped out status advisory
+    stripped=$(mktemp)
+    python3 -c '
+import pathlib, sys
+text = pathlib.Path("deny.toml").read_text()
+start = text.index("ignore = [")
+end = text.index("]", start)
+pathlib.Path(sys.argv[1]).write_text(text[:start] + "ignore = []" + text[end + 1:])
+' "$stripped"
+    set +e
+    out=$(cargo deny --locked --all-features --config "$stripped" check advisories 2>&1)
+    status=$?
+    set -e
+    rm -f "$stripped"
+    if [ "$status" -eq 0 ]; then
+        echo "error: deny passed with an empty advisory ignore list" >&2
+        return 1
+    fi
+    for advisory in RUSTSEC-2026-0542 RUSTSEC-2026-0543; do
+        if ! printf '%s\n' "$out" | grep -q "$advisory"; then
+            echo "error: empty ignore list did not fail $advisory" >&2
+            printf '%s\n' "$out" >&2
+            return 1
+        fi
+    done
 }
 
 # M7: foreign actors in real gVisor sandboxes. Needs root and runsc

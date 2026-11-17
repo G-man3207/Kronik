@@ -5,7 +5,12 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
-
+- `cargo deny` records exceptions for unmaintained `humantime`
+  (RUSTSEC-2026-0542) and `chrono` (RUSTSEC-2026-0543). Neither has a
+  patched release, and the locked graph still resolves them through
+  `object_store`, `oci-client`, `rmcp` and `schemars`. `unmaintained`
+  stays `"all"`, so either crate without its exception still fails the
+  check (ADR 0154).
 - The admin UI no longer treats a failed first load or bearer connect as
   sign-out. HTTP 401 and 403 still clear the session, the in-memory bearer
   and the displayed data. Any other failure keeps them, so the operator can
