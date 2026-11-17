@@ -8,6 +8,7 @@
   let session = null;
   let controller = null;
   let authVersion = 0;
+  let authCleared = false;
   let oidcEnabled = false;
   const oidcReasons = {
     not_configured: "OIDC has no admitted enabled profile.",
@@ -122,6 +123,7 @@
   }
 
   function clearAuth() {
+    authCleared = true;
     authVersion += 1;
     token = "";
     session = null;
@@ -545,6 +547,7 @@
     event.preventDefault();
     const supplied = $("bearer-token").value;
     clearAuth();
+    authCleared = false; // dropping the previous session is not a rejected sign-in
     token = supplied;
     $("token-connect").disabled = true;
     perform(async () => {
@@ -554,8 +557,10 @@
           $("token-alternative").open = false;
           await navigate();
         }
-      } catch (error) { clearAuth(); throw error; }
-      finally { $("token-connect").disabled = false; }
+      } catch (error) {
+        if (!authCleared) $("bearer-token").value = supplied;
+        throw error;
+      } finally { $("token-connect").disabled = false; }
     });
   });
 
@@ -583,10 +588,18 @@
     $("main").focus();
   });
   window.addEventListener("hashchange", () => perform(() => navigate()));
-  perform(async () => {
+  async function boot() {
+    authCleared = false;
     try {
       await checkSession();
       await navigate(false);
-    } catch (error) { clearAuth(); throw error; }
-  });
+    } catch (error) {
+      if (!authCleared && !$("refresh-button")) {
+        content.setAttribute("aria-busy", "false");
+        content.append(button("Refresh view", boot, { id: "refresh-button" }));
+      }
+      throw error;
+    }
+  }
+  perform(boot);
 })();

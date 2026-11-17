@@ -395,7 +395,11 @@ A current session is not historical proof. Native approvals keep this field abse
 
 Bearer tokens keep working. The optional password field holds a bearer only in
 memory and sends Authorization without cookies; clearing it does not revoke it.
-No credential is stored in localStorage, sessionStorage or offline caches.
+A first load or token connect that fails with anything other than HTTP 401 or
+403 keeps the session and the typed bearer, so the page can be retried without
+a reload. Only those statuses, or logout, clear the session, the bearer and
+the displayed data. No credential is stored in localStorage, sessionStorage
+or offline caches.
 Mutations retain reason/dry-run, proposal hashes, catch-up and required approvals.
 
 `scripts/e2e-ui-oidc.py` runs the finite owned TLS/code/JWT fixture. Its browser

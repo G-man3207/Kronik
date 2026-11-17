@@ -6,6 +6,10 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- The admin UI no longer treats a failed first load or bearer connect as
+  sign-out. HTTP 401 and 403 still clear the session, the in-memory bearer
+  and the displayed data. Any other failure keeps them, so the operator can
+  retry from the page without reloading or pasting the token again.
 - `kronik explain IMPORT_NOT_ALLOWED` no longer says every `wasi:http` import
   is denied. `wasi:http/types` and `wasi:http/outgoing-handler` at 0.2.x are
   allowed and become `http.fetch` effects; incoming-handler, filesystem and
