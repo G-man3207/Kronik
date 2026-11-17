@@ -6,6 +6,10 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- `examples/payments-platform` adds dogfood scenario 1: a refactor-only
+  `billing-ts-refactor.wasm` must replay with zero divergent turns and
+  propose with policy `allow`. `demo/payments-platform-pure-refactor.sh`
+  exercises it with billing-ts, the ledger actor and fake-payments.
 - The retention pass's orphan-pin sweep now probes each pin's source row by
   an indexed generated `owner` column on `timers`, `ingress_keys` and
   `dead_letters` (added on open to an existing `state.db`) instead of
