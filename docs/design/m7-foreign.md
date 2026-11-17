@@ -456,18 +456,23 @@ decimals (`0.5`). `--json` prints the response body unchanged.
   resolution and digest checks (a tampered blob, a wrong size, a wrong
   `diff_id`); unpacking (whiteouts, opaque directories, hostile symlinks,
   `..`, hard links, entry types, limits); `config.json` (user resolution,
-  env merge, limits, mounts, namespaces); secret env names; log rotation
-  and tail; backoff.
+  env merge, limits, mounts, namespaces); a trusted declaration's spec denies
+  `unshare`, `mount`, `bpf` and `io_uring_setup` (gVisor and microvm specs do
+  not); secret env names; log rotation and tail; backoff.
 - **Integration** (`crates/kronik/tests/foreign.rs`, needs root and runsc;
   skipped with a message otherwise; `scripts/ci.sh foreign` runs it with
   `KRONIK_FOREIGN_TESTS=require`, which turns a skip into a failure; GitHub
-  CI installs gVisor with `scripts/install-runsc.sh` and runs it under `sudo`): a
+  CI installs gVisor with `scripts/install-runsc.sh` and runc at
+  `/usr/bin/runc`, and runs it under `sudo`): a
   daemon with the `foreign-echo` layout (`examples/foreign-echo`,
   `scripts/build-foreign-examples.sh`) where a test actor calls
   `foreign://echo/...`; the calls are in the log as `foreign.http`; a fork
   replay matches them exactly while the sandbox is stopped and no sandbox
   starts; `GET /egress` inside the sandbox (TCP and UDP to public, private
-  and host addresses, DNS) fails every attempt; `remove` stops the sandbox
+  and host addresses, DNS) fails every attempt; the trusted actor needs runc
+  at `/usr/bin/runc` and, under require, a missing binary fails instead of
+  skipping; that actor's loaded seccomp filter is asserted (failed egress is
+  the empty netns, not the filter); `remove` stops the sandbox
   and deletes its namespace and cgroup; `POST /exit` restarts it with
   backoff; a secret reaches the program's environment and never the log.
 - **Registry fetch**: `kronik-foreign`'s ignored `pull_smoke` test against a

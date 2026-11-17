@@ -115,8 +115,10 @@ and `cargo-deny`. Some steps need more:
   access on first use), so a libc function that musl lacks fails here.
 - `foreign` needs root and gVisor's `runsc` (`scripts/install-runsc.sh`) and
   is skipped with a message without them, unless
-  `KRONIK_FOREIGN_TESTS=require`. When it runs, it also needs Docker for the
-  pinned Postgres image, and skopeo for the registry test.
+  `KRONIK_FOREIGN_TESTS=require`. The trusted actor also needs runc at
+  `/usr/bin/runc`; CI installs it, and under require its absence fails the
+  foreign test instead of skipping. When the step runs, it also needs Docker
+  for the pinned Postgres image, and skopeo for the registry test.
 - `s3` runs the S3 variants of the shipping, restore, blob and audit-sink
   tests against moto's S3 server (`scripts/s3.sh`). It needs Docker and is
   skipped with a message without it, unless `KRONIK_TEST_S3=require`.

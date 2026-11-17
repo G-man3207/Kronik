@@ -4,7 +4,8 @@
 //! and `scripts/build-foreign-examples.sh` (`--only foreign-probe` for the
 //! probe); without them the tests say why and pass, unless
 //! `KRONIK_FOREIGN_TESTS=require` (`scripts/ci.sh foreign`), which turns that
-//! into a failure.
+//! into a failure. The trusted actor also needs runc at `/usr/bin/runc`;
+//! under require that absence fails instead of skipping.
 
 // Test harness code: unwraps, std threads and std time are fine here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
@@ -542,8 +543,20 @@ fn foreign_actors_end_to_end() {
     let (r, last_call) = d.fetch_lsn("GET foreign://echo/healthz");
     assert_eq!(r, "200 ok");
 
-    // trusted: plain runc, with a warning; still no network out.
-    if Path::new("/usr/bin/runc").exists() {
+    // trusted: plain runc and the host kernel. Egress denial is the empty
+    // netns, not the seccomp filter.
+    let runc = Path::new("/usr/bin/runc");
+    if !runc.exists() {
+        assert!(
+            std::env::var("KRONIK_FOREIGN_TESTS").as_deref() != Ok("require"),
+            "KRONIK_FOREIGN_TESTS=require, but needs runc at {}",
+            runc.display()
+        );
+        eprintln!(
+            "skipped: trusted isolation needs runc at {}",
+            runc.display()
+        );
+    } else {
         let v = d.ok(
             "POST",
             "/v1/foreign",
@@ -555,6 +568,29 @@ fn foreign_actors_end_to_end() {
             "{v}"
         );
         assert_eq!(v["foreign"]["status"]["state"], "running", "{v}");
+        // shortcut: runc's state.json keeps loaded syscall names as strings, if a release stops writing them assert a denied syscall from inside the sandbox
+        let id = kronik_foreign::container_id("echo-t");
+        let state_path = dir.join("run/runc").join(&id).join("state.json");
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap_or_else(|e| {
+                panic!(
+                    "trusted sandbox has no runc state at {}: {e}",
+                    state_path.display()
+                )
+            }))
+            .unwrap();
+        let seccomp = &state["config"]["seccomp"];
+        assert!(
+            !seccomp.is_null(),
+            "trusted sandbox has no seccomp filter: {state}"
+        );
+        let listed = seccomp.to_string();
+        for syscall in ["unshare", "mount", "bpf", "io_uring_setup"] {
+            assert!(
+                listed.contains(&format!("\"{syscall}\"")),
+                "trusted filter missing {syscall}: {seccomp}"
+            );
+        }
         d.ok(
             "POST",
             "/v1/grants",
