@@ -774,17 +774,19 @@ impl Node {
         let log_dir = log_cfg.dir.clone();
         let space_dir = log_dir.clone();
         let group_commit_window = log_cfg.group_commit_window;
-        let native_source_first_lsn = log_cfg.first_lsn;
         // What state.db applied was fsynced and acknowledged: the log must
         // never cut it off as a torn tail (#26).
         log_cfg.acknowledged_through = store.applied.get();
         let (log, opened) = Log::open(&env, log_cfg, committed_tx, fatal_tx).await?;
         let writer = log.bind_native_execution(publication.clone(), lifecycle.ownership())?;
+        // The opened log's first LSN, not the config default: after compaction
+        // the retained start is later than 1, and a source must not treat that
+        // gap as a missing prefix (#160).
         let native_execution = crate::native_execution::NativeExecution::new(
             publication.clone(),
             lifecycle.clone(),
             writer,
-            native_source_first_lsn,
+            opened.first_lsn,
         );
         let native_recovery = native_execution
             .recovery_authority()

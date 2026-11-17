@@ -173,7 +173,9 @@ impl NativeExecution {
     }
     /// Positive provenance of the native Node constructor and its actual bound
     /// WAL writer. This is a historical source fact, never an execution grant:
-    /// stopped execution may still read its original history.
+    /// stopped execution may still read its original history. The LSN is the
+    /// opened log's first record, not the config default; retention may move
+    /// the live start further, so it is not a walk cursor.
     pub(crate) fn native_source_start(
         &self,
         node: &crate::Node,

@@ -49,6 +49,16 @@ impl Node {
     /// A source is a historical frame, not current authority. The native
     /// constructor supplies the shard domain; the held WAL header supplies the
     /// namespace. The caller proves the existing record's exact edge role.
+    ///
+    /// The frame comes from `turn_index` or `open_turns` and one
+    /// `read_at_with_namespace`. The applied index is the dense-prefix
+    /// watermark: a row exists only after those records were decoded in
+    /// order, and a gap before the opened log's first LSN is retention, not
+    /// an incomplete prefix. A call does not walk earlier records.
+    ///
+    /// shortcut: a CRC-valid unknown frame spliced into an already-applied
+    /// prefix is not re-read on each call, upgrade when a provenance
+    /// projection can name that frame without a walk.
     pub async fn actor_source(
         &self,
         lsn: Lsn,
@@ -60,58 +70,59 @@ impl Node {
                 "invalid actor source position",
             ));
         }
-        let first = self.native_execution.native_source_start(self, &self.log)?;
-        if lsn < first {
+        let opened_first = self.native_execution.native_source_start(self, &self.log)?;
+        if lsn < opened_first {
             return Err(ApiError::new(
                 ErrorCode::Unavailable,
                 "actor source predates its original native log",
             ));
         }
-        let mut source = None;
-        let mut expected = first;
-        // Without a member/provenance projection this native profile cannot
-        // claim a source after an unknown record or a missing historical prefix.
-        // Decode the dense prefix in bounded frames; never call truncation complete.
-        self.reader
-            .read_while_with_namespace(first, lsn, |branch, committed| {
-                if committed.lsn != expected {
-                    return Err(kronik_log::LogError::Corrupt(
-                        "incomplete native source prefix".into(),
-                    ));
-                }
-                if committed.lsn < lsn {
-                    expected += 1;
-                    return Ok(true);
-                }
-                if !matches!(
-                    &committed.record,
-                    Record::TurnBegin(_) | Record::TurnRecord(_)
-                ) || !matches(&committed.record)
-                {
-                    return Err(kronik_log::LogError::Corrupt(
-                        "actor source does not match its original turn".into(),
-                    ));
-                }
-                let actual = pb::ActorSource {
-                    shard: None,
-                    lsn: committed.lsn,
-                    branch: branch.to_owned(),
-                };
-                actual.validate().map_err(|_| {
-                    kronik_log::LogError::Corrupt("invalid original actor source namespace".into())
-                })?;
-                source = Some(actual);
-                Ok(false)
-            })
-            .await
-            .map_err(|error| ApiError::new(ErrorCode::StorageCorrupt, error.to_string()))?;
-        self.native_execution.native_source_start(self, &self.log)?;
-        source.ok_or_else(|| {
-            ApiError::new(
+        let pos = {
+            let db = self.store.db();
+            match db.turn(lsn).map_err(store_err)? {
+                Some(turn) => Some(turn.pos),
+                None => db.open_turn(lsn).map_err(store_err)?.map(|turn| turn.pos),
+            }
+        };
+        let Some(pos) = pos else {
+            // Not an applied turn or an open begin. An unknown frame appended
+            // after the watermark is not a source, and walking to it would
+            // repeat the prefix check this path exists to avoid.
+            return Err(ApiError::new(
                 ErrorCode::Unavailable,
                 "the original actor source frame is unavailable",
+            ));
+        };
+        let (branch, committed) = self
+            .reader
+            .read_at_with_namespace(pos)
+            .await
+            .map_err(|error| ApiError::new(ErrorCode::StorageCorrupt, error.to_string()))?;
+        if committed.lsn != lsn
+            || !matches!(
+                &committed.record,
+                Record::TurnBegin(_) | Record::TurnRecord(_)
             )
-        })
+            || !matches(&committed.record)
+        {
+            return Err(ApiError::new(
+                ErrorCode::StorageCorrupt,
+                "actor source does not match its original turn",
+            ));
+        }
+        let actual = pb::ActorSource {
+            shard: None,
+            lsn: committed.lsn,
+            branch,
+        };
+        actual.validate().map_err(|_| {
+            ApiError::new(
+                ErrorCode::StorageCorrupt,
+                "invalid original actor source namespace",
+            )
+        })?;
+        self.native_execution.native_source_start(self, &self.log)?;
+        Ok(actual)
     }
 }
 
