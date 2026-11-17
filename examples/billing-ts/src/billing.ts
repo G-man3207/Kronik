@@ -159,7 +159,44 @@ function draft(req: Request, ctx: Ctx, id: string): Output {
   return ctx.json(previous === undefined ? 201 : 200, invoice);
 }
 
-function finalize(ctx: Ctx, id: string, vatRule: VatRule): Output {
+function pingPayments(ctx: Ctx): void {
+  const cfg = config(ctx);
+  // Live fork GETs need an http(s) target (ADR 0020 / m3-fork §11), not foreign://.
+  const base = cfg.payments.replace(/^foreign:\/\//, "https://");
+  const res = ctx.http.fetch({ method: "GET", url: `${base}/healthz` });
+  if (!res.ok) throw new Rejected(`payments health check answered ${res.status}`);
+}
+
+function charge(ctx: Ctx, invoice: Invoice): void {
+  const cfg = config(ctx);
+  const res = ctx.http.fetch({
+    method: "POST",
+    url: `${cfg.payments}/v1/charges`,
+    headers: cfg.api_key_secret === null ? {} : { authorization: ctx.secret(cfg.api_key_secret).header("Bearer {}") },
+    body: { customer: invoice.customer, invoice: invoice.id, amount: invoice.total, currency: invoice.currency },
+  });
+  if (!res.ok) {
+    let reason = `the payments service answered ${res.status}`;
+    try {
+      reason += `: ${res.json<{ error?: { code?: string } }>().error?.code ?? "no error code"}`;
+    } catch {
+      // Not JSON; the status says enough.
+    }
+    throw new Rejected(`invoice ${invoice.id} was not charged: ${reason}`);
+  }
+  invoice.charge = res.json<{ id: string }>().id;
+}
+
+function postLedger(ctx: Ctx, invoice: Invoice, id: string): void {
+  const posted = ctx.call(
+    `ledger/${invoice.customer}`,
+    { name: "post", body: { invoice: id, amount: invoice.total, currency: invoice.currency } },
+    { name: "reverse", body: { invoice: id } },
+  );
+  invoice.ledger_entry = posted?.json<{ entry: number }>().entry ?? null;
+}
+
+function finalize(ctx: Ctx, id: string, vatRule: VatRule, pingPaymentsAfterCharge: boolean): Output {
   const invoice = ctx.state.getJson<Invoice>(`invoice/${id}`);
   if (invoice === undefined) return ctx.status(404);
   if (invoice.status !== "draft") throw new Conflict(`invoice ${id} is already ${invoice.status}`);
@@ -171,39 +208,19 @@ function finalize(ctx: Ctx, id: string, vatRule: VatRule): Output {
   invoice.vat = vatOf(invoice.net, vat.rate_bp);
   invoice.total = invoice.net + invoice.vat;
 
-  // The ledger commits its posting now. If this turn fails later, for
-  // instance because the charge is declined, it gets `reverse` instead.
-  const posted = ctx.call(
-    `ledger/${invoice.customer}`,
-    { name: "post", body: { invoice: id, amount: invoice.total, currency: invoice.currency } },
-    { name: "reverse", body: { invoice: id } },
-  );
-  invoice.ledger_entry = posted?.json<{ entry: number }>().entry ?? null;
+  // The ledger commits now. If this turn fails later, for instance because the
+  // charge is declined, it gets `reverse` instead.
+  postLedger(ctx, invoice, id);
+  charge(ctx, invoice);
+  if (pingPaymentsAfterCharge) pingPayments(ctx);
 
-  const cfg = config(ctx);
-  const res = ctx.http.fetch({
-    method: "POST",
-    url: `${cfg.payments}/v1/charges`,
-    headers: cfg.api_key_secret === null ? {} : { authorization: ctx.secret(cfg.api_key_secret).header("Bearer {}") },
-    body: { customer: invoice.customer, invoice: id, amount: invoice.total, currency: invoice.currency },
-  });
-  if (!res.ok) {
-    let reason = `the payments service answered ${res.status}`;
-    try {
-      reason += `: ${res.json<{ error?: { code?: string } }>().error?.code ?? "no error code"}`;
-    } catch {
-      // Not JSON; the status says enough.
-    }
-    throw new Rejected(`invoice ${id} was not charged: ${reason}`);
-  }
-  invoice.charge = res.json<{ id: string }>().id;
   invoice.status = "paid";
   invoice.updated_ms = ctx.now();
   ctx.state.setJson(`invoice/${id}`, invoice);
   return ctx.json(200, invoice);
 }
 
-function route(req: Request, ctx: Ctx, vatRule: VatRule): Output {
+function route(req: Request, ctx: Ctx, vatRule: VatRule, pingPaymentsAfterCharge: boolean): Output {
   const id = req.param("id");
   if (id === undefined) {
     if (req.method === "PUT") {
@@ -221,14 +238,18 @@ function route(req: Request, ctx: Ctx, vatRule: VatRule): Output {
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) return ctx.status(404);
   // /billing/{key}/invoices/{id}/finalize has one segment more than the
   // invoice itself (whose id may well be "finalize").
-  if (req.path.split("/").length === 6) return finalize(ctx, id, vatRule);
+  if (req.path.split("/").length === 6) return finalize(ctx, id, vatRule, pingPaymentsAfterCharge);
   if (req.method === "POST") return draft(req, ctx, id);
   const invoice = ctx.state.getJson<Invoice>(`invoice/${id}`);
   return invoice === undefined ? ctx.status(404) : ctx.json(200, invoice);
 }
 
 /** The billing actor type, with `vatRule` choosing each invoice's VAT. */
-export function billing(vatRule: VatRule): Handler {
+export function billing(
+  vatRule: VatRule,
+  opts: { pingPaymentsAfterCharge?: boolean } = {},
+): Handler {
+  const pingPaymentsAfterCharge = opts.pingPaymentsAfterCharge === true;
   return actor({
     kind: "billing",
     schemaVersion: 0,
@@ -243,7 +264,7 @@ export function billing(vatRule: VatRule): Handler {
 
     http(req, ctx) {
       try {
-        return route(req, ctx, vatRule);
+        return route(req, ctx, vatRule, pingPaymentsAfterCharge);
       } catch (e) {
         if (e instanceof BadRequest) return ctx.json(400, { error: e.message });
         if (e instanceof Conflict) return ctx.json(409, { error: e.message });
