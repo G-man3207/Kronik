@@ -362,13 +362,17 @@ fields are 0 when the node has no storage config.
   database's canonical SQL hash (ADR 0005). Positions and other derived
   index columns are excluded, so a restored node built from a snapshot plus
   segments hashes the same as the original. An actor database hashes its
-  committed rows: while a turn has its savepoint open, the hash comes from
-  a copy of the committed state (`SqlActor::committed_hash`, a
-  `.hash-copy-<file>.tmp` file deleted after and swept at start; a
-  snapshot hashes its copies), so `state_hash` is always the applied
-  LSN's.
+  committed rows. `GET /v1/integrity` hashes a private copy of those
+  databases and does not hold the apply lock across the copy or the hash
+  (ADR 0153); a turn's open savepoint is not in the copy. The copy is named
+  `.hash-copy-` under `sql/` and deleted after; one a crash left is swept
+  at start. A snapshot hashes its own copies the same way, so `state_hash`
+  is always the applied LSN's.
 - `log_hash` = BLAKE3 over the encoded records `log_first_lsn..=through_lsn`
-  (`applied_lsn` unless `through` is given).
+  (`applied_lsn` unless `through` is given). The handler keeps that hasher
+  and resumes from the last LSN it hashed, instead of reading the log from
+  LSN 1 on every request. A `through` behind the tip uses a saved prefix.
+  The bytes are unchanged, so a restored node at the same LSN still matches.
 - `demo/vps-restore.sh` compares the state hash, the log hash through the
   source's applied LSN, and the history of sample actors, between the
   source and the restored node; after that LSN the restored node holds

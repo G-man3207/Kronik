@@ -108,35 +108,7 @@ impl Api {
             ));
         }
         let upto = through.unwrap_or(applied);
-        let mut first = None;
-        let mut h = blake3::Hasher::new();
-        let mut needed = kronik_store::db::SubjectKeys::new();
-        self.node
-            .reader()
-            .read(1, applied, |mut c| {
-                first.get_or_insert(c.lsn);
-                if c.lsn > applied {
-                    return Ok(());
-                }
-                if c.lsn <= upto {
-                    h.update(&c.lsn.to_le_bytes());
-                    h.update(&[c.record.kind()]);
-                    h.update(&c.record.encode());
-                }
-                kronik_proto::sealables::record_mut(
-                    &mut c.record,
-                    &mut kronik_store::db::note_sealed(&mut needed),
-                );
-                Ok(())
-            })
-            .await
-            .map_err(internal)?;
-        if applied > 0 && first.is_none() {
-            return Err(ApiError::new(
-                ErrorCode::StorageCorrupt,
-                "the log holds no records",
-            ));
-        }
+        let (log_first_lsn, log_hash, mut needed) = self.hashed_log(applied, upto).await?;
         let (retention_history_ms, newest_logical_time_ms, retention_cutoff_ms) =
             match self.node.storage_config() {
                 Some(storage) => {
@@ -172,12 +144,301 @@ impl Api {
             keys_missing,
             applied_lsn: applied,
             state_hash,
-            log_first_lsn: first.unwrap_or(1),
-            log_hash: format!("b3:{}", h.finalize().to_hex()),
+            log_first_lsn,
+            log_hash,
             through_lsn: upto,
             retention_history_ms,
             newest_logical_time_ms,
             retention_cutoff_ms,
         })
+    }
+}
+
+/// Resumes the log hash from the last LSN this process hashed, not from LSN 1
+/// on every request (ADR 0153). Marks let a `through` behind the tip resume
+/// from a saved prefix.
+pub(super) struct IntegrityLog {
+    inner: tokio::sync::Mutex<LogHashState>,
+}
+
+struct LogHashState {
+    ready: bool,
+    origin: Option<u64>,
+    tip: u64,
+    hasher: blake3::Hasher,
+    needed: kronik_store::db::SubjectKeys,
+    /// `(lsn, hasher after records through lsn)`, ascending. `0` is the empty prefix.
+    marks: Vec<(u64, blake3::Hasher)>,
+    first: Option<u64>,
+}
+
+const LOG_MARKS: usize = 64;
+
+impl IntegrityLog {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(LogHashState::fresh(None)),
+        }
+    }
+}
+
+impl LogHashState {
+    fn fresh(origin: Option<u64>) -> Self {
+        let hasher = blake3::Hasher::new();
+        Self {
+            ready: false,
+            origin,
+            tip: 0,
+            hasher: hasher.clone(),
+            needed: kronik_store::db::SubjectKeys::new(),
+            marks: vec![(0, hasher)],
+            first: None,
+        }
+    }
+}
+
+#[cfg(test)]
+static INTEGRITY_LOG_FROM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn reset_log_from() {
+    #[cfg(test)]
+    INTEGRITY_LOG_FROM.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn note_log_from(from: u64) {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering;
+        let cur = INTEGRITY_LOG_FROM.load(Ordering::Relaxed);
+        if cur == 0 || from < cur {
+            INTEGRITY_LOG_FROM.store(from, Ordering::Relaxed);
+        }
+    }
+    #[cfg(not(test))]
+    let _ = from;
+}
+
+fn mix_record(h: &mut blake3::Hasher, c: &kronik_log::Committed) {
+    h.update(&c.lsn.to_le_bytes());
+    h.update(&[c.record.kind()]);
+    h.update(&c.record.encode());
+}
+
+fn push_mark(marks: &mut Vec<(u64, blake3::Hasher)>, lsn: u64, hasher: &blake3::Hasher) {
+    if marks.last().is_none_or(|(have, _)| *have != lsn) {
+        marks.push((lsn, hasher.clone()));
+    }
+}
+
+fn trim_marks(marks: &mut Vec<(u64, blake3::Hasher)>) {
+    if marks.len() <= LOG_MARKS {
+        return;
+    }
+    let mut kept = Vec::with_capacity(LOG_MARKS);
+    if marks.first().is_some_and(|(lsn, _)| *lsn == 0) {
+        kept.push(marks[0].clone());
+    }
+    let skip = marks.len() - (LOG_MARKS - kept.len());
+    kept.extend(marks.iter().skip(skip).cloned());
+    *marks = kept;
+}
+
+impl Api {
+    /// Log hash through `upto`, and the sealed keys of records through `applied`.
+    async fn hashed_log(
+        &self,
+        applied: u64,
+        upto: u64,
+    ) -> Result<(u64, String, kronik_store::db::SubjectKeys)> {
+        reset_log_from();
+        let starts = self.node.reader().starts().await.map_err(internal)?;
+        let origin = starts.first().copied();
+        let boundaries: std::collections::BTreeSet<u64> = starts.into_iter().skip(1).collect();
+        let mut cache = self.integrity_log.inner.lock().await;
+        if !cache.ready || cache.origin != origin || cache.tip > applied {
+            *cache = LogHashState::fresh(origin);
+        }
+        if cache.tip < applied {
+            let from = cache.tip.saturating_add(1).max(1);
+            let tip = cache.tip;
+            let at_tip = cache.hasher.clone();
+            push_mark(&mut cache.marks, tip, &at_tip);
+            let mut hasher = cache.hasher.clone();
+            let mut needed = cache.needed.clone();
+            let mut marks = cache.marks.clone();
+            let mut first = cache.first;
+            note_log_from(from);
+            self.node
+                .reader()
+                .read(from, applied, |mut c| {
+                    if c.lsn > applied {
+                        return Ok(());
+                    }
+                    if c.lsn > 0 && boundaries.contains(&c.lsn) {
+                        push_mark(&mut marks, c.lsn - 1, &hasher);
+                    }
+                    mix_record(&mut hasher, &c);
+                    first.get_or_insert(c.lsn);
+                    kronik_proto::sealables::record_mut(
+                        &mut c.record,
+                        &mut kronik_store::db::note_sealed(&mut needed),
+                    );
+                    Ok(())
+                })
+                .await
+                .map_err(internal)?;
+            if applied > 0 && first.is_none() {
+                return Err(ApiError::new(
+                    ErrorCode::StorageCorrupt,
+                    "the log holds no records",
+                ));
+            }
+            push_mark(&mut marks, applied, &hasher);
+            trim_marks(&mut marks);
+            cache.hasher = hasher;
+            cache.needed = needed;
+            cache.marks = marks;
+            cache.first = first;
+            cache.tip = applied;
+            cache.origin = origin;
+            cache.ready = true;
+        } else if applied > 0 && cache.first.is_none() {
+            return Err(ApiError::new(
+                ErrorCode::StorageCorrupt,
+                "the log holds no records",
+            ));
+        }
+        let hash = hash_through(&cache, upto, self).await?;
+        Ok((cache.first.unwrap_or(1), hash, cache.needed.clone()))
+    }
+}
+
+async fn hash_through(cache: &LogHashState, upto: u64, api: &Api) -> Result<String> {
+    if upto >= cache.tip {
+        return Ok(format!("b3:{}", cache.hasher.finalize().to_hex()));
+    }
+    let Some((idx, _)) = cache
+        .marks
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, (lsn, _))| *lsn <= upto)
+    else {
+        return Err(internal("log hash has no prefix mark"));
+    };
+    let (lsn, hasher) = &cache.marks[idx];
+    if *lsn == upto {
+        return Ok(format!("b3:{}", hasher.finalize().to_hex()));
+    }
+    let from = lsn.saturating_add(1).max(1);
+    note_log_from(from);
+    let mut hasher = hasher.clone();
+    api.node
+        .reader()
+        .read(from, upto, |c| {
+            if c.lsn <= upto {
+                mix_record(&mut hasher, &c);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal)?;
+    Ok(format!("b3:{}", hasher.finalize().to_hex()))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::disallowed_methods)]
+
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use kronik_core::env::Env;
+    use kronik_sched::{NodeConfig, start_local};
+    use serde_json::{Value, json};
+
+    use super::INTEGRITY_LOG_FROM;
+    use crate::{Api, ApiRequest};
+
+    async fn call(api: &Api, method: &str, path: &str, body: Value) -> (u16, Value) {
+        let (path, query) = path.split_once('?').unwrap_or((path, ""));
+        let r = api
+            .handle(ApiRequest {
+                method: method.into(),
+                path: path.into(),
+                query: query.into(),
+                body: if body.is_null() {
+                    vec![]
+                } else {
+                    body.to_string().into_bytes()
+                },
+                token_id: "unix:uid=0".into(),
+                bearer: None,
+            })
+            .await;
+        (r.status, serde_json::from_slice(&r.body).unwrap())
+    }
+
+    async fn snapshot(api: &Api, node: &kronik_sched::Node) -> u64 {
+        let before = node.applied_lsn();
+        let (status, body) = call(api, "POST", "/v1/snapshots", json!({"reason": "r"})).await;
+        assert_eq!(status, 200, "{body}");
+        for _ in 0..500 {
+            if node.applied_lsn() > before {
+                return node.applied_lsn();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("snapshot did not apply past {before}");
+    }
+
+    /// Issue #163: the log hash resumes. A repeat does not read, a later tip
+    /// reads only the new records, and `through` of a saved tip does not
+    /// start at LSN 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integrity_log_hash_resumes_instead_of_scanning_from_lsn_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::real(tokio::runtime::Handle::current());
+        let node = start_local(env, dir.path(), NodeConfig::default())
+            .await
+            .unwrap();
+        let api = Arc::new(Api::new(node.clone()));
+        snapshot(&api, &node).await;
+
+        let (status, first) = call(&api, "GET", "/v1/integrity", Value::Null).await;
+        assert_eq!(status, 200, "{first}");
+        let applied = first["applied_lsn"].as_u64().unwrap();
+        let (status, again) = call(&api, "GET", "/v1/integrity", Value::Null).await;
+        assert_eq!(status, 200, "{again}");
+        assert_eq!(again, first);
+        assert_eq!(
+            INTEGRITY_LOG_FROM.load(Ordering::Relaxed),
+            0,
+            "a repeat integrity read the log"
+        );
+
+        snapshot(&api, &node).await;
+        let (status, later) = call(&api, "GET", "/v1/integrity", Value::Null).await;
+        assert_eq!(status, 200, "{later}");
+        let from = INTEGRITY_LOG_FROM.load(Ordering::Relaxed);
+        assert!(from > 1, "extended the log hash from LSN {from}");
+        assert_ne!(later["log_hash"], first["log_hash"]);
+
+        let (status, through) = call(
+            &api,
+            "GET",
+            &format!("/v1/integrity?through={applied}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "{through}");
+        assert_eq!(through["log_hash"], first["log_hash"]);
+        assert_eq!(through["through_lsn"], applied);
+        assert_eq!(
+            INTEGRITY_LOG_FROM.load(Ordering::Relaxed),
+            0,
+            "through a saved tip scanned the log"
+        );
     }
 }

@@ -27,6 +27,7 @@ thread_local! {
     /// copy, like a crash there.
     pub(crate) static CRASH_AFTER_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static APPLY_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static APPLY_LOCK_ACQUIRES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Actor WAL checkpoints after an erasure. A test asserts this moved.
     pub(crate) static ACTOR_ERASURE_CHECKPOINTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -37,13 +38,24 @@ pub(crate) fn apply_lock_held() -> bool {
     APPLY_LOCK_DEPTH.with(|c| c.get() > 0)
 }
 
-/// The apply lock. In tests, dropping it clears the depth a checkpoint asserts.
+/// How many times this thread has taken the apply lock. A state-hash test
+/// asserts an integrity request does not add to it.
+#[cfg(test)]
+pub(crate) fn apply_lock_acquires() -> usize {
+    APPLY_LOCK_ACQUIRES.with(|c| c.get())
+}
+
+/// The apply lock. Dropping it publishes the even epoch a state-hash copy
+/// waits for, and in tests clears the depth a checkpoint asserts.
 pub(crate) struct ApplyLock<'a> {
     _guard: MutexGuard<'a, ()>,
+    epoch: &'a AtomicU64,
 }
 
 impl Drop for ApplyLock<'_> {
     fn drop(&mut self) {
+        // Even: the writes under the lock are visible to a copy that sees this.
+        self.epoch.fetch_add(1, Ordering::Release);
         #[cfg(test)]
         APPLY_LOCK_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
     }
@@ -112,8 +124,11 @@ pub struct Store {
     pub applied: AppliedLsn,
     /// Held for a whole `apply` batch, and briefly by snapshots per database
     /// copy, so a snapshot sees `state.db` and every actor database at one
-    /// LSN.
+    /// LSN. An integrity state hash does not take it (ADR 0153).
     apply_lock: Mutex<()>,
+    /// Odd while [`Self::apply_lock`] is held. A state hash copies files only
+    /// while this stays even, so the copy does not take the lock.
+    apply_epoch: AtomicU64,
     /// Reads sealed SQL changesets (docs/design/m8-privacy.md §4, §6);
     /// plain until the node sets its own.
     sealer: Mutex<Arc<kronik_privacy::sealer::Sealer>>,
@@ -129,6 +144,7 @@ impl Store {
             sql,
             applied,
             apply_lock: Mutex::new(()),
+            apply_epoch: AtomicU64::new(0),
             sealer: Mutex::new(Arc::new(kronik_privacy::sealer::Sealer::plain())),
         }))
     }
@@ -178,9 +194,17 @@ impl Store {
 
     fn apply_lock(&self) -> ApplyLock<'_> {
         let guard = self.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Odd before any write, so a copy that started earlier discards itself.
+        self.apply_epoch.fetch_add(1, Ordering::Release);
         #[cfg(test)]
-        APPLY_LOCK_DEPTH.with(|c| c.set(c.get() + 1));
-        ApplyLock { _guard: guard }
+        {
+            APPLY_LOCK_DEPTH.with(|c| c.set(c.get() + 1));
+            APPLY_LOCK_ACQUIRES.with(|c| c.set(c.get() + 1));
+        }
+        ApplyLock {
+            _guard: guard,
+            epoch: &self.apply_epoch,
+        }
     }
 
     /// Read access to `state.db`.

@@ -151,3 +151,4 @@
 - [ADR 0150: The root unit renders the configuration path `--init` was given](adr/0150-root-init-renders-the-configuration-path.md)
 - [ADR 0151: A promote orders turn appends against its gap](adr/0151-promote-orders-turn-appends.md)
 - [ADR 0152: An actor source is the indexed frame](adr/0152-actor-source-from-the-turn-index.md)
+- [ADR 0153: Integrity hash off the apply lock](adr/0153-integrity-hash-off-the-apply-lock.md)
