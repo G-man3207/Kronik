@@ -160,7 +160,10 @@ Secrets arrive with M2.
   written, so the value reaches neither the log nor a state file. Fork turns are scrubbed the same way. Responses from HTTP targets are scrubbed of the inserted
   values before the guest sees them, and the API's views of actors,
   history, turns, timers and dead letters replace the values of all live
-  secrets.
+  secrets. A turn view also replaces them in a connection open's request,
+  an inbound frame, a close reason, buffered connection operations, and an
+  accept's headers and selected subprotocol. Ids, routes, codes and
+  positions stay.
 
 Scrubbing matches exact bytes, and only values of at least 4 bytes other
 than `true`, `false` and `null` (which would break JSON). An
@@ -392,11 +395,13 @@ Long-lived connections ([Connections](connections.md), M24):
   `Authorization` on a WebSocket, so apps pass bearer tokens in this
   header. Kronik records it like `Authorization`: as a header of the open's
   request, sealed when the request has a subject (`privacy.subject_from`),
-  and shown by the API only to callers with `pii:read`. An open without a
-  subject, the usual browser case, is recorded in plain text, so the log,
-  snapshots, backups and forks hold the token: prefer short-lived tokens,
-  or set a subject for the request. The accept records only the selected
-  subprotocol's position, never its value.
+  and shown by the API only to callers with `pii:read`, then scrubbed if
+  that value is a stored secret. An open without a subject, the usual
+  browser case, is recorded in plain text, so the log, snapshots, backups
+  and forks hold the token: prefer short-lived tokens, or set a subject
+  for the request. The accept records only the selected subprotocol's
+  position, never its value. Callers with `pii:read` also see that value,
+  resolved from the request, and a stored secret in it is scrubbed.
 - **Subjects.** As for HTTP, only `[gateway] trusted_proxies` may set the
   subject of an open. An actor that learns its user from a token sets the
   connection's subject in its accept; the API shows a connection's subject
