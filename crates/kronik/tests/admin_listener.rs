@@ -1,6 +1,7 @@
 //! The TLS admin listener is a public API client: it serves every documented
 //! `/v1` GET operation, including the streamed blob content that the buffered
-//! router refuses (issue #123).
+//! router refuses (issue #123). A subject's blob content needs `pii:read` on
+//! that listener, the Unix socket and the TCP API (issue #171).
 
 // Test harness code: unwraps, std threads and std time are fine here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
@@ -13,7 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use common::free_port;
@@ -120,6 +121,9 @@ struct Daemon {
     dir: PathBuf,
     child: Option<Child>,
     admin: String,
+    /// `server.api_listen`. With `[tls] mode = "files"` this is HTTPS, the
+    /// same certificate as the admin listener.
+    api: String,
     tls: rustls::ClientConfig,
 }
 
@@ -133,12 +137,14 @@ impl Daemon {
         std::fs::write(dir.join("cert.pem"), cert.pem()).unwrap();
         std::fs::write(dir.join("key.pem"), key.serialize_pem()).unwrap();
         let admin_port = free_port();
+        let api_port = free_port();
         let config = dir.join("kronik.toml");
         std::fs::write(
             &config,
             format!(
                 "[server]\ndata_dir = {:?}\napi_socket = {:?}\n\
-                 http_listen = \"127.0.0.1:0\"\nadmin_listen = \"127.0.0.1:{admin_port}\"\n\n\
+                 http_listen = \"127.0.0.1:0\"\napi_listen = \"127.0.0.1:{api_port}\"\n\
+                 admin_listen = \"127.0.0.1:{admin_port}\"\n\n\
                  [tls]\nmode = \"files\"\ncert_file = {:?}\nkey_file = {:?}\n",
                 dir.join("data"),
                 dir.join("api.sock"),
@@ -173,6 +179,7 @@ impl Daemon {
             dir: dir.to_path_buf(),
             child: Some(child),
             admin: format!("127.0.0.1:{admin_port}"),
+            api: format!("127.0.0.1:{api_port}"),
             tls,
         };
         for _ in 0..800 {
@@ -231,13 +238,14 @@ impl Daemon {
         read_answer(stream)
     }
 
-    /// A GET over the TLS admin listener. `streaming` stops after the
-    /// response head, which is all an SSE answer gives without waiting.
-    fn admin_get(&self, path: &str, bearer: &str, streaming: bool) -> Answer {
+    /// A GET over TLS on `addr` (the admin listener or the TCP API).
+    /// `streaming` stops after the response head, which is all an SSE
+    /// answer gives without waiting.
+    fn tls_get(&self, addr: &str, path: &str, bearer: &str, streaming: bool) -> Answer {
         let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let mut connection =
             rustls::ClientConnection::new(Arc::new(self.tls.clone()), name).unwrap();
-        let mut socket = TcpStream::connect(&self.admin).unwrap();
+        let mut socket = TcpStream::connect(addr).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
@@ -271,6 +279,39 @@ impl Daemon {
             };
         }
         read_answer(stream)
+    }
+
+    /// A GET over the TLS admin listener.
+    fn admin_get(&self, path: &str, bearer: &str, streaming: bool) -> Answer {
+        self.tls_get(&self.admin, path, bearer, streaming)
+    }
+
+    /// `GET path` with `bearer` on the Unix socket, the TCP API and the TLS
+    /// admin listener. The socket sends the token: without one the peer has
+    /// every scope, including `pii:read`.
+    fn content(&self, path: &str, bearer: &str) -> Vec<(&'static str, Answer)> {
+        vec![
+            ("unix", self.unix_get(path, Some(bearer))),
+            ("tcp", self.tls_get(&self.api, path, bearer, false)),
+            ("admin", self.tls_get(&self.admin, path, bearer, false)),
+        ]
+    }
+
+    /// [`Daemon::content`], waiting out the fail-closed secret-coverage
+    /// window after a secret change (ADR 0108). A scope refusal is not
+    /// retried: it is decided before the matcher is built.
+    fn content_when_ready(&self, path: &str, bearer: &str) -> Vec<(&'static str, Answer)> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let answers = self.content(path, bearer);
+            let waiting = answers
+                .iter()
+                .any(|(_, answer)| answer.error_code().as_deref() == Some("SECRET_UNAVAILABLE"));
+            if !waiting || Instant::now() >= deadline {
+                return answers;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn token(&self, name: &str, scopes: &[&str]) -> String {
@@ -411,5 +452,173 @@ fn the_admin_listener_streams_a_blobs_bytes() {
     );
     for name in ["content-length", "x-kronik-blob-size", "content-type"] {
         assert_eq!(admin.header(name), local.header(name), "{name}");
+    }
+}
+
+/// Bytes the media guest writes for a blob of `n` bytes.
+fn pattern(n: u64) -> Vec<u8> {
+    (0..n)
+        .map(|i| ((i.wrapping_mul(31) + 7) % 251) as u8)
+        .collect()
+}
+
+/// `bytes` with every `secret` replaced by `[secret:name]`, as the output
+/// matcher does.
+fn scrubbed(bytes: &[u8], secret: &[u8], name: &str) -> Vec<u8> {
+    let marker = format!("[secret:{name}]");
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(secret) {
+            out.extend_from_slice(marker.as_bytes());
+            i += secret.len();
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A message whose turn writes `size` bytes. `subject` is the turn's
+/// default subject, so the blob is that subject's.
+fn written(d: &Daemon, key: &str, size: u64, subject: Option<&str>) -> String {
+    let mut body = json!({
+        "name": format!("write?size={size}"),
+        "reason": "blob content scope",
+    });
+    if let Some(subject) = subject {
+        body["subject"] = json!(subject);
+    }
+    let turn = d.api("POST", &format!("/v1/actors/media/{key}/messages"), body);
+    let hash = turn["reply"]["blob"]["hash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{turn}"))
+        .to_owned();
+    assert_eq!(turn["reply"]["blob"]["size"], size, "{turn}");
+    hash
+}
+
+/// `GET /v1/blobs/{hash}/content` of a subject's blob is `SCOPE_MISSING`
+/// for a token that has `read` and not `pii:read`, on the Unix socket, the
+/// TCP API and the TLS admin listener, and returns no blob bytes. The same
+/// hash with `pii:read` returns the bytes through the secret output matcher.
+/// A blob with no subject stays readable with `read` alone (issue #171).
+#[test]
+fn a_subjects_blob_content_needs_pii_read_on_every_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
+    let wasm = std::fs::read(MEDIA).unwrap();
+    d.api(
+        "POST",
+        "/v1/deployments",
+        json!({
+            "wasm_base64": base64::engine::general_purpose::STANDARD.encode(wasm),
+            "reason": "blob content scope",
+        }),
+    );
+
+    const SUBJECT_SIZE: u64 = 2048;
+    const PLAIN_SIZE: u64 = 40;
+    let subject_bytes = pattern(SUBJECT_SIZE);
+    let plain_bytes = pattern(PLAIN_SIZE);
+    // Inside the subject blob, absent from the plain one.
+    let secret = subject_bytes[100..124].to_vec();
+    assert!(!plain_bytes.windows(secret.len()).any(|w| w == secret));
+
+    let subject_hash = written(&d, "s", SUBJECT_SIZE, Some("user:1"));
+    let plain_hash = written(&d, "p", PLAIN_SIZE, None);
+    assert!(
+        subject_hash.starts_with("b3s:"),
+        "a subject's blob is keyed: {subject_hash}"
+    );
+    assert!(plain_hash.starts_with("b3:"), "{plain_hash}");
+    let subject_row = d.api("GET", &format!("/v1/blobs/{subject_hash}"), Value::Null);
+    assert_eq!(subject_row["subject"], "user:1", "{subject_row}");
+    let plain_row = d.api("GET", &format!("/v1/blobs/{plain_hash}"), Value::Null);
+    assert_eq!(plain_row["subject"], Value::Null, "{plain_row}");
+
+    // After the writes, so the stored bytes still hold the value. The
+    // download matcher is what must replace it.
+    d.api(
+        "PUT",
+        "/v1/secrets/token",
+        json!({
+            "base64": base64::engine::general_purpose::STANDARD.encode(&secret),
+            "reason": "a value in a subject blob",
+        }),
+    );
+    let expected = scrubbed(&subject_bytes, &secret, "token");
+    assert!(expected.len() < subject_bytes.len());
+    assert!(!expected.windows(secret.len()).any(|w| w == secret));
+
+    let reader = d.token("blob-reader", &["read"]);
+    let pii = d.token("blob-pii", &["read", "pii:read"]);
+    let subject_path = format!("/v1/blobs/{subject_hash}/content");
+    let plain_path = format!("/v1/blobs/{plain_hash}/content");
+
+    for (via, answer) in d.content(&subject_path, &reader) {
+        assert_eq!(
+            (answer.status, answer.error_code().as_deref()),
+            (403, Some("SCOPE_MISSING")),
+            "{via}: {}\n{}",
+            String::from_utf8_lossy(&answer.body),
+            d.log()
+        );
+        assert_eq!(
+            answer.header("content-type"),
+            Some("application/json"),
+            "{via}"
+        );
+        assert!(
+            answer.body.len() < SUBJECT_SIZE as usize,
+            "{via} returned {} bytes of a refused blob",
+            answer.body.len()
+        );
+        assert!(
+            !answer.body.windows(16).any(|w| w == &subject_bytes[..16]),
+            "{via} included the blob's bytes"
+        );
+        assert!(
+            !answer.body.windows(secret.len()).any(|w| w == secret),
+            "{via} included the secret value"
+        );
+    }
+
+    for (via, answer) in d.content_when_ready(&subject_path, &pii) {
+        assert_eq!(
+            (answer.status, answer.error_code()),
+            (200, None),
+            "{via}: {}\n{}",
+            String::from_utf8_lossy(&answer.body),
+            d.log()
+        );
+        assert_eq!(answer.body, expected, "{via} did not scrub the download");
+        assert_eq!(
+            answer.header("content-type"),
+            Some("application/octet-stream"),
+            "{via}"
+        );
+        assert_eq!(
+            answer.header("content-length"),
+            Some(expected.len().to_string()).as_deref(),
+            "{via}"
+        );
+        assert_eq!(
+            answer.header("x-kronik-blob-size"),
+            Some(SUBJECT_SIZE.to_string()).as_deref(),
+            "{via}"
+        );
+    }
+
+    for (via, answer) in d.content_when_ready(&plain_path, &reader) {
+        assert_eq!(
+            (answer.status, answer.error_code()),
+            (200, None),
+            "{via}: {}\n{}",
+            String::from_utf8_lossy(&answer.body),
+            d.log()
+        );
+        assert_eq!(answer.body, plain_bytes, "{via}");
     }
 }
