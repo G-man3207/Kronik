@@ -649,25 +649,59 @@ fn headers(value: &mut Value, secrets: &mut Context<'_>) -> Result<()> {
     Ok(())
 }
 
+/// HTTP request fields, also the request nested in a connection open.
+fn scrub_http_request(value: &mut Value, secrets: &mut Context<'_>) -> Result<()> {
+    text_fields(value, &["path", "query", "idempotency_key"], secrets);
+    if let Some(params) = value.get_mut("params").and_then(Value::as_array_mut) {
+        for param in params {
+            // param_values() emits (schema name, free value).
+            if let Some(value) = param.get_mut(1) {
+                json_text(value, secrets);
+            }
+        }
+    }
+    headers(value, secrets)?;
+    sealable_field(value, "body", secrets)
+}
+
+/// Frame data, plus an SSE event's name and id. `kind` is an enum.
+fn scrub_frame(value: &mut Value, secrets: &mut Context<'_>) -> Result<()> {
+    if !value.is_object() {
+        return Ok(());
+    }
+    text_fields(value, &["event", "id"], secrets);
+    sealable_field(value, "data", secrets)
+}
+
+/// A connection input. Record time scrubs guest output, not these client fields.
+fn scrub_connection_input(value: &mut Value, secrets: &mut Context<'_>) -> Result<()> {
+    if let Some(Value::String(reason)) = value.get_mut("reason") {
+        persisted_reason(reason, secrets);
+    }
+    if let Some(request) = value
+        .get_mut("request")
+        .filter(|request| request.is_object())
+    {
+        scrub_http_request(request, secrets)?;
+    }
+    if let Some(frame) = value.get_mut("frame") {
+        scrub_frame(frame, secrets)?;
+    }
+    if let Some(close) = value.get_mut("close").filter(|close| close.is_object()) {
+        sealable_field(close, "reason", secrets)?;
+    }
+    Ok(())
+}
+
 impl ScrubbedOutput for TurnJson {
     fn scrub_fields(&mut self, secrets: &mut Context<'_>) -> Result<()> {
         let turn = &mut self.0;
 
-        if let Some(value) = turn.get_mut("input") {
+        if let Some(value) = turn.get_mut("input")
+            && !value.is_null()
+        {
             match value.get("type").and_then(Value::as_str) {
-                Some("http") => {
-                    text_fields(value, &["path", "query", "idempotency_key"], secrets);
-                    if let Some(params) = value.get_mut("params").and_then(Value::as_array_mut) {
-                        for param in params {
-                            // param_values() emits (schema name, free value).
-                            if let Some(value) = param.get_mut(1) {
-                                json_text(value, secrets);
-                            }
-                        }
-                    }
-                    headers(value, secrets)?;
-                    sealable_field(value, "body", secrets)?;
-                }
+                Some("http") => scrub_http_request(value, secrets)?,
                 Some("message") => {
                     if let Some(Value::String(reason)) = value.get_mut("reason") {
                         persisted_reason(reason, secrets);
@@ -677,8 +711,15 @@ impl ScrubbedOutput for TurnJson {
                 Some("timer") => {
                     message_field(value, "msg", secrets)?;
                 }
-                // Migrate has only numeric schema versions; null has no data.
-                _ => {}
+                // Numeric schema versions only.
+                Some("migrate") => {}
+                Some("connection") => scrub_connection_input(value, secrets)?,
+                _ => {
+                    return Err(ApiError::new(
+                        ErrorCode::SecretUnavailable,
+                        "turn JSON input type is not classified for secret scrubbing",
+                    ));
+                }
             }
         }
 
@@ -690,6 +731,19 @@ impl ScrubbedOutput for TurnJson {
             if let Some(http) = value.get_mut("http") {
                 headers(http, secrets)?;
                 sealable_field(http, "body", secrets)?;
+            }
+            if let Some(accept) = value.get_mut("accept") {
+                headers(accept, secrets)?;
+                // Resolved from the client's Sec-WebSocket-Protocol list.
+                text_fields(accept, &["subprotocol"], secrets);
+            }
+        }
+        if let Some(ops) = turn.get_mut("connection_ops").and_then(Value::as_array_mut) {
+            for op in ops {
+                if let Some(frame) = op.get_mut("frame") {
+                    scrub_frame(frame, secrets)?;
+                }
+                sealable_field(op, "reason", secrets)?;
             }
         }
         if let Some(values) = turn.get_mut("writes").and_then(Value::as_array_mut) {
@@ -1538,4 +1592,597 @@ mod tests {
             );
         }
     }
+    const SECRET: &str = "sekret-value";
+    const NAME: &str = "room-token";
+    const MARKER: &str = "[secret:room-token]";
+
+    fn secrets() -> Vec<(&'static str, &'static [u8])> {
+        vec![(NAME, SECRET.as_bytes())]
+    }
+
+    fn tagged(bytes: &[u8]) -> Option<pb::Sealable> {
+        Some(pb::Sealable {
+            subject: Some(format!("user:{SECRET}")),
+            value: Some(pb::sealable::Value::Plain(bytes.to_vec())),
+        })
+    }
+
+    /// `Api::turn` and `fork_turn_json` both render with `turn_json` and
+    /// return through `ok_scrubbed`, so this is the walk both routes use.
+    #[test]
+    fn connection_turn_json_scrubs_free_text_and_classifies_every_field() {
+        let open = connection_open();
+        let frame = connection_frame();
+        let close = connection_close();
+        let blob = connection_blob();
+        let mut saw_scrub = Vec::new();
+        let mut saw_keep = Vec::new();
+        let mut missing = Vec::new();
+        for record in [&open, &frame, &close, &blob] {
+            let mut view = crate::turn_json("main", 7, record);
+            crate::accept_subprotocol(&mut view.0, record, true);
+            let before = view.0.clone();
+            view.scrub_free(&secrets()).unwrap();
+            let mut was = Vec::new();
+            let mut now = Vec::new();
+            leaves(&before, "", &mut was);
+            leaves(&view.0, "", &mut now);
+            assert_eq!(was.len(), now.len());
+            for ((path, was), (after_path, now)) in was.iter().zip(&now) {
+                assert_eq!(path, after_path);
+                if !scoped(path) {
+                    continue;
+                }
+                match classify(path) {
+                    None => missing.push(path.clone()),
+                    Some(FieldClass::Keep) => {
+                        assert_eq!(was, now, "kept field changed: {path}");
+                        if holds_secret(was) {
+                            saw_keep.push(path.clone());
+                        }
+                    }
+                    Some(FieldClass::Scrub) => {
+                        assert!(!holds_secret(now), "secret remains in {path}: {now}");
+                        if holds_secret(was) {
+                            assert_ne!(was, now, "{path}");
+                            saw_scrub.push(path.clone());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "unclassified turn fields: {missing:?}");
+        for path in MUST_SCRUB {
+            assert!(
+                saw_scrub.iter().any(|seen| seen == path),
+                "secret never planted in {path}"
+            );
+        }
+        for path in MUST_KEEP {
+            assert!(
+                saw_keep.iter().any(|seen| seen == path),
+                "kept secret never planted in {path}"
+            );
+        }
+
+        let mut view = crate::turn_json("main", 7, &open);
+        crate::accept_subprotocol(&mut view.0, &open, true);
+        view.scrub_free(&secrets()).unwrap();
+        let request = &view["input"]["request"];
+        assert_eq!(request["path"], MARKER);
+        assert_eq!(request["query"], MARKER);
+        assert_eq!(request["params"][0][0], SECRET);
+        assert_eq!(request["params"][0][1], MARKER);
+        assert_eq!(request["headers"][0]["name"], format!("x-{MARKER}"));
+        assert_eq!(
+            decoded(&request["headers"][0]["value"]["value"]),
+            MARKER.as_bytes()
+        );
+        assert_eq!(decoded(&request["body"]["value"]), MARKER.as_bytes());
+        assert_eq!(request["idempotency_key"], MARKER);
+        assert_eq!(request["route"], format!("/room/{{{SECRET}}}"));
+        assert_eq!(view["input"]["reason"], kronik_sched::scrub::WITHHELD);
+        assert_eq!(view["input"]["connection"], format!("c-{SECRET}"));
+        assert_eq!(view["output"]["accept"]["subprotocol"], MARKER);
+        assert_eq!(view["output"]["accept"]["subprotocol_index"], 0);
+        assert_eq!(
+            view["output"]["accept"]["subject"],
+            format!("user:{SECRET}")
+        );
+        assert_eq!(
+            view["output"]["accept"]["headers"][0]["name"],
+            format!("x-{MARKER}")
+        );
+        assert_eq!(
+            decoded(&view["output"]["accept"]["headers"][0]["value"]["value"]),
+            MARKER.as_bytes()
+        );
+        assert_eq!(
+            decoded(&view["connection_ops"][0]["frame"]["data"]["value"]),
+            MARKER.as_bytes()
+        );
+        assert_eq!(view["connection_ops"][0]["frame"]["event"], MARKER);
+        assert_eq!(view["connection_ops"][0]["frame"]["id"], MARKER);
+        assert_eq!(
+            decoded(&view["connection_ops"][1]["reason"]["value"]),
+            MARKER.as_bytes()
+        );
+        assert_eq!(view["connection_ops"][1]["code"], 1000);
+
+        let mut view = crate::turn_json("main", 8, &frame);
+        view.scrub_free(&secrets()).unwrap();
+        assert_eq!(
+            decoded(&view["input"]["frame"]["data"]["value"]),
+            MARKER.as_bytes()
+        );
+        assert_eq!(view["input"]["frame"]["event"], MARKER);
+        assert_eq!(view["input"]["frame"]["id"], MARKER);
+        assert_eq!(view["input"]["frame"]["kind"], "text");
+        assert_eq!(view["input"]["seq"], 4);
+
+        let mut view = crate::turn_json("main", 9, &close);
+        view.scrub_free(&secrets()).unwrap();
+        assert_eq!(
+            decoded(&view["input"]["close"]["reason"]["value"]),
+            MARKER.as_bytes()
+        );
+        assert_eq!(view["input"]["close"]["cause"], "client");
+        assert_eq!(view["input"]["close"]["code"], 1000);
+
+        let keys: std::collections::BTreeSet<_> = crate::turn_json("main", 7, &open)
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "actor",
+                "causal_id",
+                "causal_key",
+                "code_hash",
+                "compensations",
+                "config_epoch",
+                "connection_ops",
+                "effects",
+                "engine_version",
+                "fuel_used",
+                "input",
+                "logical_time_ms",
+                "lsn",
+                "memory_peak_bytes",
+                "messages",
+                "outcome",
+                "output",
+                "schema_version",
+                "sql_changes",
+                "sql_schema",
+                "timers",
+                "turn_id",
+                "writes",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+    }
+
+    #[test]
+    fn http_message_and_timer_scrubbing_is_unchanged() {
+        let http = pb::TurnRecord {
+            input: Some(pb::Input {
+                kind: Some(pb::input::Kind::Http(pb::HttpInput {
+                    method: "GET".into(),
+                    path: SECRET.into(),
+                    query: SECRET.into(),
+                    route: format!("/{{key}}/{SECRET}"),
+                    params: vec![pb::Param {
+                        name: "key".into(),
+                        value: SECRET.into(),
+                        sealed_value: None,
+                    }],
+                    idempotency_key: SECRET.into(),
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        };
+        let mut view = crate::turn_json("main", 1, &http);
+        view.scrub_free(&secrets()).unwrap();
+        assert_eq!(view["input"]["method"], "GET");
+        assert_eq!(view["input"]["path"], MARKER);
+        assert_eq!(view["input"]["query"], MARKER);
+        assert_eq!(view["input"]["params"][0][0], "key");
+        assert_eq!(view["input"]["params"][0][1], MARKER);
+        assert_eq!(view["input"]["idempotency_key"], MARKER);
+        assert_eq!(view["input"]["route"], format!("/{{key}}/{SECRET}"));
+
+        let message = pb::TurnRecord {
+            input: Some(pb::Input {
+                kind: Some(pb::input::Kind::Message(pb::MessageInput {
+                    msg: Some(pb::Message {
+                        name: SECRET.into(),
+                        ..Default::default()
+                    }),
+                    audit: Some(pb::Audit {
+                        reason: format!("because {SECRET}"),
+                        token_id: format!("tok-{SECRET}"),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        };
+        let mut view = crate::turn_json("main", 1, &message);
+        view.scrub_free(&secrets()).unwrap();
+        assert_eq!(view["input"]["msg"]["name"], MARKER);
+        assert_eq!(view["input"]["reason"], kronik_sched::scrub::WITHHELD);
+        assert_eq!(view["input"]["token_id"], format!("tok-{SECRET}"));
+
+        let timer = pb::TurnRecord {
+            input: Some(pb::Input {
+                kind: Some(pb::input::Kind::Timer(pb::TimerInput {
+                    timer_id: 7,
+                    msg: Some(pb::Message {
+                        name: SECRET.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        };
+        let mut view = crate::turn_json("main", 1, &timer);
+        view.scrub_free(&secrets()).unwrap();
+        assert_eq!(view["input"]["timer_id"], 7);
+        assert_eq!(view["input"]["msg"]["name"], MARKER);
+    }
+
+    #[test]
+    fn unclassified_input_type_is_refused_and_known_kinds_are_not_skipped() {
+        use pb::input::Kind;
+        let check = |kind: Kind| {
+            let expected = match &kind {
+                Kind::Http(_) => "http",
+                Kind::Message(_) => "message",
+                Kind::Timer(_) => "timer",
+                Kind::Migrate(_) => "migrate",
+                Kind::Connection(_) => "connection",
+            };
+            let record = pb::TurnRecord {
+                input: Some(pb::Input { kind: Some(kind) }),
+                ..Default::default()
+            };
+            let mut view = crate::turn_json("main", 1, &record);
+            view.scrub_free(&[] as &[(&str, &[u8])]).unwrap();
+            assert_eq!(view["input"]["type"], expected);
+        };
+        // No wildcard: a new input kind fails this test until it is classified.
+        check(Kind::Http(pb::HttpInput::default()));
+        check(Kind::Message(pb::MessageInput::default()));
+        check(Kind::Timer(pb::TimerInput::default()));
+        check(Kind::Migrate(pb::MigrateInput::default()));
+        check(Kind::Connection(pb::ConnectionInput::default()));
+
+        let mut bare = crate::turn_json("main", 1, &pb::TurnRecord::default());
+        bare.scrub_free(&[] as &[(&str, &[u8])]).unwrap();
+        assert!(bare["input"].is_null());
+
+        let mut unknown = crate::turn_json("main", 1, &pb::TurnRecord::default());
+        unknown["input"] = serde_json::json!({"type": "future", "path": SECRET});
+        let err = unknown.scrub_free(&secrets()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SecretUnavailable);
+        assert_eq!(unknown["input"]["path"], SECRET);
+    }
+
+    fn connection_input(event: pb::connection_input::Event) -> pb::ConnectionInput {
+        pb::ConnectionInput {
+            connection: format!("c-{SECRET}"),
+            protocol: pb::ConnectionProtocol::Websocket as i32,
+            route: format!("/{SECRET}/{{key}}"),
+            event: Some(event),
+            resend_of: format!("main:{SECRET}"),
+            audit: Some(pb::Audit {
+                token_id: format!("tok-{SECRET}"),
+                reason: format!("because {SECRET}"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn request(body: pb::Body) -> pb::HttpInput {
+        pb::HttpInput {
+            method: SECRET.into(),
+            path: SECRET.into(),
+            query: SECRET.into(),
+            route: format!("/room/{{{SECRET}}}"),
+            params: vec![pb::Param {
+                name: SECRET.into(),
+                value: SECRET.into(),
+                sealed_value: None,
+            }],
+            headers: vec![
+                pb::Header {
+                    name: format!("x-{SECRET}"),
+                    value: tagged(SECRET.as_bytes()),
+                },
+                pb::Header {
+                    name: "sec-websocket-protocol".into(),
+                    value: tagged(SECRET.as_bytes()),
+                },
+            ],
+            body: Some(body),
+            idempotency_key: SECRET.into(),
+            ..Default::default()
+        }
+    }
+
+    fn connection_open() -> pb::TurnRecord {
+        let mut turn = connection_turn(pb::connection_input::Event::Open(pb::ConnectionOpen {
+            request: Some(request(pb::Body {
+                value: Some(pb::body::Value::Inline(tagged(SECRET.as_bytes()).unwrap())),
+            })),
+        }));
+        turn.outcome = Some(pb::Outcome {
+            kind: pb::OutcomeKind::Committed as i32,
+            output: Some(pb::outcome::Output::Accept(pb::ConnectionAccept {
+                subprotocol_index: Some(0),
+                headers: vec![pb::Header {
+                    name: format!("x-{SECRET}"),
+                    value: tagged(SECRET.as_bytes()),
+                }],
+                subject: Some(format!("user:{SECRET}")),
+            })),
+            ..Default::default()
+        });
+        turn.connection_ops = vec![
+            pb::ConnectionOp {
+                connections: vec![format!("c-{SECRET}")],
+                seqs: vec![1],
+                op: Some(pb::connection_op::Op::Send(pb::Frame {
+                    kind: pb::frame::Kind::Event as i32,
+                    data: tagged(SECRET.as_bytes()),
+                    event: SECRET.into(),
+                    id: SECRET.into(),
+                })),
+                dropped: Vec::new(),
+            },
+            pb::ConnectionOp {
+                connections: vec![format!("c-{SECRET}")],
+                seqs: Vec::new(),
+                op: Some(pb::connection_op::Op::Close(pb::ConnectionCloseRequest {
+                    code: 1000,
+                    reason: tagged(SECRET.as_bytes()),
+                })),
+                dropped: vec![format!("d-{SECRET}")],
+            },
+        ];
+        turn
+    }
+
+    fn connection_frame() -> pb::TurnRecord {
+        connection_turn(pb::connection_input::Event::Frame(pb::ConnectionFrame {
+            seq: 4,
+            frame: Some(pb::Frame {
+                kind: pb::frame::Kind::Text as i32,
+                data: tagged(SECRET.as_bytes()),
+                event: SECRET.into(),
+                id: SECRET.into(),
+            }),
+        }))
+    }
+
+    fn connection_close() -> pb::TurnRecord {
+        connection_turn(pb::connection_input::Event::Close(pb::ConnectionClose {
+            cause: pb::CloseCause::Client as i32,
+            code: 1000,
+            reason: tagged(SECRET.as_bytes()),
+            frames_written: 1,
+            frames_written_known: true,
+            frames_received: 2,
+            restart_after_lsn: 3,
+        }))
+    }
+
+    fn connection_blob() -> pb::TurnRecord {
+        connection_turn(pb::connection_input::Event::Open(pb::ConnectionOpen {
+            request: Some(request(pb::Body {
+                value: Some(pb::body::Value::Blob(pb::BlobRef {
+                    hash: format!("b3:{SECRET}"),
+                    size: 4,
+                    subject: Some(format!("user:{SECRET}")),
+                    key_version: 0,
+                })),
+            })),
+        }))
+    }
+
+    fn connection_turn(event: pb::connection_input::Event) -> pb::TurnRecord {
+        pb::TurnRecord {
+            input: Some(pb::Input {
+                kind: Some(pb::input::Kind::Connection(connection_input(event))),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn holds_secret(value: &Value) -> bool {
+        let Some(text) = value.as_str() else {
+            return false;
+        };
+        text.contains(SECRET)
+            || STANDARD.decode(text).is_ok_and(|bytes| {
+                bytes
+                    .windows(SECRET.len())
+                    .any(|window| window == SECRET.as_bytes())
+            })
+    }
+
+    fn scoped(path: &str) -> bool {
+        path.starts_with("input.")
+            || path.starts_with("connection_ops")
+            || path.starts_with("output.accept")
+    }
+
+    fn leaves<'a>(value: &'a Value, prefix: &str, out: &mut Vec<(String, &'a Value)>) {
+        match value {
+            Value::Array(items) if items.is_empty() => {
+                out.push((format!("{prefix}[]"), value));
+            }
+            Value::Array(items) if items.iter().all(Value::is_array) => {
+                for item in items {
+                    let Value::Array(pair) = item else {
+                        continue;
+                    };
+                    for (index, child) in pair.iter().enumerate() {
+                        leaves(child, &format!("{prefix}[][{index}]"), out);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    leaves(item, &format!("{prefix}[]"), out);
+                }
+            }
+            Value::Object(map) => {
+                for (key, child) in map {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    leaves(child, &path, out);
+                }
+            }
+            _ => out.push((prefix.to_owned(), value)),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FieldClass {
+        Scrub,
+        Keep,
+    }
+
+    fn classify(path: &str) -> Option<FieldClass> {
+        use FieldClass::{Keep, Scrub};
+        Some(match path {
+            "input.type"
+            | "input.event"
+            | "input.connection"
+            | "input.protocol"
+            | "input.route"
+            | "input.seq"
+            | "input.frame"
+            | "input.close"
+            | "input.request"
+            | "input.resend_of"
+            | "input.token_id"
+            | "input.request.method"
+            | "input.request.route"
+            | "input.request.params[][0]"
+            | "input.request.headers[].value.subject"
+            | "input.request.body.subject"
+            | "input.request.body.blob.hash"
+            | "input.request.body.blob.size"
+            | "input.request.body.blob.subject"
+            | "input.frame.kind"
+            | "input.frame.data.subject"
+            | "input.close.initiator"
+            | "input.close.cause"
+            | "input.close.code"
+            | "input.close.reason.subject"
+            | "input.close.frames_written"
+            | "input.close.frames_received"
+            | "input.close.restart_after_lsn"
+            | "connection_ops[]"
+            | "connection_ops[].op"
+            | "connection_ops[].connections[]"
+            | "connection_ops[].seqs[]"
+            | "connection_ops[].dropped[]"
+            | "connection_ops[].frame"
+            | "connection_ops[].frame.kind"
+            | "connection_ops[].frame.data.subject"
+            | "connection_ops[].code"
+            | "connection_ops[].reason"
+            | "connection_ops[].reason.subject"
+            | "output.accept.subprotocol_index"
+            | "output.accept.subject"
+            | "output.accept.headers[].value.subject" => Keep,
+            "input.reason"
+            | "input.request.path"
+            | "input.request.query"
+            | "input.request.idempotency_key"
+            | "input.request.params[][1]"
+            | "input.request.headers[].name"
+            | "input.request.headers[].value.value.text"
+            | "input.request.headers[].value.value.base64"
+            | "input.request.body.value.text"
+            | "input.request.body.value.base64"
+            | "input.frame.event"
+            | "input.frame.id"
+            | "input.frame.data.value.text"
+            | "input.frame.data.value.base64"
+            | "input.close.reason.value.text"
+            | "input.close.reason.value.base64"
+            | "connection_ops[].frame.event"
+            | "connection_ops[].frame.id"
+            | "connection_ops[].frame.data.value.text"
+            | "connection_ops[].frame.data.value.base64"
+            | "connection_ops[].reason.value.text"
+            | "connection_ops[].reason.value.base64"
+            | "output.accept.subprotocol"
+            | "output.accept.headers[].name"
+            | "output.accept.headers[].value.value.text"
+            | "output.accept.headers[].value.value.base64" => Scrub,
+            _ => return None,
+        })
+    }
+
+    const MUST_SCRUB: &[&str] = &[
+        "input.request.path",
+        "input.request.query",
+        "input.request.idempotency_key",
+        "input.request.params[][1]",
+        "input.request.headers[].name",
+        "input.request.headers[].value.value.text",
+        "input.request.body.value.text",
+        "input.frame.data.value.text",
+        "input.frame.event",
+        "input.frame.id",
+        "input.close.reason.value.text",
+        "input.reason",
+        "connection_ops[].frame.data.value.text",
+        "connection_ops[].frame.event",
+        "connection_ops[].frame.id",
+        "connection_ops[].reason.value.text",
+        "output.accept.headers[].name",
+        "output.accept.headers[].value.value.text",
+        "output.accept.subprotocol",
+    ];
+
+    const MUST_KEEP: &[&str] = &[
+        "input.connection",
+        "input.route",
+        "input.resend_of",
+        "input.token_id",
+        "input.request.method",
+        "input.request.route",
+        "input.request.params[][0]",
+        "input.request.headers[].value.subject",
+        "input.request.body.subject",
+        "input.request.body.blob.hash",
+        "input.request.body.blob.subject",
+        "input.frame.data.subject",
+        "input.close.reason.subject",
+        "connection_ops[].connections[]",
+        "connection_ops[].dropped[]",
+        "connection_ops[].frame.data.subject",
+        "connection_ops[].reason.subject",
+        "output.accept.subject",
+        "output.accept.headers[].value.subject",
+    ];
 }

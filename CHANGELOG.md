@@ -5,6 +5,13 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- `GET /v1/turns/{id}` scrubs a stored secret from a connection open's
+  request, an inbound frame, a close reason, buffered `connection_ops`,
+  and an accept's headers and selected subprotocol. The read-side
+  scrubber skipped those fields, so the turn API returned the secret to
+  any `read` token, and to `pii:read` after unsealing. Fork turns use the
+  same walk. An input type the scrubber has not classified is refused
+  instead of returned as rendered.
 - `privacy reseal` rewrites a failed connection frame or close in
   `state.db` to the sealed copy, as it already did for a message or timer
   dead letter. Those rows stayed plain, so `privacy status` counted the
