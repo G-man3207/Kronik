@@ -6,6 +6,10 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- SQL erasure, `has_table_without_subject`, and `--no-pii` pseudonymization
+  treat any ASCII case of `_subject` as the subject column, as the write
+  path already did. A column declared `_Subject` is erased, and its text
+  and blob cells are pseudonymized; the subject id is left unchanged.
 - A connection dead-letter resend that checked its letter just before a
   rollback via replay and was queued just after the switch answers
   `DEAD_LETTER_NOT_FOUND` and starts no turn, as a message resend already
