@@ -286,8 +286,9 @@ closed log segments. The mode must already be `on`. A tagged plain value
 becomes sealed with the subject's current key; a value of an erased
 subject becomes a tombstone that can never be unsealed. LSNs and record
 order stay the same. The state values, the bodies of pending timers and
-undelivered messages, saved responses and dead letters that the rewritten
-records hold in `state.db` are sealed the same way. The
+undelivered messages, saved responses and dead letters (including a failed
+connection frame or close) that the rewritten records hold in `state.db`
+are sealed the same way. The
 segment still being written is left until the next roll. A dry run reports
 how many closed segments would change and writes nothing. Run it after
 turning the mode on, before the first erasure. The command is `kronik
