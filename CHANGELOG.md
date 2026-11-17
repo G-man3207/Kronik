@@ -6,6 +6,10 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- A connection dead-letter resend that checked its letter just before a
+  rollback via replay and was queued just after the switch answers
+  `DEAD_LETTER_NOT_FOUND` and starts no turn, as a message resend already
+  did. One whose letter the rebased state still has still runs once.
 - Fork replay of a failed `actor.call` runs the compensation with the
   caller's subject, as live delivery does. The compensation message body
   already carried that tag; replay queued the turn with none, so its KV

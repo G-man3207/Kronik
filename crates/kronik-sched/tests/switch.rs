@@ -1,7 +1,7 @@
 //! Code switches and the rebase switch (ADR 0013, 0018) against the cases
 //! the happy path does not show: a caller that goes away mid-switch, a
 //! deployment that lands before the rebase switch, a pause past its bound,
-//! a resend held by the pause.
+//! a resend held by the pause, a connection resend queued across the switch.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
@@ -12,6 +12,7 @@ use std::time::Duration;
 use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, Lsn};
+use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Born, CodeSwitch, Node, NodeConfig, SwitchHold, start_local};
 
@@ -386,6 +387,193 @@ async fn a_held_resend_of_a_dead_letter_gone_by_the_switch_is_dropped() {
         "the resend ran"
     );
     assert!(node.store().db().dead_letters(0, 100).unwrap().is_empty());
+}
+
+fn text_frame(text: &str) -> pb::Frame {
+    pb::Frame {
+        kind: pb::frame::Kind::Text as i32,
+        data: Some(pb::Sealable {
+            subject: None,
+            value: Some(pb::sealable::Value::Plain(text.as_bytes().to_vec())),
+        }),
+        ..Default::default()
+    }
+}
+
+fn open_request(key: &str, query: &str) -> pb::HttpInput {
+    pb::HttpInput {
+        method: "GET".into(),
+        path: format!("/room/{key}/ws"),
+        query: query.into(),
+        params: vec![pb::Param {
+            name: "key".into(),
+            value: key.into(),
+            sealed_value: None,
+        }],
+        headers: vec![pb::Header {
+            name: "sec-websocket-protocol".into(),
+            value: Some(pb::Sealable {
+                subject: None,
+                value: Some(pb::sealable::Value::Plain(b"room.v1".to_vec())),
+            }),
+        }],
+        route: "/room/{key}/ws".into(),
+        ..Default::default()
+    }
+}
+
+/// Room deployed (epoch 1). Code switches park on `hold`; deploys do not.
+async fn room_node(dir: &std::path::Path) -> (Arc<Node>, Arc<SwitchHold>) {
+    let hold = Arc::new(SwitchHold::default());
+    let env = Env::real(tokio::runtime::Handle::current());
+    let config = NodeConfig {
+        concurrency: 8,
+        test_hold_switch: Some(hold.clone()),
+        ..NodeConfig::default()
+    };
+    let node = start_local(env, dir, config).await.unwrap();
+    node.deploy(&guest("room"), audit(), false, owner(&node))
+        .await
+        .unwrap();
+    (node, hold)
+}
+
+/// Opens a room connection and fails one frame; that dead letter's LSN.
+async fn fail_frame(node: &Node) -> Lsn {
+    let (id, waiter) = node
+        .connection_open(
+            ActorRef::parse("room/lobby").unwrap(),
+            open_request("lobby", "user=ada"),
+            pb::ConnectionProtocol::Websocket,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+    let opened = waiter.wait().await.unwrap();
+    assert!(opened.committed(), "{opened:?}");
+    kronik_sched::connections::RecordingTransport::attach(node.hub(), &id).unwrap();
+    node.hub().incoming(&id, text_frame("fail")).await;
+    wait_until("the frame's dead letter", || {
+        !node.store().db().dead_letters(0, 10).unwrap().is_empty()
+    })
+    .await;
+    let letters = node.store().db().dead_letters(0, 10).unwrap();
+    assert_eq!(letters.len(), 1, "{letters:?}");
+    letters[0].lsn
+}
+
+/// Turns of `room/lobby` whose connection input resends `of`.
+async fn connection_resends(node: &Node, of: &str) -> usize {
+    let refs = node
+        .store()
+        .db()
+        .history("room", "lobby", None, 100)
+        .unwrap();
+    let mut n = 0;
+    for t in refs {
+        let committed = node.read_record(t.lsn).await.unwrap().unwrap();
+        let Record::TurnRecord(turn) = committed.record else {
+            continue;
+        };
+        if let Some(pb::input::Kind::Connection(c)) = turn.input.and_then(|i| i.kind)
+            && c.resend_of == of
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// A connection resend that checked its dead letter before the rebase
+/// switch and is queued after it does not run: the rebased state no longer
+/// has the letter (m13-rebase §3), same as a message resend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_resend_queued_after_the_switch_does_not_run_when_the_letter_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, hold) = room_node(dir.path()).await;
+    let epoch = promote_now(&node, &hold, "room-fmt2").await;
+    let dead = fail_frame(&node).await;
+    let (sw, kinds, not_after) = prepare_rebase(&node, "r-conn", epoch).await;
+    let pause = node
+        .rebase_pause(Duration::from_secs(5), owner(&node))
+        .await
+        .unwrap();
+    let started = hold.arrived.load(Ordering::SeqCst);
+    hold.park_resend.store(true, Ordering::SeqCst);
+    let resend = {
+        let node = node.clone();
+        tokio::spawn(async move { node.resend(dead, audit(), false, owner(&node)).await })
+    };
+    wait_until("the resend parks after its check", || {
+        hold.resend_parked.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    hold.release.add_permits(1);
+    node.rebase_switch(pause, "r-conn", sw, kinds, not_after, audit(), owner(&node))
+        .await
+        .unwrap();
+    assert!(node.store().db().dead_letter(dead).unwrap().is_none());
+    hold.resend_release.add_permits(1);
+    let r: Result<_, ApiError> = resend.await.unwrap();
+    let err = r.unwrap_err();
+    assert_eq!(err.code, ErrorCode::DeadLetterNotFound, "{err}");
+    assert!(err.message.contains("gone"), "{err}");
+    assert_eq!(
+        hold.arrived.load(Ordering::SeqCst),
+        started,
+        "the resend ran"
+    );
+    assert!(node.store().db().dead_letters(0, 100).unwrap().is_empty());
+}
+
+/// The same window, when the rebased state still has the letter: the
+/// resend runs once and is not applied again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_resend_queued_after_the_switch_runs_once_when_the_letter_remains() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, hold) = room_node(dir.path()).await;
+    let dead = fail_frame(&node).await;
+    let epoch = promote_now(&node, &hold, "room-fmt2").await;
+    let (sw, kinds, not_after) = prepare_rebase(&node, "r-kept", epoch).await;
+    let pause = node
+        .rebase_pause(Duration::from_secs(5), owner(&node))
+        .await
+        .unwrap();
+    hold.park_resend.store(true, Ordering::SeqCst);
+    let resend = {
+        let node = node.clone();
+        tokio::spawn(async move { node.resend(dead, audit(), false, owner(&node)).await })
+    };
+    wait_until("the resend parks after its check", || {
+        hold.resend_parked.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    hold.release.add_permits(1);
+    node.rebase_switch(pause, "r-kept", sw, kinds, not_after, audit(), owner(&node))
+        .await
+        .unwrap();
+    assert!(
+        node.store().db().dead_letter(dead).unwrap().is_some(),
+        "the rebased state still has the letter"
+    );
+    hold.resend_release.add_permits(1);
+    let r: Result<_, ApiError> = resend.await.unwrap();
+    let turn = r.expect("the letter remained").expect("not a dry run");
+    assert_eq!(
+        node.store()
+            .db()
+            .dead_letter(dead)
+            .unwrap()
+            .unwrap()
+            .resent_as,
+        Some(turn.turn_id.lsn)
+    );
+    assert_eq!(
+        connection_resends(&node, &format!("main:{dead}")).await,
+        1,
+        "the resend ran once"
+    );
 }
 
 /// Re-review #3 (v0.1): a configuration change whose caller goes away while
