@@ -446,6 +446,10 @@ pub struct SqlActor {
     /// Erasures applied while a turn had its savepoint open (subject, LSN):
     /// they run when the turn ends ([`SqlActor::erase_subject`]).
     deferred_erasures: Vec<(String, u64)>,
+    /// A delete already ran, but its WAL checkpoint could not: a turn had
+    /// the connection. [`SqlActor::end_turn`] and [`SqlActor::abort_turn`]
+    /// checkpoint once the connection is idle (H11).
+    erasure_checkpoint: bool,
 }
 
 fn lock(m: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
@@ -623,6 +627,7 @@ impl SqlActor {
             has_triggers: None,
             page_size: page_size.max(512) as u64,
             deferred_erasures: Vec::new(),
+            erasure_checkpoint: false,
         })
     }
 
@@ -862,6 +867,7 @@ impl SqlActor {
             .pragma_update(None, "max_page_count", UNLIMITED_PAGES)
             .map_err(|e| e.to_string());
         let erased = self.run_deferred_erasures();
+        self.checkpoint_pending_erasure();
         let t = res?;
         unlimit?;
         erased?;
@@ -1127,9 +1133,24 @@ impl SqlActor {
     /// Until then the database's applied LSN stays below `lsn`, so a stop
     /// in between replays the erasure.
     pub fn erase_subject(&mut self, subject: &str, lsn: u64) -> Result<u64, String> {
+        let (n, checkpoint) = self.erase_subject_at(subject, lsn)?;
+        if checkpoint {
+            self.checkpoint_erasure();
+        }
+        Ok(n)
+    }
+
+    /// The deletes of [`erase_subject`] without the WAL checkpoint.
+    /// `checkpoint` is true when the deletes ran and the connection is idle,
+    /// so the caller can truncate the WAL after it releases the apply lock.
+    pub(crate) fn erase_subject_at(
+        &mut self,
+        subject: &str,
+        lsn: u64,
+    ) -> Result<(u64, bool), String> {
         if self.session.is_some() {
             self.deferred_erasures.push((subject.to_owned(), lsn));
-            return Ok(0);
+            return Ok((0, false));
         }
         lock(&self.shared).host = true;
         let tables = tables_with_subject_column(&self.conn)?;
@@ -1155,11 +1176,34 @@ impl SqlActor {
         self.conn
             .execute_batch("RELEASE kronik_apply")
             .map_err(|e| e.to_string())?;
-        // The WAL still holds the pages from before the deletes (H11).
-        if self.conn.is_autocommit() {
-            crate::db::checkpoint_truncate(&self.conn, "actor database");
+        Ok((n, self.conn.is_autocommit()))
+    }
+
+    /// H11: truncate the WAL after an erasure. A caller that holds the apply
+    /// lock must call this after releasing it. If a turn has the connection,
+    /// the checkpoint waits for [`SqlActor::end_turn`].
+    pub(crate) fn checkpoint_erasure(&mut self) {
+        if !self.conn.is_autocommit() {
+            self.erasure_checkpoint = true;
+            return;
         }
-        Ok(n)
+        self.erasure_checkpoint = false;
+        #[cfg(test)]
+        {
+            assert!(
+                !crate::apply_lock_held(),
+                "actor WAL checkpoint ran under the apply lock"
+            );
+            crate::ACTOR_ERASURE_CHECKPOINTS.with(|c| c.set(c.get() + 1));
+        }
+        // The WAL still holds the pages from before the deletes (H11).
+        crate::db::checkpoint_truncate(&self.conn, "actor database");
+    }
+
+    fn checkpoint_pending_erasure(&mut self) {
+        if self.erasure_checkpoint {
+            self.checkpoint_erasure();
+        }
     }
 
     /// Whether a guest table has no `_subject` column (any ASCII case). A
@@ -1262,6 +1306,7 @@ impl SqlActor {
         // A failure leaves the applied LSN below the erasure's: the next
         // start replays it.
         let _ = self.run_deferred_erasures();
+        self.checkpoint_pending_erasure();
     }
 
     /// Every user table's rows in canonical order: primary-key order, or

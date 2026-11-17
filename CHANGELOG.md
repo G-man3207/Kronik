@@ -6,6 +6,12 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- An erasure deletes a subject's `kv`, `ingress_keys` and `dead_letters`
+  rows through an index, and tombstones only that subject's queued timer
+  and mailbox bodies, instead of scanning those tables under the apply
+  lock. Actor-database WAL checkpoints after the erasure run after the
+  lock is released. The subject column on `timers` and `mailbox` is an
+  index probe added on open; it is not part of the state hash.
 - An actor call reads the callee's source from the turn index and one log
   frame, instead of decoding every retained record from LSN 1. A call whose
   callee is still in the log succeeds after retention moves the log start

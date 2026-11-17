@@ -43,8 +43,29 @@ const HASHED_TABLES: &[&str] = &[
 ];
 
 /// Tables hashed with some of their columns, in this order: a hold is the
-/// state, not the LSN of the record that made it (M26 §5.3).
-const HASHED_COLUMNS: &[(&str, &[&str])] = &[("blob_refs", &["kind", "key", "hash"])];
+/// state, not the LSN of the record that made it (M26 §5.3). `timers` and
+/// `mailbox` omit `subject`: it is an index probe derived from the body,
+/// which is already hashed, so an old snapshot's hash does not move when
+/// the column is added on open.
+const HASHED_COLUMNS: &[(&str, &[&str])] = &[
+    ("blob_refs", &["kind", "key", "hash"]),
+    (
+        "timers",
+        &["kind", "key", "timer_id", "due_ms", "msg", "causal", "lsn"],
+    ),
+    (
+        "mailbox",
+        &[
+            "message_id",
+            "to_kind",
+            "to_key",
+            "lsn",
+            "ordinal",
+            "input",
+            "causal",
+        ],
+    ),
+];
 
 /// What `Store::snapshot_to` wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,7 +389,7 @@ fn remove_snapshot_copies(dir: &Path, actors: &[String]) -> Result<(), StoreErro
     Ok(())
 }
 
-fn snapshot_apply_lock(store: &Store) -> std::sync::MutexGuard<'_, ()> {
+fn snapshot_apply_lock(store: &Store) -> crate::ApplyLock<'_> {
     #[cfg(test)]
     SNAPSHOT_APPLY_LOCK_HOLDS.with(|c| c.set(c.get() + 1));
     store.apply_lock()
