@@ -22,6 +22,8 @@
 #                                          to propose (payments-must-be-exact)
 #   billing-ts-refactor.wasm               billing-ts refactor (same behavior),
 #                                          for examples/payments-platform
+#   billing-ts-reorder.wasm                billing-ts with GET /healthz after
+#                                          charge (dogfood scenario 3)
 #
 # `npm ci` installs the pinned toolchain (jco, ComponentizeJS, TypeScript)
 # first. kronik build type-checks each example, builds it, checks its imports
@@ -47,11 +49,12 @@ cp examples/counter-ts/dist/counter-ts-step2.wasm examples/dist/counter-ts-step2
 cp examples/chat-ts/dist/chat-ts-step2.wasm examples/dist/chat-ts-step2.wasm
 # billing-ts's package is called billing, so its dist/ matches the brief's
 # ./dist/billing.wasm.
-for entry in actor ledger eu-vat refactor; do
+for entry in actor ledger eu-vat refactor reorder; do
     "$bin" build --dir examples/billing-ts --entry "src/$entry.ts"
 done
 cp examples/billing-ts/dist/billing.wasm examples/dist/billing-ts.wasm
 cp examples/billing-ts/dist/billing-ledger.wasm examples/dist/billing-ts-ledger.wasm
 cp examples/billing-ts/dist/billing-eu-vat.wasm examples/dist/billing-ts-eu-vat.wasm
 cp examples/billing-ts/dist/billing-refactor.wasm examples/dist/billing-ts-refactor.wasm
+cp examples/billing-ts/dist/billing-reorder.wasm examples/dist/billing-ts-reorder.wasm
 ls -l examples/dist/*-ts*.wasm
