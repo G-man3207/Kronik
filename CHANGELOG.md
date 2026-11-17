@@ -6,6 +6,10 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- `kronik explain IMPORT_NOT_ALLOWED` no longer says every `wasi:http` import
+  is denied. `wasi:http/types` and `wasi:http/outgoing-handler` at 0.2.x are
+  allowed and become `http.fetch` effects; incoming-handler, filesystem and
+  sockets stay denied.
 - `GET /v1/integrity` hashes a private copy of the committed databases and
   does not hold the apply lock across that copy or the hash. The log hash
   resumes from the last LSN hashed in this process, instead of reading the
