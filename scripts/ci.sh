@@ -439,6 +439,22 @@ step_foreign() {
     # user (no copy of the host's /etc).
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --bin kronik restore::tests
     KRONIK_FOREIGN_TESTS=require cargo test --locked -p kronik --test restore_drop
+    # Issue #136: payments-platform dogfood scenarios need billing-ts WASM and
+    # fake-payments in gVisor (same root + runsc gate as the tests above).
+    local kronik
+    kronik="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/kronik"
+    if ! command -v npm >/dev/null 2>&1; then
+        if [ "${KRONIK_FOREIGN_TESTS:-}" = require ]; then
+            echo "error: KRONIK_FOREIGN_TESTS=require, but npm is missing for build-examples-ts.sh" >&2
+            return 1
+        fi
+        echo "skipped: npm missing for payments-platform dogfood demos"
+        return 0
+    fi
+    cargo build --locked --release -p kronik
+    KRONIK_BIN="$kronik" scripts/build-examples-ts.sh
+    KRONIK_BIN="$kronik" demo/payments-platform-pure-refactor.sh
+    KRONIK_BIN="$kronik" demo/payments-platform-eu-vat.sh
 }
 
 # The S3 variants of the shipping, restore, blob and audit-sink tests, against
