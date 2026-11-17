@@ -1012,6 +1012,32 @@ async fn ensure_image(ctx: &Arc<Ctx>, decl: &pb::ForeignActor) -> Result<(), Str
     Ok(())
 }
 
+/// Overrides for one start. Only `trusted` gets the host-kernel seccomp
+/// filter; gVisor and a microVM have their own kernels.
+fn sandbox_overrides(
+    decl: &pb::ForeignActor,
+    env_vars: Vec<(String, String)>,
+    cgroup: String,
+    data_dir: PathBuf,
+    netns: Option<PathBuf>,
+) -> oci::Overrides {
+    oci::Overrides {
+        cpu_millis: decl.cpu_millis,
+        memory_bytes: decl.memory_bytes,
+        pids: PIDS_LIMIT,
+        env: env_vars,
+        binds: vec![oci::Bind {
+            source: data_dir,
+            destination: "/data".into(),
+            read_only: false,
+        }],
+        cgroups_path: Some(cgroup),
+        netns,
+        hostname: decl.name.clone(),
+        syscall_filter: decl.isolation == pb::Isolation::Trusted as i32,
+    }
+}
+
 /// Blocking: bundle (rebuilt if its marker differs), data directory, network
 /// namespace and `config.json`.
 fn prepare(
@@ -1067,21 +1093,13 @@ fn prepare(
             .map_err(|e| io("creating the network namespace", &netns, e))?;
     }
 
-    let overrides = oci::Overrides {
-        cpu_millis: decl.cpu_millis,
-        memory_bytes: decl.memory_bytes,
-        pids: PIDS_LIMIT,
-        env: env_vars,
-        binds: vec![oci::Bind {
-            source: p.data_dir(name),
-            destination: "/data".into(),
-            read_only: false,
-        }],
-        cgroups_path: Some(cgroup),
-        netns: (!microvm).then_some(netns),
-        hostname: name.clone(),
-        syscall_filter: decl.isolation == pb::Isolation::Trusted as i32,
-    };
+    let overrides = sandbox_overrides(
+        decl,
+        env_vars,
+        cgroup,
+        p.data_dir(name),
+        (!microvm).then_some(netns),
+    );
     let spec = oci::runtime_spec(&img, &rootfs, &overrides).map_err(|e| e.to_string())?;
     let data = p.data_dir(name);
     if crate::sys::is_root() {
@@ -1272,5 +1290,78 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e, "SECRET_NOT_FOUND: the secret store is not configured");
+    }
+
+    /// The bundle spec of a trusted declaration denies the escape syscalls.
+    /// gVisor and a microVM have their own kernels and get no host filter.
+    /// Passing `syscall_filter: true` itself would not catch a supervisor
+    /// that stopped setting the flag.
+    #[test]
+    fn a_trusted_declaration_spec_denies_escape_syscalls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        let image = oci::Image {
+            manifest_digest: String::new(),
+            config_digest: String::new(),
+            config: serde_json::json!({
+                "config": {
+                    "Entrypoint": ["/bin/echo"],
+                    "Env": ["PATH=/bin"],
+                    "User": "",
+                    "WorkingDir": "/",
+                },
+            }),
+            layers: Vec::new(),
+            diff_ids: Vec::new(),
+            chain: Vec::new(),
+        };
+        let spec_for = |isolation: i32| {
+            let decl = pb::ForeignActor {
+                name: "echo".into(),
+                isolation,
+                cpu_millis: 500,
+                memory_bytes: 64 << 20,
+                ..pb::ForeignActor::default()
+            };
+            let overrides = sandbox_overrides(
+                &decl,
+                Vec::new(),
+                "/kronik/0123abcd/echo".into(),
+                tmp.path().join("data"),
+                Some(tmp.path().join("netns")),
+            );
+            oci::runtime_spec(&image, &rootfs, &overrides).unwrap()
+        };
+        let trusted = spec_for(pb::Isolation::Trusted as i32);
+        let filter = &trusted.json["linux"]["seccomp"];
+        assert_eq!(filter["defaultAction"], "SCMP_ACT_ALLOW");
+        let denied = filter["syscalls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| {
+                rule["names"]
+                    .as_array()
+                    .is_some_and(|names| names.iter().any(|name| name == "unshare"))
+            })
+            .unwrap_or_else(|| panic!("no denied-syscall rule: {filter}"));
+        assert_eq!(denied["action"], "SCMP_ACT_ERRNO");
+        assert_eq!(denied["errnoRet"], 1);
+        let names = denied["names"].as_array().unwrap();
+        for syscall in ["unshare", "mount", "bpf", "io_uring_setup"] {
+            assert!(
+                names.contains(&serde_json::json!(syscall)),
+                "trusted spec does not deny {syscall}: {names:?}"
+            );
+        }
+        for isolation in [pb::Isolation::Gvisor as i32, pb::Isolation::Microvm as i32] {
+            let spec = spec_for(isolation);
+            assert!(
+                spec.json["linux"]["seccomp"].is_null(),
+                "isolation {isolation} must not get the host filter: {}",
+                spec.json["linux"]
+            );
+        }
     }
 }

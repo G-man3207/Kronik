@@ -198,6 +198,21 @@ jobs:
           sudo KRONIK_INSTALL_RUNSC=yes sh scripts/install-runsc.sh </dev/null
           runsc --version
 
+      # The trusted branch of the foreign test uses this path. A missing
+      # binary must not be a silent skip under KRONIK_FOREIGN_TESTS=require.
+      - name: Install runc
+        run: |
+          if [ ! -x /usr/bin/runc ]; then
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y runc
+            if [ ! -x /usr/bin/runc ]; then
+              runc_bin="$(command -v runc)"
+              test -n "$runc_bin"
+              sudo ln -s "$runc_bin" /usr/bin/runc
+            fi
+          fi
+          /usr/bin/runc --version
+
       # The foreign step needs root: it runs as root with this user's
       # toolchain, then gives the build files back for the cache.
       # KRONIK_FOREIGN_TESTS=require makes any skip a failure.

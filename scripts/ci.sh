@@ -7,7 +7,8 @@
 # dst, deny,
 # musl (the release target, linked against the release's zig and musl),
 # foreign (needs root and runsc; skipped with a message otherwise, a failure
-# with KRONIK_FOREIGN_TESTS=require),
+# with KRONIK_FOREIGN_TESTS=require; the trusted actor also needs runc at
+# /usr/bin/runc, and under require that absence fails the foreign test),
 # s3 (needs docker; skipped with a message otherwise, a failure with
 # KRONIK_TEST_S3=require),
 # identity (without libfaketime, todo-ts is skipped with a message too),
@@ -426,8 +427,9 @@ pathlib.Path(sys.argv[1]).write_text(text[:start] + "ignore = []" + text[end + 1
 # M7: foreign actors in real gVisor sandboxes. Needs root and runsc
 # (docs/design/m7-foreign.md §14); elsewhere it says why and skips, unless
 # KRONIK_FOREIGN_TESTS=require (as in CI), which makes every skip, here and
-# in the tests, a failure. M14's Postgres fork test also needs docker, for
-# the foreign-pg image's base.
+# in the tests, a failure. The trusted actor needs runc at /usr/bin/runc;
+# under require that absence fails the foreign test (CI installs it). M14's
+# Postgres fork test also needs docker, for
 step_foreign() {
     local runsc="${KRONIK_RUNSC:-/usr/local/bin/runsc}"
     if [ "$(id -u)" != 0 ] || [ ! -x "$runsc" ]; then
