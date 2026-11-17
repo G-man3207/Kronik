@@ -994,6 +994,26 @@ rounds, committed turns/s (p50 / p99 in ms), no errors:
   allocator's size classes and are kept for reuse instead of returned, a few
   MiB.
 
+## Allocator and Wasm memory retention (issue #78)
+
+The static musl release build still uses zig's allocator (`SmpAllocator`). A
+C allocator (`mimalloc` or `jemalloc`) through `#[global_allocator]` would be
+a new C dependency beyond SQLite and needs a maintainer decision with
+measurements before it ships.
+
+The other lever is Wasmtime's `linear_memory_keep_resident` (default
+[`LINEAR_MEMORY_KEEP_RESIDENT_BYTES`](../crates/kronik-runtime/src/engine.rs),
+2 MiB): less resident memory means less `memset` on the turn path but more
+page faults on replay (see [Memory cost of the resident Wasm
+memories](#memory-cost-of-the-resident-wasm-memories)). Any change must be
+re-measured against M24 criterion 1.
+
+`scripts/perf-linear-memory-keep-resident.sh` rebuilds the release musl binary
+for each allowed compile-time value
+(`KRONIK_PERF_LINEAR_MEMORY_KEEP_RESIDENT`, documented on the constant) and
+prints the 64-actor `perf-m1` row. Record numbers in this file before changing
+the default.
+
 ## M32 benchmark and regression contract
 
 The M32 targets are unchanged:
