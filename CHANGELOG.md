@@ -5,6 +5,10 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- A registry pull keeps a layer whose bytes match its descriptor even when
+  the registry's `Docker-Content-Digest` header does not. The header cannot
+  authorize bytes that do not match the pin; those are refused and not
+  stored.
 - `cargo deny` records exceptions for unmaintained `humantime`
   (RUSTSEC-2026-0542) and `chrono` (RUSTSEC-2026-0543). Neither has a
   patched release, and the locked graph still resolves them through

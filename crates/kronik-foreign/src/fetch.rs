@@ -485,6 +485,9 @@ async fn manifest(
     {
         return Ok(bytes);
     }
+    // shortcut: oci-client withholds a manifest whose Docker-Content-Digest
+    // disagrees with the body, so a matching manifest is still refused; upgrade
+    // when the client returns those bytes for the local hash to accept.
     let (bytes, _registry_digest) = client
         .pull_manifest_raw(reference, &RegistryAuth::Anonymous, &ACCEPTED_MANIFESTS)
         .await
@@ -628,9 +631,23 @@ async fn blob(
             desc.digest, desc.size
         )));
     }
-    pulled.map_err(|e| registry_error(&format!("fetch blob {}", desc.digest), e))?;
     let actual = format!("sha256:{}", hex(&out.hasher.finalize()));
-    check(desc, out.written, &actual)?;
+    // A Docker-Content-Digest is not an authority. oci-client rejects a
+    // header that does not match the body; that must not reject bytes that
+    // match the pin, and must not keep bytes that do not.
+    let verified = check(desc, out.written, &actual);
+    if let Err(e) = pulled {
+        let header_disagrees = matches!(
+            &e,
+            oci_client::errors::OciDistributionError::DigestError(
+                oci_client::errors::DigestError::VerificationError { .. }
+            )
+        );
+        if !header_disagrees || verified.is_err() {
+            return Err(registry_error(&format!("fetch blob {}", desc.digest), e));
+        }
+    }
+    verified?;
     commit(store, out.file, temp, &desc.digest).await
 }
 
@@ -682,7 +699,10 @@ impl AsyncWrite for HashingFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oci::{Image, ImageSpec, LayerSource, pack};
+    use crate::oci::{
+        Image, ImageSpec, LayerSource, MEDIA_CONFIG, MEDIA_INDEX, MEDIA_LAYER_GZIP, MEDIA_MANIFEST,
+        host_arch, pack,
+    };
 
     fn temp_dir() -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -860,6 +880,376 @@ mod tests {
         let store = BlobStore::new(tmp.path().join("blobs"));
         let err = import_layout(&store, &layout, None).unwrap_err();
         assert!(err.to_string().contains("descriptor says"), "{err}");
+    }
+
+    /// Bytes of one packed image, plus the digests the registry is asked for.
+    struct PackedImage {
+        manifest_digest: String,
+        manifest: Vec<u8>,
+        config_digest: String,
+        config: Vec<u8>,
+        layer_digest: String,
+        layer: Vec<u8>,
+    }
+
+    fn packed_image(tmp: &tempfile::TempDir) -> PackedImage {
+        let (layout, manifest_digest) = packed(tmp, "img", "payload");
+        let manifest = fs::read(layout.join("blobs/sha256").join(&manifest_digest[7..])).unwrap();
+        let doc: Value = serde_json::from_slice(&manifest).unwrap();
+        let config_digest = doc["config"]["digest"].as_str().unwrap().to_string();
+        let layer_digest = doc["layers"][0]["digest"].as_str().unwrap().to_string();
+        let read = |digest: &str| fs::read(layout.join("blobs/sha256").join(&digest[7..])).unwrap();
+        PackedImage {
+            config: read(&config_digest),
+            layer: read(&layer_digest),
+            manifest_digest,
+            manifest,
+            config_digest,
+            layer_digest,
+        }
+    }
+
+    /// A registry object. `reported` is `Docker-Content-Digest`; `None` omits it.
+    struct Served {
+        body: Vec<u8>,
+        reported: Option<String>,
+        content_type: &'static str,
+    }
+
+    fn served(body: &[u8], reported: Option<String>, content_type: &'static str) -> Served {
+        Served {
+            body: body.to_vec(),
+            reported,
+            content_type,
+        }
+    }
+
+    fn sha512_digest(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        format!("sha512:{}", hex(&sha2::Sha512::digest(bytes)))
+    }
+
+    /// Serves `objects`, keyed by the digest in the request URL, on plain HTTP.
+    /// `GET /v2/` is anonymous. The thread runs until the process exits.
+    fn serve(objects: impl IntoIterator<Item = (String, Served)>) -> String {
+        use std::collections::HashMap;
+        use std::net::TcpListener;
+
+        let objects: HashMap<String, Served> = objects.into_iter().collect();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::Builder::new()
+            .name("km7-registry".into())
+            .spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut conn) = conn else { break };
+                    let _ = answer(&mut conn, &objects);
+                }
+            })
+            .unwrap();
+        addr
+    }
+
+    fn answer(
+        conn: &mut std::net::TcpStream,
+        objects: &std::collections::HashMap<String, Served>,
+    ) -> std::io::Result<()> {
+        use std::io::{Read, Write};
+        use std::time::Duration;
+
+        conn.set_read_timeout(Some(Duration::from_secs(2)))?;
+        conn.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 8192 {
+            match conn.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let req = String::from_utf8_lossy(&buf);
+        let path = req
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/");
+        let path = path.replace("%3A", ":").replace("%3a", ":");
+        let digest = path.find("sha256:").and_then(|i| {
+            let rest = &path[i..];
+            (rest.len() >= 71).then(|| rest[..71].to_string())
+        });
+        let (status, content_type, reported, body) = if path == "/v2" || path == "/v2/" {
+            (200, "application/json", None, b"{}".to_vec())
+        } else if let Some(obj) = digest.as_ref().and_then(|d| objects.get(d)) {
+            (
+                200,
+                obj.content_type,
+                obj.reported.clone(),
+                obj.body.clone(),
+            )
+        } else {
+            (
+                404,
+                "application/json",
+                None,
+                format!(r#"{{"errors":[{{"code":"BLOB_UNKNOWN","message":"unknown {path}"}}]}}"#)
+                    .into_bytes(),
+            )
+        };
+        let reason = if status == 200 { "OK" } else { "Not Found" };
+        let mut head = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nDocker-Distribution-API-Version: registry/2.0\r\n",
+            body.len()
+        );
+        if let Some(reported) = &reported {
+            head.push_str("Docker-Content-Digest: ");
+            head.push_str(reported);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
+        conn.write_all(head.as_bytes())?;
+        conn.write_all(&body)?;
+        conn.flush()
+    }
+
+    async fn pull_pin(
+        store: &BlobStore,
+        registry: &str,
+        digest: &str,
+    ) -> Result<Resolved, ImageError> {
+        pull(
+            store,
+            registry,
+            "img",
+            digest,
+            &FetchOptions {
+                insecure_registries: vec![registry.to_string()],
+                max_new_bytes: None,
+            },
+        )
+        .await
+    }
+
+    fn store_names(store: &BlobStore) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(store.dir()) else {
+            return Vec::new();
+        };
+        let mut names: Vec<_> = entries
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn pull_refuses_a_manifest_that_does_not_match_the_pinned_digest() {
+        let tmp = temp_dir();
+        let image = packed_image(&tmp);
+        let pinned = image.manifest_digest.clone();
+        // The header names the pin. That must not authorize other bytes.
+        let registry = serve([(
+            pinned.clone(),
+            served(b"not the manifest", Some(pinned.clone()), MEDIA_MANIFEST),
+        )]);
+        let store = BlobStore::new(tmp.path().join("blobs"));
+        let err = pull_pin(&store, &registry, &pinned).await.unwrap_err();
+        assert!(err.to_string().contains("digest"), "{err}");
+        let names = store_names(&store);
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn pull_refuses_a_layer_that_does_not_match_its_descriptor() {
+        let tmp = temp_dir();
+        let image = packed_image(&tmp);
+        let registry = serve([
+            (
+                image.manifest_digest.clone(),
+                served(
+                    &image.manifest,
+                    Some(image.manifest_digest.clone()),
+                    MEDIA_MANIFEST,
+                ),
+            ),
+            (
+                image.config_digest.clone(),
+                served(
+                    &image.config,
+                    Some(image.config_digest.clone()),
+                    MEDIA_CONFIG,
+                ),
+            ),
+            (
+                image.layer_digest.clone(),
+                served(
+                    b"not the layer",
+                    Some(image.layer_digest.clone()),
+                    MEDIA_LAYER_GZIP,
+                ),
+            ),
+        ]);
+        let store = BlobStore::new(tmp.path().join("blobs"));
+        let err = pull_pin(&store, &registry, &image.manifest_digest)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("digest"), "{err}");
+        let names = store_names(&store);
+        assert!(
+            !names
+                .iter()
+                .any(|n| n == &image.layer_digest[7..] || n.starts_with(".tmp")),
+            "{names:?}"
+        );
+    }
+
+    /// A reported digest that is not the body's sha256 is ignored when the
+    /// bytes match the pin: the manifest header is sha512 of the body, and
+    /// the layer header is the sha256 of other bytes.
+    #[tokio::test]
+    async fn pull_ignores_a_registry_digest_that_disagrees_with_matching_bytes() {
+        let tmp = temp_dir();
+        let image = packed_image(&tmp);
+        let registry = serve([
+            (
+                image.manifest_digest.clone(),
+                served(
+                    &image.manifest,
+                    Some(sha512_digest(&image.manifest)),
+                    MEDIA_MANIFEST,
+                ),
+            ),
+            (
+                image.config_digest.clone(),
+                served(&image.config, None, MEDIA_CONFIG),
+            ),
+            (
+                image.layer_digest.clone(),
+                served(
+                    &image.layer,
+                    Some(sha256_digest(b"not the layer")),
+                    MEDIA_LAYER_GZIP,
+                ),
+            ),
+        ]);
+        let store = BlobStore::new(tmp.path().join("blobs"));
+        let resolved = pull_pin(&store, &registry, &image.manifest_digest)
+            .await
+            .expect("a disagreeing registry digest must not reject matching bytes");
+        assert_eq!(resolved.manifest_digest, image.manifest_digest);
+        let opened = Image::open(&store, &image.manifest_digest).unwrap();
+        assert_eq!(opened.layers[0].digest, image.layer_digest);
+        assert!(store.has(&opened.layers[0]));
+    }
+
+    /// oci-client accepts this manifest: the digest matches and it does not
+    /// check size. Deleting `check` in `manifest` would store it and succeed.
+    #[tokio::test]
+    async fn pull_refuses_a_nested_manifest_whose_size_is_not_its_descriptor() {
+        let tmp = temp_dir();
+        let image = packed_image(&tmp);
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": MEDIA_INDEX,
+            "manifests": [{
+                "mediaType": MEDIA_MANIFEST,
+                "digest": image.manifest_digest,
+                "size": image.manifest.len() as u64 + 1,
+                "platform": { "os": "linux", "architecture": host_arch().unwrap() },
+            }],
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+        let index_digest = sha256_digest(&index_bytes);
+        let registry = serve([
+            (
+                index_digest.clone(),
+                served(&index_bytes, Some(index_digest.clone()), MEDIA_INDEX),
+            ),
+            (
+                image.manifest_digest.clone(),
+                served(
+                    &image.manifest,
+                    Some(image.manifest_digest.clone()),
+                    MEDIA_MANIFEST,
+                ),
+            ),
+            (
+                image.config_digest.clone(),
+                served(
+                    &image.config,
+                    Some(image.config_digest.clone()),
+                    MEDIA_CONFIG,
+                ),
+            ),
+            (
+                image.layer_digest.clone(),
+                served(
+                    &image.layer,
+                    Some(image.layer_digest.clone()),
+                    MEDIA_LAYER_GZIP,
+                ),
+            ),
+        ]);
+        let store = BlobStore::new(tmp.path().join("blobs"));
+        let err = pull_pin(&store, &registry, &index_digest)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("descriptor says"), "{err}");
+        let names = store_names(&store);
+        assert!(
+            !names.iter().any(|n| n == &image.manifest_digest[7..]),
+            "{names:?}"
+        );
+    }
+
+    /// oci-client accepts this layer: the digest matches and it does not
+    /// check size. Deleting `check` in `blob` would store it and succeed.
+    #[tokio::test]
+    async fn pull_refuses_a_layer_whose_size_is_not_its_descriptor() {
+        let tmp = temp_dir();
+        let image = packed_image(&tmp);
+        let mut doc: Value = serde_json::from_slice(&image.manifest).unwrap();
+        doc["layers"][0]["size"] = serde_json::json!(image.layer.len() as u64 + 1);
+        let manifest = serde_json::to_vec(&doc).unwrap();
+        let pinned = sha256_digest(&manifest);
+        let registry = serve([
+            (
+                pinned.clone(),
+                served(&manifest, Some(pinned.clone()), MEDIA_MANIFEST),
+            ),
+            (
+                image.config_digest.clone(),
+                served(
+                    &image.config,
+                    Some(image.config_digest.clone()),
+                    MEDIA_CONFIG,
+                ),
+            ),
+            (
+                image.layer_digest.clone(),
+                served(
+                    &image.layer,
+                    Some(image.layer_digest.clone()),
+                    MEDIA_LAYER_GZIP,
+                ),
+            ),
+        ]);
+        let store = BlobStore::new(tmp.path().join("blobs"));
+        let err = pull_pin(&store, &registry, &pinned).await.unwrap_err();
+        assert!(err.to_string().contains("descriptor says"), "{err}");
+        let names = store_names(&store);
+        assert!(
+            !names
+                .iter()
+                .any(|n| n == &image.layer_digest[7..] || n.starts_with(".tmp")),
+            "{names:?}"
+        );
     }
 
     /// Manual smoke test against a registry, e.g. a local `registry:2`:

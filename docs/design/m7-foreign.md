@@ -117,7 +117,10 @@ never share a cgroup. Shutdown and `kronik foreign cleanup` remove the empty
   to the entry for `linux` and the host architecture, which is fetched and
   verified by its own digest. Config and layer blobs stream into the blob
   store through SHA-256 and are kept only if digest and size match their
-  descriptors. Kronik never trusts a digest a registry reports.
+  descriptors. A layer's `Docker-Content-Digest` header is not that check:
+  one that disagrees with the bytes does not reject a layer that matches
+  its descriptor, and does not keep a layer that does not. Kronik never
+  trusts a digest a registry reports.
 - **Local layout** (`oci-layout:<dir>`): index, manifest, config and layers
   are read from the layout, verified the same way and copied into the blob
   store, so the actor no longer depends on the directory. The daemon reads
