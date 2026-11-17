@@ -89,8 +89,9 @@ pub struct Store {
     db: Mutex<StateDb>,
     pub sql: sql::SqlPool,
     pub applied: AppliedLsn,
-    /// Held for a whole `apply` batch, and by snapshots, so a snapshot sees
-    /// `state.db` and every actor database at one LSN.
+    /// Held for a whole `apply` batch, and briefly by snapshots per database
+    /// copy, so a snapshot sees `state.db` and every actor database at one
+    /// LSN.
     apply_lock: Mutex<()>,
     /// Reads sealed SQL changesets (docs/design/m8-privacy.md §4, §6);
     /// plain until the node sets its own.
