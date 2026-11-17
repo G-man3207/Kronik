@@ -3109,7 +3109,8 @@ fn row_change_diff(p: &[RowChange], f: &[RowChange]) -> Vec<SqlDiff> {
 }
 
 /// Final-state rows by (table, pk) -> (columns, values). A row with a
-/// `_subject` is that subject's data: its values are redacted, as in the
+/// `_subject` column (any ASCII case, the spelling `pragma_table_info`
+/// returns) is that subject's data: its values are redacted, as in the
 /// isolated side's row changes.
 fn table_map(
     tables: &[TableRows],
@@ -3117,7 +3118,10 @@ fn table_map(
 ) -> BTreeMap<(String, String), (Vec<Value>, Value)> {
     let mut out = BTreeMap::new();
     for t in tables {
-        let subject_col = t.columns.iter().position(|c| c == "_subject");
+        let subject_col = t
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case("_subject"));
         for row in &t.rows {
             let pk: Vec<Value> =
                 t.pk.iter()
@@ -4118,6 +4122,27 @@ mod tests {
             plain,
             json!({"redacted": true, "subject": "-", "hash": "-"})
         );
+    }
+
+    #[test]
+    fn a_case_variant_subject_column_redacts_the_row() {
+        let table = TableRows {
+            name: "notes".into(),
+            columns: vec!["id".into(), "_Subject".into(), "body".into()],
+            pk: vec![0],
+            rows: vec![vec![
+                SqlValue::Integer(1),
+                SqlValue::Text("user:1".into()),
+                SqlValue::Text("secret".into()),
+            ]],
+        };
+        let (_, value) = table_map(std::slice::from_ref(&table), &Sealer::plain())
+            .into_values()
+            .next()
+            .unwrap();
+        let text = value.to_string();
+        assert!(!text.contains("secret"), "{text}");
+        assert!(text.contains("redacted"), "{text}");
     }
 
     /// M5: what a `--no-pii` turn that used SQL produced is shown like a

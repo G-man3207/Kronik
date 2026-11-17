@@ -56,6 +56,16 @@ pub struct TurnOpts {
 /// SQLite's largest `max_page_count`: no limit.
 const UNLIMITED_PAGES: i64 = 4_294_967_294;
 
+/// `pragma_table_info` returns the declared spelling. The write path treats
+/// any ASCII case of `_subject` as the subject column, so erasure and
+/// pseudonymization must too. SQLite `NOCASE` folds ASCII only, matching
+/// [`is_subject_column`].
+const SUBJECT_COL_EQ: &str = "c.name = '_subject' COLLATE NOCASE";
+
+fn is_subject_column(name: &str) -> bool {
+    name.eq_ignore_ascii_case("_subject")
+}
+
 /// What a turn contributes to its turn record.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnSql {
@@ -381,7 +391,7 @@ fn authorize(s: &mut Shared, ctx: &AuthContext<'_>) -> Authorization {
                 return deny(s, format!("table {table_name} is not writable"));
             }
             if let AuthAction::Update { column_name, .. } = &ctx.action
-                && column_name.eq_ignore_ascii_case("_subject")
+                && is_subject_column(column_name)
             {
                 return deny(
                     s,
@@ -826,7 +836,7 @@ impl SqlActor {
         let pk_rowid = self.limits.track_rowid_tables && !self.has_explicit_pk(table)?;
         let col = names
             .iter()
-            .position(|n| n.eq_ignore_ascii_case("_subject"))
+            .position(|n| is_subject_column(n))
             .map(|i| i + usize::from(pk_rowid));
         self.subject_cols.insert(table.to_string(), col);
         Ok(col)
@@ -1101,9 +1111,9 @@ impl SqlActor {
     }
 
     /// Erasure turn for privacy mode: physically deletes the subject's rows
-    /// from every table with a `_subject` column. Recorded in the log as an
-    /// operation, not as a changeset (whose old values would be the erased
-    /// data itself).
+    /// from every table with a `_subject` column, in any ASCII case.
+    /// Recorded in the log as an operation, not as a changeset (whose old
+    /// values would be the erased data itself).
     ///
     /// Tables without `_subject` are untouched here. A turn with a subject
     /// cannot write them (`subjects/table-without-subject`); rows written
@@ -1122,19 +1132,7 @@ impl SqlActor {
             return Ok(0);
         }
         lock(&self.shared).host = true;
-        let tables: Vec<String> = {
-            let mut st = self
-                .conn
-                .prepare(
-                    "SELECT m.name FROM sqlite_schema m, pragma_table_info(m.name) c \
-                     WHERE m.type = 'table' AND c.name = '_subject' AND m.name NOT LIKE '\\_kronik%' ESCAPE '\\' ORDER BY m.name",
-                )
-                .map_err(|e| e.to_string())?;
-            st.query_map([], |r| r.get(0))
-                .map_err(|e| e.to_string())?
-                .collect::<rusqlite::Result<_>>()
-                .map_err(|e| e.to_string())?
-        };
+        let tables = tables_with_subject_column(&self.conn)?;
         self.host_batch("SAVEPOINT kronik_apply")
             .map_err(|e| e.to_string())?;
         let mut n = 0;
@@ -1164,46 +1162,32 @@ impl SqlActor {
         Ok(n)
     }
 
-    /// Whether a table of the guest's has no `_subject` column. A subject's
-    /// erasure leaves such a table's rows, which a turn with a subject could
-    /// write before ADR 0005 §6 option B refused it.
+    /// Whether a guest table has no `_subject` column (any ASCII case). A
+    /// subject's erasure leaves such a table's rows, which a turn with a
+    /// subject could write before ADR 0005 §6 option B refused it.
     pub fn has_table_without_subject(&self) -> Result<bool, String> {
         lock(&self.shared).host = true;
+        let sql = format!(
+            "SELECT count(*) > 0 FROM sqlite_schema m WHERE m.type = 'table' \
+             AND m.name NOT LIKE '\\_kronik%' ESCAPE '\\' AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+             AND NOT EXISTS (SELECT 1 FROM pragma_table_info(m.name) c WHERE {SUBJECT_COL_EQ})"
+        );
         self.conn
-            .query_row(
-                "SELECT count(*) > 0 FROM sqlite_schema m WHERE m.type = 'table' \
-                 AND m.name NOT LIKE '\\_kronik%' ESCAPE '\\' AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
-                 AND NOT EXISTS (SELECT 1 FROM pragma_table_info(m.name) c WHERE c.name = '_subject')",
-                [],
-                |r| r.get(0),
-            )
+            .query_row(&sql, [], |r| r.get(0))
             .map_err(|e| e.to_string())
     }
 
-    /// Replaces text and blob cells of rows tagged with `_subject`. Integer
-    /// and real values, and the `_subject` column itself, are left as they
-    /// are. A `--no-pii` fork does this to a snapshot it continues, with the
-    /// same function it uses on changesets, so a later UPDATE still matches
-    /// and the guest cannot read the plaintext.
+    /// Replaces text and blob cells of rows tagged with `_subject` (any
+    /// ASCII case of that name). Integer and real values, and the subject
+    /// column itself, are left as they are. A `--no-pii` fork does this to a
+    /// snapshot it continues, with the same function it uses on changesets,
+    /// so a later UPDATE still matches and the guest cannot read the plaintext.
     pub fn pseudonymize_subject_cells(
         &mut self,
         mut rewrite: impl FnMut(&str, &[u8]) -> Vec<u8>,
     ) -> Result<(), String> {
         lock(&self.shared).host = true;
-        let tables: Vec<String> = {
-            let mut st = self
-                .conn
-                .prepare(
-                    "SELECT m.name FROM sqlite_schema m, pragma_table_info(m.name) c \
-                     WHERE m.type = 'table' AND c.name = '_subject' \
-                     AND m.name NOT LIKE '\\_kronik%' ESCAPE '\\' ORDER BY m.name",
-                )
-                .map_err(|e| e.to_string())?;
-            st.query_map([], |r| r.get(0))
-                .map_err(|e| e.to_string())?
-                .collect::<rusqlite::Result<_>>()
-                .map_err(|e| e.to_string())?
-        };
+        let tables = tables_with_subject_column(&self.conn)?;
         if tables.is_empty() {
             return Ok(());
         }
@@ -1431,7 +1415,7 @@ fn rewrite_subject_table(
         .map_err(|e| e.to_string())?;
     let subject_at = cols
         .iter()
-        .position(|(name, _)| name == "_subject")
+        .position(|(name, _)| is_subject_column(name))
         .ok_or_else(|| format!("{table} has no _subject column"))?;
     let without_rowid: bool = conn
         .query_row(
@@ -1679,6 +1663,19 @@ pub fn canonical_hash_raw(conn: &Connection) -> rusqlite::Result<String> {
         }
     }
     Ok(format!("b3:{}", &h.finalize().to_hex()[..16]))
+}
+
+fn tables_with_subject_column(conn: &Connection) -> Result<Vec<String>, String> {
+    let sql = format!(
+        "SELECT m.name FROM sqlite_schema m, pragma_table_info(m.name) c \
+         WHERE m.type = 'table' AND {SUBJECT_COL_EQ} \
+         AND m.name NOT LIKE '\\_kronik%' ESCAPE '\\' ORDER BY m.name"
+    );
+    let mut st = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    st.query_map([], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|e| e.to_string())
 }
 
 /// Rows in tables without a `_subject` column. A turn with a default

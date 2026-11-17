@@ -199,8 +199,9 @@ placeholders in order.
 - **Schema.** DDL is allowed only in a `migrate` turn, before its first DML
   statement; elsewhere it is `denied`. Tables without a `PRIMARY KEY` are
   allowed.
-- **Subjects.** A row's subject is its `_subject` column; rows of tables
-  without one take the turn's default subject. The SQL function
+- **Subjects.** A row's subject is its `_subject` column, in any ASCII case
+  of that name; rows of tables without one take the turn's default subject.
+  The SQL function
   `kronik_subject()` returns the current default subject, for example
   `_subject TEXT DEFAULT (kronik_subject())`. `UPDATE ... SET _subject` is
   denied, and a turn that moves a row to another subject fails.

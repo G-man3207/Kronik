@@ -760,6 +760,89 @@ fn a_subject_turn_cannot_write_a_table_without_subject_column() {
     assert_eq!(plain.values, [[Value::Text("system".into())]]);
 }
 
+/// The write path already treats any ASCII case of `_subject` as the subject
+/// column. Erasure, `has_table_without_subject`, and `--no-pii` must too:
+/// a declared `_Subject` is not a table without a subject column.
+#[test]
+fn a_subject_column_of_any_ascii_case_is_erased_and_pseudonymized() {
+    let schema = [
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
+         payload BLOB, \"_Subject\" TEXT DEFAULT (kronik_subject()))",
+    ];
+    let mut a = actor("case-subject");
+    let (_, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    assert!(
+        !a.has_table_without_subject().unwrap(),
+        "a case-variant subject column is still a subject column"
+    );
+
+    let mut first = opts(2, 2, false);
+    first.default_subject = Some("user:1".into());
+    let (_, res) = commit(
+        &mut a,
+        &first,
+        &["INSERT INTO notes(body, payload) VALUES ('ROW-secret', x'0102')"],
+        2,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let mut second = opts(3, 3, false);
+    second.default_subject = Some("user:2".into());
+    let (_, res) = commit(
+        &mut a,
+        &second,
+        &["INSERT INTO notes(body, payload) VALUES ('ROW-other', x'0304')"],
+        3,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+
+    a.pseudonymize_subject_cells(|_, value| {
+        let mut out = b"pii:".to_vec();
+        out.extend_from_slice(value);
+        out
+    })
+    .unwrap();
+    a.begin_turn(&opts(0, 0, false)).unwrap();
+    let rows = a
+        .query(
+            "SELECT body, payload, \"_Subject\" FROM notes ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    a.end_turn(false).unwrap();
+    assert_eq!(
+        rows.values,
+        [
+            vec![
+                Value::Text("pii:ROW-secret".into()),
+                Value::Blob(b"pii:\x01\x02".to_vec()),
+                Value::Text("user:1".into()),
+            ],
+            vec![
+                Value::Text("pii:ROW-other".into()),
+                Value::Blob(b"pii:\x03\x04".to_vec()),
+                Value::Text("user:2".into()),
+            ],
+        ],
+        "text and blob cells are rewritten; the subject id is not"
+    );
+
+    let n = a.erase_subject("user:1", 4).unwrap();
+    assert_eq!(n, 1, "the case-variant row was not erased");
+    a.begin_turn(&opts(0, 0, false)).unwrap();
+    let left = a
+        .query("SELECT body, \"_Subject\" FROM notes", &[])
+        .unwrap();
+    a.end_turn(false).unwrap();
+    assert_eq!(
+        left.values,
+        [[
+            Value::Text("pii:ROW-other".into()),
+            Value::Text("user:2".into())
+        ]]
+    );
+}
+
 fn holds(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }

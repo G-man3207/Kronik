@@ -108,7 +108,8 @@ CREATE TABLE orders (
 - The rows of one turn may belong to several subjects: each subject's
   changes go into a changeset of their own, which privacy mode seals under
   that subject's key, so erasing one subject leaves the others' rows.
-- Erasure deletes the subject's rows from every table that has `_subject`.
+- Erasure deletes the subject's rows from every table that has a `_subject`
+  column, in any ASCII case of that name.
 - A turn that has a default subject may only write tables that have a
   `_subject` column. A write to a table without that column fails the turn
   with `subjects/table-without-subject` and names the table. A turn without
@@ -416,10 +417,10 @@ the same deterministic pseudonym as every other tagged value, so equal
 values stay equal. Old and new images are rewritten the same way, so a
 later UPDATE still matches the row. Integer and real values, including
 primary-key columns, are left unchanged so changeset apply can find the
-row. The `_subject` column stays the subject id, so erasure still finds
-the row. A snapshot the fork continues is rewritten the same way before
-later changesets are applied. Changesets with no subject are not
-rewritten. Erased subjects stay skipped and unreadable.
+row. The `_subject` column stays the subject id, in any ASCII case of that
+name, so erasure still finds the row. A snapshot the fork continues is
+rewritten the same way before later changesets are applied. Changesets with
+no subject are not rewritten. Erased subjects stay skipped and unreadable.
 
 Integer and real cells are not pseudonymized, key columns or not: a
 `--no-pii` fork's actors read a subject's numbers (an age, an amount, an
