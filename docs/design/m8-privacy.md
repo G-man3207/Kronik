@@ -553,16 +553,19 @@ Where the code differs from the sections above:
   call gets `SUBJECT_ERASED` instead of a second run - and a caller that
   fails after that call still owes its orphan and its compensation. The
   bodies of its pending timers and undelivered messages become tombstones
-  (§6.3). Dead letters a
+  (§6.3), found by an index on the row's subject rather than by decoding
+  every queued body. `kv`, `ingress_keys` and `dead_letters` are deleted
+  through an index on `subject`. Dead letters a
   subject's turns produce after its erasure stay (their input is sealed
   under the erased key); resending one fails with `SUBJECT_ERASED`.
 - **Nothing left in the files (v0.1 fix).** `state.db`, every actor
   database and `keys/keystore.db` run with `PRAGMA secure_delete = ON`, so
   deleted rows are zeroed in their pages. `Keystore::erase` runs
   `wal_checkpoint(TRUNCATE)` after its commit, before the `Erasure` record
-  is written; applying the record checkpoints every actor database it
-  touched and then `state.db` the same way (skipped inside an overlay and
-  in a bulk replay, whose journal is off). A checkpoint a reader blocks is
+  is written; applying the record checkpoints `state.db` under the apply
+  lock (skipped inside an overlay and in a bulk replay, whose journal is
+  off), then each actor database it touched after that lock is released.
+  A checkpoint a reader blocks is
   logged as a warning. Snapshots copy `state.db` and the actor databases
   with `VACUUM INTO` (the actor database's attach limit is raised to 1 for
   it), so no free page reaches a snapshot; the state hash is computed from

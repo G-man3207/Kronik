@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS turn_index (
   segment INTEGER NOT NULL, offset INTEGER NOT NULL, outcome INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS mailbox (
   message_id TEXT PRIMARY KEY, to_kind TEXT NOT NULL, to_key TEXT NOT NULL,
-  lsn INTEGER NOT NULL, ordinal INTEGER NOT NULL, input BLOB NOT NULL, causal BLOB NOT NULL);
+  lsn INTEGER NOT NULL, ordinal INTEGER NOT NULL, input BLOB NOT NULL, causal BLOB NOT NULL,
+  subject TEXT);
 CREATE INDEX IF NOT EXISTS mailbox_order ON mailbox (lsn, ordinal);
 CREATE TABLE IF NOT EXISTS deliveries (
   message_id TEXT PRIMARY KEY, lsn INTEGER NOT NULL, outcome BLOB,
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS open_effects (
 CREATE TABLE IF NOT EXISTS timers (
   kind TEXT NOT NULL, key TEXT NOT NULL, timer_id INTEGER NOT NULL, due_ms INTEGER NOT NULL,
   msg BLOB NOT NULL, causal BLOB NOT NULL, lsn INTEGER NOT NULL,
+  subject TEXT,
   owner TEXT GENERATED ALWAYS AS (kind || char(31) || key || char(31) || timer_id) VIRTUAL,
   PRIMARY KEY (kind, key, timer_id)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS timers_due ON timers (due_ms);
@@ -410,7 +412,9 @@ impl StateDb {
         if !has_sealed {
             conn.execute_batch("ALTER TABLE kv ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0")?;
         }
+        add_queued_subjects(&conn)?;
         add_subject_columns(&conn)?;
+        ensure_subject_indexes(&conn)?;
         let db = StateDb {
             conn,
             bulk: false,
@@ -1932,14 +1936,15 @@ impl StateDb {
                             continue;
                         }
                         tx.execute(
-                            "UPDATE timers SET msg = ?1 \
+                            "UPDATE timers SET msg = ?1, subject = ?6 \
                              WHERE kind = ?2 AND key = ?3 AND timer_id = ?4 AND lsn = ?5",
                             params![
                                 msg.encode_to_vec(),
                                 actor.kind,
                                 actor.key,
                                 op.timer_id as i64,
-                                lsn
+                                lsn,
+                                message_subject(msg)
                             ],
                         )?;
                     }
@@ -1952,8 +1957,14 @@ impl StateDb {
                             "",
                         );
                         tx.execute(
-                            "UPDATE mailbox SET input = ?1 WHERE message_id = ?2 AND lsn = ?3",
-                            params![input.encode_to_vec(), m.message_id, lsn],
+                            "UPDATE mailbox SET input = ?1, subject = ?4 \
+                             WHERE message_id = ?2 AND lsn = ?3",
+                            params![
+                                input.encode_to_vec(),
+                                m.message_id,
+                                lsn,
+                                input_subject(&input)
+                            ],
                         )?;
                     }
                 } else {
@@ -1967,8 +1978,14 @@ impl StateDb {
                             &compensates,
                         );
                         tx.execute(
-                            "UPDATE mailbox SET input = ?1 WHERE message_id = ?2 AND lsn = ?3",
-                            params![input.encode_to_vec(), m.message_id, lsn],
+                            "UPDATE mailbox SET input = ?1, subject = ?4 \
+                             WHERE message_id = ?2 AND lsn = ?3",
+                            params![
+                                input.encode_to_vec(),
+                                m.message_id,
+                                lsn,
+                                input_subject(&input)
+                            ],
                         )?;
                     }
                 }
@@ -2475,8 +2492,9 @@ fn apply_turn(
             mailbox_insert(tx, m, lsn, &input, &causal)?;
         }
         let mut schedule = tx.prepare_cached(
-            "INSERT OR REPLACE INTO timers (kind, key, timer_id, due_ms, msg, causal, lsn) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO timers \
+             (kind, key, timer_id, due_ms, msg, causal, lsn, subject) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
         let mut cancel =
             tx.prepare_cached("DELETE FROM timers WHERE kind = ?1 AND key = ?2 AND timer_id = ?3")?;
@@ -2494,7 +2512,8 @@ fn apply_turn(
                     i(op.due_ms),
                     msg.encode_to_vec(),
                     causal.encode_to_vec(),
-                    lsn
+                    lsn,
+                    message_subject(msg)
                 ])?;
                 blobs::pin_timer(tx, kind, key, op.timer_id as i64, msg, lsn)?;
             } else {
@@ -2964,8 +2983,9 @@ fn mailbox_insert(
         m.to.as_ref()
             .ok_or_else(|| corrupt("message without target"))?;
     tx.prepare_cached(
-        "INSERT INTO mailbox (message_id, to_kind, to_key, lsn, ordinal, input, causal) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO mailbox \
+         (message_id, to_kind, to_key, lsn, ordinal, input, causal, subject) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?
     .execute(params![
         m.message_id,
@@ -2974,7 +2994,8 @@ fn mailbox_insert(
         lsn,
         m.ordinal,
         input.encode_to_vec(),
-        causal.encode_to_vec()
+        causal.encode_to_vec(),
+        input_subject(input)
     ])?;
     blobs::pin_message(tx, &m.message_id, input, lsn)?;
     Ok(())
@@ -3202,6 +3223,11 @@ fn outcome_subject(o: &pb::Outcome) -> Option<&str> {
     }
 }
 
+/// The subject of a timer or message body: the only sealable those rows carry.
+fn message_subject(msg: &pb::Message) -> Option<&str> {
+    msg.body.as_ref()?.subject.as_deref()
+}
+
 /// The subject of an input's body (message, timer) or request; for a
 /// connection input (M24), of its request, frame data or close reason.
 fn input_subject(input: &pb::Input) -> Option<&str> {
@@ -3303,14 +3329,14 @@ fn tombstone(subject: &str, key_version: u32) -> impl FnMut(&mut pb::Sealable) -
 }
 
 /// The erasure operation on state.db's user data (§6.3), live, on rebuild
-/// and for erasures applied before these tables had a subject. The queued
-/// timer and message bodies of the subject (written in `off` mode they are
-/// plain, and nothing else would stop them) become tombstones: the row
-/// stays, so its turn still runs, meets an erased input and becomes a
-/// `SUBJECT_ERASED` dead letter instead of handing the value to the guest
-/// and sealing it again under a new key version (issue #31). So do the
-/// subject's values in the recorded effects of turns still open, which a
-/// re-run would hand to its guest.
+/// and for erasures applied before these tables had a subject. Deletes of
+/// `kv`, `ingress_keys` and `dead_letters` use the subject indexes. Queued
+/// timer and mailbox bodies are tombstoned through their subject column,
+/// not by decoding every queued body. The row stays, so its turn still
+/// runs, meets an erased input and becomes a `SUBJECT_ERASED` dead letter
+/// instead of handing the value to the guest and sealing it again under a
+/// new key version (issue #31). So do the subject's values in the recorded
+/// effects of turns still open, which a re-run would hand to its guest.
 /// `lsn`: the erasure record's, when it is applied as one: the subject's
 /// rows that counted against an actor's quota count until that actor's next
 /// turn ([`blobs::unpin`]).
@@ -3320,11 +3346,7 @@ fn erase_rows(
     key_version: u32,
     lsn: Option<Lsn>,
 ) -> Result<(), StoreError> {
-    for sql in [
-        "DELETE FROM kv WHERE subject = ?1",
-        "DELETE FROM ingress_keys WHERE subject = ?1",
-        "DELETE FROM dead_letters WHERE subject = ?1",
-    ] {
+    for sql in SUBJECT_DELETES {
         tx.prepare_cached(sql)?.execute([subject])?;
     }
     for source in [blob_source::INGRESS_KEY, blob_source::DEAD_LETTER] {
@@ -3356,8 +3378,10 @@ fn erase_rows(
     }
     let mut f = tombstone(subject, key_version);
     let timers: Vec<(String, String, i64, Vec<u8>)> = tx
-        .prepare_cached("SELECT kind, key, timer_id, msg FROM timers")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .prepare_cached(TIMER_SUBJECT_PROBE)?
+        .query_map([subject], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
         .collect::<Result<_, _>>()?;
     for (kind, key, id, bytes) in timers {
         let mut msg: pb::Message = decode(&bytes, "timer message")?;
@@ -3371,8 +3395,8 @@ fn erase_rows(
         }
     }
     let queued: Vec<(String, Vec<u8>)> = tx
-        .prepare_cached("SELECT message_id, input FROM mailbox")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .prepare_cached(MAILBOX_SUBJECT_PROBE)?
+        .query_map([subject], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     for (id, bytes) in queued {
         let mut input: pb::Input = decode(&bytes, "mailbox input")?;
@@ -3455,6 +3479,80 @@ fn add_subject_columns(conn: &Connection) -> Result<(), StoreError> {
         erase_rows(&tx, s, *v, None)?;
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Statements [`erase_rows`] uses for a subject's indexed deletes. Tests
+/// explain these, so a scan cannot return unnoticed.
+const SUBJECT_DELETES: &[&str] = &[
+    "DELETE FROM kv WHERE subject = ?1",
+    "DELETE FROM ingress_keys WHERE subject = ?1",
+    "DELETE FROM dead_letters WHERE subject = ?1",
+];
+
+const TIMER_SUBJECT_PROBE: &str = "SELECT kind, key, timer_id, msg FROM timers WHERE subject = ?1";
+
+const MAILBOX_SUBJECT_PROBE: &str = "SELECT message_id, input FROM mailbox WHERE subject = ?1";
+
+/// `timers.subject` and `mailbox.subject` name the queued body's subject so
+/// an erasure tombstones that subject's rows. Added on open to a database
+/// from before the column; not part of the state hash (the body already is).
+fn add_queued_subjects(conn: &Connection) -> Result<(), StoreError> {
+    add_queued_subject(
+        conn,
+        "timers",
+        "SELECT kind, key, timer_id, msg FROM timers",
+        "UPDATE timers SET subject = ?4 WHERE kind = ?1 AND key = ?2 AND timer_id = ?3",
+        3,
+        |b| {
+            let msg: pb::Message = decode(b, "timer message")?;
+            Ok(message_subject(&msg).map(str::to_owned))
+        },
+    )?;
+    add_queued_subject(
+        conn,
+        "mailbox",
+        "SELECT message_id, input FROM mailbox",
+        "UPDATE mailbox SET subject = ?2 WHERE message_id = ?1",
+        1,
+        |b| {
+            let input: pb::Input = decode(b, "mailbox input")?;
+            Ok(input_subject(&input).map(str::to_owned))
+        },
+    )
+}
+
+fn add_queued_subject(
+    conn: &Connection,
+    table: &str,
+    select: &str,
+    update: &str,
+    keys: usize,
+    subject: impl Fn(&[u8]) -> Result<Option<String>, StoreError>,
+) -> Result<(), StoreError> {
+    let has: bool = conn.query_row(
+        "SELECT count(*) > 0 FROM pragma_table_info(?1) WHERE name = 'subject'",
+        [table],
+        |r| r.get(0),
+    )?;
+    if has {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN subject TEXT;"))?;
+    backfill(&tx, select, update, keys, subject)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn ensure_subject_indexes(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS kv_subject ON kv (subject);
+         CREATE INDEX IF NOT EXISTS ingress_keys_subject ON ingress_keys (subject);
+         CREATE INDEX IF NOT EXISTS dead_letters_subject ON dead_letters (subject);
+         CREATE INDEX IF NOT EXISTS timers_subject ON timers (subject);
+         CREATE INDEX IF NOT EXISTS mailbox_subject ON mailbox (subject);",
+    )?;
     Ok(())
 }
 
@@ -5763,5 +5861,258 @@ mod tests {
             "{:?}",
             message.body
         );
+    }
+
+    fn plan(conn: &Connection, sql: &str) -> Vec<String> {
+        let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        st.query_map(["user:1"], |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn assert_search(conn: &Connection, sql: &str) {
+        let plan = plan(conn, sql);
+        assert!(
+            plan.iter().any(|d| d.starts_with("SEARCH ")),
+            "{sql} has no indexed lookup: {plan:?}"
+        );
+        assert!(
+            plan.iter().all(|d| !d.starts_with("SCAN ")),
+            "{sql} scans: {plan:?}"
+        );
+    }
+
+    /// Issue #161: subject deletes and queued-body tombstones use an index.
+    /// A large unrelated kv table and mailbox are not scanned to erase one
+    /// subject.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // the bound is wall time, not logical time
+    fn erasure_subject_probes_search_instead_of_scanning() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut db = StateDb::open(conn).unwrap();
+        let op = pb::MessageSource::Operator;
+        let schedule = |exec: &str, subject: &str, id: u64| -> pb::TurnRecord {
+            let Record::TurnRecord(mut t) = turn(exec, exec, message(op, exec, subject)) else {
+                unreachable!("turn() builds a TurnRecord");
+            };
+            t.timers.push(pb::TimerOp {
+                kind: pb::TimerOpKind::Schedule as i32,
+                timer_id: id,
+                due_ms: 1_000,
+                msg: Some(pb::Message {
+                    body: tagged(subject, "NEEDLE"),
+                    ..Default::default()
+                }),
+                ordinal: 0,
+            });
+            t.messages.push(pb::OutboundMessage {
+                to: Some(pb::ActorRef {
+                    kind: "counter".into(),
+                    key: "b".into(),
+                }),
+                msg: Some(pb::Message {
+                    body: tagged(subject, "NEEDLE"),
+                    ..Default::default()
+                }),
+                ordinal: 1,
+                message_id: format!("{exec}-m"),
+            });
+            t
+        };
+        db.apply(&[
+            committed(1, Record::TurnRecord(schedule("e1", "user:1", 1))),
+            committed(2, Record::TurnRecord(schedule("e2", "user:2", 2))),
+        ])
+        .unwrap();
+        {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            {
+                let mut kv = tx
+                    .prepare(
+                        "INSERT INTO kv (kind, key, k, value, subject, lsn, sealed) \
+                         VALUES ('counter', 'a', ?1, x'00', 'other', 1, 0)",
+                    )
+                    .unwrap();
+                let mut mail = tx
+                    .prepare(
+                        "INSERT INTO mailbox \
+                         (message_id, to_kind, to_key, lsn, ordinal, input, causal, subject) \
+                         VALUES (?1, 'counter', 'z', 1, 0, x'', x'', 'other')",
+                    )
+                    .unwrap();
+                for n in 0..20_000 {
+                    kv.execute([format!("k{n}")]).unwrap();
+                    mail.execute([format!("other-{n}")]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        for sql in super::SUBJECT_DELETES
+            .iter()
+            .copied()
+            .chain([super::TIMER_SUBJECT_PROBE, super::MAILBOX_SUBJECT_PROBE])
+        {
+            assert_search(&db.conn, sql);
+        }
+        let before = crate::snapshot::hash_for_test(&db, &["timers", "mailbox"]);
+        db.conn
+            .execute("UPDATE timers SET subject = 'rewritten'", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE mailbox SET subject = 'rewritten' WHERE message_id IN ('e1-m', 'e2-m')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            crate::snapshot::hash_for_test(&db, &["timers", "mailbox"]),
+            before,
+            "the subject column is an index probe, not part of the state hash"
+        );
+        db.conn
+            .execute(
+                "UPDATE timers SET subject = 'user:1' WHERE timer_id = 1",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE timers SET subject = 'user:2' WHERE timer_id = 2",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE mailbox SET subject = 'user:1' WHERE message_id = 'e1-m'",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE mailbox SET subject = 'user:2' WHERE message_id = 'e2-m'",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO kv (kind, key, k, value, subject, lsn, sealed) \
+                 VALUES ('counter', 'a', 'mine', x'01', 'user:1', 1, 0)",
+                [],
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        db.apply(&[committed(
+            3,
+            Record::Erasure(pb::Erasure {
+                subject: "user:1".into(),
+                key_version: 0,
+                ..Default::default()
+            }),
+        )])
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "erasing one subject over 20 000 unrelated rows took {elapsed:?}"
+        );
+        let timer = db
+            .timers(None)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.timer_id == 1)
+            .unwrap();
+        assert!(
+            kronik_privacy::sealer::is_erased(timer.msg.body.as_ref().unwrap()),
+            "user:1's timer was not tombstoned"
+        );
+        let other = db
+            .timers(None)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.timer_id == 2)
+            .unwrap();
+        assert!(
+            !kronik_privacy::sealer::is_erased(other.msg.body.as_ref().unwrap()),
+            "user:2's timer was tombstoned"
+        );
+        let mail = db
+            .mailbox()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.message_id == "e1-m")
+            .unwrap();
+        let Some(pb::input::Kind::Message(m)) = mail.input.kind else {
+            panic!("not a message");
+        };
+        assert!(
+            kronik_privacy::sealer::is_erased(m.msg.as_ref().unwrap().body.as_ref().unwrap()),
+            "user:1's mailbox body was not tombstoned"
+        );
+        let kept: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM mailbox WHERE subject = 'other'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 20_000);
+        let gone: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM kv WHERE subject = 'user:1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone, 0);
+    }
+
+    /// A database from before `timers.subject` and `mailbox.subject` gains
+    /// them, filled from the stored bodies.
+    #[test]
+    fn queued_subject_columns_migrate_old_databases() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE timers (
+               kind TEXT NOT NULL, key TEXT NOT NULL, timer_id INTEGER NOT NULL,
+               due_ms INTEGER NOT NULL, msg BLOB NOT NULL, causal BLOB NOT NULL,
+               lsn INTEGER NOT NULL,
+               PRIMARY KEY (kind, key, timer_id)) WITHOUT ROWID;
+             CREATE TABLE mailbox (
+               message_id TEXT PRIMARY KEY, to_kind TEXT NOT NULL, to_key TEXT NOT NULL,
+               lsn INTEGER NOT NULL, ordinal INTEGER NOT NULL, input BLOB NOT NULL,
+               causal BLOB NOT NULL);",
+        )
+        .unwrap();
+        let msg = pb::Message {
+            body: tagged("user:9", "old"),
+            ..Default::default()
+        };
+        conn.execute(
+            "INSERT INTO timers VALUES ('counter', 'a', 3, 0, ?1, x'', 1)",
+            [msg.encode_to_vec()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mailbox VALUES ('m9', 'counter', 'b', 1, 0, ?1, x'')",
+            [message(pb::MessageSource::Actor, "m9", "user:9")
+                .unwrap()
+                .encode_to_vec()],
+        )
+        .unwrap();
+        let db = StateDb::open(conn).unwrap();
+        let timer: String = db
+            .conn
+            .query_row("SELECT subject FROM timers", [], |r| r.get(0))
+            .unwrap();
+        let mail: String = db
+            .conn
+            .query_row("SELECT subject FROM mailbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((timer, mail), ("user:9".into(), "user:9".into()));
+        assert_search(&db.conn, super::TIMER_SUBJECT_PROBE);
+        assert_search(&db.conn, super::MAILBOX_SUBJECT_PROBE);
     }
 }

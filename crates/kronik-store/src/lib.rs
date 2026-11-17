@@ -26,6 +26,27 @@ thread_local! {
     /// Test hook: a rebase switch fails right after an actor database's
     /// copy, like a crash there.
     pub(crate) static CRASH_AFTER_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static APPLY_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Actor WAL checkpoints after an erasure. A test asserts this moved.
+    pub(crate) static ACTOR_ERASURE_CHECKPOINTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn apply_lock_held() -> bool {
+    APPLY_LOCK_DEPTH.with(|c| c.get() > 0)
+}
+
+/// The apply lock. In tests, dropping it clears the depth a checkpoint asserts.
+pub(crate) struct ApplyLock<'a> {
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl Drop for ApplyLock<'_> {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        APPLY_LOCK_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -155,8 +176,11 @@ impl Store {
         Ok(())
     }
 
-    fn apply_lock(&self) -> MutexGuard<'_, ()> {
-        self.apply_lock.lock().unwrap_or_else(|e| e.into_inner())
+    fn apply_lock(&self) -> ApplyLock<'_> {
+        let guard = self.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        APPLY_LOCK_DEPTH.with(|c| c.set(c.get() + 1));
+        ApplyLock { _guard: guard }
     }
 
     /// Read access to `state.db`.
@@ -168,7 +192,8 @@ impl Store {
     /// databases first (each tracks its own applied LSN, so a record is
     /// applied to an actor database at most once even when `state.db` is
     /// ahead or behind it), then `state.db` in one transaction (records at or
-    /// below its applied LSN are skipped), then wakes waiters.
+    /// below its applied LSN are skipped), then wakes waiters. An erasure's
+    /// actor-database WAL checkpoints run after this releases the apply lock.
     pub fn apply(&self, batch: &[Committed]) -> Result<(), StoreError> {
         let Some(last) = batch.last() else {
             return Ok(());
@@ -179,19 +204,26 @@ impl Store {
                 c.lsn
             )));
         }
-        let _apply = self.apply_lock();
-        for (i, c) in batch.iter().enumerate() {
-            match &c.record {
-                Record::TurnRecord(t) => self.apply_sql(c.lsn, t)?,
-                Record::Erasure(e) => self.erase_sql(c.lsn, &e.subject, &batch[..i])?,
-                _ => {}
+        let checkpoint = {
+            let _apply = self.apply_lock();
+            let mut actors = Vec::new();
+            for (i, c) in batch.iter().enumerate() {
+                match &c.record {
+                    Record::TurnRecord(t) => self.apply_sql(c.lsn, t)?,
+                    Record::Erasure(e) => {
+                        actors.extend(self.erase_sql(c.lsn, &e.subject, &batch[..i])?);
+                    }
+                    _ => {}
+                }
             }
-        }
-        self.db().apply(batch)?;
-        if batch.iter().any(|c| matches!(c.record, Record::Erasure(_))) {
-            self.db().checkpoint();
-        }
-        self.applied.set(self.applied.get().max(last.lsn));
+            self.db().apply(batch)?;
+            if batch.iter().any(|c| matches!(c.record, Record::Erasure(_))) {
+                self.db().checkpoint();
+            }
+            self.applied.set(self.applied.get().max(last.lsn));
+            actors
+        };
+        self.checkpoint_erased(&checkpoint);
         Ok(())
     }
 
@@ -513,7 +545,15 @@ impl Store {
     /// rebuild, so a rebuilt database equals the live one. `earlier` is the
     /// batch before the record: state.db, which lists the actor databases,
     /// is applied after them, so the ones these records create are added.
-    fn erase_sql(&self, lsn: Lsn, subject: &str, earlier: &[Committed]) -> Result<(), StoreError> {
+    ///
+    /// Names whose deletes ran and whose WAL still needs a checkpoint. The
+    /// checkpoint itself runs after the apply lock is released.
+    fn erase_sql(
+        &self,
+        lsn: Lsn,
+        subject: &str,
+        earlier: &[Committed],
+    ) -> Result<Vec<String>, StoreError> {
         let mut actors: BTreeSet<String> = self.db().sql_actors()?.into_iter().collect();
         for c in earlier {
             if let Record::TurnRecord(t) = &c.record
@@ -523,16 +563,39 @@ impl Store {
                 actors.insert(format!("{}/{}", a.kind, a.key));
             }
         }
+        let mut checkpoint = Vec::new();
         for name in actors {
             let db = self.sql.get(&name)?;
             let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
             if db.applied_lsn()? >= lsn {
                 continue;
             }
-            db.erase_subject(subject, lsn)
+            let (_n, needs) = db
+                .erase_subject_at(subject, lsn)
                 .map_err(|e| StoreError::Corrupt(format!("erasure in {name} at lsn {lsn}: {e}")))?;
+            if needs {
+                checkpoint.push(name);
+            }
         }
-        Ok(())
+        Ok(checkpoint)
+    }
+
+    fn checkpoint_erased(&self, names: &[String]) {
+        for name in names {
+            match self.sql.get(name) {
+                Ok(db) => {
+                    let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+                    db.checkpoint_erasure();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        actor = name,
+                        error = %e,
+                        "actor WAL checkpoint after an erasure failed"
+                    );
+                }
+            }
+        }
     }
 
     /// The erasure operation of `subject` through `key_version` again, on
@@ -540,18 +603,99 @@ impl Store {
     /// rebase shadow after its staged turns (m13-rebase §3), and a fork's
     /// continuous replay at the place of production's `Erasure` record, so
     /// the fork's state loses what production's lost there (ADR 0109).
+    /// Actor-database WAL checkpoints run after the apply lock is released.
     pub fn erase_again(&self, subject: &str, key_version: u32) -> Result<(), StoreError> {
-        let _apply = self.apply_lock();
-        for name in self.db().sql_actors()? {
-            let db = self.sql.get(&name)?;
-            let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
-            let applied = db.applied_lsn()?;
-            db.erase_subject(subject, applied)
-                .map_err(|e| StoreError::Corrupt(format!("erasure in {name}: {e}")))?;
-        }
-        // At this place: after every record applied here, so an actor's
-        // blobs of the subject count until its next turn (ADR 0119).
-        self.db()
-            .erase_subject_rows(subject, key_version, self.applied.get() + 1)
+        let checkpoint = {
+            let _apply = self.apply_lock();
+            let mut checkpoint = Vec::new();
+            for name in self.db().sql_actors()? {
+                let db = self.sql.get(&name)?;
+                let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+                let applied = db.applied_lsn()?;
+                let (_n, needs) = db
+                    .erase_subject_at(subject, applied)
+                    .map_err(|e| StoreError::Corrupt(format!("erasure in {name}: {e}")))?;
+                if needs {
+                    checkpoint.push(name);
+                }
+            }
+            // At this place: after every record applied here, so an actor's
+            // blobs of the subject count until its next turn (ADR 0119).
+            self.db()
+                .erase_subject_rows(subject, key_version, self.applied.get() + 1)?;
+            checkpoint
+        };
+        self.checkpoint_erased(&checkpoint);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod erasure_lock_tests {
+    use std::sync::Arc;
+
+    use rusqlite::Connection;
+
+    use super::*;
+    use crate::sql::{FileOpener, Limits, SqlPool};
+
+    /// Issue #161: an erasure's actor-database WAL checkpoint does not run
+    /// while the apply lock is held.
+    #[test]
+    fn erasure_checkpoints_actor_databases_outside_the_apply_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            Connection::open(dir.path().join("state.db")).unwrap(),
+            SqlPool::new(
+                Arc::new(FileOpener {
+                    root: dir.path().join("sql"),
+                }),
+                Limits::default(),
+                8,
+            ),
+        )
+        .unwrap();
+        store
+            .db()
+            .conn()
+            .execute(
+                "INSERT INTO actors (kind, key, schema_version, first_lsn, last_lsn, turns, sql) \
+                 VALUES ('notes', 'n', 0, 1, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        store
+            .db()
+            .conn()
+            .execute("UPDATE meta SET v = 1 WHERE k = 'applied_lsn'", [])
+            .unwrap();
+        store.applied.set(1);
+        store
+            .sql
+            .get("notes/n")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .stamp_applied(1)
+            .unwrap();
+        ACTOR_ERASURE_CHECKPOINTS.with(|c| c.set(0));
+        store
+            .apply(&[Committed {
+                lsn: 2,
+                pos: kronik_log::Position {
+                    segment: 0,
+                    offset: 0,
+                },
+                record: Record::Erasure(pb::Erasure {
+                    subject: "user:1".into(),
+                    key_version: 1,
+                    ..Default::default()
+                }),
+            }])
+            .unwrap();
+        ACTOR_ERASURE_CHECKPOINTS.with(|c| {
+            assert_eq!(c.get(), 1, "the actor database was not checkpointed");
+        });
+        assert!(!apply_lock_held());
     }
 }
