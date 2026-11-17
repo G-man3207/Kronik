@@ -504,7 +504,8 @@ impl Runner {
     /// After the callee's turn of a call served its recorded timeout is
     /// applied at `lsn`: the compensation that turn released, if the caller
     /// failed first, runs where production ran it, with the caller's taint
-    /// at the call ([`TimedOutCall`]).
+    /// at the call ([`TimedOutCall`]) and the subject tag on the
+    /// compensation message body.
     fn release_compensation(&self, input: &pb::Input, lsn: Lsn) -> Result<(), ReplayError> {
         let Some(pb::input::Kind::Message(m)) = input.kind.as_ref() else {
             return Ok(());
@@ -518,9 +519,11 @@ impl Runner {
         if self.deferred(&row.causal_key) {
             return Ok(());
         }
-        let time = match row.input.kind.as_ref() {
-            Some(pb::input::Kind::Message(sent)) => sent.sent_logical_time_ms,
-            _ => 0,
+        let (time, subject) = match &row.input.kind {
+            Some(pb::input::Kind::Message(sent)) => {
+                (sent.sent_logical_time_ms, body_subject(sent.msg.as_ref()))
+            }
+            _ => (0, None),
         };
         self.push(
             call.order,
@@ -529,7 +532,7 @@ impl Runner {
                 input: row.input,
                 key: row.causal_key,
                 time,
-                subject: None,
+                subject,
                 sql: call.sql,
                 personal: call.personal,
                 unverified: call.unverified,
@@ -1494,11 +1497,7 @@ impl Runner {
                     continue;
                 }
                 let order = self.child_order(&order, &key, m.ordinal);
-                let subject = m
-                    .msg
-                    .as_ref()
-                    .and_then(|x| x.body.as_ref())
-                    .and_then(|b| b.subject.clone());
+                let subject = body_subject(m.msg.as_ref());
                 self.push(
                     order,
                     Pending {
@@ -1560,7 +1559,7 @@ impl Runner {
                         ),
                         key,
                         time,
-                        subject: None,
+                        subject: body_subject(m.msg.as_ref()),
                         sql: real_rows,
                         personal,
                         unverified: erased,
@@ -1611,6 +1610,13 @@ fn message_input(
             ..Default::default()
         })),
     }
+}
+
+/// The subject tag on a message body: live delivery uses it as the
+/// receiving turn's default subject, and so does replay.
+fn body_subject(msg: Option<&pb::Message>) -> Option<String> {
+    msg.and_then(|m| m.body.as_ref())
+        .and_then(|b| b.subject.clone())
 }
 
 /// Whether a turn's effects used a secret (ADR 0015): a `crypto.*` effect or
