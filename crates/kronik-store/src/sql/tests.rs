@@ -968,3 +968,159 @@ fn an_erasure_during_a_turn_is_not_rolled_back_by_its_end() {
         [[Value::Text("other".into()), Value::Text("user:2".into())]]
     );
 }
+
+/// A migrate may create a table whose name or primary-key column contains
+/// `"`. Erasure, subject lookup on an UPDATE, and the actor database hash
+/// must quote those names. The erasure deletes the subject's rows, advances
+/// the applied LSN, and a replay of the same records (what a restart applies)
+/// still answers queries.
+#[test]
+fn a_quoted_table_name_erases_splits_and_hashes() {
+    let schema = [
+        "CREATE TABLE \"a\"\"b\" (\"id\"\"x\" INTEGER PRIMARY KEY, body TEXT NOT NULL, \
+         _subject TEXT DEFAULT (kronik_subject()))",
+        "CREATE TABLE \"c\"\"d\" (body TEXT NOT NULL, \
+         _subject TEXT DEFAULT (kronik_subject()))",
+    ];
+    let mut live = actor("quoted-live");
+    let (schema_turn, res) = commit(&mut live, &opts(1, 1, true), &schema, 1);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+
+    let inserts = [
+        "INSERT INTO \"a\"\"b\"(body) VALUES ('pk-mine')",
+        "INSERT INTO \"a\"\"b\"(body, _subject) VALUES ('pk-theirs', 'user:2')",
+        "INSERT INTO \"c\"\"d\"(body) VALUES ('row-mine')",
+        "INSERT INTO \"c\"\"d\"(body, _subject) VALUES ('row-theirs', 'user:2')",
+    ];
+    let (inserted, res) = commit(&mut live, &as_subject(2, "user:1"), &inserts, 2);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+
+    let updates = [
+        "UPDATE \"a\"\"b\" SET body = 'pk-edited' WHERE \"id\"\"x\" = 1",
+        "UPDATE \"c\"\"d\" SET body = 'row-edited' WHERE rowid = 1",
+    ];
+    let (updated, res) = commit(&mut live, &as_subject(3, "user:3"), &updates, 3);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    assert!(
+        updated
+            .changesets
+            .iter()
+            .all(|(s, _)| s.as_deref() == Some("user:1")),
+        "subject lookup must attribute the update to the row's subject: {updated:?}"
+    );
+    let before = live.canonical_hash().unwrap();
+    assert!(
+        live.table_rows()
+            .unwrap()
+            .iter()
+            .any(|(name, _)| name.contains('"')),
+        "inspect must read a quoted table name"
+    );
+    assert!(
+        live.canonical_rows()
+            .unwrap()
+            .iter()
+            .any(|table| table.name.contains('"')),
+        "a behavior diff must read a quoted table name"
+    );
+
+    let erased = live.erase_subject("user:1", 4).unwrap();
+    assert!(erased >= 2, "quoted tables were not erased: {erased}");
+    assert_eq!(live.applied_lsn().unwrap(), 4);
+    assert!(live.conn.is_autocommit());
+    assert_eq!(quoted_bodies(&mut live), ["pk-theirs", "row-theirs"]);
+
+    let mut rebuilt = actor("quoted-rebuilt");
+    for (lsn, turn) in [schema_turn, inserted, updated].into_iter().enumerate() {
+        rebuilt
+            .apply(&turn, lsn as u64 + 1, &BTreeSet::new())
+            .unwrap();
+    }
+    assert_eq!(rebuilt.canonical_hash().unwrap(), before);
+    rebuilt.erase_subject("user:1", 4).unwrap();
+    assert_eq!(rebuilt.applied_lsn().unwrap(), 4);
+    assert_eq!(
+        rebuilt.canonical_hash().unwrap(),
+        live.canonical_hash().unwrap()
+    );
+    assert_eq!(quoted_bodies(&mut rebuilt), ["pk-theirs", "row-theirs"]);
+}
+
+fn quoted_bodies(a: &mut SqlActor) -> Vec<String> {
+    a.begin_turn(&opts(0, 0, false)).unwrap();
+    let mut bodies = Vec::new();
+    for sql in [
+        "SELECT body FROM \"a\"\"b\" ORDER BY \"id\"\"x\"",
+        "SELECT body FROM \"c\"\"d\" ORDER BY rowid",
+    ] {
+        let rows = a.query(sql, &[]).unwrap();
+        bodies.extend(rows.values.into_iter().map(|row| match row.as_slice() {
+            [Value::Text(body)] => body.clone(),
+            other => panic!("unexpected row {other:?}"),
+        }));
+    }
+    a.end_turn(false).unwrap();
+    bodies
+}
+
+/// A statement that fails during erasure rolls `kronik_apply` back before
+/// the error is returned. The quoted parent name parses; the foreign-key
+/// check is what fails. Rows deleted earlier in the same erasure come back,
+/// the applied LSN does not move, and the connection can still take a turn
+/// and erase once the constraint is gone.
+#[test]
+fn a_failed_erasure_statement_rolls_the_savepoint_back() {
+    let schema = [
+        "CREATE TABLE early (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
+         _subject TEXT DEFAULT (kronik_subject()))",
+        "CREATE TABLE \"m\"\"parent\" (id INTEGER PRIMARY KEY, _subject TEXT)",
+        "CREATE TABLE \"z\"\"child\" (id INTEGER PRIMARY KEY, \
+         parent INTEGER NOT NULL REFERENCES \"m\"\"parent\"(id), _subject TEXT)",
+    ];
+    let mut a = actor("erasure-rollback");
+    let (_, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let inserts = [
+        "INSERT INTO early(body) VALUES ('kept')",
+        "INSERT INTO early(body, _subject) VALUES ('other', 'user:2')",
+        "INSERT INTO \"m\"\"parent\"(id, _subject) VALUES (1, 'user:1')",
+        "INSERT INTO \"z\"\"child\"(id, parent, _subject) VALUES (1, 1, 'user:1')",
+    ];
+    let (_, res) = commit(&mut a, &as_subject(2, "user:1"), &inserts, 2);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+
+    let err = a.erase_subject("user:1", 3).unwrap_err();
+    assert!(
+        err.contains("FOREIGN KEY"),
+        "the quoted parent name must parse; the statement then fails the constraint: {err}"
+    );
+    assert!(
+        a.conn.is_autocommit(),
+        "kronik_apply was left open after {err}"
+    );
+    assert_eq!(
+        a.applied_lsn().unwrap(),
+        2,
+        "a failed erasure advanced the LSN"
+    );
+    a.begin_turn(&opts(0, 0, false)).unwrap();
+    let kept = a.query("SELECT body FROM early ORDER BY id", &[]).unwrap();
+    a.end_turn(false).unwrap();
+    assert_eq!(
+        kept.values,
+        [[Value::Text("kept".into())], [Value::Text("other".into())]],
+        "the earlier delete in the same erasure was committed"
+    );
+
+    let (_, res) = commit(
+        &mut a,
+        &as_subject(4, "user:1"),
+        &["DELETE FROM \"z\"\"child\" WHERE id = 1"],
+        3,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let n = a.erase_subject("user:1", 4).unwrap();
+    assert!(n >= 2, "erasure after the rollback did not delete: {n}");
+    assert_eq!(a.applied_lsn().unwrap(), 4);
+    assert!(a.conn.is_autocommit());
+}
