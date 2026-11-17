@@ -126,9 +126,10 @@ fn hash_tables(conn: &Connection, tables: &[&str], h: &mut blake3::Hasher) -> ru
 /// writes live rows only, so free pages that held deleted rows never reach
 /// a snapshot (H11); the logical content, and so the state hash, is equal.
 ///
-/// The caller holds the apply lock, so what is committed is the applied
-/// state: an actor turn's `SAVEPOINT kronik_turn` is always rolled back,
-/// and its changeset is applied under that lock. `VACUUM INTO` refuses to
+/// A snapshot's caller holds the apply lock for this database only, so
+/// what is copied is the applied state: an actor turn's
+/// `SAVEPOINT kronik_turn` is always rolled back, and its changeset is
+/// applied under the store's apply lock. `VACUUM INTO` refuses to
 /// run inside a transaction, and the connection can be inside one (a turn
 /// keeps its savepoint open between its statements, v0.1 re-review R1).
 /// Then the copy is made from the committed state on disk instead: the
@@ -321,41 +322,115 @@ impl SqlActor {
     }
 }
 
+/// Retries when the applied LSN moves between per-database copies.
+const SNAPSHOT_LSN_RETRIES: usize = 128;
+
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_APPLY_LOCK_HOLDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// SQL actors from a `state.db` copy.
+fn sql_actors_at(state: &Path) -> Result<Vec<String>, StoreError> {
+    let conn = Connection::open(state).map_err(sqlite)?;
+    let mut st = conn
+        .prepare("SELECT kind, key FROM actors WHERE sql = 1 ORDER BY kind, key")
+        .map_err(sqlite)?;
+    let rows = st.query_map([], |r| {
+        Ok(format!(
+            "{}/{}",
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?
+        ))
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// State hash from on-disk snapshot copies (not the live store).
+fn hash_snapshot_at(dir: &Path, state: &Path, actors: &[String]) -> Result<String, StoreError> {
+    let mut h = blake3::Hasher::new();
+    let conn = Connection::open(state).map_err(sqlite)?;
+    hash_tables(&conn, HASHED_TABLES, &mut h).map_err(sqlite)?;
+    for name in actors {
+        let rel = actor_file(Path::new("sql"), name);
+        let copy = Connection::open(dir.join(&rel)).map_err(sqlite)?;
+        let hash = crate::sql::canonical_hash_raw(&copy).map_err(sqlite)?;
+        h.update(format!("sql|{name}|{hash}\n").as_bytes());
+    }
+    Ok(format!("b3:{}", h.finalize().to_hex()))
+}
+
+fn remove_snapshot_copies(dir: &Path, actors: &[String]) -> Result<(), StoreError> {
+    let _ = std::fs::remove_file(dir.join("state.db"));
+    for name in actors {
+        let _ = std::fs::remove_file(dir.join(actor_file(Path::new("sql"), name)));
+    }
+    Ok(())
+}
+
+fn snapshot_apply_lock(store: &Store) -> std::sync::MutexGuard<'_, ()> {
+    #[cfg(test)]
+    SNAPSHOT_APPLY_LOCK_HOLDS.with(|c| c.set(c.get() + 1));
+    store.apply_lock()
+}
+
 impl Store {
     /// Copies `state.db` and every actor database at the applied LSN into
-    /// `dir` (created), holding the apply lock so all copies are at the
-    /// same LSN. Also computes the state hash at that LSN: of the actor
-    /// databases from their copies, since a running turn's open savepoint
-    /// shows its rows on the live connection (v0.1 re-review R1).
+    /// `dir` (created). The apply lock is taken only to read the LSN and for
+    /// each database copy, never for the whole-state hash (v0.1 re-review R1
+    /// hashes actor copies, not live savepoints). If the applied LSN moves
+    /// during the copies the pass retries.
     pub fn snapshot_to(&self, dir: &Path) -> Result<SnapshotCopy, StoreError> {
-        let _apply = self.apply_lock();
-        let lsn = self.applied.get();
         std::fs::create_dir_all(dir.join("sql")).map_err(io)?;
-        let mut files = vec![PathBuf::from("state.db")];
-        self.db().backup_to(&dir.join("state.db"))?;
-        let mut h = blake3::Hasher::new();
-        hash_tables(self.db().conn(), HASHED_TABLES, &mut h).map_err(sqlite)?;
-        let actors = self.db().sql_actors()?;
-        for name in &actors {
-            let rel = actor_file(Path::new("sql"), name);
-            if let Some(parent) = dir.join(&rel).parent() {
-                std::fs::create_dir_all(parent).map_err(io)?;
+        let state_path = dir.join("state.db");
+        for _ in 0..SNAPSHOT_LSN_RETRIES {
+            let (lsn, actors) = {
+                let _apply = snapshot_apply_lock(self);
+                let lsn = self.applied.get();
+                let actors = self.db().sql_actors()?;
+                (lsn, actors)
+            };
+            {
+                let _apply = snapshot_apply_lock(self);
+                if self.applied.get() != lsn {
+                    continue;
+                }
+                self.db().backup_to(&state_path)?;
             }
-            let db = self.sql.get(name)?;
-            db.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .backup_to(&dir.join(&rel))?;
-            let copy = Connection::open(dir.join(&rel)).map_err(sqlite)?;
-            let hash = crate::sql::canonical_hash_raw(&copy).map_err(sqlite)?;
-            h.update(format!("sql|{name}|{hash}\n").as_bytes());
-            files.push(rel);
+            let mut files = vec![PathBuf::from("state.db")];
+            let mut complete = true;
+            for name in &actors {
+                let rel = actor_file(Path::new("sql"), name);
+                let dest = dir.join(&rel);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent).map_err(io)?;
+                }
+                let _apply = snapshot_apply_lock(self);
+                if self.applied.get() != lsn {
+                    complete = false;
+                    break;
+                }
+                let db = self.sql.get(name)?;
+                db.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .backup_to(&dest)?;
+                files.push(rel);
+            }
+            if !complete {
+                remove_snapshot_copies(dir, &actors)?;
+                continue;
+            }
+            let actors = sql_actors_at(&state_path)?;
+            let state_hash = hash_snapshot_at(dir, &state_path, &actors)?;
+            return Ok(SnapshotCopy {
+                lsn,
+                state_hash,
+                files,
+            });
         }
-        let state_hash = format!("b3:{}", h.finalize().to_hex());
-        Ok(SnapshotCopy {
-            lsn,
-            state_hash,
-            files,
-        })
+        Err(StoreError::Corrupt(
+            "snapshot: the applied LSN kept moving during copy".into(),
+        ))
     }
 
     /// The state hash (m6-storage §8) at the applied LSN.
@@ -1064,6 +1139,20 @@ mod tests {
         let out = store.raise_idle_sql(50, 64).unwrap();
         assert_eq!(out.blocked, ["a/idle"], "{out:?}");
         assert!(!file.exists(), "stamping must not invent an empty database");
+    }
+
+    #[test]
+    fn snapshot_takes_the_apply_lock_once_per_database_not_for_the_hash() {
+        SNAPSHOT_APPLY_LOCK_HOLDS.with(|c| c.set(0));
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with(dir.path(), 100, &[("a/idle", 5), ("b/recent", 90)]);
+        let snap = dir.path().join("snap");
+        let before = store.state_hash().unwrap();
+        SNAPSHOT_APPLY_LOCK_HOLDS.with(|c| c.set(0));
+        let copy = store.snapshot_to(&snap).unwrap();
+        assert_eq!(copy.state_hash, before);
+        // LSN read, `state.db`, two actors — never one hold for copy and hash.
+        SNAPSHOT_APPLY_LOCK_HOLDS.with(|c| assert_eq!(c.get(), 4));
     }
 
     #[test]

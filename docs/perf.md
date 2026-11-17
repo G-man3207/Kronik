@@ -229,6 +229,19 @@ for operators.
 The build brief: "start with 1 GB of log after the latest snapshot: under 30
 seconds" (docs/design/m6-storage.md §9).
 
+### Snapshot apply-lock hold
+
+`Store::snapshot_to` holds the apply lock only to read the LSN and during
+each on-disk database copy; the state hash runs on the copies afterward with
+no lock. On the development machine (2026-11-17), the unit test
+`snapshot_takes_the_apply_lock_once_per_database_not_for_the_hash` in
+`crates/kronik-store/src/snapshot.rs` checks that a snapshot of two on-disk
+actor databases takes four apply-lock holds (LSN read, `state.db`, two
+actors), not one hold across copy and hash. That test is the regression
+guard for apply-lock pause during snapshots. Wall-clock `snapshot_ms` from
+`scripts/benchmark-single-node.py` still measures the public CLI path on a
+small fixture only.
+
 Since v0.4.0 a start also certifies the secret inventory before it serves
 ([ADR 0108](adr/0108-durable-secret-coverage-watermark.md)); the results
 below were measured before that. The certification runs after the replay,
