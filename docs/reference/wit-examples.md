@@ -228,7 +228,7 @@ A component that imports `blobs` receives large request bodies and effect
 responses as `HttpBody::Blob`. Read them in ranges of at most 1 MiB; write a
 large response with a `writer` and return its reference as the body. Handle
 `not-held` (a reference the turn neither holds nor received) and `erased`.
-M25 and M26 are being built: until then these calls trap with
+These calls work on a normal daemon. A turn with no blob host traps with
 `NOT_IMPLEMENTED`.
 
 ```rust

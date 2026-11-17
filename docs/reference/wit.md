@@ -144,10 +144,11 @@ record manifest { kind: string, schema-version: u32, routes: list<route>, capabi
 
 - An `actor-ref` is `kind/key`, for example `billing/acme`; an invalid one
   traps where it is used.
-- Blobs are not available in v0.1. `message.blobs` must be empty and
-  `http-body` must be `inline`; a blob traps with `NOT_IMPLEMENTED`. Blob
-  references arrive with M25 and messages with blobs with M26, without a
-  breaking change to the WIT.
+- A `blob-ref` is a blob's hash and size, not a permission. `message.blobs`
+  carries references the receiver may read; an empty list is a message with
+  no blobs. `http-body` is `inline`, or `blob` above the kind's blob
+  threshold when the component imports `blobs`. A blob in a turn that has
+  no blob host traps with `NOT_IMPLEMENTED`.
 
 ## state
 
@@ -595,8 +596,8 @@ checks the references the turn may use
 ([ADR 0119](../adr/0119-blob-reference-graph.md)), and any other reference,
 whatever its hash, is `not-held` (`BLOB_NOT_HELD`).
 
-M25 and M26 are being built: until their parts land, these functions trap
-with `NOT_IMPLEMENTED`.
+`kronik serve` always starts a blob store, so these functions work on a
+normal turn. A turn with no blob host traps with `NOT_IMPLEMENTED`.
 
 - **Who gets blobs.** A component that imports `blobs` reads blob bodies:
   an HTTP request body or an effect response above the kind's blob
@@ -653,7 +654,8 @@ host either records it or derives it from what it recorded (I1, I2):
 | Fuel per turn | 50,000,000 | The turn fails with `FUEL_EXHAUSTED` |
 | Memory per instance (all linear memories together) | 64 MiB, at most 1 GiB | `memory.grow` returns -1; a trap that follows fails the turn with `TURN_FAILED` |
 | Host buffers per turn (guest logs and stdout/stderr, state writes, messages, timers), 128 bytes of bookkeeping per entry | the memory limit, 64 MiB by default, at most 1 GiB | Traps; the turn fails with `TURN_TOO_LARGE` and commits none of its writes, messages or timers (ADR 0149) |
-| Message body | 1 MiB | Traps in a turn; `PAYLOAD_TOO_LARGE` at the API and the gateway |
+| Message body | 1 MiB | Traps in a turn; `PAYLOAD_TOO_LARGE` at the API |
+| Gateway request body | 1 MiB, or the kind's upload size (64 MiB) when its code imports `blobs` | `PAYLOAD_TOO_LARGE` |
 | State value | 1 MiB | Traps |
 | `random-bytes` request | 1 MiB | Traps |
 | SQL value | 1 MiB | `too-large` |
@@ -672,8 +674,12 @@ be set per kind from M2
 (`kronik limits set`); a turn uses the limits of its configuration epoch.
 Fuel is charged for bulk memory instructions in proportion to their length,
 so with the defaults a turn runs out of fuel before it can touch all of its
-memory. The gateway accepts request bodies up to 1 MiB and answers 504
-`GATEWAY_TIMEOUT` after 30 s, while the turn still completes.
+memory. A kind that does not import `blobs` gets inline request bodies, and
+the gateway accepts those up to 1 MiB. A kind that imports `blobs` may
+accept a body up to its upload size (64 MiB by default, `kronik limits set
+<kind> --upload-size`); above that it answers 413 `PAYLOAD_TOO_LARGE`. It
+answers 504 `GATEWAY_TIMEOUT` after `[gateway] timeout` (30 s by default),
+while the turn still completes.
 
 ## WASI and the import allowlist
 
