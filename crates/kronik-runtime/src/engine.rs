@@ -22,6 +22,7 @@ pub const DEFAULT_MEMORY_BYTES: usize = 64 << 20;
 /// Hard ceiling for one linear memory in the pooling allocator; per-kind
 /// limits can be raised up to this.
 pub const POOL_MAX_MEMORY_BYTES: usize = 1 << 30;
+include!(concat!(env!("OUT_DIR"), "/linear_memory_keep_resident.rs"));
 /// Fuel between cooperative yields of a running turn, so one CPU-heavy turn
 /// cannot starve an executor thread. Deterministic because fuel is.
 pub const FUEL_YIELD_INTERVAL: u64 = 1_000_000;
@@ -104,7 +105,7 @@ pub fn build_engine(pool: PoolSize) -> Result<Engine, CodeError> {
     // heap took about a fifth of isolated replay on dev, more on a VM
     // (docs/perf.md). A slot keeps resident only what its instances used,
     // at most this. Memory is still cleared (I3).
-    p.linear_memory_keep_resident(2 << 20);
+    p.linear_memory_keep_resident(LINEAR_MEMORY_KEEP_RESIDENT_BYTES);
     p.table_keep_resident(64 << 10);
     cfg.allocation_strategy(InstanceAllocationStrategy::Pooling(p));
     Engine::new(&cfg).map_err(wt)
@@ -327,6 +328,11 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn default_linear_memory_keep_resident_is_two_mebibytes() {
+        assert_eq!(LINEAR_MEMORY_KEEP_RESIDENT_BYTES, 2 << 20);
     }
 
     #[test]
