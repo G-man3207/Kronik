@@ -6,6 +6,12 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- Fork replay of a failed `actor.call` runs the compensation with the
+  caller's subject, as live delivery does. The compensation message body
+  already carried that tag; replay queued the turn with none, so its KV
+  writes, SQL rows and outgoing messages were untagged in the fork and
+  tagged on main. A compensation whose body has no subject still runs with
+  no default subject.
 - `examples/payments-platform` adds dogfood scenario 3: `billing-ts-reorder.wasm`
   inserts a replay-safe `GET payments.internal/healthz` after charge. Fork diff
   shows three tail `added` effects without shifting earlier pairs; replay uses

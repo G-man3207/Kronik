@@ -149,6 +149,12 @@ the root id).
   that failed drops it. In isolated replay that callee turn is always
   applied, not buffered as a leaf, because applying it decides the
   compensation.
+- **Compensation subject.** The compensation turn's default subject is the
+  subject tag on the compensation message body, the same tag live delivery
+  uses, whether the failed record queues the compensation or the callee's
+  turn releases it. Its KV writes, SQL rows and outgoing messages are
+  attributed as they were on main. A body with no subject runs with no
+  default subject.
 - **Fork-only timers** (continuous): a timer due at `d` fires at the first
   production position whose logical time is ≥ `d`, before that root input:
   its order key is `[that root input's LSN - 1, u64::MAX, seq]`, which sorts

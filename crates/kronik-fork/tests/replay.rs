@@ -78,6 +78,9 @@ fn replay_with(
             node.secrets().cloned(),
             original,
         );
+        // Subject-tagged effect fingerprints are keyed with the node's
+        // sealer, as a real fork's setup is (proposal replay).
+        setup.privacy.sealer = node.sealer().clone();
         setup.stubs = options.stubs.clone();
         setup.live = (!options.live_allowlist.is_empty()).then(|| kronik_fork::LiveAccess {
             hosts: options.live_allowlist.clone(),
@@ -1805,4 +1808,258 @@ fn identity_replay_over_a_call_lost_to_a_restart_is_empty() {
             "{mode:?}"
         );
     }
+}
+
+/// A failed call's compensation runs in a fork with the caller's subject,
+/// as live delivery does. The compensation message body carries that tag.
+/// The compensation turn's KV writes, SQL rows and the call it sends are
+/// attributed the same way on main and in the fork. A body with no subject
+/// still runs with no default subject. A timed-out call whose callee
+/// commits later releases its compensation the same way.
+#[test]
+fn fork_replay_keeps_a_compensation_turns_caller_subject() {
+    use kronik_core::ids::ActorRef;
+    use kronik_proto::log::v1 as pb;
+    use prost::Message as _;
+
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    p.rt.block_on(p.node.deploy(
+        &std::fs::read(guest("notes")).unwrap(),
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    // Before the window, so the spin and its replay share one fuel limit.
+    // A limit change inside the window moves fuel p99 and marks the diff
+    // changed even when every turn matches.
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "counter".into(),
+            effect_timeout_ms: Some(100),
+            fuel: Some(5_000_000_000),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    let fork_lsn = p.settle();
+
+    let send = |actor: &str, body: &str, subject: Option<&str>| {
+        let m = pb::Message {
+            name: "call-fail".into(),
+            content_type: "text/plain".into(),
+            body: Some(pb::Sealable {
+                subject: subject.map(str::to_owned),
+                value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
+            }),
+            blobs: vec![],
+            retained_compensation_source: None,
+        };
+        let r =
+            p.rt.block_on(p.node.send(
+                ActorRef::parse(actor).unwrap(),
+                m,
+                audit(),
+                false,
+                p.owner(),
+            ))
+            .unwrap()
+            .unwrap();
+        assert!(!r.committed(), "{actor}: {:?}", r.outcome);
+    };
+    // The callee commits first, so the failed record queues the compensation.
+    send(
+        "counter/kv-caller",
+        "counter/kv increment increment",
+        Some("user:kv"),
+    );
+    send("counter/sql-caller", "notes/sql add add", Some("user:sql"));
+    send(
+        "counter/msg-caller",
+        "counter/msg call call",
+        Some("user:msg"),
+    );
+    send(
+        "counter/none-caller",
+        "counter/none increment increment",
+        None,
+    );
+
+    let started = p.node.probe.turns_run.load(Ordering::SeqCst);
+    p.http_detached("held", "spin", "250000000");
+    while p.node.probe.turns_run.load(Ordering::SeqCst) == started {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    send(
+        "counter/held-caller",
+        "counter/held increment increment",
+        Some("user:held"),
+    );
+    let n = |key: &str| p.node.store().db().kv_get("counter", key, "n").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while n("held").as_deref() != Some(b"2".as_slice()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "held compensation did not run: {:?}",
+            n("held")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let kv_subject = |key: &str| {
+        p.node
+            .store()
+            .db()
+            .kv_get_sealable("counter", key, "n")
+            .unwrap()
+            .and_then(|s| s.subject)
+    };
+    assert_eq!(kv_subject("kv").as_deref(), Some("user:kv"));
+    assert_eq!(kv_subject("none").as_deref(), None);
+    assert_eq!(kv_subject("held").as_deref(), Some("user:held"));
+    assert_eq!(n("x").as_deref(), Some(b"2".as_slice()));
+    assert_eq!(kv_subject("x").as_deref(), Some("user:msg"));
+    let sql_rows = |store: &kronik_store::Store| -> Vec<(String, Option<String>)> {
+        let db = store.sql.get("notes/sql").unwrap();
+        let actor = db.lock().unwrap();
+        actor.set_host();
+        let mut st = actor
+            .conn
+            .prepare("SELECT body, _subject FROM notes ORDER BY id")
+            .unwrap();
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let tagged_sql = vec![
+        (String::new(), Some("user:sql".into())),
+        (String::new(), Some("user:sql".into())),
+    ];
+    assert_eq!(sql_rows(p.node.store()), tagged_sql);
+
+    let to = p.settle();
+    let turns: Vec<pb::TurnRecord> = (fork_lsn + 1..=to)
+        .filter_map(|l| p.rt.block_on(p.node.read_record(l)).unwrap())
+        .filter_map(|c| match c.record {
+            kronik_proto::Record::TurnRecord(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    let is_compensation = |t: &pb::TurnRecord| {
+        matches!(
+            t.input.as_ref().and_then(|i| i.kind.as_ref()),
+            Some(pb::input::Kind::Message(m))
+                if m.source == pb::MessageSource::Compensation as i32
+        )
+    };
+    let compensation = |key: &str| {
+        turns
+            .iter()
+            .find(|t| t.actor.as_ref().is_some_and(|a| a.key == key) && is_compensation(t))
+    };
+    let write_subject = |t: &pb::TurnRecord| {
+        t.writes
+            .iter()
+            .find_map(|w| w.value.as_ref().and_then(|v| v.subject.clone()))
+    };
+    let sql_subject = |t: &pb::TurnRecord| {
+        t.sql_changes
+            .iter()
+            .find_map(|c| c.changeset.as_ref().and_then(|s| s.subject.clone()))
+    };
+    let call_subject = |t: &pb::TurnRecord| -> Option<String> {
+        let bytes = t
+            .effects
+            .iter()
+            .find(|e| e.kind == "actor.call")
+            .and_then(
+                |e| match e.request.as_ref().and_then(|r| r.value.as_ref()) {
+                    Some(pb::sealable::Value::Plain(b)) => Some(b.as_slice()),
+                    _ => None,
+                },
+            )?;
+        pb::CallEffectRequest::decode(bytes)
+            .ok()?
+            .msg
+            .as_ref()
+            .and_then(|m| m.body.as_ref())
+            .and_then(|b| b.subject.clone())
+    };
+    assert_eq!(
+        write_subject(compensation("kv").expect("kv compensation")).as_deref(),
+        Some("user:kv")
+    );
+    assert_eq!(
+        write_subject(compensation("none").expect("untagged compensation")),
+        None
+    );
+    assert_eq!(
+        sql_subject(compensation("sql").expect("sql compensation")).as_deref(),
+        Some("user:sql")
+    );
+    assert_eq!(
+        call_subject(compensation("msg").expect("call compensation")).as_deref(),
+        Some("user:msg")
+    );
+    assert_eq!(
+        write_subject(compensation("held").expect("released compensation")).as_deref(),
+        Some("user:held")
+    );
+
+    let out = replay(&p, None, fork_lsn, &opts(Mode::Both), 2);
+    assert!(
+        !out.diff.summary.changed,
+        "{}",
+        String::from_utf8_lossy(&out.bytes)
+    );
+    assert_eq!(
+        (
+            out.diff.summary.turns_prod,
+            out.diff.summary.divergent_turns
+        ),
+        (out.diff.summary.turns_fork, 0)
+    );
+    let cont = out.continuous.expect("continuous replay");
+    assert_eq!(sql_rows(&cont.store), tagged_sql);
+    let fork_kv = |key: &str| {
+        cont.store
+            .db()
+            .kv_get_sealable("counter", key, "n")
+            .unwrap()
+            .and_then(|s| s.subject)
+    };
+    assert_eq!(fork_kv("kv").as_deref(), Some("user:kv"));
+    assert_eq!(fork_kv("none").as_deref(), None);
+    assert_eq!(fork_kv("held").as_deref(), Some("user:held"));
+    assert_eq!(fork_kv("x").as_deref(), Some("user:msg"));
+    let fork = cont.turns();
+    let fork_comp = |key: &str| {
+        fork.iter()
+            .find(|t| {
+                t.record.actor.as_ref().is_some_and(|a| a.key == key) && is_compensation(&t.record)
+            })
+            .unwrap_or_else(|| panic!("fork compensation {key}"))
+    };
+    assert_eq!(
+        write_subject(&fork_comp("kv").record).as_deref(),
+        Some("user:kv")
+    );
+    assert_eq!(write_subject(&fork_comp("none").record), None);
+    assert_eq!(
+        sql_subject(&fork_comp("sql").record).as_deref(),
+        Some("user:sql")
+    );
+    assert_eq!(
+        call_subject(&fork_comp("msg").record).as_deref(),
+        Some("user:msg")
+    );
+    assert_eq!(
+        write_subject(&fork_comp("held").record).as_deref(),
+        Some("user:held")
+    );
 }
