@@ -406,10 +406,12 @@ auth = "approle"                # token | approle | cert
 role_id_file = "bao-role-id"    # relative: $CREDENTIALS_DIRECTORY
 secret_id_file = "bao-secret-id"
 ca_file = "/etc/kronik/bao-ca.pem"
+allowed_refs = ["secret/payments"]
 
 [secrets.backends.aws]
 type = "aws"
 region = "eu-north-1"
+allowed_refs = ["payments/"]
 # endpoint = "http://127.0.0.1:5000"   # moto, tests only
 ```
 
@@ -435,12 +437,13 @@ As built, `SecretLink` also carries `binding`, `generation`, `epoch` and
   that `ref` lies under one of the backend's `allowed_refs` prefixes, then
   fetches the current value once, so a bad ref fails now with the backend's
   error rather than at the first turn. The dry run fetches but appends
-  nothing and does not fill the cache.
+  nothing and does not fill the cache. The AWS example above covers
+  `--backend aws --ref payments/stripe#key` the same way.
 - **Scope `admin`, and an allowlist**: the backend sees only
   the node's identity, so its own policy cannot tell which Kronik caller
   asked. Without a limit, `link` (with `secret-reveal` and an `http.fetch`
   grant) could read and send out anything that identity can read. So
-  `[secrets.backends.<id>] allowed_refs = ["secret/payments/", …]` is
+  `[secrets.backends.<id>] allowed_refs = ["secret/payments", …]` is
   required for every external backend (an empty list refuses every link),
   a ref outside it is `SECRET_REF_NOT_ALLOWED` (403), and `link`/`unlink`
   need scope `admin`.

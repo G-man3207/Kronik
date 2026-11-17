@@ -511,7 +511,10 @@ The blob store, `<data_dir>/blobs`, is always on; see [blobs](#blobs).
 | `fetch_timeout` | `"2s"` | The longest a request to a backend, or a secret change waiting for the inventory to be published again, takes; at most `"60s"`. When the wait for the inventory runs out, `kronik secret set`, `delete`, `link`, `unlink` and `refresh` answer 503 `SECRET_UNAVAILABLE` saying that the change is already committed: it is made, so do not repeat it. A mutation that begins while the inventory is being rebuilt waits for it for this long plus 5 s before its reason is recorded |
 
 External backends are defined in `[secrets.backends.<id>]` tables; see the
-[M23 design](../design/m23-secret-backends.md). Effects, foreign actors'
+[M23 design](../design/m23-secret-backends.md). Each
+`[secrets.backends.<id>]` table needs a non-empty `allowed_refs` prefix
+list. The field defaults to an empty list, and an empty list denies every
+link (`SECRET_REF_NOT_ALLOWED`). Effects, foreign actors'
 starts and `foreign add --secret` all read a linked name through the same
 in-memory cache, and a fork uses only a value the cache already holds for
 the fork point's link. `kronik secret backends` shows each backend's last
