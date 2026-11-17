@@ -6,6 +6,12 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- `examples/payments-platform` adds dogfood scenario 3: `billing-ts-reorder.wasm`
+  inserts a replay-safe `GET payments.internal/healthz` after charge. Fork diff
+  shows three tail `added` effects without shifting earlier pairs; replay uses
+  live GETs when `[fork] live_allowlist` and an `http:payments.internal`
+  `replay-safe` grant are set. `demo/payments-platform-reorder.sh` exercises it;
+  the `foreign` CI step runs scenarios 1–3 when root and gVisor are available.
 - `demo/payments-platform-pure-refactor.sh` forks before it records traffic so
   fork replay actually re-runs the invoices (it forked at the tip before).
 - `examples/payments-platform` adds dogfood scenario 2: billing-ts with EU

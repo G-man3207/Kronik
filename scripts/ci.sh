@@ -455,6 +455,7 @@ step_foreign() {
     KRONIK_BIN="$kronik" scripts/build-examples-ts.sh
     KRONIK_BIN="$kronik" demo/payments-platform-pure-refactor.sh
     KRONIK_BIN="$kronik" demo/payments-platform-eu-vat.sh
+    KRONIK_BIN="$kronik" demo/payments-platform-reorder.sh
 }
 
 # The S3 variants of the shipping, restore, blob and audit-sink tests, against
