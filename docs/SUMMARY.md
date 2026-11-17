@@ -152,3 +152,4 @@
 - [ADR 0151: A promote orders turn appends against its gap](adr/0151-promote-orders-turn-appends.md)
 - [ADR 0152: An actor source is the indexed frame](adr/0152-actor-source-from-the-turn-index.md)
 - [ADR 0153: Integrity hash off the apply lock](adr/0153-integrity-hash-off-the-apply-lock.md)
+- [ADR 0154: Exceptions for unmaintained chrono and humantime](adr/0154-unmaintained-chrono-humantime.md)

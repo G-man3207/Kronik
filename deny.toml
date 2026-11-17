@@ -16,7 +16,14 @@ targets = [
 yanked = "deny"
 unmaintained = "all"
 unsound = "all"
-ignore = []
+# Maintenance status, not a memory-safety defect, and no patched release.
+# Drop an entry when that crate leaves the resolved graph (ADR 0154).
+# cargo-deny 0.20.2 accepts only id and reason, so these are not limited
+# to the current parent crates.
+ignore = [
+    { id = "RUSTSEC-2026-0542", reason = "humantime wraps unmaintained chrono; object_store 0.14 depends on it and no release drops it" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained with no patched release; object_store, oci-client, rmcp and schemars still resolve it" },
+]
 
 [licenses]
 # Licenses that allow distributing Kronik under the Elastic License 2.0.
