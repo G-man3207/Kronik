@@ -1302,8 +1302,9 @@ impl Node {
     /// `history` whose records the window's base covers (the newest snapshot
     /// no newer than the window's start, [`retention_plan`]), and none from
     /// the segment holding the `TurnBegin` of a turn open in the live state
-    /// or in a snapshot on, then the index rows of what they held. Returns
-    /// the log's first LSN afterwards.
+    /// or in a snapshot on, then the index rows of what they held, unless no
+    /// segment was deleted and no ingress key is past TTL (those deletes take
+    /// the store lock, #162). Returns the log's first LSN afterwards.
     ///
     /// A segment's own time (the turn-time high-water mark at its last
     /// record) says nothing about records after its last turn: a
@@ -1318,10 +1319,11 @@ impl Node {
     }
 
     /// [`Node::compact`]; with `always_index` false the index rows are
-    /// compacted only when a segment was deleted: their deletes scan whole
-    /// tables under the store's lock, which the disk loop must not take
-    /// every minute while a released hold has nothing left to delete
-    /// (perf review R2-cost).
+    /// compacted only when a segment was deleted. Those deletes take the
+    /// store lock; the disk loop must not take it every minute while a
+    /// released hold has nothing left to delete (perf review R2-cost). The
+    /// hourly pass skips them too unless an ingress key is past TTL. That
+    /// probe uses `ingress_keys_time`, not a scan of `trees` (#162).
     fn compact_with(&self, storage: &StorageConfig, always_index: bool) -> Result<Lsn, ApiError> {
         let dir = storage
             .data_dir
@@ -1430,16 +1432,29 @@ impl Node {
                 ));
             }
         }
-        if !always_index && first == was_first {
+        // Disk loop: index rows follow only when a segment was deleted (R2).
+        if first == was_first && !always_index {
             return Ok(first);
         }
-        let ingress_ttl = self.cfg.ingress_ttl.as_millis() as u64;
-        self.db_compactions
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.store()
-            .db()
-            .compact(first, hwm.saturating_sub(ingress_ttl))
-            .map_err(store_err)?;
+        let ingress_before = hwm.saturating_sub(self.cfg.ingress_ttl.as_millis() as u64);
+        // No segment went and no ingress key is past TTL: do not hold the
+        // store lock for the `trees` and `ingress_keys` deletes (#162). A
+        // crash after the segment delete and before this leaves those rows
+        // until the next segment deletion or an expired ingress key.
+        if first != was_first
+            || self
+                .store()
+                .db()
+                .has_ingress_before(ingress_before)
+                .map_err(store_err)?
+        {
+            self.db_compactions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.store()
+                .db()
+                .compact(first, ingress_before)
+                .map_err(store_err)?;
+        }
         // The pins of the saved responses compaction deleted (M26 §5.4).
         // ... and of saved call outcomes below the blob floor.
         let floor = self.blob_floor().unwrap_or(first);
