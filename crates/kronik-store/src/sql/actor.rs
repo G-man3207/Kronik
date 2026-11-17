@@ -1156,27 +1156,35 @@ impl SqlActor {
         let tables = tables_with_subject_column(&self.conn)?;
         self.host_batch("SAVEPOINT kronik_apply")
             .map_err(|e| e.to_string())?;
-        let mut n = 0;
-        for t in &tables {
-            n += self
-                .conn
+        let deleted: Result<u64, String> = (|| {
+            let mut n = 0u64;
+            for t in &tables {
+                n += self
+                    .conn
+                    .execute(
+                        &format!("DELETE FROM {} WHERE _subject = ?1", quote_ident(t)),
+                        [subject],
+                    )
+                    .map_err(|e| e.to_string())? as u64;
+            }
+            n += rows_without_subject_column(&self.conn, subject)?;
+            self.conn
                 .execute(
-                    &format!("DELETE FROM \"{t}\" WHERE _subject = ?1"),
-                    [subject],
+                    "UPDATE _kronik_meta SET v = ?1 WHERE k = 'applied_lsn'",
+                    [lsn as i64],
                 )
-                .map_err(|e| e.to_string())? as u64;
-        }
-        n += rows_without_subject_column(&self.conn, subject)?;
-        self.conn
-            .execute(
-                "UPDATE _kronik_meta SET v = ?1 WHERE k = 'applied_lsn'",
-                [lsn as i64],
-            )
-            .map_err(|e| e.to_string())?;
-        self.conn
-            .execute_batch("RELEASE kronik_apply")
-            .map_err(|e| e.to_string())?;
-        Ok((n, self.conn.is_autocommit()))
+                .map_err(|e| e.to_string())?;
+            Ok(n)
+        })();
+        // A failed statement used to return with this savepoint open, so the
+        // logged erasure failed again on the next start.
+        let end = if deleted.is_ok() {
+            "RELEASE kronik_apply"
+        } else {
+            "ROLLBACK TO kronik_apply; RELEASE kronik_apply"
+        };
+        self.host_batch(end).map_err(|e| e.to_string())?;
+        Ok((deleted?, self.conn.is_autocommit()))
     }
 
     /// H11: truncate the WAL after an erasure. A caller that holds the apply
@@ -1336,25 +1344,25 @@ impl SqlActor {
                 .map(|(i, (_, p))| (*p, i))
                 .collect();
             pk.sort();
-            let quoted = name.replace('"', "\"\"");
+            let quoted = quote_ident(&name);
             let (columns, pk, select): (Vec<String>, Vec<usize>, String) = if pk.is_empty() {
                 let mut c = vec!["rowid".to_string()];
                 c.extend(cols.iter().map(|(n, _)| n.clone()));
                 (
                     c,
                     vec![0],
-                    format!("SELECT rowid, * FROM \"{quoted}\" ORDER BY rowid"),
+                    format!("SELECT rowid, * FROM {quoted} ORDER BY rowid"),
                 )
             } else {
                 let order = pk
                     .iter()
-                    .map(|(_, i)| format!("\"{}\"", cols[*i].0.replace('"', "\"\"")))
+                    .map(|(_, i)| quote_ident(&cols[*i].0))
                     .collect::<Vec<_>>()
                     .join(", ");
                 (
                     cols.iter().map(|(n, _)| n.clone()).collect(),
                     pk.iter().map(|(_, i)| *i).collect(),
-                    format!("SELECT * FROM \"{quoted}\" ORDER BY {order}"),
+                    format!("SELECT * FROM {quoted} ORDER BY {order}"),
                 )
             };
             let mut st = self.conn.prepare(&select)?;
@@ -1391,7 +1399,7 @@ impl SqlActor {
         let mut out = Vec::with_capacity(names.len());
         for n in names {
             let rows: i64 = self.conn.query_row(
-                &format!("SELECT count(*) FROM \"{}\"", n.replace('"', "\"\"")),
+                &format!("SELECT count(*) FROM {}", quote_ident(&n)),
                 [],
                 |r| r.get(0),
             )?;
@@ -1605,7 +1613,7 @@ impl SqlActor {
                     } else {
                         names[k].clone()
                     };
-                    conds.push(format!("\"{col}\" = ?{}", params.len() + 1));
+                    conds.push(format!("{} = ?{}", quote_ident(&col), params.len() + 1));
                     params.push(
                         c.old
                             .get(k)
@@ -1616,8 +1624,8 @@ impl SqlActor {
                     );
                 }
                 let sql = format!(
-                    "SELECT _subject FROM \"{}\" WHERE {}",
-                    c.table,
+                    "SELECT _subject FROM {} WHERE {}",
+                    quote_ident(&c.table),
                     conds.join(" AND ")
                 );
                 lock(&self.shared).host = true;
@@ -1672,16 +1680,16 @@ pub fn canonical_hash_raw(conn: &Connection) -> rusqlite::Result<String> {
         )?;
         let (select, order) = if pk.is_empty() {
             (
-                format!("SELECT rowid, * FROM \"{name}\""),
+                format!("SELECT rowid, * FROM {}", quote_ident(name)),
                 "rowid".to_string(),
             )
         } else {
             let o = pk
                 .iter()
-                .map(|(_, c)| format!("\"{c}\""))
+                .map(|(_, c)| quote_ident(c))
                 .collect::<Vec<_>>()
                 .join(", ");
-            (format!("SELECT * FROM \"{name}\""), o)
+            (format!("SELECT * FROM {}", quote_ident(name)), o)
         };
         let _ = without_rowid;
         let mut st = conn.prepare(&format!("{select} ORDER BY {order}"))?;

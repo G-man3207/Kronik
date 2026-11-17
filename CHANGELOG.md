@@ -5,6 +5,15 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- Subject erasure of a SQL table whose name contains `"` deletes that
+  subject's rows and leaves the node running. The name was interpolated
+  into `DELETE FROM "{name}"` without escaping the quote, so the statement
+  was not SQL, the apply savepoint stayed open, and the applier marked the
+  node fatal. The erasure record was already in the log, so the next start
+  failed the same way and the rows were never deleted. Schema names in
+  erasure, subject lookup, and the actor database hash are quoted, and a
+  failed erasure statement rolls its savepoint back before the error is
+  returned.
 - A registry pull keeps a layer whose bytes match its descriptor even when
   the registry's `Docker-Content-Digest` header does not. The header cannot
   authorize bytes that do not match the pin; those are refused and not

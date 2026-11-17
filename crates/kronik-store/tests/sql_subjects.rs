@@ -265,3 +265,140 @@ fn erasing_one_subject_of_a_turn_keeps_the_other_subjects_rows_live_and_rebuilt(
         "rebuilt to a point before the erasure record"
     );
 }
+
+/// Issue #187: a table name containing `"` used to make `DELETE FROM "{name}"`
+/// invalid SQL. `Store::apply` reported the erasure corrupt, which is what
+/// marks the node fatal, and a restart replayed the same record. The erasure
+/// must delete the subject's rows, advance the actor's applied LSN, and a
+/// rebuild from the log must still answer a query.
+#[test]
+fn a_quoted_table_name_erases_and_a_rebuild_still_serves() {
+    let master = MasterKey::from_bytes([7; 32]).unwrap();
+    let sealer = Arc::new(Sealer::new(Arc::new(
+        Keystore::open_memory(&master).unwrap(),
+    )));
+    sealer.set_on(true);
+
+    let ddl = "CREATE TABLE \"a\"\"b\" (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
+         _subject TEXT DEFAULT (kronik_subject()))";
+    let mut actor = SqlActor::open(&MemOpener, "notes/n", Limits::default()).unwrap();
+    actor.begin_turn(&turn_opts(1, None, true)).unwrap();
+    actor.query(ddl, &[]).unwrap();
+    let schema = actor.end_turn(true).unwrap();
+    actor.apply(&schema, 1, &BTreeSet::new()).unwrap();
+    actor
+        .begin_turn(&turn_opts(2, Some("user:1"), false))
+        .unwrap();
+    actor
+        .query("INSERT INTO \"a\"\"b\"(body) VALUES ('mine')", &[])
+        .unwrap();
+    actor
+        .query(
+            "INSERT INTO \"a\"\"b\"(body, _subject) VALUES ('theirs', 'user:2')",
+            &[],
+        )
+        .unwrap();
+    let inserted = actor.end_turn(true).unwrap();
+    actor.apply(&inserted, 2, &BTreeSet::new()).unwrap();
+    actor
+        .begin_turn(&turn_opts(3, Some("user:3"), false))
+        .unwrap();
+    actor
+        .query(
+            "UPDATE \"a\"\"b\" SET body = 'mine, edited' WHERE id = 1",
+            &[],
+        )
+        .unwrap();
+    let updated = actor.end_turn(true).unwrap();
+    actor.apply(&updated, 3, &BTreeSet::new()).unwrap();
+    assert_eq!(
+        updated.changesets[0].0.as_deref(),
+        Some("user:1"),
+        "subject split failed for the quoted table: {updated:?}"
+    );
+    actor.canonical_hash().unwrap();
+
+    let seal = |changesets: Vec<(Option<String>, Vec<u8>)>, lsn: u64| {
+        changesets
+            .into_iter()
+            .map(|(subject, cs)| {
+                let mut value = pb::Sealable {
+                    subject,
+                    value: Some(pb::sealable::Value::Plain(cs)),
+                };
+                sealer
+                    .seal_value(&mut value, &|b: &mut [u8]| b.fill(3), lsn)
+                    .unwrap();
+                pb::SqlChangeset {
+                    changeset: Some(value),
+                }
+            })
+            .collect()
+    };
+    let mut log = vec![
+        turn(1, &schema.ddl, Vec::new()),
+        turn(2, &[], seal(inserted.changesets, 2)),
+        turn(3, &[], seal(updated.changesets, 3)),
+    ];
+    let live = store_after(&sealer, &log);
+    assert_eq!(
+        quoted_rows(&live),
+        [row("mine, edited", "user:1"), row("theirs", "user:2")]
+    );
+
+    let key_version = sealer.erase("user:1", 4).unwrap();
+    log.push(committed(
+        4,
+        Record::Erasure(pb::Erasure {
+            subject: "user:1".into(),
+            key_version,
+            ..Default::default()
+        }),
+    ));
+    live.apply(&log[3..])
+        .expect("erasure apply must succeed; a corrupt apply marks the node fatal");
+    assert_eq!(quoted_rows(&live), [row("theirs", "user:2")]);
+    assert_eq!(actor_applied(&live), 4);
+
+    let rebuilt = store_after(&sealer, &from_log(&log));
+    assert_eq!(quoted_rows(&rebuilt), [row("theirs", "user:2")]);
+    assert_eq!(actor_applied(&rebuilt), 4);
+    let hash = |store: &Store| {
+        let db = store.sql.get("notes/n").unwrap();
+        db.lock().unwrap().canonical_hash().unwrap()
+    };
+    assert_eq!(hash(&live), hash(&rebuilt));
+    let db = rebuilt.sql.get("notes/n").unwrap();
+    let mut served = db.lock().unwrap();
+    served.begin_turn(&turn_opts(9, None, false)).unwrap();
+    let rows = served
+        .query("SELECT body, _subject FROM \"a\"\"b\"", &[])
+        .unwrap();
+    served.end_turn(false).unwrap();
+    assert_eq!(
+        rows.values,
+        [[
+            rusqlite::types::Value::Text("theirs".into()),
+            rusqlite::types::Value::Text("user:2".into())
+        ]]
+    );
+}
+
+fn quoted_rows(store: &Store) -> Vec<(String, String)> {
+    let db = store.sql.get("notes/n").unwrap();
+    let actor = db.lock().unwrap();
+    actor.set_host();
+    let mut st = actor
+        .conn
+        .prepare("SELECT body, _subject FROM \"a\"\"b\" ORDER BY id")
+        .unwrap();
+    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn actor_applied(store: &Store) -> u64 {
+    let db = store.sql.get("notes/n").unwrap();
+    db.lock().unwrap().applied_lsn().unwrap()
+}
