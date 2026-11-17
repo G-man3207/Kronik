@@ -6,6 +6,10 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- An actor call reads the callee's source from the turn index and one log
+  frame, instead of decoding every retained record from LSN 1. A call whose
+  callee is still in the log succeeds after retention moves the log start
+  past 1; before, that walk failed the call with `UNAVAILABLE` (ADR 0152).
 - SQL erasure, `has_table_without_subject`, and `--no-pii` pseudonymization
   treat any ASCII case of `_subject` as the subject column, as the write
   path already did. A column declared `_Subject` is erased, and its text

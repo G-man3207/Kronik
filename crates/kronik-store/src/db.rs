@@ -1516,6 +1516,15 @@ impl StateDb {
             .optional()?)
     }
 
+    /// An open `TurnBegin` at exactly `lsn`, if that begin has not closed.
+    pub fn open_turn(&self, lsn: Lsn) -> Result<Option<TurnRef>, StoreError> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT lsn, segment, offset FROM open_turns WHERE lsn = ?1")?
+            .query_row([i(lsn)], turn_ref)
+            .optional()?)
+    }
+
     /// The newest completed turn at or below `at_most`.
     pub fn latest_turn_at(&self, at_most: Lsn) -> Result<Option<TurnRef>, StoreError> {
         Ok(self
