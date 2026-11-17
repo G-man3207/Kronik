@@ -693,4 +693,34 @@ mod tests {
         let e = ApiError::new(ErrorCode::TurnFailed, "boom");
         assert_eq!(e.to_string(), "TURN_FAILED: boom");
     }
+
+    /// `kronik explain IMPORT_NOT_ALLOWED` is the remediation deploy prints.
+    /// It must match the allowlist: the two outgoing `wasi:http` imports are
+    /// allowed, and the page must not send a reader to strip them.
+    #[test]
+    fn import_not_allowed_names_the_allowed_wasi_http_imports() {
+        let text = ErrorCode::ImportNotAllowed.explain();
+        assert!(
+            text.contains("`wasi:http/types` and `wasi:http/outgoing-handler` at 0.2.x"),
+            "{text}"
+        );
+        assert!(
+            text.contains("are allowed") && text.contains("`http.fetch` effect"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "`wasi:http/incoming-handler`, `wasi:filesystem` and `wasi:sockets` are denied"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("wasi:http` are denied") && !text.contains("denied in v0.1"),
+            "must not deny every wasi:http import: {text}"
+        );
+        assert!(
+            !text.contains("http-client") && !text.contains("must go through"),
+            "must not tell the reader to use only the http-client interface: {text}"
+        );
+    }
 }
