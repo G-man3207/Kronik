@@ -151,6 +151,8 @@ pub struct Api {
     exports: Vec<Arc<kronik_otel::follow::Stream>>,
     browser: Option<Arc<oidc::BrowserAuth>>,
     cluster_status: Option<ClusterStatusRead>,
+    /// Log hash resumed across `GET /v1/integrity` calls (ADR 0153).
+    integrity_log: m6::IntegrityLog,
 }
 
 type Result<T, E = ApiError> = std::result::Result<T, E>;
@@ -984,6 +986,7 @@ impl Api {
             exports: Vec::new(),
             browser: None,
             cluster_status: None,
+            integrity_log: m6::IntegrityLog::new(),
         }
     }
 

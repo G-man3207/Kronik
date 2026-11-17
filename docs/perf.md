@@ -242,6 +242,16 @@ guard for apply-lock pause during snapshots. Wall-clock `snapshot_ms` from
 `scripts/benchmark-single-node.py` still measures the public CLI path on a
 small fixture only.
 
+### Integrity apply-lock hold
+
+`GET /v1/integrity` does not hold the apply lock across the state hash or
+an actor-database copy (ADR 0153). It hashes a private copy taken while
+the apply epoch is even, and resumes the log hash from the last LSN hashed
+in this process. `state_hash_does_not_hold_the_apply_lock_across_the_hash`
+fails if that hash holds the lock across a pause another thread is waiting
+on. The log-hash check is
+`integrity_log_hash_resumes_instead_of_scanning_from_lsn_1`.
+
 Since v0.4.0 a start also certifies the secret inventory before it serves
 ([ADR 0108](adr/0108-durable-secret-coverage-watermark.md)); the results
 below were measured before that. The certification runs after the replay,

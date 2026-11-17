@@ -6,6 +6,11 @@ until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
 
+- `GET /v1/integrity` hashes a private copy of the committed databases and
+  does not hold the apply lock across that copy or the hash. The log hash
+  resumes from the last LSN hashed in this process, instead of reading the
+  log from LSN 1 on every request. The hashes are unchanged, so a restored
+  node at the same applied LSN still matches (ADR 0153).
 - An erasure deletes a subject's `kv`, `ingress_keys` and `dead_letters`
   rows through an index, and tombstones only that subject's queued timer
   and mailbox bodies, instead of scanning those tables under the apply

@@ -3,6 +3,7 @@
 //! LSN, their installation, and the state hash.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kronik_core::ids::Lsn;
 use rusqlite::limits::Limit;
@@ -349,6 +350,8 @@ const SNAPSHOT_LSN_RETRIES: usize = 128;
 #[cfg(test)]
 thread_local! {
     static SNAPSHOT_APPLY_LOCK_HOLDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Runs once inside `state_hash`, on the hashing thread, not under the apply lock.
+    static STATE_HASH_HOOK: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
 }
 
 /// SQL actors from a `state.db` copy.
@@ -393,6 +396,71 @@ fn snapshot_apply_lock(store: &Store) -> crate::ApplyLock<'_> {
     #[cfg(test)]
     SNAPSHOT_APPLY_LOCK_HOLDS.with(|c| c.set(c.get() + 1));
     store.apply_lock()
+}
+
+#[cfg(test)]
+fn fire_state_hash_hook() {
+    STATE_HASH_HOOK.with(|c| {
+        if let Some(f) = c.take() {
+            f();
+        }
+    });
+}
+
+/// Even epoch: no apply holds the lock. Spins while one does, without taking it.
+fn wait_even_epoch(store: &Store) -> u64 {
+    loop {
+        let g = store.apply_epoch.load(Ordering::Acquire);
+        if g & 1 == 0 {
+            std::sync::atomic::fence(Ordering::Acquire);
+            return g;
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn epoch_stable(store: &Store, g: u64) -> bool {
+    std::sync::atomic::fence(Ordering::Acquire);
+    store.apply_epoch.load(Ordering::Acquire) == g
+}
+
+/// A staging directory under `sql/` so [`sweep_hash_copies`] removes one a crash left.
+struct HashStaging(PathBuf);
+
+impl HashStaging {
+    fn create(state_db: &Path) -> Result<Self, StoreError> {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = state_db
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("sql")
+            .join(format!("{HASH_COPY_PREFIX}{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(io)?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for HashStaging {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Copies a database and its WAL or journal. Skips `-shm`: SQLite rebuilds it,
+/// and a partial index would hide frames the copy should see.
+fn copy_db(from: &Path, to: &Path) -> Result<(), StoreError> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(io)?;
+    }
+    copy_private(from, to).map_err(io)?;
+    for suffix in ["-wal", "-journal"] {
+        let src = with_suffix(from, suffix);
+        if src.is_file() {
+            copy_private(&src, &with_suffix(to, suffix)).map_err(io)?;
+        }
+    }
+    Ok(())
 }
 
 impl Store {
@@ -455,9 +523,92 @@ impl Store {
     }
 
     /// The state hash (m6-storage §8) at the applied LSN.
+    ///
+    /// A file-backed store hashes a private copy of the committed databases
+    /// and does not hold the apply lock across that copy or the hash
+    /// (ADR 0153). An in-memory store has no file to copy: it hashes the
+    /// live connections and retries if an apply lands mid-hash.
     pub fn state_hash(&self) -> Result<String, StoreError> {
-        let _apply = self.apply_lock();
-        self.state_hash_locked()
+        let path = {
+            let db = self.db();
+            db.conn()
+                .path()
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+        };
+        if let Some(path) = path {
+            self.state_hash_from_files(&path)
+        } else {
+            // shortcut: in-memory (DST, forks) has no file; retry covers an apply.
+            self.state_hash_consistent()
+        }
+    }
+
+    fn state_hash_from_files(&self, state_path: &Path) -> Result<String, StoreError> {
+        let mut last = None;
+        for _ in 0..SNAPSHOT_LSN_RETRIES {
+            let g = wait_even_epoch(self);
+            #[cfg(test)]
+            fire_state_hash_hook();
+            if !epoch_stable(self, g) {
+                continue;
+            }
+            match self.copy_and_hash(state_path, g) {
+                Ok(Some(hash)) => return Ok(hash),
+                Ok(None) => continue,
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            StoreError::Corrupt("state hash: the applied state kept moving".into())
+        }))
+    }
+
+    /// Copies `state.db` and every actor database, then hashes the copies.
+    /// `None` when an apply landed during the copy: the bytes may be mixed.
+    fn copy_and_hash(&self, state_path: &Path, epoch: u64) -> Result<Option<String>, StoreError> {
+        let staging = HashStaging::create(state_path)?;
+        let dest_state = staging.0.join("state.db");
+        copy_db(state_path, &dest_state)?;
+        let actors = sql_actors_at(&dest_state)?;
+        for name in &actors {
+            let src = self.actor_db_path(name)?;
+            let dest = staging.0.join(actor_file(Path::new("sql"), name));
+            copy_db(&src, &dest)?;
+        }
+        if !epoch_stable(self, epoch) {
+            return Ok(None);
+        }
+        Ok(Some(hash_snapshot_at(&staging.0, &dest_state, &actors)?))
+    }
+
+    fn actor_db_path(&self, name: &str) -> Result<PathBuf, StoreError> {
+        let db = self.sql.get(name).map_err(sqlite)?;
+        let guard = db.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .conn
+            .path()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| StoreError::Corrupt(format!("actor {name} has no database file")))
+    }
+
+    fn state_hash_consistent(&self) -> Result<String, StoreError> {
+        for _ in 0..SNAPSHOT_LSN_RETRIES {
+            let g = wait_even_epoch(self);
+            #[cfg(test)]
+            fire_state_hash_hook();
+            if !epoch_stable(self, g) {
+                continue;
+            }
+            let hash = self.state_hash_locked()?;
+            if epoch_stable(self, g) {
+                return Ok(hash);
+            }
+        }
+        Err(StoreError::Corrupt(
+            "state hash: the applied state kept moving".into(),
+        ))
     }
 
     fn state_hash_locked(&self) -> Result<String, StoreError> {
@@ -937,15 +1088,26 @@ pub(crate) fn remove_bulk_marker(state_db: &Path) -> Result<(), StoreError> {
 pub const HASH_COPY_PREFIX: &str = ".hash-copy-";
 
 /// Before the node runs: deletes the [`HASH_COPY_PREFIX`] copies a crash
-/// left under the actor databases' directory `sql` (`sql/<xx>/`). They hold
-/// an actor's rows, which an erasure would not reach. Returns how many.
+/// left under the actor databases' directory `sql` (`sql/<xx>/`, and a
+/// staging directory an integrity hash left directly under `sql/`). They
+/// hold an actor's rows, which an erasure would not reach. Returns how many.
 pub fn sweep_hash_copies(sql: &Path) -> Result<usize, StoreError> {
     let mut swept = 0;
     let Ok(dirs) = std::fs::read_dir(sql) else {
         return Ok(0);
     };
     for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir.map_err(io)?.path()) else {
+        let dir = dir.map_err(io)?;
+        if dir
+            .file_name()
+            .to_string_lossy()
+            .starts_with(HASH_COPY_PREFIX)
+        {
+            remove_hash_copy(&dir)?;
+            swept += 1;
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(dir.path()) else {
             continue;
         };
         for e in entries {
@@ -957,15 +1119,19 @@ pub fn sweep_hash_copies(sql: &Path) -> Result<usize, StoreError> {
             {
                 continue;
             }
-            if e.file_type().map_err(io)?.is_dir() {
-                std::fs::remove_dir_all(e.path()).map_err(io)?;
-            } else {
-                std::fs::remove_file(e.path()).map_err(io)?;
-            }
+            remove_hash_copy(&e)?;
             swept += 1;
         }
     }
     Ok(swept)
+}
+
+fn remove_hash_copy(e: &std::fs::DirEntry) -> Result<(), StoreError> {
+    if e.file_type().map_err(io)?.is_dir() {
+        std::fs::remove_dir_all(e.path()).map_err(io)
+    } else {
+        std::fs::remove_file(e.path()).map_err(io)
+    }
 }
 
 /// Before `state.db` opens. When a bulk replay was interrupted (its marker
@@ -1004,6 +1170,8 @@ mod tests {
     #![allow(clippy::disallowed_methods)]
 
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     use rusqlite::Connection;
 
@@ -1174,6 +1342,121 @@ mod tests {
         assert_eq!(copy.state_hash, before);
         // LSN read, `state.db`, two actors — never one hold for copy and hash.
         SNAPSHOT_APPLY_LOCK_HOLDS.with(|c| assert_eq!(c.get(), 4));
+    }
+
+    static HASH_ENTERED: AtomicBool = AtomicBool::new(false);
+    static PROBE_ATTEMPTING: AtomicBool = AtomicBool::new(false);
+
+    fn pause_while_a_probe_takes_the_lock() {
+        HASH_ENTERED.store(true, Ordering::Release);
+        let start = Instant::now();
+        while !PROBE_ATTEMPTING.load(Ordering::Acquire) {
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!("the apply-lock probe did not start");
+            }
+            std::thread::yield_now();
+        }
+        // Longer than the bound below: a lock held across this pause fails the check.
+        std::thread::sleep(Duration::from_millis(400));
+    }
+
+    /// Issue #163: an integrity state hash must not hold the apply lock across
+    /// the hash or an actor-database copy. Another thread takes the lock during
+    /// a pause in that section; a hold across the pause exceeds the bound.
+    #[test]
+    fn state_hash_does_not_hold_the_apply_lock_across_the_hash() {
+        HASH_ENTERED.store(false, Ordering::Release);
+        PROBE_ATTEMPTING.store(false, Ordering::Release);
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with(dir.path(), 100, &[("a/idle", 5), ("b/recent", 90)]);
+        let snap = dir.path().join("snap");
+        let copy = store.snapshot_to(&snap).unwrap();
+        let acquires = crate::apply_lock_acquires();
+        STATE_HASH_HOOK.with(|c| c.set(Some(pause_while_a_probe_takes_the_lock)));
+        let probed = Arc::clone(&store);
+        let probe = std::thread::spawn(move || {
+            let start = Instant::now();
+            while !HASH_ENTERED.load(Ordering::Acquire) {
+                if start.elapsed() > Duration::from_secs(2) {
+                    panic!("state hash never reached the unlocked section");
+                }
+                std::thread::yield_now();
+            }
+            PROBE_ATTEMPTING.store(true, Ordering::Release);
+            let t = Instant::now();
+            let _held = probed.apply_lock();
+            t.elapsed()
+        });
+        let hash = store.state_hash().unwrap();
+        assert_eq!(
+            crate::apply_lock_acquires(),
+            acquires,
+            "state hash took the apply lock"
+        );
+        let waited = probe.join().unwrap();
+        assert!(
+            waited < Duration::from_millis(250),
+            "apply lock held for {waited:?} during the state hash"
+        );
+        assert_eq!(hash, copy.state_hash);
+        let left = std::fs::read_dir(dir.path().join("sql"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(HASH_COPY_PREFIX)
+            });
+        assert!(!left, "a hash copy was left under sql/");
+    }
+
+    #[test]
+    fn an_in_memory_state_hash_does_not_take_the_apply_lock() {
+        let store = Store::memory().unwrap();
+        let acquires = crate::apply_lock_acquires();
+        let _ = store.state_hash().unwrap();
+        assert_eq!(crate::apply_lock_acquires(), acquires);
+    }
+
+    #[test]
+    fn an_open_turn_is_not_part_of_the_state_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with(dir.path(), 100, &[("a/idle", 5)]);
+        let before = store.state_hash().unwrap();
+        {
+            let db = store.sql.get("a/idle").unwrap();
+            let mut db = db.lock().unwrap();
+            db.begin_turn(&opts()).unwrap();
+            db.query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[])
+                .unwrap();
+            db.query("INSERT INTO t VALUES (1, 'open')", &[]).unwrap();
+        }
+        assert_eq!(store.state_hash().unwrap(), before);
+        store
+            .sql
+            .get("a/idle")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .end_turn(false)
+            .unwrap();
+        assert_eq!(store.state_hash().unwrap(), before);
+    }
+
+    #[test]
+    fn sweep_removes_an_integrity_hash_staging_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = dir.path().join("sql");
+        let staging = sql.join(format!("{HASH_COPY_PREFIX}crash"));
+        std::fs::create_dir_all(staging.join("sql/ab")).unwrap();
+        std::fs::write(staging.join("state.db"), b"rows").unwrap();
+        let xx = sql.join("ab");
+        std::fs::create_dir_all(&xx).unwrap();
+        let leftover = xx.join(format!("{HASH_COPY_PREFIX}actor.db.tmp"));
+        std::fs::write(&leftover, b"rows").unwrap();
+        assert_eq!(sweep_hash_copies(&sql).unwrap(), 2);
+        assert!(!staging.exists());
+        assert!(!leftover.exists());
     }
 
     #[test]
