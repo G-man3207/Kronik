@@ -5,6 +5,12 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- Startup install of a snapshot no longer deletes the live `state.db`
+  before the replacement is durable. The new `state.db` and actor
+  databases are staged, fsynced, and their directories fsynced before the
+  live tree is replaced, so a failure before that fsync leaves the previous
+  `state.db`. A `secrets.db` copied from the snapshot on that path is
+  fsynced the same way.
 - `fork create --at <RFC 3339>` uses the last turn at or before that time
   when a closed configuration-only segment sits between that turn and a
   later one. The segment mark is a turn-time high-water mark, so the
