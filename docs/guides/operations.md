@@ -1923,8 +1923,12 @@ when the source died before shipping the segments that hold it, rather
 than writing a directory `serve` would refuse.
 
 `--endpoint` is the same URL as `[ship] endpoint` when the bucket is not
-AWS. An existing `state.db` is refused unless `--force`. `--dry-run` prints
-the plan and writes nothing. Restore writes no log record, so it takes no
+AWS. An existing `state.db` is refused unless `--force`. Each staged file
+is fsynced before it is renamed into place; a failure before that leaves
+the previous file. An interrupt after the log has moved and before the new
+`state.db` is in place leaves that previous file beside the new log: do
+not start the daemon, and run the restore again with `--force`. `--dry-run`
+prints the plan and writes nothing. Restore writes no log record, so it takes no
 `--reason`. It does not bring back forks, proposals or their diffs: on the
 restored node, `kronik proposals list` shows only proposals made after the
 restore, and an earlier one answers `PROPOSAL_NOT_FOUND`. Deployments and

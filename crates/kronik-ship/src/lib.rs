@@ -32,6 +32,8 @@ mod blobs;
 mod bucket_tests;
 #[cfg(test)]
 mod credential_tests;
+#[cfg(test)]
+mod install_tests;
 
 pub use blobs::{BlobRestore, missing_blob_names, shipped_blob_names};
 
@@ -2193,10 +2195,96 @@ fn list_some(items: &[String]) -> String {
     }
 }
 
-/// Moves a checked staging directory into place, with renames only. The
-/// old `state.db` goes first and the new one comes last: an interrupted
-/// install leaves no `state.db`, never the old state with the new log, and
-/// `kronik restore` can run again without `--force` (m6-storage §6).
+/// fsyncs every file under `dir`, then each directory, children first. A
+/// renamed directory keeps those entries: the inode was synced before the
+/// rename.
+fn sync_tree(dir: &Path) -> std::io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut dirs = vec![dir.to_path_buf()];
+    let mut i = 0;
+    while i < dirs.len() {
+        let current = dirs[i].clone();
+        for entry in std::fs::read_dir(&current)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                dirs.push(path);
+            } else {
+                sync_path(&path)?;
+            }
+        }
+        i += 1;
+    }
+    for dir in dirs.iter().rev() {
+        sync_path(dir)?;
+    }
+    Ok(())
+}
+
+fn sync_path(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_INSTALL_SYNC.with(|fail| fail.get()) {
+        return Err(std::io::Error::other("injected failure before fsync"));
+    }
+    std::fs::File::open(path)?.sync_all()?;
+    #[cfg(test)]
+    {
+        INSTALL_SYNCS.with(|syncs| syncs.borrow_mut().push(path.to_path_buf()));
+        if let Ok(bytes) = std::fs::read(path.join("state.db")) {
+            DIR_STATE.with(|seen| seen.borrow_mut().push((path.to_path_buf(), bytes)));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static INSTALL_SYNCS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static FAIL_INSTALL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // `(directory, state.db bytes)` at each fsync of a directory that holds
+    // `state.db`: the live branch is synced once while the previous file is
+    // still the name, and once after the replacement takes it.
+    static DIR_STATE: std::cell::RefCell<Vec<(PathBuf, Vec<u8>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn install_syncs() -> Vec<PathBuf> {
+    INSTALL_SYNCS.with(|syncs| syncs.borrow().clone())
+}
+
+#[cfg(test)]
+fn dir_state_at_sync() -> Vec<(PathBuf, Vec<u8>)> {
+    DIR_STATE.with(|seen| seen.borrow().clone())
+}
+
+#[cfg(test)]
+struct FailInstallSync;
+
+#[cfg(test)]
+impl FailInstallSync {
+    fn arm() -> Self {
+        FAIL_INSTALL_SYNC.with(|fail| fail.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailInstallSync {
+    fn drop(&mut self) {
+        FAIL_INSTALL_SYNC.with(|fail| fail.set(false));
+    }
+}
+
+/// Moves a checked staging directory into place, with renames only. Each
+/// staged file is fsynced before it is renamed, and the destination
+/// directory is fsynced after, so a power loss after this returns keeps
+/// the bytes. The previous `state.db` stays until the new file's bytes and
+/// name are durable (m6-storage §6). The restore marker is durable before
+/// that name is what a reader opens.
 fn install_staged(
     data: &Path,
     stage: &Path,
@@ -2206,6 +2294,11 @@ fn install_staged(
     keystore_restore: kronik_privacy::keystore::KeystoreRestore,
     fault: &dyn Fn(&str) -> std::io::Result<()>,
 ) -> Result<RestoreReport, ShipError> {
+    #[cfg(test)]
+    {
+        INSTALL_SYNCS.with(|syncs| syncs.borrow_mut().clear());
+        DIR_STATE.with(|seen| seen.borrow_mut().clear());
+    }
     let replace_dir = |from: &Path, to: &Path| -> std::io::Result<()> {
         if to.exists() {
             std::fs::remove_dir_all(to)?;
@@ -2221,26 +2314,30 @@ fn install_staged(
         }
         std::fs::rename(from, to)
     };
+    // Bytes and the names inside the stage, before any live name is
+    // replaced. A failure here leaves the previous state.db.
+    fault("sync")?;
+    sync_tree(stage)?;
     std::fs::create_dir_all(branch_dir)?;
+    // Seam only: the previous state.db is not removed here.
     fault("state")?;
-    for f in ["state.db", "state.db-wal", "state.db-shm"] {
-        let p = branch_dir.join(f);
-        if p.exists() {
-            std::fs::remove_file(&p)?;
-        }
-    }
     fault("log")?;
     let log_dir = branch_dir.join("log");
     replace_dir(&stage.join("log"), &log_dir)?;
+    sync_path(&log_dir)?;
     fault("sql")?;
-    replace_dir(&stage.join("branch").join("sql"), &branch_dir.join("sql"))?;
+    let sql_dir = branch_dir.join("sql");
+    replace_dir(&stage.join("branch").join("sql"), &sql_dir)?;
+    sync_path(&sql_dir)?;
     fault("snapshot")?;
-    let snap_dir = snapshots::snapshots_dir(data, branch).join(format!("{:020}", s.m.lsn));
+    let snap_root = snapshots::snapshots_dir(data, branch);
+    let snap_dir = snap_root.join(format!("{:020}", s.m.lsn));
     replace_dir(&stage.join("snapshot"), &snap_dir)?;
     if let Some(o) = &s.older {
-        let dir = snapshots::snapshots_dir(data, branch).join(format!("{:020}", o.lsn));
+        let dir = snap_root.join(format!("{:020}", o.lsn));
         replace_dir(&stage.join("older-snapshot"), &dir)?;
     }
+    sync_path(&snap_root)?;
     fault("code")?;
     let code = data.join("code");
     std::fs::create_dir_all(&code)?;
@@ -2251,9 +2348,11 @@ fn install_staged(
     for c in &s.components {
         std::fs::rename(stage.join("code").join(c), code.join(c))?;
     }
+    sync_path(&code)?;
     fault("blobs")?;
     if stage.join("blobs").exists() {
         replace_dir(&stage.join("blobs"), &data.join("blobs"))?;
+        sync_path(&data.join("blobs"))?;
     }
     fault("keys")?;
     let keys = data.join("keys");
@@ -2275,7 +2374,7 @@ fn install_staged(
     if let Some(path) = &s.wrapped_path {
         replace_file(&stage.join("master.wrapped"), path)?;
         if let Some(parent) = path.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
+            sync_path(parent)?;
         }
     }
     if !s.keys_missing.is_empty() {
@@ -2297,17 +2396,26 @@ fn install_staged(
     let marker = serde_json::json!({ "through_lsn": s.through_lsn }).to_string();
     snapshots::write_synced(&branch_dir.join(RESTORE_MARKER), marker.as_bytes())?;
     fault("commit")?;
+    // The old WAL is named for state.db. It must be durably gone before the
+    // replacement takes that name, or the next open would replay it into the
+    // restored file. The previous state.db stays until this rename.
+    for name in ["state.db-wal", "state.db-shm"] {
+        let path = branch_dir.join(name);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    sync_path(branch_dir)?;
     std::fs::rename(
         stage.join("branch").join("state.db"),
         branch_dir.join("state.db"),
     )?;
-    // Certify only the installed keystore, not the archive's broader durability.
     if keys.exists() {
-        std::fs::File::open(&keys)?.sync_all()?;
+        sync_path(&keys)?;
     }
-    std::fs::File::open(branch_dir)?.sync_all()?;
-    std::fs::File::open(data.join("branches"))?.sync_all()?;
-    std::fs::File::open(data)?.sync_all()?;
+    sync_path(branch_dir)?;
+    sync_path(&data.join("branches"))?;
+    sync_path(data)?;
     drop(
         keystore_restore
             .finish(s.keystore_master.as_ref())

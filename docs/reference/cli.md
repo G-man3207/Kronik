@@ -385,10 +385,18 @@ works as before. It refuses
 a directory owned by anyone else, and a missing directory when a Kronik user
 namespace is pinned.
 
-Then the result is moved into place with renames: the old `state.db` is
-removed first and the new one put in place last. A restore interrupted
-there (a crash, a full disk) leaves no `state.db`, never the old state with
-the new log; run the restore again, without `--force`.
+Then the result is moved into place with renames. Each staged file is
+fsynced before it is renamed, and the destination directory is fsynced
+after, so a power loss after restore returns keeps the bytes. The previous
+`state.db` is not removed until the new file's bytes and its directory
+entry are durable. A failure before those fsyncs leaves that previous
+file, not a short replacement. The restore marker is durable before the
+new `state.db` is the name a reader opens. An interrupt after the log has
+moved and before that replacement leaves the previous `state.db` beside
+the new log: do not start the daemon on that directory; run the restore
+again with `--force`. A directory that had no `state.db`, interrupted
+before the new file is in place, still has none: run it again without
+`--force`.
 
 When the source node is gone and its newest backup lacks a subject's key
 (it ships within a minute of a new subject's first value),

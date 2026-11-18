@@ -5,6 +5,12 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- `kronik restore` fsyncs each staged file before renaming it into place,
+  and fsyncs the destination directory after. A power loss after restore
+  returns no longer leaves `state.db`, an actor database, a log segment, or
+  a code object empty or short. The previous `state.db` stays until the new
+  file's bytes and name are durable. The restore marker is still durable
+  before that name is what readers open.
 - The four SDKs decode a query parameter the same way. A malformed `%`
   stays, `;` is data, and a value that is not UTF-8 after decoding is
   missing. Go no longer drops a semicolon URL or a bad percent escape,
