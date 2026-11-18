@@ -474,6 +474,16 @@ async function main() {
       const button = document.getElementById(id);
       return button && !button.disabled;
     }, name + '-button');
+    check(await page.locator('#' + name + '-dry-run').isChecked(), 'dry-run-defaults-on-' + name);
+    if (name === 'promote') {
+      await page.locator('#promote-dry-run').setChecked(false);
+      const named = await page.locator('#promote-button').evaluate((element, id) => {
+        const described = (element.getAttribute('aria-describedby') || '').split(/\s+/).map((item) => document.getElementById(item)?.textContent || '').join(' ');
+        return element.textContent.includes('production will change') && element.textContent.includes(id) && described.includes('a real promotion changes production');
+      }, proposal.id);
+      check(named, 'real-promote-names-production');
+      await page.locator('#promote-dry-run').setChecked(true);
+    }
     await page.locator('#' + name + '-reason').fill('Synthetic M27 acceptance ' + name);
     await page.locator('#' + name + '-dry-run').setChecked(dryRun);
     const responseWait = page.waitForResponse(reply => new URL(reply.url()).pathname === route && reply.request().method() === 'POST');

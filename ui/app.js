@@ -212,20 +212,31 @@
     return reason;
   }
 
-  function mutation(parent, name, label, scope, path, description, onSuccess) {
+  function mutation(parent, name, label, scope, path, description, onSuccess, realLabel) {
     const area = section(parent, label, `${name}-section`);
     area.className = "mutation";
-    area.append(element("p", description));
+    const warning = element("p", description, { id: `${name}-effect` });
+    area.append(warning);
     const form = element("form", null, { id: `${name}-form` });
     const reason = element("input", null, { id: `${name}-reason`, required: "", maxlength: "4096", autocomplete: "off" });
     const dry = element("input", null, { id: `${name}-dry-run`, type: "checkbox" });
+    dry.checked = true;
     const check = element("label", null, { class: "check" });
     check.append(dry, document.createTextNode("Dry run (validate without changing anything)"));
-    const submit = element("button", label, { id: `${name}-button`, type: "submit", "aria-describedby": `${name}-scope` });
+    const submit = element("button", label, { id: `${name}-button`, type: "submit", "aria-describedby": `${name}-effect ${name}-scope` });
     const allowed = has(scope);
     let completed = false;
     submit.disabled = !allowed;
     const explanation = element("p", allowed ? `Requires ${scope} scope. Every real change records your reason and caller identity.` : `Disabled: missing ${scope} scope (or admin).`, { id: `${name}-scope` });
+    function nameButton() {
+      submit.textContent = realLabel && !dry.checked ? realLabel : label;
+    }
+    nameButton();
+    dry.addEventListener("change", nameButton);
+    // Enter in the reason field must not submit: the button is the change.
+    reason.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.isComposing) event.preventDefault();
+    });
     form.append(element("label", "Reason", { for: reason.id }), reason, check, submit);
     area.append(explanation, form);
     const result = element("div", null, { id: `${name}-result` });
@@ -441,9 +452,11 @@
     if (proposal.status !== "running" && proposal.status !== "failed") {
       const diff = await request(`/v1/proposals/${encodeURIComponent(id)}/diff`, { signal });
       renderDiff(content, diff);
-    } else notice(content, proposal.status === "running" ? "Replay is running. Refresh to read progress and the completed diff." : "Replay failed. Read the recorded error; no completed diff is available.");
+    } else notice(content, proposal.status === "running" ? "Replay is running. Refresh to read progress and the completed diff. Promotion is not available until replay finishes." : "Replay failed. Read the recorded error; no completed diff is available. Promotion is not available.");
     mutation(content, "approve", "Approve proposal", "approve", `/v1/proposals/${encodeURIComponent(id)}/approve`, "Approval binds the current diff hash and verified-through LSN to your authenticated principal. Verified OIDC issuer and subject are stored encrypted and revealed only with pii:read.");
-    mutation(content, "promote", "Promote proposal", "promote", `/v1/proposals/${encodeURIComponent(id)}/promote`, "Promotion catches up to main and atomically switches code. The server enforces policy, approval and freshness; a real promotion changes production.");
+    if (proposal.status !== "running" && proposal.status !== "failed") {
+      mutation(content, "promote", "Promote proposal", "promote", `/v1/proposals/${encodeURIComponent(id)}/promote`, "Promotion catches up to main and atomically switches code. The server enforces policy, approval and freshness; a real promotion changes production.", undefined, `Promote ${proposal.id}: production will change`);
+    }
     notice(content, "Refresh this proposal after a real mutation to read its current status and any catch-up diff changes.");
   }
 

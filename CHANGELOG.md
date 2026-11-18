@@ -5,6 +5,13 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- The admin UI no longer treats Enter in a mutation reason field as a
+  real change. Dry run starts checked. A real promotion is the button
+  whose name includes the proposal and "production will change"; that
+  warning is in the button's description. Promote is not offered while
+  the proposal is running or has failed. A dry-run promote that policy
+  denies still returns `POLICY_DENIED` without marking the proposal
+  rejected or retiring its fork.
 - The admin UI no longer treats `APPROVAL_REQUIRED`, `POLICY_DENIED`, or
   any other non-authentication 403 as sign-out. The session, the bearer and
   the proposal stay on screen; the error shows the code, hint and docs line,
