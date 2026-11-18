@@ -55,19 +55,20 @@ per turn. A value gets its subject in four ways:
   gets `400 BAD_REQUEST`, and so does a subject header (or `Authorization`
   for `jwt:`) that appears more than once or holds a comma-separated list.
 
-  **Kronik does not verify the JWT's signature in v0.1; it only reads the
-  claim.** Whoever can reach the gateway can choose the subject. The subject
-  tags data; it is not authentication. Put an authenticating proxy in front
-  of the gateway, or check the token in the actor. The proxy must *replace*
-  the subject header a client sent, not append to it. With
-  `[gateway] trusted_proxies` set, only a connection from a listed proxy may
-  carry the subject: a request with the subject header (or, for `jwt:`, a
-  bearer token with the claim) from any other peer gets `400 BAD_REQUEST`
-  ("the subject header is accepted only from [gateway] trusted_proxies"),
-  rather than running without a subject, which would store its data
-  unsealed and beyond erasure. Requests without one run as usual. List the
-  proxy's address as it connects (IPv4 or IPv6). With `trusted_proxies`
-  empty, every peer's header counts.
+  **Kronik does not verify the JWT's signature; it only reads the claim.**
+  The subject tags data; it is not authentication. Put an authenticating
+  proxy in front of the gateway and list that proxy in
+  `[gateway] trusted_proxies`. `subject_from` is refused at start when that
+  list is empty: an empty list does not mean every peer is a proxy, and a
+  client who can choose the subject can replay that subject's saved
+  response. Only a connection from a listed proxy may carry the subject. A
+  request with the subject header (or, for `jwt:`, a bearer token with the
+  claim) from any other peer gets `400 BAD_REQUEST` ("the subject header is
+  accepted only from [gateway] trusted_proxies"), rather than running
+  without a subject, which would store its data unsealed and beyond
+  erasure. Requests without one run as usual. The proxy must *replace* the
+  subject header a client sent, not append to it. List the proxy's address
+  as it connects (IPv4 or IPv6).
 
   The method and the route pattern (`/notes/{key}`) are configuration and
   stay plain. **Actor keys are identities, not values:** the key in
@@ -191,12 +192,15 @@ subject), get the method and path.
 A saved response to a request with an `Idempotency-Key` is replayed only to
 the same requester. With a subject, the requester is the subject alone: a
 rotated cookie (a load balancer's sticky cookie) or a refreshed token in a
-client's own retry still gets the saved response. Without a subject, the
-requester is the `Authorization` header's value (none: anonymous);
-`Cookie` never counts. The same key from another requester is
-`422 IDEMPOTENCY_KEY_REUSED`, never the saved response. So without a
-subject, two cookie-only sessions that send the same `Idempotency-Key`
-share its saved response; set `subject_from` where sessions are cookies.
+client's own retry still gets the saved response. That binding holds only
+because `subject_from` requires a non-empty `[gateway] trusted_proxies`: a
+peer that is not listed cannot forge the subject and take the saved
+response. Without a subject, the requester is the `Authorization` header's
+value (none: anonymous); `Cookie` never counts. The same key from another
+requester is `422 IDEMPOTENCY_KEY_REUSED`, never the saved response. So
+without a subject, two cookie-only sessions that send the same
+`Idempotency-Key` share its saved response; set `subject_from`, and list
+the proxy, where sessions are cookies.
 Responses saved with an older hash (v0.1 candidates) count as expired, so
 such a key is used anew. Hashes that sit next to sealed values (the
 request hash, effect fingerprints of a subject's requests, the diff's

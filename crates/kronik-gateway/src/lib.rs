@@ -84,7 +84,8 @@ pub struct GatewayConfig {
     /// ASCII case-insensitively. Default `Idempotency-Key`.
     pub idempotency_header: String,
     /// Reverse proxies (`gateway.trusted_proxies`): their connections are
-    /// exempt from the per-client connection cap.
+    /// exempt from the per-client connection cap, and only they may set a
+    /// request's subject. An empty list trusts no peer.
     pub trusted_proxies: Vec<IpNet>,
     /// Requests for the host `<id>.<preview_domain>` go to preview `<id>`
     /// (`gateway.preview_domain`, M11).
@@ -938,11 +939,11 @@ impl Gateway {
 
     /// Serves one request: route, admit the root input, wait for the turn
     /// (at most the gateway timeout) and map its outcome to a response.
-    /// Whether `peer` may set the request's subject: always without
-    /// `trusted_proxies`, else only a trusted proxy.
+    /// Whether `peer` may set the request's subject. An empty list trusts
+    /// nobody: "no proxies configured" is not "every peer is a proxy".
     fn subject_trusted(&self, peer: Option<IpAddr>) -> bool {
         let trusted = &self.cfg.trusted_proxies;
-        trusted.is_empty() || peer.is_some_and(|ip| trusted.iter().any(|n| n.contains(ip)))
+        !trusted.is_empty() && peer.is_some_and(|ip| trusted.iter().any(|n| n.contains(ip)))
     }
 
     /// Serves one request whose body is `req.body`, and reads the answer
@@ -1768,9 +1769,10 @@ impl Gateway {
             None => None,
             Some(from) => {
                 let subject = from.subject(&req.headers);
-                // With trusted proxies configured, only they may say who the
-                // subject is: a client reaching the gateway directly could
-                // set the header (or the bearer token) to any subject.
+                // Only a listed proxy may say who the subject is. An empty
+                // list trusts nobody: a client reaching the gateway could
+                // otherwise set the header (or the bearer token) to any
+                // subject and replay that subject's saved response.
                 // Refused rather than dropped: without its subject the
                 // request's data would be stored unsealed and could not be
                 // erased.

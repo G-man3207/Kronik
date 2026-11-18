@@ -49,7 +49,7 @@ measure() { # BIN LABEL MODE -> JSON lines on stdout
     local bin="$1" label="$2" mode="$3" dir="$work/run" pid
     rm -rf "$dir"
     mkdir -p "$dir"
-    printf '[server]\ndata_dir = "%s/data"\n\n[privacy]\nsubject_from = "header:x-user-id"\n' "$dir" >"$dir/kronik.toml"
+    printf '[server]\ndata_dir = "%s/data"\n\n[gateway]\ntrusted_proxies = ["127.0.0.1"]\n\n[privacy]\nsubject_from = "header:x-user-id"\n' "$dir" >"$dir/kronik.toml"
     setsid nice -n "${NICE:-0}" "$bin" serve --config "$dir/kronik.toml" --http-listen "127.0.0.1:$port" \
         --api-listen "127.0.0.1:$api_port" --admin-listen 127.0.0.1:0 \
         --api-socket "$dir/api.sock" >>"$dir/serve.log" 2>&1 &

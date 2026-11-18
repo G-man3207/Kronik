@@ -5,6 +5,11 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- `privacy.subject_from` is refused at start unless `[gateway] trusted_proxies`
+  is non-empty. An empty list no longer treats every peer as a proxy, so a
+  client cannot forge a subject and replay that subject's saved response.
+  A listed proxy's own retry, with the same subject and a rotated
+  `Authorization`, is still a replay (ADR 0155).
 - An `http:` grant accepts an IPv6 literal with brackets (`http:[::1]`),
   and a fetch to `http://[::1]/` matches it. The grant and the denial name
   the host without brackets (`http:::1`). A port in the capability

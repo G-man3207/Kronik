@@ -553,6 +553,7 @@ fn a_preview_upload_creates_no_subject_key() {
         p.node.clone(),
         GatewayConfig {
             subject_from: SubjectFrom::parse("header:x-user-id"),
+            trusted_proxies: vec![kronik_gateway::IpNet::parse("127.0.0.1").unwrap()],
             ..GatewayConfig::default()
         },
     )
@@ -563,7 +564,7 @@ fn a_preview_upload_creates_no_subject_key() {
         query: String::new(),
         headers: vec![("x-user-id".into(), user.into())],
         body: vec![3u8; 2_000_000],
-        peer: None,
+        peer: Some("127.0.0.1".parse().unwrap()),
     };
     let keys = || {
         p.node
@@ -997,6 +998,7 @@ fn a_preview_seals_a_new_subjects_blobs_and_refuses_an_erased_ones() {
         p.node.clone(),
         GatewayConfig {
             subject_from: SubjectFrom::parse("header:x-user-id"),
+            trusted_proxies: vec![kronik_gateway::IpNet::parse("127.0.0.1").unwrap()],
             ..GatewayConfig::default()
         },
     )
@@ -1007,7 +1009,7 @@ fn a_preview_seals_a_new_subjects_blobs_and_refuses_an_erased_ones() {
         query: query.into(),
         headers: vec![("x-user-id".into(), user.into())],
         body,
-        peer: None,
+        peer: Some("127.0.0.1".parse().unwrap()),
     };
     // An upload of a subject that has no key yet: sealed under its new key.
     let mut body = Vec::new();
