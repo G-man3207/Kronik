@@ -296,6 +296,13 @@ is refused unless `--force`):
    then applies the log from `L + 1`. The last LSN and the skipped
    snapshots are `log_last_lsn` and `snapshots_skipped` in the JSON.
 
+Each staged file is fsynced before it is renamed into place, and the
+destination directory is fsynced after. The previous `state.db` is not
+removed until the new file's bytes and its directory entry are durable. A
+failure before those fsyncs leaves that previous file, not a short
+replacement. The restore marker (`branches/<branch>/restored.json`) is
+durable before the new `state.db` is the name a reader opens.
+
 `kronik restore` needs the master key file in place (or `--master-key-file`)
 only for the secrets to be usable; restore itself does not decrypt.
 

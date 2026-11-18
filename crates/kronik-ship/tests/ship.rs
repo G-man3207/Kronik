@@ -407,11 +407,11 @@ fn restore_refuses_a_bucket_whose_log_reaches_no_snapshot() {
     );
 }
 
-/// Review F2: a restore interrupted while it moves into place leaves no
-/// `state.db` (never the old state with the new log), so it can simply run
-/// again; and nothing of the staging directory is left behind. Perf review
-/// R4: the restore marker is durable before the commit step, so restored
-/// state never comes without it.
+/// A restore interrupted before the staged files are fsynced, or before the
+/// new `state.db` is renamed into place, leaves the previous file (not a
+/// short replacement). The restore marker is durable before that rename.
+/// Nothing of the staging directory is left behind, and the restore can run
+/// again with `--force`.
 #[test]
 fn an_interrupted_restore_leaves_a_consistent_directory() {
     let bucket = tempdir("ship-int-bucket-");
@@ -465,7 +465,9 @@ fn an_interrupted_restore_leaves_a_consistent_directory() {
     };
     let want = through("restore");
     assert!(want >= report.snapshot_lsn, "{want}");
+    let good = vec![0xABu8; 64];
     for step in [
+        "sync",
         "state",
         "log",
         "sql",
@@ -477,21 +479,22 @@ fn an_interrupted_restore_leaves_a_consistent_directory() {
     ] {
         // As `kronik serve` leaves it after recording the restore.
         std::fs::remove_file(&marker).unwrap();
+        std::fs::write(&state, &good).unwrap();
         let err = run(true, Some(step)).unwrap_err();
         assert!(err.to_string().contains("injected"), "{step}: {err}");
-        // "state" fails before anything moved: the old restore is intact.
-        // After "committed" the restore is in place.
-        assert_eq!(
-            state.exists(),
-            matches!(step, "state" | "committed"),
-            "{step}"
-        );
+        // Before the rename, the previous file is still the one readers open.
+        // "committed" is after the install, so the restored file is in place.
+        if step == "committed" {
+            assert_ne!(std::fs::read(&state).unwrap(), good, "{step}");
+        } else {
+            assert_eq!(std::fs::read(&state).unwrap(), good, "{step}");
+        }
         if matches!(step, "commit" | "committed") {
             assert_eq!(through(step), want, "{step}");
         }
         assert!(!dst.path().join(".restore").exists(), "{step}: stage left");
-        // Without a state.db, a plain restore runs again and is complete.
-        run(matches!(step, "state" | "committed"), None).unwrap();
+        // The previous state.db is still there, so the retry needs --force.
+        run(true, None).unwrap();
         assert!(state.exists(), "{step}");
         through(step);
     }
