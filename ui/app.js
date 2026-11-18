@@ -113,8 +113,10 @@
 
   function report(error) {
     if (error.name === "AbortError") return;
-    $("error").textContent = error.message || "The operation failed.";
-    $("error").hidden = false;
+    const box = $("error");
+    box.textContent = error.message || "The operation failed.";
+    box.hidden = false;
+    box.focus();
     $("status").textContent = "Operation failed. See the error above.";
   }
 
@@ -138,6 +140,12 @@
     updateAuth();
   }
 
+  // A 403 clears the session only when the credential itself was refused.
+  function sessionFailure(status, code) {
+    if (status === 401) return true;
+    return status === 403 && (code === "SCOPE_MISSING" || code === "UNAUTHENTICATED");
+  }
+
   async function request(path, { method = "GET", body, signal = controller?.signal } = {}) {
     const headers = { Accept: "application/json" };
     if (token) headers.Authorization = `Bearer ${token}`;
@@ -158,6 +166,7 @@
     let data = null;
     if (response.status !== 204) {
       try { data = await response.json(); } catch {
+        // No code to read: a 401 or 403 here is an auth failure.
         if (response.status === 401 || response.status === 403) clearAuth();
         throw new Error(`The API returned an invalid JSON response (HTTP ${response.status}).`);
       }
@@ -165,9 +174,10 @@
     if (signal?.aborted) throw new DOMException("Request cancelled", "AbortError");
     if (!response.ok) {
       const failure = data?.error;
-      const message = [failure?.code || `HTTP ${response.status}`, failure?.message || "The API rejected the request.", failure?.hint].filter(Boolean).join("\n");
-      if (response.status === 401 || response.status === 403) clearAuth();
-      throw new Error(message);
+      const lines = [failure?.code || `HTTP ${response.status}`, failure?.message || "The API rejected the request.", failure?.hint];
+      if (failure?.docs) lines.push(`docs: ${failure.docs}`);
+      if (sessionFailure(response.status, failure?.code)) clearAuth();
+      throw new Error(lines.filter(Boolean).join("\n"));
     }
     return data;
   }

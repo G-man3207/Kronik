@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 /*
- * Admin UI session check for a non-auth first load (issue 167).
+ * Admin UI session check for a non-auth first load (issue 167) and a
+ * policy 403 on promote (issue 190).
  * Run: node scripts/test-ui-session-retry.cjs
  * Chrome: $KRONIK_CHROME or /usr/bin/google-chrome. No package install.
  */
@@ -21,14 +22,17 @@ function session(authenticated) {
   return {
     authenticated,
     oidc_enabled: false,
-    scopes: authenticated ? ['read'] : [],
+    scopes: authenticated ? ['read', 'approve', 'promote'] : [],
     principal: authenticated ? PRINCIPAL : null,
     csrf_token: authenticated ? 'fixture-csrf' : null,
     expires_at_ms: null,
   };
 }
-function fail(status, code, message) {
-  return { status, body: { error: { code, message } } };
+function fail(status, code, message, hint, docs) {
+  const error = { code, message };
+  if (hint) error.hint = hint;
+  if (docs) error.docs = docs;
+  return { status, body: { error } };
 }
 function invalid(status) {
   return { status, raw: 'not-json' };
@@ -40,6 +44,18 @@ const okActors = () => ({ status: 200, body: { actors: [], next: null } });
 const unavailable = () => fail(500, 'UNAVAILABLE', 'Synthetic load failure.');
 const denied = () => fail(401, 'UNAUTHENTICATED', 'Synthetic auth failure.');
 const forbidden = () => fail(403, 'SCOPE_MISSING', 'Synthetic scope failure.');
+function policy(code) {
+  return fail(403, code, 'The change was refused.', 'Read the diff.', `kronik explain ${code}`);
+}
+function okProposal() {
+  return {
+    status: 200,
+    body: {
+      id: 'p-1', status: 'running', fork: 'f-1', fork_lsn: 1, verified_through_lsn: 1,
+      diff_hash: 'abc', kinds: [], unchanged: false, policy: 'open', approvals: [], approval_requests: [],
+    },
+  };
+}
 
 // reply(n, headers) -> HTTP reply. n is 1-based for that path.
 const cases = [
@@ -58,6 +74,12 @@ const cases = [
   { name: 'bearer-success', recipe: 'connect-ok', session: (n) => n === 1 ? anonSession() : okSession(), actors: () => okActors() },
   { name: 'bearer-401', recipe: 'clear-connect', session: (n) => n === 1 ? anonSession() : denied(), actors: () => okActors() },
   { name: 'bearer-403', recipe: 'clear-connect', session: (n) => n === 1 ? anonSession() : invalid(403), actors: () => okActors() },
+  { name: 'promote-approval-required', recipe: 'keep-policy', hash: '#proposals/p-1', code: 'APPROVAL_REQUIRED', session: () => okSession(), proposal: () => okProposal(), promote: () => policy('APPROVAL_REQUIRED') },
+  { name: 'promote-policy-denied', recipe: 'keep-policy', hash: '#proposals/p-1', code: 'POLICY_DENIED', session: () => okSession(), proposal: () => okProposal(), promote: () => policy('POLICY_DENIED') },
+  { name: 'promote-other-403', recipe: 'keep-policy', hash: '#proposals/p-1', code: 'CAPABILITY_NOT_GRANTED', session: () => okSession(), proposal: () => okProposal(), promote: () => policy('CAPABILITY_NOT_GRANTED') },
+  { name: 'promote-unauthenticated', recipe: 'clear-policy', hash: '#proposals/p-1', code: 'UNAUTHENTICATED', session: () => okSession(), proposal: () => okProposal(), promote: () => fail(401, 'UNAUTHENTICATED', 'No valid token.', 'Send a token.') },
+  { name: 'promote-scope-missing', recipe: 'clear-policy', hash: '#proposals/p-1', code: 'SCOPE_MISSING', session: () => okSession(), proposal: () => okProposal(), promote: () => fail(403, 'SCOPE_MISSING', 'Missing scope.', 'Use another token.') },
+  { name: 'promote-bearer-approval', recipe: 'keep-policy-bearer', hash: '#proposals/p-1', code: 'APPROVAL_REQUIRED', session: (n) => n === 1 ? anonSession() : okSession(), proposal: () => okProposal(), promote: () => policy('APPROVAL_REQUIRED') },
 ];
 
 function driver() {
@@ -67,6 +89,7 @@ const TOKEN = ${JSON.stringify(TOKEN)};
 const KEPT = ${JSON.stringify(KEPT)};
 const PRINCIPAL = ${JSON.stringify(PRINCIPAL)};
 const recipe = ${JSON.stringify(Object.fromEntries(cases.map((item) => [item.name, item.recipe])))}[CASE];
+const expected = ${JSON.stringify(Object.fromEntries(cases.filter((item) => item.code).map((item) => [item.name, item.code])))}[CASE];
 const status = () => document.getElementById('session-status').textContent;
 const errorBox = () => document.getElementById('error');
 const field = () => document.getElementById('bearer-token');
@@ -105,7 +128,7 @@ async function finish(ok, detail) {
 async function release() { await fetch('/release', { method: 'POST' }); }
 async function run() {
   if (!recipe) throw new Error('unknown case');
-  if (CASE.startsWith('startup')) field().value = KEPT;
+  if (CASE.startsWith('startup') || recipe === 'keep-policy' || recipe === 'clear-policy') field().value = KEPT;
   if (recipe === 'keep-load') {
     await waitFor(() => status().includes('OIDC: ' + PRINCIPAL), 'session');
     await shownError();
@@ -162,6 +185,42 @@ async function run() {
     await shownError();
     assert(signedOut() && field().value === '' && !refresh(), 'auth failure kept the bearer');
     assert(document.getElementById('view-content').childElementCount === 0, 'auth failure left data');
+  } else if (recipe === 'keep-policy' || recipe === 'keep-policy-bearer') {
+    if (recipe === 'keep-policy-bearer') {
+      await waitFor(() => signedOut(), 'initial');
+      submit(TOKEN);
+      await waitFor(() => status().includes('Bearer token'), 'bearer');
+    } else {
+      await waitFor(() => status().includes('OIDC: ' + PRINCIPAL), 'session');
+    }
+    await waitFor(() => {
+      const button = document.getElementById('promote-button');
+      return button && !button.disabled;
+    }, 'promote');
+    document.getElementById('promote-reason').value = 'Synthetic policy refusal';
+    document.getElementById('promote-form').requestSubmit();
+    await waitFor(() => document.activeElement === errorBox() && errorBox().textContent.includes(expected), 'focused error');
+    assert(!signedOut(), 'policy error signed out');
+    assert(document.getElementById('proposal-detail'), 'proposal cleared');
+    assert(errorBox().textContent.includes('Read the diff.'), 'hint missing');
+    assert(errorBox().textContent.includes('docs: kronik explain ' + expected), 'docs line missing');
+    assert(document.getElementById('status').textContent.includes('Operation failed'), 'operation-failed not announced');
+    assert(!errorBox().textContent.includes('Not signed in'), 'error announced sign-out');
+    if (recipe === 'keep-policy') assert(field().value === KEPT, 'password field changed');
+    else {
+      document.getElementById('refresh-button').click();
+      await waitFor(() => document.getElementById('status').textContent.includes('Proposals loaded.'), 'refresh');
+      assert(status().includes('Bearer token') && !signedOut(), 'refresh signed out');
+    }
+  } else if (recipe === 'clear-policy') {
+    await waitFor(() => status().includes('OIDC: ' + PRINCIPAL), 'session');
+    await waitFor(() => document.getElementById('promote-button'), 'promote');
+    document.getElementById('promote-reason').value = 'Synthetic auth refusal';
+    document.getElementById('promote-form').requestSubmit();
+    await waitFor(() => signedOut(), 'still signed in');
+    await shownError();
+    assert(field().value === '' && document.getElementById('view-content').childElementCount === 0, 'auth failure did not clear');
+    assert(errorBox().textContent.includes(expected), 'auth code missing');
   } else throw new Error('unknown recipe');
   assert(performance.getEntriesByType('navigation').length === 1, 'page reloaded');
 }
@@ -182,6 +241,13 @@ function expects(item, seen) {
   if (item.recipe === 'keep-bearer-load') return seen.actors === 2 && bearer(seen.actorAuth[0]) && bearer(seen.actorAuth[1]);
   if (item.recipe === 'connect-ok') return seen.session === 2 && bearer(seen.authorization[1]) && seen.actors === 1 && bearer(seen.actorAuth[0]);
   if (item.recipe === 'clear-connect') return seen.actors === 0 && seen.session === 2 && bearer(seen.authorization[1]);
+  if (item.recipe === 'keep-policy' || item.recipe === 'clear-policy') {
+    return none && seen.proposal === 1 && seen.promote === 1 && seen.pages === 1 && seen.session >= 1;
+  }
+  if (item.recipe === 'keep-policy-bearer') {
+    return seen.session === 2 && bearer(seen.authorization[1]) && seen.promote === 1 && bearer(seen.promoteAuth[0])
+      && seen.proposal === 2 && seen.proposalAuth.every(bearer) && seen.pages === 1;
+  }
   return false;
 }
 
@@ -195,7 +261,7 @@ async function runCase(origin, item) {
   const args = [
     '--headless=new', '--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage',
     '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-sync',
-    `--user-data-dir=${profile}`, `${origin}/ui/?case=${item.name}`,
+    `--user-data-dir=${profile}`, `${origin}/ui/?case=${item.name}${item.hash || ''}`,
   ];
   const child = spawn(chromeBin, args, { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
   let stderr = '';
@@ -217,7 +283,7 @@ async function runCase(origin, item) {
 async function main() {
   if (!fs.existsSync(chromeBin)) throw new Error(`chrome not found: ${chromeBin}`);
   let current = null;
-  const seen = { session: 0, actors: 0, pages: 0, released: false, authorization: [], actorAuth: [], served: { session: 0, actors: 0 }, servedAuth: { session: [], actors: [] } };
+  const seen = { session: 0, actors: 0, proposal: 0, promote: 0, pages: 0, released: false, authorization: [], actorAuth: [], proposalAuth: [], promoteAuth: [], served: { session: 0, actors: 0 }, servedAuth: { session: [], actors: [] } };
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (req.method === 'GET' && (url.pathname === '/ui' || url.pathname === '/ui/')) {
@@ -257,6 +323,7 @@ async function main() {
         const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
         if (global.currentResult) global.currentResult({ ...body, stderr: '', seen: {
           ...seen, authorization: [...seen.authorization], actorAuth: [...seen.actorAuth],
+          proposalAuth: [...seen.proposalAuth], promoteAuth: [...seen.promoteAuth],
           served: { ...seen.served }, servedAuth: { session: [...seen.servedAuth.session], actors: [...seen.servedAuth.actors] },
         } });
       });
@@ -267,7 +334,11 @@ async function main() {
       res.end();
       return;
     }
-    const route = url.pathname === '/v1/auth/session' ? 'session' : url.pathname === '/v1/actors' ? 'actors' : '';
+    const route = url.pathname === '/v1/auth/session' ? 'session'
+      : url.pathname === '/v1/actors' ? 'actors'
+      : url.pathname === '/v1/proposals/p-1' && req.method === 'GET' ? 'proposal'
+      : url.pathname === '/v1/proposals/p-1/promote' && req.method === 'POST' ? 'promote'
+      : '';
     if (!route) {
       res.writeHead(404, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify({ error: { code: 'NOT_FOUND', message: url.pathname } }));
@@ -277,6 +348,8 @@ async function main() {
     const authorization = req.headers.authorization || '';
     seen.authorization.push(authorization);
     if (route === 'actors') seen.actorAuth.push(authorization);
+    if (route === 'proposal') seen.proposalAuth.push(authorization);
+    if (route === 'promote') seen.promoteAuth.push(authorization);
     const hold = current.network && !seen.released && (
       current.network === route || (current.network === 'session-after-1' && route === 'session' && seen.session > 1)
     );
@@ -289,10 +362,20 @@ async function main() {
       res.destroy();
       return;
     }
-    seen.served[route] += 1;
-    seen.servedAuth[route].push(authorization);
-    res.writeHead(reply.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-    res.end(replyBytes(reply));
+    if (route === 'session' || route === 'actors') {
+      seen.served[route] += 1;
+      seen.servedAuth[route].push(authorization);
+    }
+    const send = () => {
+      res.writeHead(reply.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(replyBytes(reply));
+    };
+    if (req.method === 'POST') {
+      req.on('end', send);
+      req.resume();
+      return;
+    }
+    send();
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
@@ -302,10 +385,14 @@ async function main() {
       current = item;
       seen.session = 0;
       seen.actors = 0;
+      seen.proposal = 0;
+      seen.promote = 0;
       seen.pages = 0;
       seen.released = false;
       seen.authorization = [];
       seen.actorAuth = [];
+      seen.proposalAuth = [];
+      seen.promoteAuth = [];
       seen.served = { session: 0, actors: 0 };
       seen.servedAuth = { session: [], actors: [] };
       const result = await runCase(origin, item);

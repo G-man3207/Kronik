@@ -5,6 +5,11 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- The admin UI no longer treats `APPROVAL_REQUIRED`, `POLICY_DENIED`, or
+  any other non-authentication 403 as sign-out. The session, the bearer and
+  the proposal stay on screen; the error shows the code, hint and docs line,
+  and focus moves to it. `UNAUTHENTICATED` and `SCOPE_MISSING` still clear
+  the session.
 - `GET /v1/turns/{id}` scrubs a stored secret from a connection open's
   request, an inbound frame, a close reason, buffered `connection_ops`,
   and an accept's headers and selected subprotocol. The read-side
@@ -37,13 +42,10 @@ until the v1.0 compatibility promise takes effect.
   stays `"all"`, so either crate without its exception still fails the
   check (ADR 0154).
 - The admin UI no longer treats a failed first load or bearer connect as
-  sign-out. HTTP 401 and 403 still clear the session, the in-memory bearer
-  and the displayed data. Any other failure keeps them, so the operator can
-  retry from the page without reloading or pasting the token again.
-- `kronik explain IMPORT_NOT_ALLOWED` no longer says every `wasi:http` import
-  is denied. `wasi:http/types` and `wasi:http/outgoing-handler` at 0.2.x are
-  allowed and become `http.fetch` effects; incoming-handler, filesystem and
-  sockets stay denied.
+  sign-out. An authentication failure still clears the session, the
+  in-memory bearer and the displayed data. Any other failure keeps them,
+  so the operator can retry from the page without reloading or pasting
+  the token again.
 - `GET /v1/integrity` hashes a private copy of the committed databases and
   does not hold the apply lock across that copy or the hash. The log hash
   resumes from the last LSN hashed in this process, instead of reading the
