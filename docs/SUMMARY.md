@@ -156,3 +156,4 @@
 - [ADR 0155: `subject_from` requires a trusted proxy](adr/0155-subject-from-requires-a-trusted-proxy.md)
 - [ADR 0156: The SQL pool grows with the actors opened](adr/0156-sql-pool-grows-with-actors.md)
 - [ADR 0157: Erasure scans the subject's rows, not every actor](adr/0157-erasure-scans-matching-rows.md)
+- [ADR 0158: A SQL secret is scanned once, then only in rows the turn wrote](adr/0158-sql-secret-scrub-scans-once.md)

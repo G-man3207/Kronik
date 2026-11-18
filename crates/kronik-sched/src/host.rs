@@ -137,9 +137,10 @@ impl SqlTurn {
     }
 
     /// Ends the turn's SQL: the changes when `commit`, nothing otherwise.
-    /// Values of `secrets` the turn wrote are scrubbed first. `Ok(None)` when
-    /// the turn never used SQL; `Err` when SQLite rolled the transaction back
-    /// (the turn must fail).
+    /// Values of `secrets` the turn wrote are scrubbed first. The first write
+    /// that sees a secret value also scans that actor's cells once (ADR 0158).
+    /// `Ok(None)` when the turn never used SQL; `Err` when SQLite rolled the
+    /// transaction back (the turn must fail).
     pub fn end<N: AsRef<str>, V: AsRef<[u8]>>(
         &mut self,
         commit: bool,

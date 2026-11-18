@@ -5,6 +5,13 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- A committed SQL turn that used a secret no longer scans every column of
+  every table before the turn can commit. The first write that sees a
+  secret value scans once, and that replacement is in the turn's changeset.
+  A later turn scrubs only the rows it wrote. A turn that used a secret and
+  did not write SQL does not run `instr`. A value written after the scan by
+  a turn that did not use the secret stays until a revealing turn writes
+  that cell (ADR 0158).
 - The live SQL pool grows with the actors it has opened, up to the open-file
   budget, instead of staying at 256. A cold open no longer runs under the
   apply lock or while the pool mutex is held, so one actor's first database
