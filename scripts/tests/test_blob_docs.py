@@ -1,9 +1,10 @@
-"""The WIT reference and the operator table match the shipped blob store.
+"""The WIT reference, the operator table and the security guide match the
+shipped blob store.
 
 `kronik serve` always starts a blob store. Blob calls trap with
 `NOT_IMPLEMENTED` only in a turn that has no blob host, and a kind that
-imports blobs may accept a gateway body up to its upload size. These pages
-used to say the opposite.
+imports blobs may accept a gateway body up to its upload size. The security
+guide states that limit beside the 1 MiB inline body.
 """
 
 from pathlib import Path
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 WIT = (ROOT / "docs/reference/wit.md").read_text()
 EXAMPLES = (ROOT / "docs/reference/wit-examples.md").read_text()
 OPERATIONS = (ROOT / "docs/guides/operations.md").read_text()
+SECURITY = (ROOT / "docs/guides/security.md").read_text()
 EXPLAIN = (ROOT / "crates/kronik-core/explain/codes/PAYLOAD_TOO_LARGE.md").read_text()
 
 
@@ -49,6 +51,21 @@ class BlobDocsTest(unittest.TestCase):
         self.assertIn("upload size", limits)
         self.assertIn("imports `blobs`", limits)
         self.assertIn("64 MiB", limits)
+
+    def test_security_guide_states_both_gateway_body_policies(self):
+        gateway = SECURITY.split("- **The gateway**", 1)[1].split("\n- **", 1)[0]
+        self.assertNotIn("accepts request bodies up to 1 MiB", gateway)
+        self.assertNotIn("30 s for its body", gateway)
+        self.assertIn("does not import", gateway)
+        self.assertIn("1 MiB", gateway)
+        self.assertIn("within\n  30 s", gateway)
+        self.assertIn("imports `blobs`", gateway)
+        self.assertIn("upload size", gateway)
+        self.assertIn("64 MiB", gateway)
+        self.assertIn("--upload-size", gateway)
+        self.assertIn("no whole-body", gateway)
+        self.assertIn("idle timeout", gateway)
+        self.assertIn("upload_min_rate", gateway)
 
     def test_payload_too_large_row_matches_explain(self):
         row = next(
