@@ -290,8 +290,9 @@ impl Api {
                     ))
                 })?;
                 // The last LSN whose turn ran at or before that logical time.
-                // Segment marks skip every segment older than the one that
-                // contains it (#197).
+                // Segment marks skip segments that cannot hold it (#197). A
+                // configuration-only segment keeps the previous mark, so the
+                // read walks back to the turn (#217).
                 let segments = self.node.store().db().segments().map_err(internal)?;
                 kronik_fork::window::last_lsn_at_or_before(self.node.reader(), &segments, head, ms)
                     .await

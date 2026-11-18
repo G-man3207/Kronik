@@ -20,7 +20,8 @@ is self-contained for the `kronik-policy` implementer.
 - **A fork is a branch** named `f-<12 hex>` (or `--name`), created at a
   fork point `fork_lsn` on `main` (`--at <lsn>`, `--at <RFC 3339 time>`: the
   last LSN whose logical time is ≤ the time, found from `segments.last_time_ms`
-  without reading older segments, or `now`: the applied LSN).
+  and a read that walks back across a configuration-only segment, or `now`:
+  the applied LSN).
 - **Storage.** `branches/<fork>/log/` holds the fork's own records; its
   first record is `BranchCreated {branch, parent_branch: "main", fork_lsn,
   no_pii, proposal_id, audit}` at LSN `fork_lsn + 1`. Fork LSNs continue

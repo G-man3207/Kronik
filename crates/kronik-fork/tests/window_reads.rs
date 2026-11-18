@@ -247,3 +247,98 @@ fn a_timestamp_fork_does_not_read_older_segments() {
         );
     }
 }
+
+/// A closed configuration segment keeps the previous turn's mark. A time
+/// between that turn and the next must still select the earlier turn (#217).
+#[test]
+fn a_timestamp_between_turns_uses_the_earlier_turn_across_a_config_segment() {
+    let dir = tempdir();
+    let offset = Arc::new(AtomicU64::new(0));
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let armed = Arc::new(AtomicBool::new(false));
+    let p = start(dir.path(), offset.clone(), hits, armed);
+    p.http("early", "increment", "");
+    p.settle();
+    p.grant("http:example.com");
+    offset.store(60_000, Ordering::SeqCst);
+    p.http("late", "increment", "");
+    p.settle();
+
+    let head = p.node.applied_lsn();
+    let mut turns = Vec::new();
+    let mut turn_segments = std::collections::BTreeSet::new();
+    p.rt.block_on(p.node.reader().read(1, head, |c| {
+        let is_turn = matches!(
+            c.record,
+            kronik_proto::Record::TurnBegin(_) | kronik_proto::Record::TurnRecord(_)
+        );
+        if is_turn {
+            turn_segments.insert(c.pos.segment);
+        }
+        if let kronik_proto::Record::TurnRecord(t) = &c.record {
+            turns.push((c.pos.segment, c.lsn, t.logical_time_ms));
+        }
+        Ok(())
+    }))
+    .unwrap();
+    assert!(turns.len() >= 2, "need two turns, got {turns:?}");
+    let early_time = turns[0].2;
+    let late_time = turns.last().unwrap().2;
+    assert!(
+        early_time > 0 && late_time > early_time + 1,
+        "times {early_time} then {late_time} leave no point between or before them"
+    );
+    let between = early_time + 1;
+    let (early_seg, early_lsn, _) = turns
+        .iter()
+        .copied()
+        .filter(|(_, _, time)| *time <= between)
+        .max_by_key(|(_, lsn, _)| *lsn)
+        .unwrap();
+    let late_lsn = turns.last().unwrap().1;
+    let late_seg = turns
+        .iter()
+        .filter(|(_, _, time)| *time > between)
+        .map(|(seg, _, _)| *seg)
+        .min()
+        .unwrap();
+
+    let segments = p.node.store().db().segments().unwrap();
+    let Some(guess_at) = segments.iter().position(|(_, _, time)| *time > between) else {
+        panic!("no segment mark past {between}: {segments:?}");
+    };
+    assert!(
+        guess_at > 0,
+        "the later mark is the first segment; no config gap: {segments:?}"
+    );
+    let (guess_start, _, guess_time) = segments[guess_at - 1];
+    assert!(
+        !turn_segments.contains(&guess_start)
+            && guess_start > early_seg
+            && guess_start < late_seg
+            && guess_time <= early_time,
+        "segment {guess_start} at {guess_time} is not a config-only gap between {early_seg} and {late_seg}; segments {segments:?}"
+    );
+
+    let at = |ms| {
+        let segments = p.node.store().db().segments().unwrap();
+        p.rt.block_on(kronik_fork::window::last_lsn_at_or_before(
+            p.node.reader(),
+            &segments,
+            head,
+            ms,
+        ))
+        .unwrap()
+    };
+    assert_eq!(
+        at(between),
+        early_lsn,
+        "a time between the turns must use the earlier turn, not LSN 0"
+    );
+    assert_eq!(at(early_time - 1), 0, "a time before every turn is LSN 0");
+    assert_eq!(
+        at(late_time + 1),
+        late_lsn,
+        "a time after the latest turn uses that turn"
+    );
+}
