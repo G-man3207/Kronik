@@ -74,7 +74,9 @@ impl OpenRequest {
         self.request.param(name)
     }
 
-    /// The first query parameter called `name`, decoded.
+    /// The first query parameter called `name`, percent-decoded (`+` is a
+    /// space). A malformed `%` stays and `;` is data. `None` if it is
+    /// missing or not UTF-8 after decoding.
     pub fn query_param(&self, name: &str) -> Option<String> {
         self.request.query_param(name)
     }

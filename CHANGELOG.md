@@ -5,6 +5,10 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- The four SDKs decode a query parameter the same way. A malformed `%`
+  stays, `;` is data, and a value that is not UTF-8 after decoding is
+  missing. Go no longer drops a semicolon URL or a bad percent escape,
+  and TypeScript and Python no longer accept `%ff` as U+FFFD.
 - Startup install of a snapshot no longer deletes the live `state.db`
   before the replacement is durable. The new `state.db` and actor
   databases are staged, fsynced, and their directories fsynced before the

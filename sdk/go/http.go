@@ -6,7 +6,6 @@ package kronik
 import (
 	"bytes"
 	"encoding/json"
-	"net/url"
 	"strings"
 	"unicode/utf8"
 
@@ -181,17 +180,63 @@ func (r *Request) Param(name string) (string, bool) {
 	return v, ok
 }
 
-// QueryParam returns the first query parameter called name, decoded.
+// QueryParam returns the first query parameter called name, percent-decoded
+// (`+` is a space). A malformed `%` stays as it is and `;` is data, not a
+// separator. Missing if it is absent or not UTF-8 after decoding.
+// Not net/url.ParseQuery: that splits on `;` and drops a malformed `%`.
 func (r *Request) QueryParam(name string) (string, bool) {
-	values, err := url.ParseQuery(r.Query)
-	if err != nil && values == nil {
+	for _, pair := range strings.Split(r.Query, "&") {
+		rawName, rawValue, _ := strings.Cut(pair, "=")
+		decoded, ok := percentDecode(rawName)
+		if !ok || decoded != name {
+			continue
+		}
+		return percentDecode(rawValue)
+	}
+	return "", false
+}
+
+// percentDecode decodes `%XX` and `+` (a space) in one query component.
+// A malformed `%` stays. ok is false when the result is not UTF-8.
+func percentDecode(s string) (string, bool) {
+	in := []byte(s)
+	out := make([]byte, 0, len(in))
+	for i := 0; i < len(in); i++ {
+		switch in[i] {
+		case '+':
+			out = append(out, ' ')
+		case '%':
+			if i+2 < len(in) {
+				hi, okHi := unhex(in[i+1])
+				lo, okLo := unhex(in[i+2])
+				if okHi && okLo {
+					out = append(out, hi<<4|lo)
+					i += 2
+					continue
+				}
+			}
+			out = append(out, '%')
+		default:
+			out = append(out, in[i])
+		}
+	}
+	if !utf8.Valid(out) {
 		return "", false
 	}
-	v, ok := values[name]
-	if !ok || len(v) == 0 {
-		return "", false
+	return string(out), true
+}
+
+func unhex(b byte) (byte, bool) {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0', true
+	case b >= 'a' && b <= 'f':
+		return b - 'a' + 10, true
+	case b >= 'A' && b <= 'F':
+		return b - 'A' + 10, true
+	default:
+		return 0, false
 	}
-	return v[0], true
 }
 
 // Header returns the first header called name, ignoring case.
