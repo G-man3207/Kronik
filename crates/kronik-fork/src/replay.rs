@@ -2598,7 +2598,15 @@ impl ReplayGate {
                 .is_some()
         };
         if !granted {
-            let e = format!("CAPABILITY_NOT_GRANTED: {cap}");
+            let named = if foreign {
+                cap.clone()
+            } else {
+                format!(
+                    "http:{}",
+                    kronik_effects::config::http_capability_host(&t.host)
+                )
+            };
+            let e = format!("CAPABILITY_NOT_GRANTED: {named}");
             // Production withholds a rejected target's host (`http:[withheld]`);
             // the denial's audited error still names the capability.
             let withheld = if foreign {

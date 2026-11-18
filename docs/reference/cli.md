@@ -1041,6 +1041,12 @@ turn, M24; always delivery class `unsafe`, so `--delivery` other than
 `unsafe` and `--rate` are refused). Grants apply per actor type, not per
 code hash, and take effect at a new configuration epoch.
 
+An `http:` host is a hostname, an IPv4 address, or an IPv6 literal. Brackets
+are accepted (`http:[::1]`, `http:[2001:db8::1]`) and stored without them
+(`http:::1`, `http:2001:db8::1`); a denial names that same spelling. A port
+is not part of the capability: `http:example.com:8443` is refused, and a
+grant of the host covers every port.
+
 `--in-forks` chooses what a fork does with an unmatched
 `crypto.hmac-sha256` or `crypto.sign-ed25519` of a `secret:` grant
 ([ADR 0112](../adr/0112-fork-crypto-grant-mode.md)). `recorded`, the

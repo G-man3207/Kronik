@@ -5,6 +5,10 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- An `http:` grant accepts an IPv6 literal with brackets (`http:[::1]`),
+  and a fetch to `http://[::1]/` matches it. The grant and the denial name
+  the host without brackets (`http:::1`). A port in the capability
+  (`http:example.com:8443`) is refused: ports are not part of the capability.
 - Revoking the caller's authority while a connection dead-letter resend is
   still queued removes the job, clears the resend reservation, and returns
   `UNAUTHENTICATED`, as a message or timer resend already did. The frame or

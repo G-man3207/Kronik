@@ -334,7 +334,10 @@ interface http-client {
   denied until then.
 - **Capability.** The kind needs a grant of `http:<host>`, or of a wildcard
   `http:*.<suffix>`; the most specific wildcard wins, and a wildcard never
-  matches the bare suffix. Without one the guest gets
+  matches the bare suffix. An IPv6 literal may be granted with brackets
+  (`http:[::1]`); the denial names the host without them (`http:::1`), the
+  same string the grant stores. A port is not part of the capability.
+  Without one the guest gets
   `denied("CAPABILITY_NOT_GRANTED: http:<host>")`, and the denied effect is
   recorded in the turn.
 - **Secret headers.** A `secret(secret-template)` value names a secret and

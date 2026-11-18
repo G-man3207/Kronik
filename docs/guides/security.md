@@ -49,7 +49,9 @@ repository root says how to report a vulnerability.
   [ADR 0149](../adr/0149-bounded-host-buffers-per-turn.md).
 - **Default deny (I6, M2).** An actor can do nothing beyond its own state,
   its messages and its timers until the operator grants a capability:
-  `http:<host>` or `http:*.<suffix>` for outgoing HTTP, `secret:<name>` to
+  `http:<host>` or `http:*.<suffix>` for outgoing HTTP (an IPv6 literal may
+  be written with brackets; the grant and the denial use the host without
+  them, and a port is not part of the capability), `secret:<name>` to
   use a secret in a header or in `crypto`, `secret-reveal:<name>` to read
   its value, `connection:send-now` to send on a connection before the turn
   commits (M24). Without a grant the guest gets `denied` and the denied effect

@@ -52,7 +52,11 @@ struct Server {
 
 impl Server {
     fn start() -> Server {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        Self::start_on("127.0.0.1:0")
+    }
+
+    fn start_on(bind: &str) -> Server {
+        let listener = TcpListener::bind(bind).unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let state = Arc::new((Mutex::new(ServerState::default()), Condvar::new()));
         let st = state.clone();
@@ -408,6 +412,59 @@ fn denied_without_grant_then_allowed() {
         seen[0].headers.get("idempotency-key"),
         Some(&ok.idempotency_key)
     );
+}
+
+/// `http:[::1]` is a grant, a fetch to `http://[::1]/` is not
+/// `CAPABILITY_NOT_GRANTED`, and a port in the capability is refused.
+#[test]
+fn an_ipv6_literal_grant_authorizes_the_bracketed_fetch() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start_on("[::1]:0");
+    let p = start(dir.path());
+    p.deploy();
+    let spec = format!("GET {}", server.url("/ok"));
+
+    let denied = p.send("counter/a", msg("fetch-ok", &spec));
+    let text = reply(&denied);
+    assert!(text.contains("CAPABILITY_NOT_GRANTED: http:::1"), "{text}");
+    assert!(!text.contains("http:[::1]"), "{text}");
+    assert!(server.seen("/ok").is_empty());
+    let turns = turn_records(&p.records());
+    assert_eq!(
+        turns.last().unwrap().effects[0].error,
+        "CAPABILITY_NOT_GRANTED: http:::1"
+    );
+
+    let port = p.rt.block_on(p.node.grant(
+        "counter",
+        "http:example.com:8443",
+        None,
+        None,
+        kronik_effects::InForks::Recorded,
+        audit(),
+        false,
+        p.owner(),
+    ));
+    let err = port.unwrap_err();
+    assert_eq!(err.code, kronik_core::error::ErrorCode::BadRequest);
+    assert!(
+        err.message.contains("ports are not part of the capability"),
+        "{}",
+        err.message
+    );
+
+    p.grant("http:[::1]", None, None);
+    assert_eq!(
+        p.node
+            .config_now()
+            .http_grant("counter", "[::1]")
+            .unwrap()
+            .capability,
+        "http:::1"
+    );
+    let allowed = p.send("counter/b", msg("fetch-ok", &spec));
+    assert_eq!(reply(&allowed), "200 ok 1");
+    assert_eq!(server.seen("/ok").len(), 1);
 }
 
 #[test]

@@ -5618,10 +5618,14 @@ impl Node {
         let cap = Capability::parse(capability).ok_or_else(|| {
             ApiError::new(
                 ErrorCode::BadRequest,
-                format!(
-                    "{capability:?} is not a capability (http:<host>, http:*.<domain>, \
-                     foreign:<name>, secret:<name>, secret-reveal:<name>, \
-                     connection:send-now)"
+                kronik_effects::config::http_capability_rejection(capability).unwrap_or_else(
+                    || {
+                        format!(
+                            "{capability:?} is not a capability (http:<host>, http:*.<domain>, \
+                         foreign:<name>, secret:<name>, secret-reveal:<name>, \
+                         connection:send-now)"
+                        )
+                    },
                 ),
             )
         })?;
