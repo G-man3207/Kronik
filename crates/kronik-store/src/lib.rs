@@ -168,14 +168,16 @@ impl Store {
         let db = StateDb::open(state)?;
         let applied = AppliedLsn::default();
         applied.set(db.applied_lsn()?);
-        Ok(Arc::new(Store {
+        let store = Arc::new(Store {
             db: Mutex::new(db),
             sql,
             applied,
             apply_lock: Mutex::new(()),
             apply_epoch: AtomicU64::new(0),
             sealer: Mutex::new(Arc::new(kronik_privacy::sealer::Sealer::plain())),
-        }))
+        });
+        store.backfill_sql_subjects()?;
+        Ok(store)
     }
 
     /// An empty in-memory store (rebase shadows).
@@ -260,10 +262,10 @@ impl Store {
                 c.lsn
             )));
         }
-        let checkpoint = loop {
+        let (actors, checkpoint_state) = loop {
             let names = self.sql_targets(batch)?;
             let pinned = self.pin_sql(names.iter())?;
-            let actors = {
+            let done = {
                 let _apply = self.apply_lock();
                 // A concurrent apply may have created an actor this erasure
                 // must open. Drop the lock and pin it; do not open under it.
@@ -281,16 +283,19 @@ impl Store {
                     }
                 }
                 self.db().apply(batch)?;
-                if batch.iter().any(|c| matches!(c.record, Record::Erasure(_))) {
-                    self.db().checkpoint();
-                }
+                let checkpoint_state = batch.iter().any(|c| matches!(c.record, Record::Erasure(_)));
                 self.applied.set(self.applied.get().max(last.lsn));
-                actors
+                (actors, checkpoint_state)
             };
             drop(pinned);
-            break actors;
+            break done;
         };
-        self.checkpoint_erased(&checkpoint);
+        // The state.db WAL checkpoint is the same class of stall as the
+        // actor one: it runs after the apply lock (#196).
+        if checkpoint_state {
+            self.db().checkpoint();
+        }
+        self.checkpoint_erased(&actors);
         Ok(())
     }
 
@@ -618,10 +623,10 @@ impl Store {
 
     /// The erasure operation on the actor databases (§6.3): every row of
     /// the subject in a table with a `_subject` column is deleted, in every
-    /// actor database that has not applied this LSN yet. Replayed on every
-    /// rebuild, so a rebuilt database equals the live one. `earlier` is the
-    /// batch before the record: state.db, which lists the actor databases,
-    /// is applied after them, so the ones these records create are added.
+    /// actor that has such a row (or a turn still open, which may be writing
+    /// one). Replayed on every rebuild, so a rebuilt database equals the
+    /// live one. `earlier` is the batch before the record: state.db, which
+    /// records those actors, is applied after them.
     ///
     /// Names whose deletes ran and whose WAL still needs a checkpoint. The
     /// checkpoint itself runs after the apply lock is released.
@@ -631,17 +636,8 @@ impl Store {
         subject: &str,
         earlier: &[Committed],
     ) -> Result<Vec<String>, StoreError> {
-        let mut actors: BTreeSet<String> = self.db().sql_actors()?.into_iter().collect();
-        for c in earlier {
-            if let Record::TurnRecord(t) = &c.record
-                && (!t.sql_changes.is_empty() || !t.sql_schema.is_empty())
-                && let Some(a) = &t.actor
-            {
-                actors.insert(format!("{}/{}", a.kind, a.key));
-            }
-        }
         let mut checkpoint = Vec::new();
-        for name in actors {
+        for name in self.actors_for_erasure(subject, earlier)? {
             let db = self.sql.get(&name)?;
             let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
             if db.applied_lsn()? >= lsn {
@@ -655,6 +651,51 @@ impl Store {
             }
         }
         Ok(checkpoint)
+    }
+
+    /// Actors an erasure of `subject` must open: the index, turns in
+    /// `records` whose changesets carry the subject (not yet in the index),
+    /// and any open SQL session (the delete waits for that turn).
+    fn actors_for_erasure(
+        &self,
+        subject: &str,
+        records: &[Committed],
+    ) -> Result<BTreeSet<String>, StoreError> {
+        let mut actors: BTreeSet<String> = self
+            .db()
+            .sql_actors_for_subject(subject)?
+            .into_iter()
+            .collect();
+        for c in records {
+            if let Record::TurnRecord(t) = &c.record
+                && changeset_has_subject(t, subject)
+                && let Some(name) = turn_actor(t)
+            {
+                actors.insert(name);
+            }
+        }
+        actors.extend(self.sql.open_sessions());
+        Ok(actors)
+    }
+
+    /// Databases written before `sql_subjects` existed: one scan, outside
+    /// the apply lock, then the flag so an erasure does not repeat it.
+    fn backfill_sql_subjects(&self) -> Result<(), StoreError> {
+        if self.db().sql_subjects_ready()? {
+            return Ok(());
+        }
+        for (kind, key) in self.db().sql_actor_refs()? {
+            let name = format!("{kind}/{key}");
+            let subjects = {
+                let db = self.sql.get(&name)?;
+                let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+                db.distinct_subjects()
+                    .map_err(|e| StoreError::Corrupt(format!("subjects in {name}: {e}")))?
+            };
+            self.db().note_actor_subjects(&kind, &key, &subjects)?;
+        }
+        self.db().mark_sql_subjects_ready()?;
+        Ok(())
     }
 
     fn checkpoint_erased(&self, names: &[String]) {
@@ -676,23 +717,24 @@ impl Store {
     }
 
     /// The erasure operation of `subject` through `key_version` again, on
-    /// `state.db` and every actor database, keeping the applied LSNs: a
-    /// rebase shadow after its staged turns (m13-rebase §3), and a fork's
-    /// continuous replay at the place of production's `Erasure` record, so
-    /// the fork's state loses what production's lost there (ADR 0109).
-    /// Actor-database WAL checkpoints run after the apply lock is released.
+    /// `state.db` and the actors that have the subject's rows, keeping the
+    /// applied LSNs: a rebase shadow after its staged turns (m13-rebase §3),
+    /// and a fork's continuous replay at the place of production's `Erasure`
+    /// record, so the fork's state loses what production's lost there
+    /// (ADR 0109). Actor-database WAL checkpoints run after the apply lock
+    /// is released.
     pub fn erase_again(&self, subject: &str, key_version: u32) -> Result<(), StoreError> {
         let checkpoint = loop {
-            let names = self.db().sql_actors()?;
+            let names = self.actors_for_erasure(subject, &[])?;
             let pinned = self.pin_sql(names.iter())?;
             let checkpoint = {
                 let _apply = self.apply_lock();
-                let now = self.db().sql_actors()?;
+                let now = self.actors_for_erasure(subject, &[])?;
                 if now != names {
                     continue;
                 }
                 let mut checkpoint = Vec::new();
-                for name in &now {
+                for name in &names {
                     let db = self.sql.get(name)?;
                     let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
                     let applied = db.applied_lsn()?;
@@ -717,10 +759,10 @@ impl Store {
     }
 
     /// Actors `apply` will open: committed SQL turns, and, when the batch
-    /// erases, every actor database plus any turn in the batch that wrote SQL.
+    /// erases, the actors that have the subject's rows (plus an open session).
     fn sql_targets(&self, batch: &[Committed]) -> Result<BTreeSet<String>, StoreError> {
         let mut names = BTreeSet::new();
-        let mut erasure = false;
+        let mut subjects = Vec::new();
         for c in batch {
             match &c.record {
                 Record::TurnRecord(t) if turn_committed(t) && turn_has_sql(t) => {
@@ -728,20 +770,12 @@ impl Store {
                         names.insert(name);
                     }
                 }
-                Record::Erasure(_) => erasure = true,
+                Record::Erasure(e) => subjects.push(e.subject.as_str()),
                 _ => {}
             }
         }
-        if erasure {
-            names.extend(self.db().sql_actors()?);
-            for c in batch {
-                if let Record::TurnRecord(t) = &c.record
-                    && turn_has_sql(t)
-                    && let Some(name) = turn_actor(t)
-                {
-                    names.insert(name);
-                }
-            }
+        for subject in subjects {
+            names.extend(self.actors_for_erasure(subject, batch)?);
         }
         Ok(names)
     }
@@ -788,6 +822,12 @@ fn turn_has_sql(t: &pb::TurnRecord) -> bool {
     !t.sql_changes.is_empty() || !t.sql_schema.is_empty()
 }
 
+fn changeset_has_subject(t: &pb::TurnRecord, subject: &str) -> bool {
+    t.sql_changes
+        .iter()
+        .any(|c| c.changeset.as_ref().and_then(|s| s.subject.as_deref()) == Some(subject))
+}
+
 fn turn_committed(t: &pb::TurnRecord) -> bool {
     t.outcome
         .as_ref()
@@ -831,6 +871,14 @@ mod erasure_lock_tests {
         store
             .db()
             .conn()
+            .execute(
+                "INSERT INTO sql_subjects (subject, kind, key) VALUES ('user:1', 'notes', 'n')",
+                [],
+            )
+            .unwrap();
+        store
+            .db()
+            .conn()
             .execute("UPDATE meta SET v = 1 WHERE k = 'applied_lsn'", [])
             .unwrap();
         store.applied.set(1);
@@ -861,6 +909,277 @@ mod erasure_lock_tests {
             assert_eq!(c.get(), 1, "the actor database was not checkpointed");
         });
         assert!(!apply_lock_held());
+    }
+
+    fn committed(lsn: u64, record: Record) -> Committed {
+        Committed {
+            lsn,
+            pos: kronik_log::Position {
+                segment: 0,
+                offset: 0,
+            },
+            record,
+        }
+    }
+
+    fn ddl(lsn: u64, key: &str) -> Committed {
+        committed(
+            lsn,
+            Record::TurnRecord(pb::TurnRecord {
+                actor: Some(pb::ActorRef {
+                    kind: "notes".into(),
+                    key: key.into(),
+                }),
+                causal_key: Some(kronik_core::causal::root(format!("r{lsn}"))),
+                input: Some(pb::Input {
+                    kind: Some(pb::input::Kind::Http(pb::HttpInput::default())),
+                }),
+                outcome: Some(pb::Outcome {
+                    kind: pb::OutcomeKind::Committed as i32,
+                    ..Default::default()
+                }),
+                sql_schema: vec![pb::SqlSchemaChange {
+                    statement: "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, \
+                         _subject TEXT)"
+                        .into(),
+                }],
+                ..Default::default()
+            }),
+        )
+    }
+
+    /// Issue #196: one subject's erasure does not open every SQL actor or
+    /// scan `deliveries`, and it still deletes the row and tombstones the
+    /// saved call answer.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn erasure_opens_only_the_actor_that_has_the_subject() {
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            Connection::open(dir.path().join("state.db")).unwrap(),
+            SqlPool::new(
+                Arc::new(FileOpener {
+                    root: dir.path().join("sql"),
+                }),
+                Limits::default(),
+                64,
+            ),
+        )
+        .unwrap();
+        const N: u64 = 32;
+        for i in 1..=N {
+            store.apply(&[ddl(i, &format!("a{i}"))]).unwrap();
+        }
+        let bytes = {
+            let mut side =
+                crate::sql::SqlActor::open(&crate::sql::MemOpener, "side", Limits::default())
+                    .unwrap();
+            let mut opts = crate::sql::TurnOpts {
+                seed: [1; 32],
+                time_ms: 1,
+                default_subject: Some("user:1".into()),
+                migrate: true,
+                sql_budget: 50_000_000,
+                max_bytes: 0,
+            };
+            side.begin_turn(&opts).unwrap();
+            side.query(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, \
+                 _subject TEXT DEFAULT (kronik_subject()))",
+                &[],
+            )
+            .unwrap();
+            let schema = side.end_turn(true).unwrap();
+            side.apply(&schema, 1, &std::collections::BTreeSet::new())
+                .unwrap();
+            opts.migrate = false;
+            side.begin_turn(&opts).unwrap();
+            side.query("INSERT INTO notes(body) VALUES ('mine')", &[])
+                .unwrap();
+            let dml = side.end_turn(true).unwrap();
+            dml.changesets.into_iter().next().unwrap().1
+        };
+        store
+            .apply(&[committed(
+                N + 1,
+                Record::TurnRecord(pb::TurnRecord {
+                    actor: Some(pb::ActorRef {
+                        kind: "notes".into(),
+                        key: "a1".into(),
+                    }),
+                    causal_key: Some(kronik_core::causal::root("ins".into())),
+                    input: Some(pb::Input {
+                        kind: Some(pb::input::Kind::Http(pb::HttpInput::default())),
+                    }),
+                    outcome: Some(pb::Outcome {
+                        kind: pb::OutcomeKind::Committed as i32,
+                        ..Default::default()
+                    }),
+                    sql_changes: vec![pb::SqlChangeset {
+                        changeset: Some(pb::Sealable {
+                            subject: Some("user:1".into()),
+                            value: Some(pb::sealable::Value::Plain(bytes)),
+                        }),
+                    }],
+                    ..Default::default()
+                }),
+            )])
+            .unwrap();
+        let reply = pb::Outcome {
+            kind: pb::OutcomeKind::Committed as i32,
+            output: Some(pb::outcome::Output::Reply(pb::Message {
+                body: Some(pb::Sealable {
+                    subject: Some("user:1".into()),
+                    value: Some(pb::sealable::Value::Plain(b"reply".to_vec())),
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        {
+            let db = store.db();
+            let plan: Vec<String> = db
+                .conn()
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT message_id, outcome FROM deliveries \
+                     WHERE subject = ?1 AND outcome IS NOT NULL",
+                )
+                .unwrap()
+                .query_map(["user:1"], |r| r.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|d| d.starts_with("SEARCH "))
+                    && plan.iter().all(|d| !d.starts_with("SCAN ")),
+                "deliveries subject select scans: {plan:?}"
+            );
+            let tx = db.conn().unchecked_transaction().unwrap();
+            tx.execute(
+                "INSERT INTO deliveries (message_id, lsn, outcome, subject) \
+                 VALUES ('c1', ?1, ?2, 'user:1')",
+                rusqlite::params![i64::try_from(N + 1).unwrap(), reply.encode_to_vec()],
+            )
+            .unwrap();
+            {
+                let mut other = tx
+                    .prepare(
+                        "INSERT INTO deliveries (message_id, lsn, outcome, subject) \
+                         VALUES (?1, 1, NULL, 'other')",
+                    )
+                    .unwrap();
+                for n in 0..20_000 {
+                    other.execute([format!("o{n}")]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let _ = take_apply_lock_hold();
+        let started = std::time::Instant::now();
+        store
+            .apply(&[committed(
+                N + 2,
+                Record::Erasure(pb::Erasure {
+                    subject: "user:1".into(),
+                    key_version: 1,
+                    ..Default::default()
+                }),
+            )])
+            .unwrap();
+        let elapsed = started.elapsed();
+        let hold = take_apply_lock_hold();
+        assert!(
+            hold < std::time::Duration::from_secs(2) && elapsed < std::time::Duration::from_secs(2),
+            "erasure hold {hold:?} elapsed {elapsed:?} over 32 actors and 20 000 deliveries"
+        );
+        let mine = store.sql.get("notes/a1").unwrap();
+        assert_eq!(mine.lock().unwrap().applied_lsn().unwrap(), N + 2);
+        let left: i64 = mine
+            .lock()
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT count(*) FROM notes WHERE _subject = 'user:1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "the subject's row was not deleted");
+        for i in 2..=N {
+            let db = store.sql.get(&format!("notes/a{i}")).unwrap();
+            assert_eq!(
+                db.lock().unwrap().applied_lsn().unwrap(),
+                i,
+                "erasure opened notes/a{i}"
+            );
+        }
+        let (_, outcome) = store.db().call_outcome("c1").unwrap().unwrap();
+        assert_eq!(outcome.kind, pb::OutcomeKind::Committed as i32);
+        let Some(pb::outcome::Output::Reply(message)) = outcome.output else {
+            panic!("saved answer lost its reply");
+        };
+        assert!(kronik_privacy::sealer::is_erased(
+            message.body.as_ref().unwrap()
+        ));
+    }
+
+    /// An in-flight turn is not in the index yet. Erasure still opens it,
+    /// so the delete runs when the turn ends instead of being skipped.
+    #[test]
+    fn erasure_defers_on_an_open_sql_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            Connection::open(dir.path().join("state.db")).unwrap(),
+            SqlPool::new(
+                Arc::new(FileOpener {
+                    root: dir.path().join("sql"),
+                }),
+                Limits::default(),
+                8,
+            ),
+        )
+        .unwrap();
+        store.apply(&[ddl(1, "n")]).unwrap();
+        {
+            let db = store.sql.get("notes/n").unwrap();
+            let mut actor = db.lock().unwrap();
+            actor
+                .begin_turn(&crate::sql::TurnOpts {
+                    seed: [2; 32],
+                    time_ms: 2,
+                    default_subject: Some("user:9".into()),
+                    migrate: false,
+                    sql_budget: 50_000_000,
+                    max_bytes: 0,
+                })
+                .unwrap();
+            actor
+                .query(
+                    "INSERT INTO notes(body, _subject) VALUES ('x', 'user:9')",
+                    &[],
+                )
+                .unwrap();
+        }
+        store
+            .apply(&[committed(
+                2,
+                Record::Erasure(pb::Erasure {
+                    subject: "user:9".into(),
+                    key_version: 1,
+                    ..Default::default()
+                }),
+            )])
+            .unwrap();
+        let db = store.sql.get("notes/n").unwrap();
+        let mut actor = db.lock().unwrap();
+        actor.end_turn(true).unwrap();
+        assert_eq!(
+            actor.applied_lsn().unwrap(),
+            2,
+            "the open session was not erased when the turn ended"
+        );
     }
 }
 

@@ -275,6 +275,23 @@ impl SqlPool {
         }
     }
 
+    /// Actors whose turn still has its savepoint open. Erasure must open
+    /// these so the delete is deferred until the turn ends (#196). Names
+    /// only: this does not create a database.
+    pub(crate) fn open_sessions(&self) -> Vec<String> {
+        let open: Vec<_> = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.open
+                .iter()
+                .map(|(name, (_, db))| (name.clone(), db.clone()))
+                .collect()
+        };
+        open.into_iter()
+            .filter(|(_, db)| db.lock().unwrap_or_else(|e| e.into_inner()).has_session())
+            .map(|(name, _)| name)
+            .collect()
+    }
+
     /// Drops every open connection (simulated crash, shutdown).
     pub fn close_all(&self) {
         self.inner

@@ -613,6 +613,14 @@ impl SqlActor {
             }),
         )?;
         lock(&shared).host = true;
+        // Existing tables gain the erasure index outside the apply lock:
+        // the first open is the pin before that lock (#196).
+        ensure_subject_indexes(&conn).map_err(|e| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some(e),
+            )
+        })?;
         Ok(Self {
             session: None,
             conn,
@@ -1075,6 +1083,10 @@ impl SqlActor {
                     .execute_batch(ddl)
                     .map_err(|e| format!("DDL replay: {e}"))?;
             }
+            if !t.ddl.is_empty() {
+                lock(&self.shared).host = true;
+                ensure_subject_indexes(&self.conn)?;
+            }
             if erased.is_empty() && !t.whole.is_empty() {
                 ffi::apply(&self.conn, &t.whole)?;
             }
@@ -1161,10 +1173,7 @@ impl SqlActor {
             for t in &tables {
                 n += self
                     .conn
-                    .execute(
-                        &format!("DELETE FROM {} WHERE _subject = ?1", quote_ident(t)),
-                        [subject],
-                    )
+                    .execute(&subject_delete_sql(t), [subject])
                     .map_err(|e| e.to_string())? as u64;
             }
             n += rows_without_subject_column(&self.conn, subject)?;
@@ -1410,6 +1419,34 @@ impl SqlActor {
 
     pub fn set_host(&self) {
         lock(&self.shared).host = true;
+    }
+
+    pub(crate) fn has_session(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Distinct non-empty `_subject` values. One scan on open, for databases
+    /// written before the actor-subject index existed (#196).
+    pub(crate) fn distinct_subjects(&mut self) -> Result<Vec<String>, String> {
+        lock(&self.shared).host = true;
+        let mut out = BTreeSet::new();
+        for table in tables_with_subject_column(&self.conn)? {
+            let sql = format!(
+                "SELECT DISTINCT _subject FROM {} WHERE _subject IS NOT NULL",
+                quote_ident(&table)
+            );
+            let mut st = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = st
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let subject = row.map_err(|e| e.to_string())?;
+                if !subject.is_empty() {
+                    out.insert(subject);
+                }
+            }
+        }
+        Ok(out.into_iter().collect())
     }
 
     /// Forgets cached schema facts (after the database was replaced).
@@ -1718,6 +1755,47 @@ pub fn canonical_hash_raw(conn: &Connection) -> rusqlite::Result<String> {
     Ok(format!("b3:{}", &h.finalize().to_hex()[..16]))
 }
 
+/// The statement [`SqlActor::erase_subject_at`] runs. Tests explain it.
+pub(crate) fn subject_delete_sql(table: &str) -> String {
+    format!("DELETE FROM {} WHERE _subject = ?1", quote_ident(table))
+}
+
+/// Index `_subject` so that delete is a search (#196). A guest index that
+/// already leads with the column is enough. The name starts with `_kronik`,
+/// so it stays out of the canonical hash.
+fn ensure_subject_indexes(conn: &Connection) -> Result<(), String> {
+    for table in tables_with_subject_column(conn)? {
+        if subject_indexed(conn, &table).map_err(|e| e.to_string())? {
+            continue;
+        }
+        let name = subject_index_name(&table);
+        conn.execute(
+            &format!(
+                "CREATE INDEX IF NOT EXISTS {} ON {}(_subject)",
+                quote_ident(&name),
+                quote_ident(&table)
+            ),
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn subject_indexed(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT count(*) > 0 FROM pragma_index_list(?1) i, pragma_index_info(i.name) c \
+         WHERE c.seqno = 0 AND c.name = '_subject' COLLATE NOCASE",
+        [table],
+        |r| r.get(0),
+    )
+}
+
+fn subject_index_name(table: &str) -> String {
+    let hash = blake3::hash(table.as_bytes());
+    format!("_kronik_subject_{}", &hash.to_hex()[..16])
+}
+
 fn tables_with_subject_column(conn: &Connection) -> Result<Vec<String>, String> {
     let sql = format!(
         "SELECT m.name FROM sqlite_schema m, pragma_table_info(m.name) c \
@@ -1783,5 +1861,44 @@ mod tests {
             conn.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
                 .unwrap();
         }
+    }
+
+    fn plan(conn: &Connection, sql: &str) -> Vec<String> {
+        let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        st.query_map(["user:1"], |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Issue #196: `DELETE WHERE _subject = ?` searches, including on a
+    /// database created before the index and on a case-variant column.
+    #[test]
+    fn subject_delete_searches_instead_of_scanning() {
+        let dir = tempfile::tempdir().unwrap();
+        let opener = FileOpener {
+            root: dir.path().to_path_buf(),
+        };
+        {
+            let conn = opener.open("notes/old", "unix").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, _Subject TEXT);
+                 INSERT INTO notes VALUES (1, 'user:1');",
+            )
+            .unwrap();
+        }
+        let actor = SqlActor::open(&opener, "notes/old", Limits::default()).unwrap();
+        let sql = subject_delete_sql("notes");
+        let plan = plan(&actor.conn, &sql);
+        assert!(
+            plan.iter().any(|d| d.starts_with("SEARCH ")),
+            "{sql} has no indexed lookup: {plan:?}"
+        );
+        assert!(
+            plan.iter().all(|d| !d.starts_with("SCAN ")),
+            "{sql} scans: {plan:?}"
+        );
+        let gone = actor.conn.execute(&sql, ["user:1"]).unwrap();
+        assert_eq!(gone, 1);
     }
 }

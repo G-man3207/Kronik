@@ -227,7 +227,8 @@ The erasure itself:
    step 2, its next start writes the missing `Erasure` record (audited as
    `kronik`) before anything else runs.
 2. The `Erasure` record is written. Applying it deletes the subject's state
-   values, its rows in every table with `_subject` of every actor, its
+   values, its rows in every table with `_subject` of each actor that has
+   such a row, its
    saved responses to requests with an `Idempotency-Key` (a repeated
    request runs anew) and its dead letters. A saved response of a call to
    an actor keeps the callee's committed outcome, with the reply's values

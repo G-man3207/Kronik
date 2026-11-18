@@ -1303,8 +1303,9 @@ impl Node {
     /// no newer than the window's start, [`retention_plan`]), and none from
     /// the segment holding the `TurnBegin` of a turn open in the live state
     /// or in a snapshot on, then the index rows of what they held, unless no
-    /// segment was deleted and no ingress key is past TTL (those deletes take
-    /// the store lock, #162). Returns the log's first LSN afterwards.
+    /// segment was deleted, no ingress key is past TTL, and no saved call
+    /// outcome is below the floor (those deletes take the store lock, #162, #196).
+    /// Returns the log's first LSN afterwards.
     ///
     /// A segment's own time (the turn-time high-water mark at its last
     /// record) says nothing about records after its last turn: a
@@ -1322,8 +1323,9 @@ impl Node {
     /// compacted only when a segment was deleted. Those deletes take the
     /// store lock; the disk loop must not take it every minute while a
     /// released hold has nothing left to delete (perf review R2-cost). The
-    /// hourly pass skips them too unless an ingress key is past TTL. That
-    /// probe uses `ingress_keys_time`, not a scan of `trees` (#162).
+    /// hourly pass skips them too unless an ingress key is past TTL or a
+    /// saved call outcome is below the floor. Those probes use indexes, not
+    /// a scan of `trees` (#162, #196).
     fn compact_with(&self, storage: &StorageConfig, always_index: bool) -> Result<Lsn, ApiError> {
         let dir = storage
             .data_dir
@@ -1437,16 +1439,23 @@ impl Node {
             return Ok(first);
         }
         let ingress_before = hwm.saturating_sub(self.cfg.ingress_ttl.as_millis() as u64);
-        // No segment went and no ingress key is past TTL: do not hold the
-        // store lock for the `trees` and `ingress_keys` deletes (#162). A
-        // crash after the segment delete and before this leaves those rows
-        // until the next segment deletion or an expired ingress key.
+        // No segment went, no ingress key is past TTL, and no delivery is
+        // below the floor: do not hold the store lock for the deletes
+        // (#162, #196). A crash after the segment delete and before this
+        // leaves those rows until the next segment deletion, an expired
+        // ingress key, or a delivery still below the floor.
+        let deliveries_before = self
+            .store()
+            .db()
+            .has_deliveries_before(first)
+            .map_err(store_err)?;
         if first != was_first
             || self
                 .store()
                 .db()
                 .has_ingress_before(ingress_before)
                 .map_err(store_err)?
+            || deliveries_before
         {
             self.db_compactions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

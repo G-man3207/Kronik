@@ -194,7 +194,8 @@ Concretely:
 3. **The erasure operation** runs when the record is applied, once in
    production and again on every rebuild. It is recorded as this record, not
    as a changeset, because a changeset's old values would be the erased data
-   (ADR 0005 §6). For every actor with SQL state it runs `DELETE FROM t WHERE
+   (ADR 0005 §6). For each actor that has a row of the subject (and any actor
+   whose SQL turn is still open) it runs `DELETE FROM t WHERE
    _subject = ?` on each table with a `_subject` column, quoting the table
    name so a `"` in it is still valid SQL, and it deletes the
    subject's KV rows from `state.db`. The bodies of the subject's pending
