@@ -59,6 +59,7 @@ article > :first-child { margin-top: 0; }
 .mutation { border: 1px solid #596779; padding: 1rem; background: #fff; }
 .mutation form { align-items: flex-start; flex-direction: column; }
 .mutation input:not([type="checkbox"]) { width: 100%; }
+.mutation button { max-width: 100%; white-space: normal; text-align: start; }
 footer { border-top: 1px solid #8b96a5; font-size: .9rem; }
 @media (max-width: 40rem) {
   form { align-items: stretch; flex-direction: column; }

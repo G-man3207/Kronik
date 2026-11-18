@@ -311,6 +311,67 @@ fn a_catch_up_that_finds_a_new_error_stops_promote() {
     );
 }
 
+/// Issue #191: a dry-run promote the policy denies still validates. It does
+/// not write `rejected` or retire the fork.
+#[test]
+fn a_dry_run_promote_the_policy_denies_does_not_reject_or_retire_the_fork() {
+    let dir = tempdir();
+    let p = Proc::start(dir.path());
+    for _ in 0..5 {
+        p.http("a", "increment", "");
+    }
+    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
+    let prop = propose(&p, &props, "counter-fail-get", DiffOptions::default());
+    assert_eq!(prop.status, "evaluated");
+    assert_eq!(prop.policy["outcome"], "allow", "{}", prop.policy);
+    p.send("counter/a", "get", "");
+    let branch = dir.path().join("branches").join(&prop.id);
+    let before = std::fs::read(branch.join("proposal.json")).unwrap();
+    let files_before = branch_files(&branch);
+
+    let err =
+        p.rt.block_on(props.promote(&prop.id, audit(), true, p.owner()))
+            .unwrap_err();
+    assert_eq!(err.code, ErrorCode::PolicyDenied, "{}", err.message);
+    assert!(err.message.contains("no-new-errors"), "{}", err.message);
+
+    let after = props_get(&p, &props, &prop.id);
+    assert_eq!(after.status, "evaluated");
+    assert_eq!(after.policy["outcome"], "allow", "{}", after.policy);
+    assert_eq!(after, prop);
+    assert_eq!(std::fs::read(branch.join("proposal.json")).unwrap(), before);
+    assert_eq!(branch_files(&branch), files_before);
+    assert!(branch.is_dir(), "the fork directory was removed");
+    // Main kept the old code: the dry run did not switch it.
+    assert_eq!(http_body(&p.http("a", "increment", "")), "6");
+    assert_eq!(
+        last_deployment(&p).1.cause,
+        pb::DeploymentCause::Deploy as i32
+    );
+}
+
+fn branch_files(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                out.push(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
 #[test]
 fn approximate_effects_need_an_approval_for_promote() {
     let (addr, hits) = server();

@@ -404,6 +404,12 @@ them in place, show the code, hint and docs line, and move focus to that error.
 Logout also clears the session. No credential is stored in localStorage,
 sessionStorage or offline caches.
 Mutations retain reason/dry-run, proposal hashes, catch-up and required approvals.
+A mutation form starts as a dry run. Enter in the reason field does not
+submit it; the button does. A real promotion's button names the proposal
+and says production will change, and that warning is part of the button's
+description. Promote is not offered while the proposal is running or has
+failed. A dry-run promote that policy denies still returns `POLICY_DENIED`
+and leaves the proposal and its fork as they were.
 
 `scripts/e2e-ui-oidc.py` runs the finite owned TLS/code/JWT fixture. Its browser
 observes actual network operations against generated OpenAPI, axe-core WCAG 2.2 AA

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 /*
- * Admin UI session check for a non-auth first load (issue 167) and a
- * policy 403 on promote (issue 190).
+ * Admin UI session check for a non-auth first load (issue 167), a
+ * policy 403 on promote (issue 190), and a real promote that is not
+ * Enter in the reason field (issue 191).
  * Run: node scripts/test-ui-session-retry.cjs
  * Chrome: $KRONIK_CHROME or /usr/bin/google-chrome. No package install.
  */
@@ -17,6 +18,63 @@ const TOKEN = 'fixture-bearer';
 const KEPT = 'kept-secret';
 const PRINCIPAL = 'fixture-operator';
 const chromeBin = process.env.KRONIK_CHROME || '/usr/bin/google-chrome';
+let activeProfile = '';
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function devtoolsPort(profile) {
+  const file = path.join(profile, 'DevToolsActivePort');
+  const start = Date.now();
+  for (;;) {
+    if (fs.existsSync(file)) {
+      const port = Number(fs.readFileSync(file, 'utf8').split('\n')[0]);
+      if (port) return port;
+    }
+    if (Date.now() - start > 8000) throw new Error('devtools port missing');
+    await sleep(50);
+  }
+}
+
+async function withPage(profile, fn) {
+  const port = await devtoolsPort(profile);
+  const list = await fetch(`http://127.0.0.1:${port}/json/list`).then((reply) => reply.json());
+  const page = list.find((item) => item.type === 'page' && item.webSocketDebuggerUrl);
+  if (!page) throw new Error('no page target');
+  const ws = new WebSocket(page.webSocketDebuggerUrl);
+  await new Promise((resolve, reject) => {
+    ws.addEventListener('open', resolve);
+    ws.addEventListener('error', () => reject(new Error('devtools socket failed')));
+  });
+  let next = 0;
+  const pending = new Map();
+  ws.addEventListener('message', (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.id && pending.has(msg.id)) {
+      pending.get(msg.id)(msg);
+      pending.delete(msg.id);
+    }
+  });
+  function send(method, params = {}) {
+    const id = ++next;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('cdp timeout ' + method)), 5000);
+      pending.set(id, (msg) => {
+        clearTimeout(timer);
+        if (msg.error) reject(new Error(method + ': ' + JSON.stringify(msg.error)));
+        else resolve(msg.result);
+      });
+      ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+  try {
+    return await fn(send);
+  } finally {
+    ws.close();
+  }
+}
+
 
 function session(authenticated) {
   return {
@@ -47,12 +105,37 @@ const forbidden = () => fail(403, 'SCOPE_MISSING', 'Synthetic scope failure.');
 function policy(code) {
   return fail(403, code, 'The change was refused.', 'Read the diff.', `kronik explain ${code}`);
 }
-function okProposal() {
+function proposal(status) {
   return {
     status: 200,
     body: {
-      id: 'p-1', status: 'running', fork: 'f-1', fork_lsn: 1, verified_through_lsn: 1,
+      id: 'p-1', status, fork: 'f-1', fork_lsn: 1, verified_through_lsn: 1,
       diff_hash: 'abc', kinds: [], unchanged: false, policy: 'open', approvals: [], approval_requests: [],
+    },
+  };
+}
+function okProposal() {
+  return proposal('evaluated');
+}
+function okDiff() {
+  const band = { p50: 0, p95: 0, p99: 0 };
+  const percentiles = { prod: band, fork: band };
+  return {
+    status: 200,
+    body: {
+      summary: {},
+      base: null,
+      code: null,
+      options: null,
+      grounding: [],
+      responses: { changed: 0, unchanged: 0, items: [] },
+      effects: { added: 0, removed: 0, changed: 0, items: [] },
+      state: { isolated: [], continuous: [] },
+      cumulative: { actors_changed: 0, items: [] },
+      causes: [],
+      errors: { introduced: 0, fixed: 0, new_orphans: 0, outcome_unknown: 0, items: [] },
+      resources: { fuel: percentiles, memory: percentiles, fuel_p99_change: 0, memory_p99_change: 0 },
+      samples: {},
     },
   };
 }
@@ -80,6 +163,10 @@ const cases = [
   { name: 'promote-unauthenticated', recipe: 'clear-policy', hash: '#proposals/p-1', code: 'UNAUTHENTICATED', session: () => okSession(), proposal: () => okProposal(), promote: () => fail(401, 'UNAUTHENTICATED', 'No valid token.', 'Send a token.') },
   { name: 'promote-scope-missing', recipe: 'clear-policy', hash: '#proposals/p-1', code: 'SCOPE_MISSING', session: () => okSession(), proposal: () => okProposal(), promote: () => fail(403, 'SCOPE_MISSING', 'Missing scope.', 'Use another token.') },
   { name: 'promote-bearer-approval', recipe: 'keep-policy-bearer', hash: '#proposals/p-1', code: 'APPROVAL_REQUIRED', session: (n) => n === 1 ? anonSession() : okSession(), proposal: () => okProposal(), promote: () => policy('APPROVAL_REQUIRED') },
+  { name: 'promote-hidden-running', recipe: 'hide-promote', hash: '#proposals/p-1', session: () => okSession(), proposal: () => proposal('running') },
+  { name: 'promote-hidden-failed', recipe: 'hide-promote', hash: '#proposals/p-1', session: () => okSession(), proposal: () => proposal('failed') },
+  { name: 'promote-enter-reason', recipe: 'enter-promote', hash: '#proposals/p-1', session: () => okSession(), proposal: () => okProposal(), promote: () => ({ status: 200, body: { dry_run: true } }) },
+  { name: 'promote-real-control', recipe: 'real-promote', hash: '#proposals/p-1', session: () => okSession(), proposal: () => okProposal(), promote: () => ({ status: 200, body: { dry_run: false, deployment: { epoch: 2, lsn: 3 } } }) },
 ];
 
 function driver() {
@@ -221,6 +308,43 @@ async function run() {
     await shownError();
     assert(field().value === '' && document.getElementById('view-content').childElementCount === 0, 'auth failure did not clear');
     assert(errorBox().textContent.includes(expected), 'auth code missing');
+  } else if (recipe === 'hide-promote') {
+    await waitFor(() => status().includes('OIDC: ' + PRINCIPAL), 'session');
+    await waitFor(() => document.getElementById('proposal-detail') && document.getElementById('view-content').getAttribute('aria-busy') === 'false', 'detail');
+    assert(!document.getElementById('promote-form') && !document.getElementById('promote-button'), 'promote offered');
+    assert(document.getElementById('view-content').textContent.includes('Promotion is not available'), 'notice missing');
+    assert(document.getElementById('approve-form'), 'approve form missing');
+  } else if (recipe === 'enter-promote' || recipe === 'real-promote') {
+    await waitFor(() => status().includes('OIDC: ' + PRINCIPAL), 'session');
+    await waitFor(() => {
+      const button = document.getElementById('promote-button');
+      return button && !button.disabled;
+    }, 'promote');
+    const dry = document.getElementById('promote-dry-run');
+    assert(dry.checked, 'dry-run not default on');
+    dry.checked = false;
+    dry.dispatchEvent(new Event('change'));
+    const button = document.getElementById('promote-button');
+    assert(button.textContent.includes('p-1') && button.textContent.includes('production will change'), 'button name');
+    const described = (button.getAttribute('aria-describedby') || '').split(' ').filter(Boolean).map(function (id) {
+      const node = document.getElementById(id);
+      return node ? node.textContent : '';
+    }).join(' ');
+    assert(described.includes('a real promotion changes production'), 'warning missing');
+    document.getElementById('promote-reason').value = recipe === 'enter-promote' ? 'Synthetic enter must not promote' : 'Synthetic real promotion';
+    document.getElementById('promote-reason').focus();
+    if (recipe === 'enter-promote') {
+      const pressed = await fetch('/press-enter', { method: 'POST' });
+      assert(pressed.ok, 'press-enter failed');
+      const ax = await pressed.json();
+      assert(ax.name && ax.name.includes('production will change') && ax.name.includes('p-1'), 'accessible name');
+      await sleep(400);
+      assert(document.getElementById('error').hidden, 'enter showed an error');
+      assert(!document.getElementById('promote-result').textContent, 'enter wrote a result');
+    } else {
+      button.click();
+      await waitFor(() => document.getElementById('promote-result').textContent.includes('Promote proposal result'), 'result');
+    }
   } else throw new Error('unknown recipe');
   assert(performance.getEntriesByType('navigation').length === 1, 'page reloaded');
 }
@@ -248,6 +372,14 @@ function expects(item, seen) {
     return seen.session === 2 && bearer(seen.authorization[1]) && seen.promote === 1 && bearer(seen.promoteAuth[0])
       && seen.proposal === 2 && seen.proposalAuth.every(bearer) && seen.pages === 1;
   }
+  if (item.recipe === 'hide-promote' || item.recipe === 'enter-promote') {
+    return none && seen.proposal === 1 && seen.promote === 0 && seen.pages === 1 && seen.session >= 1;
+  }
+  if (item.recipe === 'real-promote') {
+    const body = seen.promoteBodies && seen.promoteBodies[0];
+    return none && seen.promote === 1 && seen.pages === 1 && body && body.dry_run === false
+      && body.reason === 'Synthetic real promotion';
+  }
   return false;
 }
 
@@ -258,9 +390,11 @@ function replyBytes(reply) {
 
 async function runCase(origin, item) {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'kronik-ui-'));
+  activeProfile = profile;
   const args = [
     '--headless=new', '--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage',
     '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-sync',
+    '--remote-debugging-port=0',
     `--user-data-dir=${profile}`, `${origin}/ui/?case=${item.name}${item.hash || ''}`,
   ];
   const child = spawn(chromeBin, args, { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
@@ -283,7 +417,7 @@ async function runCase(origin, item) {
 async function main() {
   if (!fs.existsSync(chromeBin)) throw new Error(`chrome not found: ${chromeBin}`);
   let current = null;
-  const seen = { session: 0, actors: 0, proposal: 0, promote: 0, pages: 0, released: false, authorization: [], actorAuth: [], proposalAuth: [], promoteAuth: [], served: { session: 0, actors: 0 }, servedAuth: { session: [], actors: [] } };
+  const seen = { session: 0, actors: 0, proposal: 0, promote: 0, pages: 0, released: false, authorization: [], actorAuth: [], proposalAuth: [], promoteAuth: [], promoteBodies: [], served: { session: 0, actors: 0 }, servedAuth: { session: [], actors: [] } };
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (req.method === 'GET' && (url.pathname === '/ui' || url.pathname === '/ui/')) {
@@ -324,9 +458,33 @@ async function main() {
         if (global.currentResult) global.currentResult({ ...body, stderr: '', seen: {
           ...seen, authorization: [...seen.authorization], actorAuth: [...seen.actorAuth],
           proposalAuth: [...seen.proposalAuth], promoteAuth: [...seen.promoteAuth],
+          promoteBodies: [...seen.promoteBodies],
           served: { ...seen.served }, servedAuth: { session: [...seen.servedAuth.session], actors: [...seen.servedAuth.actors] },
         } });
       });
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/press-enter') {
+      (async () => {
+        try {
+          const name = await withPage(activeProfile, async (send) => {
+            await send('Accessibility.enable');
+            const tree = await send('Accessibility.getFullAXTree');
+            const button = (tree.nodes || []).find((node) => node.role && node.role.value === 'button' && String(node.name && node.name.value || '').includes('production will change'));
+            await send('Runtime.evaluate', { expression: "document.getElementById('promote-reason').focus()" });
+            await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+            await send('Input.dispatchKeyEvent', { type: 'char', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: String.fromCharCode(13) });
+            await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+            return button ? button.name.value : '';
+          });
+          await sleep(350);
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ name }));
+        } catch (error) {
+          res.writeHead(500, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+          res.end(String(error && error.message || error));
+        }
+      })();
       return;
     }
     if (!current) {
@@ -337,6 +495,7 @@ async function main() {
     const route = url.pathname === '/v1/auth/session' ? 'session'
       : url.pathname === '/v1/actors' ? 'actors'
       : url.pathname === '/v1/proposals/p-1' && req.method === 'GET' ? 'proposal'
+      : url.pathname === '/v1/proposals/p-1/diff' && req.method === 'GET' ? 'diff'
       : url.pathname === '/v1/proposals/p-1/promote' && req.method === 'POST' ? 'promote'
       : '';
     if (!route) {
@@ -344,7 +503,7 @@ async function main() {
       res.end(JSON.stringify({ error: { code: 'NOT_FOUND', message: url.pathname } }));
       return;
     }
-    seen[route] += 1;
+    if (route !== 'diff') seen[route] += 1;
     const authorization = req.headers.authorization || '';
     seen.authorization.push(authorization);
     if (route === 'actors') seen.actorAuth.push(authorization);
@@ -357,7 +516,7 @@ async function main() {
       res.destroy();
       return;
     }
-    const reply = current[route](seen[route], req.headers);
+    const reply = route === 'diff' ? okDiff() : current[route](seen[route], req.headers);
     if (reply.drop) {
       res.destroy();
       return;
@@ -371,7 +530,15 @@ async function main() {
       res.end(replyBytes(reply));
     };
     if (req.method === 'POST') {
-      req.on('end', send);
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        if (route === 'promote') {
+          try { seen.promoteBodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+          catch { seen.promoteBodies.push(null); }
+        }
+        send();
+      });
       req.resume();
       return;
     }
@@ -393,7 +560,7 @@ async function main() {
       seen.actorAuth = [];
       seen.proposalAuth = [];
       seen.promoteAuth = [];
-      seen.served = { session: 0, actors: 0 };
+      seen.promoteBodies = [];
       seen.servedAuth = { session: [], actors: [] };
       const result = await runCase(origin, item);
       const network = result.seen ? expects(item, result.seen) : false;
