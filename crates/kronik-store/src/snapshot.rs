@@ -926,21 +926,157 @@ pub fn deployment_code_hashes(
 /// Installs a snapshot directory as a branch's state: `state.db` and the
 /// actor databases are copied into `branch_dir` (`state.db`, `sql/`),
 /// replacing what is there. The daemon must not run on it.
+///
+/// The copies are staged and fsynced, and their directories fsynced, before
+/// the live tree is replaced. A failure before that directory fsync leaves
+/// the previous `state.db`.
 pub fn install(snapshot: &Path, branch_dir: &Path) -> Result<(), StoreError> {
-    let sql = branch_dir.join("sql");
-    if sql.exists() {
-        std::fs::remove_dir_all(&sql).map_err(io)?;
+    recover_interrupted_install(branch_dir)?;
+    let stage = branch_dir.join(INSTALL_STAGE);
+    #[cfg(test)]
+    INSTALL_SYNCS.with(|s| s.borrow_mut().clear());
+    let staged = (|| {
+        std::fs::create_dir_all(stage.join("sql")).map_err(io)?;
+        std::fs::copy(snapshot.join("state.db"), stage.join("state.db")).map_err(io)?;
+        copy_tree(&snapshot.join("sql"), &stage.join("sql"))?;
+        stamp_installed(snapshot, &stage.join("sql"))?;
+        sync_tree(&stage)?;
+        // The stage's name, before anything live is removed.
+        sync_path(branch_dir)
+    })();
+    if let Err(e) = staged {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err(e);
     }
-    for f in ["state.db", "state.db-wal", "state.db-shm"] {
-        let p = branch_dir.join(f);
-        if p.exists() {
-            std::fs::remove_file(&p).map_err(io)?;
+    publish_install(&stage, branch_dir)
+}
+
+/// A crash left these beside the live tree. Not state: a start opens
+/// `state.db` and `sql/`.
+const INSTALL_STAGE: &str = ".snapshot-install";
+const INSTALL_ASIDE: &str = ".snapshot-install-old";
+
+/// Puts back an actor tree [`install`] renamed aside and did not replace,
+/// and deletes a stage or old tree a crash left. The stage holds actor rows
+/// an erasure would not reach. Called before the store opens, including
+/// when this start does not install.
+pub fn recover_interrupted_install(branch_dir: &Path) -> Result<(), StoreError> {
+    let sql = branch_dir.join("sql");
+    let aside = branch_dir.join(INSTALL_ASIDE);
+    if aside.exists() && !sql.exists() {
+        std::fs::rename(&aside, &sql).map_err(io)?;
+        sync_path(branch_dir)?;
+        tracing::warn!("restored actor databases an interrupted snapshot install left aside");
+    } else if aside.exists() {
+        std::fs::remove_dir_all(&aside).map_err(io)?;
+        sync_path(branch_dir)?;
+    }
+    let stage = branch_dir.join(INSTALL_STAGE);
+    if stage.exists() {
+        std::fs::remove_dir_all(&stage).map_err(io)?;
+        sync_path(branch_dir)?;
+        tracing::info!("deleted a snapshot install a crash left unfinished");
+    }
+    Ok(())
+}
+
+fn publish_install(stage: &Path, branch_dir: &Path) -> Result<(), StoreError> {
+    // The old WAL is named for `state.db`. It must be durably gone before
+    // the replacement takes that name, or the next open would replay it
+    // into the snapshot's file.
+    for name in ["state.db-wal", "state.db-shm"] {
+        match std::fs::remove_file(branch_dir.join(name)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io(e)),
+            _ => {}
         }
     }
-    std::fs::create_dir_all(&sql).map_err(io)?;
-    std::fs::copy(snapshot.join("state.db"), branch_dir.join("state.db")).map_err(io)?;
-    copy_tree(&snapshot.join("sql"), &sql)?;
-    stamp_installed(snapshot, &sql)
+    sync_path(branch_dir)?;
+    std::fs::rename(stage.join("state.db"), branch_dir.join("state.db")).map_err(io)?;
+    let live_sql = branch_dir.join("sql");
+    let aside = branch_dir.join(INSTALL_ASIDE);
+    if live_sql.exists() {
+        std::fs::rename(&live_sql, &aside).map_err(io)?;
+    }
+    if let Err(e) = std::fs::rename(stage.join("sql"), &live_sql) {
+        if aside.exists() && !live_sql.exists() {
+            let _ = std::fs::rename(&aside, &live_sql);
+        }
+        return Err(io(e));
+    }
+    sync_path(branch_dir)?;
+    if aside.exists() {
+        std::fs::remove_dir_all(&aside).map_err(io)?;
+    }
+    std::fs::remove_dir_all(stage).map_err(io)?;
+    sync_path(branch_dir)
+}
+
+/// fsyncs every file under `dir`, then each directory, children first.
+fn sync_tree(dir: &Path) -> Result<(), StoreError> {
+    let mut dirs = vec![dir.to_path_buf()];
+    let mut i = 0;
+    while i < dirs.len() {
+        let current = dirs[i].clone();
+        for entry in std::fs::read_dir(&current).map_err(io)? {
+            let entry = entry.map_err(io)?;
+            let path = entry.path();
+            if entry.file_type().map_err(io)?.is_dir() {
+                dirs.push(path);
+            } else {
+                sync_path(&path)?;
+            }
+        }
+        i += 1;
+    }
+    for dir in dirs.iter().rev() {
+        sync_path(dir)?;
+    }
+    Ok(())
+}
+
+fn sync_path(path: &Path) -> Result<(), StoreError> {
+    #[cfg(test)]
+    {
+        if path.is_dir() && FAIL_INSTALL_DIR_SYNC.with(|c| c.get()) {
+            return Err(io(std::io::Error::other(
+                "injected failure before directory fsync",
+            )));
+        }
+        INSTALL_SYNCS.with(|s| s.borrow_mut().push(path.to_path_buf()));
+    }
+    std::fs::File::open(path)
+        .and_then(|f| f.sync_all())
+        .map_err(io)
+}
+
+#[cfg(test)]
+thread_local! {
+    static INSTALL_SYNCS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static FAIL_INSTALL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn install_syncs() -> Vec<PathBuf> {
+    INSTALL_SYNCS.with(|s| s.borrow().clone())
+}
+
+#[cfg(test)]
+struct FailInstallDirSync;
+
+#[cfg(test)]
+impl FailInstallDirSync {
+    fn arm() -> Self {
+        FAIL_INSTALL_DIR_SYNC.with(|c| c.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailInstallDirSync {
+    fn drop(&mut self) {
+        FAIL_INSTALL_DIR_SYNC.with(|c| c.set(false));
+    }
 }
 
 /// A snapshot is a consistent cut: every actor database in it is complete
@@ -959,6 +1095,17 @@ fn stamp_installed(snapshot: &Path, sql: &Path) -> Result<(), StoreError> {
             [lsn as i64],
         )
         .map_err(sqlite)?;
+        // The stamp is a WAL frame until it is checkpointed. The file
+        // `install` fsyncs has to hold the cut: a power loss drops the WAL.
+        let busy: i64 = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))
+            .map_err(sqlite)?;
+        if busy != 0 {
+            return Err(StoreError::Corrupt(format!(
+                "snapshot install: checkpoint of {} was busy",
+                path.display()
+            )));
+        }
         Ok(())
     })
 }
@@ -1706,5 +1853,139 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn applied_of(file: &Path) -> i64 {
+        Connection::open(file)
+            .unwrap()
+            .query_row("SELECT v FROM meta WHERE k = 'applied_lsn'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    /// A live branch at applied LSN 7, a snapshot of the same store at 100,
+    /// and a write-ahead log that must not be replayed into the replacement.
+    fn live_and_snapshot() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with(dir.path(), 100, &[("a/idle", 5)]);
+        let snap = dir.path().join("snap");
+        store.snapshot_to(&snap).unwrap();
+        drop(store);
+        let conn = Connection::open(dir.path().join("state.db")).unwrap();
+        conn.execute("UPDATE meta SET v = 7 WHERE k = 'applied_lsn'", [])
+            .unwrap();
+        // In the file, not only a WAL the next line replaces.
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+        drop(conn);
+        std::fs::write(dir.path().join("state.db-wal"), b"old-wal").unwrap();
+        (dir, snap)
+    }
+
+    /// Issue #218: the copy can fail before the directory fsync. The previous
+    /// `state.db` is still the live one, including its write-ahead log.
+    #[test]
+    fn a_failed_directory_fsync_leaves_the_previous_state_db() {
+        let (dir, snap) = live_and_snapshot();
+        let branch = dir.path();
+        let before = std::fs::read(branch.join("state.db")).unwrap();
+        let actor = actor_file(&branch.join("sql"), "a/idle");
+        let marker = marker_of(&actor);
+        let _fail = super::FailInstallDirSync::arm();
+        let err = install(&snap, branch).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected failure before directory fsync"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(branch.join("state.db")).unwrap(), before);
+        assert_eq!(
+            std::fs::read(branch.join("state.db-wal")).unwrap(),
+            b"old-wal"
+        );
+        assert_eq!(marker_of(&actor), marker);
+        assert!(!branch.join(".snapshot-install").exists());
+    }
+
+    /// The installed files and their directories are fsynced before `install`
+    /// returns, and the old write-ahead log is not left beside the new file.
+    /// The actor cut is in the database file, not only a WAL.
+    #[test]
+    fn install_fsyncs_the_replacement_before_it_replaces_the_live_tree() {
+        let (dir, snap) = live_and_snapshot();
+        let branch = dir.path();
+        install(&snap, branch).unwrap();
+        assert!(!branch.join("state.db-wal").exists());
+        assert!(!branch.join("state.db-shm").exists());
+        assert_eq!(applied_of(&branch.join("state.db")), 100);
+        assert!(!branch.join(".snapshot-install").exists());
+        assert!(!branch.join(".snapshot-install-old").exists());
+        let actor = actor_file(&branch.join("sql"), "a/idle");
+        let only = branch.join("only-the-file.db");
+        std::fs::copy(&actor, &only).unwrap();
+        assert_eq!(marker_of(&only), 100);
+
+        let syncs = super::install_syncs();
+        let staged_state = branch.join(".snapshot-install/state.db");
+        let staged_actor = branch.join(".snapshot-install").join(
+            actor_file(&snap.join("sql"), "a/idle")
+                .strip_prefix(&snap)
+                .unwrap(),
+        );
+        let state_at = syncs.iter().position(|p| p == &staged_state);
+        let actor_at = syncs.iter().position(|p| p == &staged_actor);
+        let actor_dir = syncs
+            .iter()
+            .position(|p| p == staged_actor.parent().unwrap());
+        let dir_at = syncs.iter().rposition(|p| p == branch);
+        assert!(
+            state_at.is_some() && actor_at.is_some() && actor_dir.is_some() && dir_at.is_some(),
+            "{syncs:?}"
+        );
+        let (state_at, actor_at, actor_dir, dir_at) = (
+            state_at.unwrap(),
+            actor_at.unwrap(),
+            actor_dir.unwrap(),
+            dir_at.unwrap(),
+        );
+        assert!(
+            actor_at < actor_dir && state_at < dir_at && actor_dir < dir_at,
+            "{syncs:?}"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_install_keeps_one_actor_tree_and_drops_the_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let branch = dir.path();
+        std::fs::write(branch.join("state.db"), b"live-state").unwrap();
+        let sql = branch.join("sql/ab");
+        std::fs::create_dir_all(&sql).unwrap();
+        std::fs::write(sql.join("actor.db"), b"live-rows").unwrap();
+        std::fs::rename(branch.join("sql"), branch.join(".snapshot-install-old")).unwrap();
+        let stage = branch.join(".snapshot-install/sql/ab");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("actor.db"), b"staged-rows").unwrap();
+
+        recover_interrupted_install(branch).unwrap();
+        assert_eq!(
+            std::fs::read(branch.join("sql/ab/actor.db")).unwrap(),
+            b"live-rows"
+        );
+        assert_eq!(
+            std::fs::read(branch.join("state.db")).unwrap(),
+            b"live-state"
+        );
+        assert!(!branch.join(".snapshot-install-old").exists());
+        assert!(!branch.join(".snapshot-install").exists());
+
+        std::fs::create_dir_all(branch.join(".snapshot-install-old")).unwrap();
+        std::fs::write(branch.join(".snapshot-install-old/leftover"), b"old").unwrap();
+        recover_interrupted_install(branch).unwrap();
+        assert!(branch.join("sql/ab/actor.db").exists());
+        assert!(!branch.join(".snapshot-install-old").exists());
     }
 }

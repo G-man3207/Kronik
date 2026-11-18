@@ -105,6 +105,12 @@ restore, a lost disk) or the log no longer holds the records after
 then the log is applied from `L + 1`. Without one: `STORAGE_CORRUPT`
 naming the gap.
 
+The install stages `state.db` and the actor databases, fsyncs each file and
+its directory, and only then replaces the live tree. A failure before that
+directory fsync leaves the previous `state.db`. When the snapshot has
+`secrets.db` and `keys/secrets.db` does not, that file is written with the
+same fsync-then-rename sequence before the start continues.
+
 *Which `applied_lsn`.* The start replays from the lowest applied LSN of
 `state.db` and of every actor database (`Store::replay_from`), because the
 files commit independently. An actor database's applied LSN is where its

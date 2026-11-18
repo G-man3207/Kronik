@@ -530,6 +530,10 @@ pub fn prepare_state(data: &Path, branch: &str) -> Result<Option<Lsn>, String> {
             "a bulk replay was interrupted; rebuilding state.db from the snapshot and the log"
         );
     }
+    // An install that died between renaming `sql/` aside and replacing it
+    // is put back first, and a stage a crash left is removed: it holds
+    // actor rows, and this start may not install.
+    kronik_store::snapshot::recover_interrupted_install(&branch_dir).map_err(|e| e.to_string())?;
     // Copies an interrupted integrity hash left (they hold actors' rows).
     let swept = kronik_store::snapshot::sweep_hash_copies(&branch_dir.join("sql"))
         .map_err(|e| e.to_string())?;
@@ -550,13 +554,10 @@ pub fn prepare_state(data: &Path, branch: &str) -> Result<Option<Lsn>, String> {
              snapshot, whose cut is complete for every database"
         );
     }
+    // Secrets before the state replace: a failed fsync leaves no
+    // `secrets.db`, and the previous state, so the next start retries both.
+    install_snapshot_secrets(&dir, data)?;
     kronik_store::snapshot::install(&dir, &branch_dir).map_err(|e| e.to_string())?;
-    let secrets = dir.join("secrets.db");
-    let keys = data.join("keys");
-    if secrets.exists() && !keys.join("secrets.db").exists() {
-        std::fs::create_dir_all(&keys).map_err(|e| e.to_string())?;
-        std::fs::copy(&secrets, keys.join("secrets.db")).map_err(|e| e.to_string())?;
-    }
     tracing::warn!(lsn = m.lsn, snapshot = %m.id, "installed a snapshot as the branch's state");
     Ok(Some(m.lsn))
 }
@@ -1498,3 +1499,21 @@ mod retention_tests;
 
 #[cfg(test)]
 mod plan_tests;
+
+#[cfg(test)]
+mod install_tests;
+
+/// `keys/secrets.db` from a snapshot, when that file is missing. The bytes
+/// are fsynced and the directory entry is fsynced before this returns; a
+/// failure leaves no file a later start would skip.
+fn install_snapshot_secrets(snapshot: &Path, data: &Path) -> Result<(), String> {
+    let src = snapshot.join("secrets.db");
+    let keys = data.join("keys");
+    let dest = keys.join("secrets.db");
+    if !src.exists() || dest.exists() {
+        return Ok(());
+    }
+    crate::durable::create_dir_all(data, &keys).map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(&src).map_err(|e| e.to_string())?;
+    write_synced(&dest, &bytes).map_err(|e| e.to_string())
+}
