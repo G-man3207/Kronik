@@ -324,9 +324,16 @@ that a turn generated from `random-bytes`.
   `mode = "acme"` (a certificate for `domains` by ACME TLS-ALPN-01 on the
   gateway's own port, renewed 30 days before expiry), since M6
   ([ADR 0009](../adr/0009-acme-instant-acme.md)). It does not authenticate
-  requests: every deployed route is open to whoever can reach the port. It
-  accepts request bodies up to 1 MiB. A client has 10 s to send a request
-  head and 30 s for its body. How many connections may be open at once
+  requests: every deployed route is open to whoever can reach the port. A
+  client has 10 s to send a request head. A kind whose code does not import
+  `blobs` accepts a body of at most 1 MiB, and that body must arrive within
+  30 s. A kind whose code imports `blobs` (the actor world does, so an SDK
+  actor does) accepts a body up to the kind's upload size, 64 MiB by default
+  (`kronik limits set <kind> --upload-size`). That body has no whole-body
+  deadline: a chunk must arrive within an idle timeout of 30 s, and once a
+  30 s grace has passed it must average `[gateway] upload_min_rate` (8 KiB/s).
+  At that rate a full upload holds the connection for hours. How many
+  connections may be open at once
   follows from the limit on open files (below). One client address may
   hold a quarter of them; a connection over that share gets
   `503 UNAVAILABLE` with `connection: close`. A reverse proxy carries many
