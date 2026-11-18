@@ -191,6 +191,8 @@ pub struct ProductionIndex {
     /// Set by [`ProductionIndex::reveal`] for a `--no-pii` fork. The cursor
     /// rewrites snapshot rows the same way revealed changesets were.
     pub no_pii: bool,
+    /// One snapshot image for every cursor of this index (#197).
+    pub(crate) snapshot: std::sync::OnceLock<std::sync::Arc<kronik_store::snapshot::SnapshotImage>>,
 }
 
 impl ProductionIndex {
@@ -213,7 +215,9 @@ impl ProductionIndex {
         to_lsn: Lsn,
     ) -> Result<ProductionIndex, LogError> {
         let first = base.as_ref().map_or(1, |b| b.lsn + 1);
-        let mut records = Vec::with_capacity(to_lsn.saturating_sub(first) as usize + 1);
+        // The LSN span is not the record count: reserving it allocates the
+        // retained log before a single record is read (#197).
+        let mut records = Vec::new();
         if to_lsn >= first {
             reader
                 .read(first, to_lsn, |c| {
@@ -331,6 +335,7 @@ impl ProductionIndex {
             erasures,
             sealer: std::sync::Arc::new(kronik_privacy::sealer::Sealer::plain()),
             no_pii: false,
+            snapshot: std::sync::OnceLock::new(),
         }
     }
 

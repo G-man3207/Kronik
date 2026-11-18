@@ -13,6 +13,7 @@ pub use actor::{
     FileOpener, Limits, MemOpener, Rows, SqlActor, SqlError, SqlResult, SqliteOpener, TableRows,
     TurnOpts, TurnSql, actor_file, canonical_hash_raw,
 };
+pub(crate) use ffi::{CowShare, arm_cow_vfs, cow_vfs_name, serialize_main};
 pub use rewrite::pseudonymize_changeset;
 
 use rusqlite::types::Value;

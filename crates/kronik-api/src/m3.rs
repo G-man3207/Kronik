@@ -290,20 +290,12 @@ impl Api {
                     ))
                 })?;
                 // The last LSN whose turn ran at or before that logical time.
-                let mut last = 0;
-                self.node
-                    .reader()
-                    .read(1, head, |c| {
-                        if let kronik_proto::Record::TurnRecord(r) = &c.record
-                            && r.logical_time_ms <= ms
-                        {
-                            last = c.lsn;
-                        }
-                        Ok(())
-                    })
+                // Segment marks skip every segment older than the one that
+                // contains it (#197).
+                let segments = self.node.store().db().segments().map_err(internal)?;
+                kronik_fork::window::last_lsn_at_or_before(self.node.reader(), &segments, head, ms)
                     .await
-                    .map_err(internal)?;
-                Ok(last)
+                    .map_err(internal)
             }
         }
     }

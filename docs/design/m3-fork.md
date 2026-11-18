@@ -19,7 +19,8 @@ is self-contained for the `kronik-policy` implementer.
 
 - **A fork is a branch** named `f-<12 hex>` (or `--name`), created at a
   fork point `fork_lsn` on `main` (`--at <lsn>`, `--at <RFC 3339 time>`: the
-  last LSN whose logical time is ≤ the time, or `now`: the applied LSN).
+  last LSN whose logical time is ≤ the time, found from `segments.last_time_ms`
+  without reading older segments, or `now`: the applied LSN).
 - **Storage.** `branches/<fork>/log/` holds the fork's own records; its
   first record is `BranchCreated {branch, parent_branch: "main", fork_lsn,
   no_pii, proposal_id, audit}` at LSN `fork_lsn + 1`. Fork LSNs continue
@@ -90,7 +91,9 @@ the root id).
 - **Parallelism.** Root inputs are partitioned into contiguous chunks, one
   per worker; each worker builds its own cursor (state at the fork point,
   then main's records up to its chunk) and runs its chunk in order of the
-  trees' first records.
+  trees' first records. The cursors share one read-only image of the base
+  snapshot; a page is copied only when that cursor writes it, so N workers
+  do not hold N copies of the snapshot.
   Results are merged in LSN order. Each root input's result depends only
   on (state at its LSN, its input, the fork's code, the recordings), so the
   diff is byte-identical with 1, 4 or 16 workers. A request for more workers

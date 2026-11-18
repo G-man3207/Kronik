@@ -317,9 +317,10 @@ pub fn memory_store() -> Result<Arc<Store>, ReplayError> {
 /// into memory, else an empty store.
 pub fn cursor(index: &ProductionIndex) -> Result<Arc<Store>, ReplayError> {
     let store = match &index.base {
-        Some(b) => Store::open_snapshot_in_memory(&b.dir)?,
+        Some(b) => shared_image(index, &b.dir)?.open()?,
         None => memory_store()?,
     };
+
     // Production's sealed SQL changesets are opened as they are applied.
     store.set_sealer(index.sealer.clone());
     if index.no_pii {
@@ -340,6 +341,22 @@ pub fn cursor(index: &ProductionIndex) -> Result<Arc<Store>, ReplayError> {
         }
     }
     Ok(store)
+}
+
+fn shared_image(
+    index: &ProductionIndex,
+    dir: &std::path::Path,
+) -> Result<std::sync::Arc<kronik_store::snapshot::SnapshotImage>, ReplayError> {
+    if let Some(image) = index.snapshot.get() {
+        return Ok(image.clone());
+    }
+    let loaded = std::sync::Arc::new(kronik_store::snapshot::SnapshotImage::load(dir)?);
+    if index.snapshot.set(loaded.clone()).is_err()
+        && let Some(winner) = index.snapshot.get()
+    {
+        return Ok(winner.clone());
+    }
+    Ok(loaded)
 }
 
 /// Applies production records up to and including `upto`.
