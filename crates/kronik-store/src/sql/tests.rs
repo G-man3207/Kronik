@@ -921,6 +921,248 @@ fn scrubbing_covers_blob_cells_and_binary_secrets() {
     );
 }
 
+/// #198: a turn that uses a secret and does not write SQL does not run `instr`.
+#[test]
+fn a_read_only_sql_turn_does_not_scrub() {
+    let mut a = actor("no-write");
+    let (_, res) = commit(
+        &mut a,
+        &opts(1, 1, true),
+        &["CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)"],
+        1,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let text = "sk-live-0123456789";
+    let (_, res) = commit(
+        &mut a,
+        &opts(2, 2, false),
+        &[&format!("INSERT INTO notes(body) VALUES ('{text}')")],
+        2,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    a.begin_turn(&opts(3, 3, false)).unwrap();
+    a.query("SELECT body FROM notes", &[]).unwrap();
+    assert_eq!(a.scrub(&[("api", text.as_bytes())]).unwrap(), 0);
+    assert_eq!(a.last_scrub_fullscan_steps, 0);
+    a.end_turn(true).unwrap();
+    a.begin_turn(&opts(4, 4, false)).unwrap();
+    let rows = a.query("SELECT body FROM notes", &[]).unwrap();
+    a.end_turn(false).unwrap();
+    assert_eq!(rows.values, [[Value::Text(text.into())]]);
+}
+
+/// #198: the first write that sees a secret removes it from cells that turn
+/// did not write, and a rebuild applies the same replacement.
+#[test]
+fn the_first_write_that_sees_a_secret_scrubs_untouched_cells() {
+    let mut a = actor("once");
+    let schema = ["CREATE TABLE keys (id INTEGER PRIMARY KEY, t TEXT, b BLOB)"];
+    let (schema_turn, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let text = "sk-live-0123456789";
+    let binary: &[u8] = &[0x00, 0xff, 0x10, 0x80, 0x7f, 0x01];
+    a.begin_turn(&opts(2, 2, false)).unwrap();
+    a.execute(
+        "INSERT INTO keys(t, b) VALUES (?1, ?2)",
+        &[
+            Value::Text(format!("x{text}y")),
+            Value::Blob([&b"\x00\x01"[..], binary, &b"\x02"[..]].concat()),
+        ],
+    )
+    .unwrap();
+    let seed = a.end_turn(true).unwrap();
+    a.apply(&seed, 2, &BTreeSet::new()).unwrap();
+    a.begin_turn(&opts(3, 3, false)).unwrap();
+    a.execute("INSERT INTO keys(t) VALUES ('other')", &[])
+        .unwrap();
+    let changed = a
+        .scrub(&[("api", text.as_bytes()), ("bin", binary)])
+        .unwrap();
+    assert!(changed >= 2, "the untouched text and blob cells");
+    assert!(
+        a.last_scrub_fullscan_steps > 0,
+        "the first sighting did not scan"
+    );
+    let scan = a.end_turn(true).unwrap();
+    a.apply(&scan, 3, &BTreeSet::new()).unwrap();
+    a.begin_turn(&opts(4, 4, false)).unwrap();
+    let rows = a.query("SELECT t, b FROM keys ORDER BY id", &[]).unwrap();
+    a.end_turn(false).unwrap();
+    assert_eq!(
+        rows.values[0][0],
+        Value::Text("x[secret:api]y".into()),
+        "the untouched text cell kept the secret"
+    );
+    assert!(
+        !holds(&blob_of(&rows.values[0][1]), binary),
+        "the untouched blob cell kept the secret"
+    );
+    let mut rebuilt = actor("once-rebuilt");
+    for (i, t) in [&schema_turn, &seed, &scan].into_iter().enumerate() {
+        let mut t = t.clone();
+        t.whole.clear();
+        rebuilt.apply(&t, i as u64 + 1, &BTreeSet::new()).unwrap();
+    }
+    rebuilt.begin_turn(&opts(5, 5, false)).unwrap();
+    let again = rebuilt
+        .query("SELECT t, b FROM keys ORDER BY id", &[])
+        .unwrap();
+    rebuilt.end_turn(false).unwrap();
+    assert_eq!(again.values, rows.values);
+}
+
+/// #198: once a secret has been seen, SQL end of a one-row update does not
+/// scan a large table, and a text or blob cell that turn wrote loses the secret.
+#[test]
+fn a_seen_secret_is_scrubbed_from_written_cells_without_scanning() {
+    let mut a = actor("seen");
+    let schema = [
+        "CREATE TABLE keys (id INTEGER PRIMARY KEY, t TEXT, b BLOB)",
+        "CREATE TABLE loose (body TEXT)",
+    ];
+    let (_, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let text = "sk-live-0123456789";
+    let binary: &[u8] = &[0x00, 0xff, 0x10, 0x80, 0x7f, 0x01];
+    a.begin_turn(&opts(2, 2, false)).unwrap();
+    a.execute("INSERT INTO keys(t) VALUES ('warm')", &[])
+        .unwrap();
+    a.execute("INSERT INTO loose(body) VALUES ('warm')", &[])
+        .unwrap();
+    a.scrub(&[("api", text.as_bytes()), ("bin", binary)])
+        .unwrap();
+    let warm = a.end_turn(true).unwrap();
+    a.apply(&warm, 2, &BTreeSet::new()).unwrap();
+
+    a.begin_turn(&opts(3, 3, false)).unwrap();
+    for i in 0..1_000 {
+        a.execute(
+            "INSERT INTO keys(t) VALUES (?1)",
+            &[Value::Text(format!("row-{i}"))],
+        )
+        .unwrap();
+    }
+    a.execute(
+        "INSERT INTO keys(t, b) VALUES (?1, ?2)",
+        &[
+            Value::Text(format!("x{text}y")),
+            Value::Blob(text.as_bytes().to_vec()),
+        ],
+    )
+    .unwrap();
+    let seeded = a.end_turn(true).unwrap();
+    a.apply(&seeded, 3, &BTreeSet::new()).unwrap();
+
+    a.begin_turn(&opts(4, 4, false)).unwrap();
+    let written_blob = [&b"aa"[..], binary, &b"bb"[..]].concat();
+    a.execute(
+        "INSERT INTO keys(t, b) VALUES (?1, ?2)",
+        &[
+            Value::Text(format!("pre-{text}-post")),
+            Value::Blob(written_blob.clone()),
+        ],
+    )
+    .unwrap();
+    a.execute(
+        "INSERT INTO loose(body) VALUES (?1)",
+        &[Value::Text(text.into())],
+    )
+    .unwrap();
+    let changed = a
+        .scrub(&[("api", text.as_bytes()), ("bin", binary)])
+        .unwrap();
+    assert!(
+        changed >= 3,
+        "the written text cell, its blob, and the rowid-table cell"
+    );
+    assert_eq!(a.last_scrub_fullscan_steps, 0, "SQL end scanned the table");
+    let t = a.end_turn(true).unwrap();
+    assert!(
+        !holds(&t.whole, text.as_bytes()),
+        "the log holds the text secret"
+    );
+    assert!(!holds(&t.whole, binary), "the log holds the binary secret");
+    for (_, cs) in &t.changesets {
+        assert!(!holds(cs, text.as_bytes()), "the log holds the text secret");
+        assert!(!holds(cs, binary), "the log holds the binary secret");
+    }
+    a.apply(&t, 4, &BTreeSet::new()).unwrap();
+    a.begin_turn(&opts(5, 5, false)).unwrap();
+    let rows = a
+        .query(
+            "SELECT t, b FROM keys WHERE t LIKE 'pre-%' OR t LIKE 'x%' ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    let loose = a
+        .query("SELECT body FROM loose ORDER BY rowid", &[])
+        .unwrap();
+    a.end_turn(false).unwrap();
+    assert_eq!(rows.values.len(), 2);
+    assert_eq!(rows.values[0][0], Value::Text(format!("x{text}y")));
+    assert!(holds(&blob_of(&rows.values[0][1]), text.as_bytes()));
+    assert_eq!(
+        rows.values[1][0],
+        Value::Text("pre-[secret:api]-post".into())
+    );
+    assert_eq!(
+        blob_of(&rows.values[1][1]),
+        [&b"aa"[..], b"[secret:bin]", &b"bb"[..]].concat()
+    );
+    assert!(!holds(&blob_of(&rows.values[1][1]), binary));
+    assert_eq!(
+        loose.values,
+        [
+            vec![Value::Text("warm".into())],
+            vec![Value::Text("[secret:api]".into())]
+        ]
+    );
+}
+
+/// #198: the one-time scan is remembered in the actor database, so a restart
+/// does not scan again.
+#[test]
+fn reopening_an_actor_does_not_rescan_a_scrubbed_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let opener = FileOpener {
+        root: dir.path().to_path_buf(),
+    };
+    let text: &[u8] = b"sk-live-0123456789";
+    {
+        let mut a = SqlActor::open(&opener, "notes/n", Limits::default()).unwrap();
+        let (_, res) = commit(
+            &mut a,
+            &opts(1, 1, true),
+            &["CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)"],
+            1,
+        );
+        assert!(res.iter().all(Result::is_ok), "{res:?}");
+        a.begin_turn(&opts(2, 2, false)).unwrap();
+        a.execute("INSERT INTO notes(body) VALUES ('warm')", &[])
+            .unwrap();
+        a.scrub(&[("api", text)]).unwrap();
+        let t = a.end_turn(true).unwrap();
+        a.apply(&t, 2, &BTreeSet::new()).unwrap();
+    }
+    let mut a = SqlActor::open(&opener, "notes/n", Limits::default()).unwrap();
+    a.begin_turn(&opts(3, 3, false)).unwrap();
+    a.execute("UPDATE notes SET body = 'later' WHERE id = 1", &[])
+        .unwrap();
+    a.scrub(&[("api", text)]).unwrap();
+    assert_eq!(
+        a.last_scrub_fullscan_steps, 0,
+        "a restart scanned for a secret already scrubbed"
+    );
+    a.end_turn(false).unwrap();
+}
+
+fn blob_of(value: &Value) -> Vec<u8> {
+    match value {
+        Value::Blob(b) => b.clone(),
+        other => panic!("expected a blob, got {other:?}"),
+    }
+}
+
 /// Found with #72: an erasure applied while a turn of the actor has its
 /// savepoint open. Before, the deletes ran inside the savepoint, so the
 /// turn's end rolled them back (and the applied LSN with them): the

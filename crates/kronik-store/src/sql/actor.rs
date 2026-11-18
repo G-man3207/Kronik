@@ -7,7 +7,7 @@
 //! daemon), so production, recovery and replay build the database the same
 //! way. DDL is recorded as text and replayed before the changeset.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex};
 
 use chacha20::ChaCha20Rng;
@@ -425,6 +425,52 @@ fn authorize(s: &mut Shared, ctx: &AuthContext<'_>) -> Authorization {
     }
 }
 
+/// A full scan whose changeset has not been applied yet. Confirmed only when
+/// `apply` sees that changeset, so a discarded turn does not skip the next scan.
+struct PendingScrub {
+    secrets: Vec<(String, [u8; 32])>,
+    cs_hash: Option<blake3::Hash>,
+}
+
+fn secret_id(name: &str, value: &[u8]) -> (String, [u8; 32]) {
+    (name.to_owned(), *blake3::hash(value).as_bytes())
+}
+
+fn changeset_hash(changesets: &[(Option<String>, Vec<u8>)]) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    for (subject, cs) in changesets {
+        let subject = subject.as_deref().unwrap_or("");
+        hasher.update(&(subject.len() as u64).to_le_bytes());
+        hasher.update(subject.as_bytes());
+        hasher.update(&(cs.len() as u64).to_le_bytes());
+        hasher.update(cs);
+    }
+    hasher.finalize()
+}
+
+fn load_scrubbed(conn: &Connection) -> rusqlite::Result<HashSet<(String, [u8; 32])>> {
+    let exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_schema WHERE name = '_kronik_scrubbed'",
+        [],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(HashSet::new());
+    }
+    let mut st = conn.prepare("SELECT name, value_hash FROM _kronik_scrubbed")?;
+    let rows = st.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut out = HashSet::new();
+    for row in rows {
+        let (name, hash) = row?;
+        if let Ok(hash) = <[u8; 32]>::try_from(hash) {
+            out.insert((name, hash));
+        }
+    }
+    Ok(out)
+}
+
 /// One actor's SQL database. Field order matters: the session must be
 /// dropped before the connection, and the connection before its VFS.
 pub struct SqlActor {
@@ -450,6 +496,14 @@ pub struct SqlActor {
     /// the connection. [`SqlActor::end_turn`] and [`SqlActor::abort_turn`]
     /// checkpoint once the connection is idle (H11).
     erasure_checkpoint: bool,
+    /// Secret values already removed from every user cell (name, blake3 of
+    /// the value). A later turn scrubs only the rows it wrote (#198).
+    seen_secrets: HashSet<(String, [u8; 32])>,
+    /// The one-time scan of this turn, until its changeset is applied.
+    pending_scrub: Option<PendingScrub>,
+    /// Full-scan steps of the last `scrub`. A seen secret must not scan.
+    #[cfg(test)]
+    pub last_scrub_fullscan_steps: u64,
 }
 
 fn lock(m: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
@@ -621,6 +675,7 @@ impl SqlActor {
                 Some(e),
             )
         })?;
+        let seen_secrets = load_scrubbed(&conn)?;
         Ok(Self {
             session: None,
             conn,
@@ -636,6 +691,10 @@ impl SqlActor {
             page_size: page_size.max(512) as u64,
             deferred_erasures: Vec::new(),
             erasure_checkpoint: false,
+            seen_secrets,
+            pending_scrub: None,
+            #[cfg(test)]
+            last_scrub_fullscan_steps: 0,
         })
     }
 
@@ -678,6 +737,7 @@ impl SqlActor {
         self.steps = 0;
         self.default_subject = opts.default_subject.clone();
         self.poisoned = false;
+        self.pending_scrub = None;
         ffi::reset_last_insert_rowid(&self.conn);
         let max = if opts.max_bytes == 0 {
             self.limits.max_bytes
@@ -877,6 +937,11 @@ impl SqlActor {
         let erased = self.run_deferred_erasures();
         self.checkpoint_pending_erasure();
         let t = res?;
+        if commit {
+            self.note_captured_scrub(&t.changesets);
+        } else {
+            self.pending_scrub = None;
+        }
         unlimit?;
         erased?;
         Ok(t)
@@ -890,68 +955,274 @@ impl SqlActor {
         Ok(())
     }
 
-    /// Replaces every exact occurrence of each secret value in the text and
-    /// blob cells of every user table with `[secret:<name>]`, inside the
-    /// turn, so neither the turn's changeset (the log) nor the actor database
-    /// holds the value (#37). A blob cell stays a blob; a value that is not
-    /// UTF-8 can only be in a blob. Returns the number of changed cells.
+    /// Replaces exact occurrences of each secret with `[secret:<name>]`
+    /// inside the turn, so the captured changeset and the applied database
+    /// do not hold the value (#37, #198).
+    ///
+    /// A turn that wrote nothing does not run `instr`. The first write that
+    /// presents a secret value scans every user cell once; that scan is part
+    /// of this turn's changeset. A later turn replaces the secret only in
+    /// the rows it wrote. A blob cell stays a blob. A value that is not
+    /// UTF-8 can only be in a blob. Values shorter than 4 bytes are skipped.
+    /// Returns the number of changed cells.
     pub fn scrub<N: AsRef<str>, V: AsRef<[u8]>>(
         &mut self,
         secrets: &[(N, V)],
     ) -> Result<u64, String> {
+        #[cfg(test)]
+        {
+            self.last_scrub_fullscan_steps = 0;
+        }
         if self.session.is_none() || self.poisoned {
             return Ok(0);
         }
+        let secrets: Vec<(&str, &[u8])> = secrets
+            .iter()
+            .map(|(name, value)| (name.as_ref(), value.as_ref()))
+            .filter(|(_, value)| value.len() >= 4)
+            .collect();
+        if secrets.is_empty() {
+            return Ok(0);
+        }
         lock(&self.shared).host = true;
-        let tables: Vec<String> = self
-            .conn
+        let Some(session) = self.session.as_ref() else {
+            return Ok(0);
+        };
+        let cs = session.changeset().map_err(|e| e.to_string())?;
+        if cs.is_empty() {
+            return Ok(0);
+        }
+        let changes = ffi::changes(&cs).map_err(|e| e.to_string())?;
+        let (unseen, seen): (Vec<_>, Vec<_>) = secrets
+            .iter()
+            .copied()
+            .partition(|(name, value)| !self.seen_secrets.contains(&secret_id(name, value)));
+        let mut changed = 0u64;
+        if !unseen.is_empty() {
+            changed += self.scrub_tables(&unseen)?;
+            self.pending_scrub = Some(PendingScrub {
+                secrets: unseen
+                    .iter()
+                    .map(|(name, value)| secret_id(name, value))
+                    .collect(),
+                cs_hash: None,
+            });
+        }
+        if !seen.is_empty() {
+            changed += self.scrub_written(&changes, &seen)?;
+        }
+        Ok(changed)
+    }
+
+    fn note_captured_scrub(&mut self, changesets: &[(Option<String>, Vec<u8>)]) {
+        if changesets.is_empty() {
+            self.pending_scrub = None;
+            return;
+        }
+        if let Some(pending) = &mut self.pending_scrub {
+            pending.cs_hash = Some(changeset_hash(changesets));
+        }
+    }
+
+    fn matching_pending(
+        &self,
+        changesets: &[(Option<String>, Vec<u8>)],
+    ) -> Option<Vec<(String, [u8; 32])>> {
+        let pending = self.pending_scrub.as_ref()?;
+        let expected = pending.cs_hash?;
+        (expected == changeset_hash(changesets)).then(|| pending.secrets.clone())
+    }
+
+    fn write_scrubbed(&self, secrets: &[(String, [u8; 32])]) -> Result<(), String> {
+        lock(&self.shared).host = true;
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS _kronik_scrubbed (
+                    name TEXT NOT NULL,
+                    value_hash BLOB NOT NULL,
+                    PRIMARY KEY (name, value_hash))",
+            )
+            .map_err(|e| e.to_string())?;
+        for (name, hash) in secrets {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO _kronik_scrubbed (name, value_hash) VALUES (?1, ?2)",
+                    rusqlite::params![name, hash.as_slice()],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn scrub_tables(&mut self, secrets: &[(&str, &[u8])]) -> Result<u64, String> {
+        let tables = self.user_tables()?;
+        let mut changed = 0u64;
+        for table in &tables {
+            changed += self.scrub_one_table(table, secrets)?;
+        }
+        Ok(changed)
+    }
+
+    fn scrub_written(
+        &mut self,
+        changes: &[Change],
+        secrets: &[(&str, &[u8])],
+    ) -> Result<u64, String> {
+        let mut changed = 0u64;
+        for change in changes {
+            if change.op == Op::Delete {
+                continue;
+            }
+            match self.row_key(change)? {
+                Some(key) => changed += self.scrub_row(&change.table, &key, secrets)?,
+                // No key to name the row: scan that table, not the others.
+                None => changed += self.scrub_one_table(&change.table, secrets)?,
+            }
+        }
+        Ok(changed)
+    }
+
+    fn scrub_one_table(&mut self, table: &str, secrets: &[(&str, &[u8])]) -> Result<u64, String> {
+        let cols = self.table_columns(table)?;
+        let mut changed = 0u64;
+        for col in &cols {
+            changed += self.scrub_column(table, col, secrets, "", &[])?;
+        }
+        Ok(changed)
+    }
+
+    fn scrub_row(
+        &mut self,
+        table: &str,
+        key: &[(String, Value)],
+        secrets: &[(&str, &[u8])],
+    ) -> Result<u64, String> {
+        let cols = self.table_columns(table)?;
+        let pred = key
+            .iter()
+            .enumerate()
+            .map(|(i, (col, _))| format!("{} = ?{}", quote_ident(col), i + 3))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let extra = format!("{pred} AND ");
+        let params: Vec<Value> = key.iter().map(|(_, value)| value.clone()).collect();
+        let mut changed = 0u64;
+        for col in &cols {
+            changed += self.scrub_column(table, col, secrets, &extra, &params)?;
+        }
+        Ok(changed)
+    }
+
+    fn scrub_column(
+        &mut self,
+        table: &str,
+        col: &str,
+        secrets: &[(&str, &[u8])],
+        extra_where: &str,
+        extra: &[Value],
+    ) -> Result<u64, String> {
+        let table = quote_ident(table);
+        let col = quote_ident(col);
+        let mut changed = 0u64;
+        for (name, value) in secrets {
+            let marker = format!("[secret:{name}]");
+            if let Ok(text) = std::str::from_utf8(value) {
+                let sql = format!(
+                    "UPDATE {table} SET {col} = replace({col}, ?1, ?2) \
+                     WHERE {extra_where}typeof({col}) = 'text' AND instr({col}, ?1) > 0"
+                );
+                let mut params = vec![Value::Text(text.to_owned()), Value::Text(marker.clone())];
+                params.extend(extra.iter().cloned());
+                changed += self.exec_scrub(&sql, &params)?;
+            }
+            // A blob needle makes instr() compare bytes. The host's replace
+            // answers a blob, byte for byte.
+            let sql = format!(
+                "UPDATE {table} SET {col} = {SCRUB_REPLACE}({col}, ?1, ?2) \
+                 WHERE {extra_where}typeof({col}) = 'blob' AND instr({col}, ?1) > 0"
+            );
+            let mut params = vec![Value::Blob(value.to_vec()), Value::Text(marker)];
+            params.extend(extra.iter().cloned());
+            changed += self.exec_scrub(&sql, &params)?;
+        }
+        Ok(changed)
+    }
+
+    fn exec_scrub(&mut self, sql: &str, params: &[Value]) -> Result<u64, String> {
+        lock(&self.shared).host = true;
+        let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
+        let n = stmt
+            .execute(rusqlite::params_from_iter(params.iter()))
+            .map_err(|e| e.to_string())? as u64;
+        #[cfg(test)]
+        {
+            self.last_scrub_fullscan_steps = self.last_scrub_fullscan_steps.saturating_add(
+                u64::try_from(stmt.get_status(StatementStatus::FullscanStep)).unwrap_or(0),
+            );
+        }
+        Ok(n)
+    }
+
+    fn user_tables(&self) -> Result<Vec<String>, String> {
+        lock(&self.shared).host = true;
+        self.conn
             .prepare(
                 "SELECT name FROM sqlite_schema WHERE type = 'table' \
                  AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
                  AND name NOT LIKE '\\_kronik%' ESCAPE '\\' ORDER BY name",
             )
             .and_then(|mut st| st.query_map([], |r| r.get(0))?.collect())
-            .map_err(|e| e.to_string())?;
-        let mut changed = 0u64;
-        for t in &tables {
-            let cols: Vec<String> = self
-                .conn
-                .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
-                .and_then(|mut st| st.query_map([t], |r| r.get(0))?.collect())
-                .map_err(|e| e.to_string())?;
-            let table = t.replace('"', "\"\"");
-            for c in &cols {
-                let col = c.replace('"', "\"\"");
-                for (name, value) in secrets {
-                    let marker = format!("[secret:{}]", name.as_ref());
-                    let bytes = value.as_ref();
-                    if bytes.len() < 4 {
-                        continue;
-                    }
-                    if let Ok(v) = std::str::from_utf8(bytes) {
-                        let q = format!(
-                            "UPDATE \"{table}\" SET \"{col}\" = replace(\"{col}\", ?1, ?2) \
-                             WHERE typeof(\"{col}\") = 'text' AND instr(\"{col}\", ?1) > 0"
-                        );
-                        changed += self
-                            .conn
-                            .execute(&q, rusqlite::params![v, marker])
-                            .map_err(|e| e.to_string())? as u64;
-                    }
-                    // With a blob needle instr() compares bytes; the replace
-                    // is the host's, byte for byte, and answers a blob.
-                    let q = format!(
-                        "UPDATE \"{table}\" SET \"{col}\" = {SCRUB_REPLACE}(\"{col}\", ?1, ?2) \
-                         WHERE typeof(\"{col}\") = 'blob' AND instr(\"{col}\", ?1) > 0"
-                    );
-                    changed += self
-                        .conn
-                        .execute(&q, rusqlite::params![bytes, marker])
-                        .map_err(|e| e.to_string())? as u64;
-                }
-            }
+            .map_err(|e| e.to_string())
+    }
+
+    fn table_columns(&self, table: &str) -> Result<Vec<String>, String> {
+        lock(&self.shared).host = true;
+        self.conn
+            .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+            .and_then(|mut st| st.query_map([table], |r| r.get(0))?.collect())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Primary key of a live row the session changed, as it is now.
+    fn row_key(&self, change: &Change) -> Result<Option<Vec<(String, Value)>>, String> {
+        if change.op == Op::Delete {
+            return Ok(None);
         }
-        Ok(changed)
+        let rowid_table = self.limits.track_rowid_tables
+            && !self
+                .has_explicit_pk(&change.table)
+                .map_err(|e| e.to_string())?;
+        let names = self.table_columns(&change.table)?;
+        let mut key = Vec::new();
+        for (index, is_pk) in change.pk.iter().enumerate() {
+            if !is_pk {
+                continue;
+            }
+            let col = if rowid_table {
+                if index == 0 {
+                    "rowid".to_string()
+                } else {
+                    names.get(index - 1).cloned().ok_or_else(|| {
+                        format!("changeset column {index} of {} has no name", change.table)
+                    })?
+                }
+            } else {
+                names.get(index).cloned().ok_or_else(|| {
+                    format!("changeset column {index} of {} has no name", change.table)
+                })?
+            };
+            let Some(value) = change
+                .new
+                .get(index)
+                .cloned()
+                .flatten()
+                .or_else(|| change.old.get(index).cloned().flatten())
+            else {
+                return Ok(None);
+            };
+            key.push((col, to_sql(&value)));
+        }
+        Ok((!key.is_empty()).then_some(key))
     }
 
     fn end_turn_inner(&mut self, commit: bool) -> Result<TurnSql, String> {
@@ -1077,6 +1348,11 @@ impl SqlActor {
                 .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)
                 .map_err(|e| e.to_string())?;
         }
+        let pending = if erased.is_empty() {
+            self.matching_pending(&t.changesets)
+        } else {
+            None
+        };
         let r = (|| {
             for ddl in &t.ddl {
                 self.conn
@@ -1104,6 +1380,9 @@ impl SqlActor {
                 .prepare_cached("UPDATE _kronik_meta SET v = ?1 WHERE k = 'applied_lsn'")
                 .and_then(|mut st| st.execute([lsn as i64]))
                 .map_err(|e| e.to_string())?;
+            if let Some(secrets) = &pending {
+                self.write_scrubbed(secrets)?;
+            }
             Ok(())
         })();
         if toggle
@@ -1124,6 +1403,12 @@ impl SqlActor {
         self.host_batch(end).map_err(|e| e.to_string())?;
         if !t.ddl.is_empty() {
             self.subject_cols.clear();
+        }
+        if r.is_ok()
+            && let Some(secrets) = pending
+        {
+            self.seen_secrets.extend(secrets);
+            self.pending_scrub = None;
         }
         r
     }
