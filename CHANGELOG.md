@@ -5,6 +5,13 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- `fork create --at <RFC 3339>` uses the last turn at or before that time
+  when a closed configuration-only segment sits between that turn and a
+  later one. The segment mark is a turn-time high-water mark, so the
+  configuration segment kept the earlier turn's time, the search started
+  there, saw the later turn first, and returned LSN 0. A time before
+  every turn is still 0, and a time after the latest turn is still that
+  turn's LSN.
 - A committed SQL turn that used a secret no longer scans every column of
   every table before the turn can commit. The first write that sees a
   secret value scans once, and that replacement is in the turn's changeset.

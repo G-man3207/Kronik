@@ -2,7 +2,10 @@
 //!
 //! Logical time does not go backwards ([`kronik_core::time`]). A segment's
 //! `last_time_ms` is the high-water mark at its last applied record, so a
-//! segment whose mark is below `T` cannot hold a turn at or after `T`.
+//! segment whose mark is below `T` cannot hold a turn at or after `T`. A
+//! non-turn record does not move the mark. A timestamp search that then
+//! sees only a later turn walks older segments until it finds the turn or
+//! the log starts (#217).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -106,8 +109,10 @@ pub async fn last_lsn_at_or_before(
     let from = timestamp_start(segments, &starts, ms);
     match scan_until(reader, from, head, ms).await? {
         Scan::Found(lsn) => Ok(lsn),
-        Scan::Exceeded => Ok(0),
-        Scan::Empty => walk_back(reader, &starts, from, ms).await,
+        // Empty: the read has no turn. Exceeded: its first turn is after
+        // `ms`. A configuration-only segment keeps an older mark, so that
+        // is not proof nothing earlier exists (#217).
+        Scan::Empty | Scan::Exceeded => walk_back(reader, &starts, from, ms).await,
     }
 }
 
@@ -138,8 +143,8 @@ fn timestamp_start(segments: &[(Lsn, Lsn, u64)], log_starts: &[Lsn], ms: u64) ->
         if i == 0 {
             return segments[0].0;
         }
-        // The previous segment holds every turn still at or below `ms`,
-        // unless the crossing segment itself has earlier turns. Start there.
+        // The crossing segment's mark is its last turn, which is past `ms`,
+        // but it may hold earlier turns. Start one segment before it.
         return segments[i - 1].0;
     }
     segments.last().map(|(start, _, _)| *start).unwrap_or(1)
@@ -194,8 +199,9 @@ async fn walk_back(
         let upto = starts[idx + 1] - 1;
         match scan_until(reader, starts[idx], upto, ms).await? {
             Scan::Found(lsn) => return Ok(lsn),
-            Scan::Exceeded => return Ok(0),
-            Scan::Empty => {}
+            // This segment's first turn is after `ms`, or it has none.
+            // An older segment can still hold the turn (#217).
+            Scan::Empty | Scan::Exceeded => {}
         }
     }
     Ok(0)
