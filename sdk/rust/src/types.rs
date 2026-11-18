@@ -197,8 +197,9 @@ impl HttpRequest {
     }
 
     /// The first query parameter called `name`, percent-decoded (`+` is a
-    /// space): `query_param("after")` is `Some("7")` for `?after=7&limit=10`.
-    /// `None` if it is missing or not UTF-8 after decoding.
+    /// space). A malformed `%` stays as it is and `;` is data, not a
+    /// separator. `None` if it is missing or not UTF-8 after decoding.
+    /// `query_param("after")` is `Some("7")` for `?after=7&limit=10`.
     pub fn query_param(&self, name: &str) -> Option<String> {
         self.query
             .split('&')
@@ -562,6 +563,32 @@ mod tests {
         assert_eq!(q("q=100%25&x=%zz%4", "x").as_deref(), Some("%zz%4"));
         assert_eq!(q("q=%ff", "q"), None);
         assert_eq!(q("", "q"), None);
+    }
+
+    #[test]
+    fn query_param_matches_the_sdk_contract() {
+        let q = |query: &str, name: &str| {
+            HttpRequest {
+                method: "GET".into(),
+                path: "/".into(),
+                query: query.into(),
+                params: vec![],
+                headers: vec![],
+                body: HttpBody::Inline(vec![]),
+            }
+            .query_param(name)
+        };
+        assert_eq!(q("q=a+b%2Fc", "q").as_deref(), Some("a b/c"));
+        assert_eq!(q("x=%zz%4", "x").as_deref(), Some("%zz%4"));
+        assert_eq!(q("q=%ff", "q"), None);
+        assert_eq!(q("flag", "flag").as_deref(), Some(""));
+        assert_eq!(
+            q("redir=http://x.com/p;jsessionid=1", "redir").as_deref(),
+            Some("http://x.com/p;jsessionid=1")
+        );
+        // A bad value is missing; it does not hide a sibling parameter.
+        assert_eq!(q("ok=1&q=%ff", "ok").as_deref(), Some("1"));
+        assert_eq!(q("ok=1&q=%ff", "q"), None);
     }
 
     #[test]

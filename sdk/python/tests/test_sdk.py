@@ -278,6 +278,18 @@ class BodyTest(unittest.TestCase):
         self.assertEqual(req.header("content-type"), "text/plain")
         self.assertEqual(req.json(), {"k": [1]})
 
+    def test_query_param_matches_the_sdk_contract(self):
+        def q(query, name):
+            return Request(http_input(query=query).value).query_param(name)
+
+        self.assertEqual(q("q=a+b%2Fc", "q"), "a b/c")
+        self.assertEqual(q("x=%zz%4", "x"), "%zz%4")
+        self.assertIsNone(q("q=%ff", "q"))
+        self.assertEqual(q("flag", "flag"), "")
+        self.assertEqual(q("redir=http://x.com/p;jsessionid=1", "redir"), "http://x.com/p;jsessionid=1")
+        self.assertEqual(q("ok=1&q=%ff", "ok"), "1")
+        self.assertIsNone(q("ok=1&q=%ff", "q"))
+
     def test_messages_and_actor_refs(self):
         self.assertEqual(wit_message({"name": "n"}, types), types.Message("n", "", b"", []))
         self.assertEqual(wit_message({"name": "n", "body": {"n": 1}}, types), types.Message("n", "application/json", b'{"n":1}', []))

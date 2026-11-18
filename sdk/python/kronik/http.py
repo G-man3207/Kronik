@@ -3,7 +3,7 @@
 
 import json as _json
 from dataclasses import dataclass
-from urllib.parse import parse_qsl
+from urllib.parse import unquote_plus
 
 from .errors import KronikError
 
@@ -88,6 +88,15 @@ def _header(headers, name):
     return next((v for n, v in headers if n.lower() == lower), None)
 
 
+def _percent_decode(value):
+    """`%XX` and `+` (a space). A malformed `%` stays. None if not UTF-8."""
+    # parse_qsl replaces invalid UTF-8, and strict mode fails the whole query.
+    try:
+        return unquote_plus(value, errors="strict")
+    except UnicodeDecodeError:
+        return None
+
+
 class Request:
     """An HTTP request routed to the actor by one of its manifest's routes.
 
@@ -120,8 +129,15 @@ class Request:
         return self.params.get(name)
 
     def query_param(self, name):
-        """The first query parameter called `name`, decoded, or None."""
-        return next((v for n, v in parse_qsl(self.query, keep_blank_values=True) if n == name), None)
+        """The first query parameter called `name`, percent-decoded (`+` is a space), or None.
+
+        A malformed `%` stays and `;` is data. None if it is missing or not UTF-8.
+        """
+        for pair in self.query.split("&"):
+            raw_name, _, raw_value = pair.partition("=")
+            if _percent_decode(raw_name) == name:
+                return _percent_decode(raw_value)
+        return None
 
     def header(self, name):
         """The first header called `name`, ignoring case, or None."""

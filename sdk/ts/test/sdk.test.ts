@@ -103,6 +103,25 @@ test('bodies, JSON and requests', () => {
   assert.deepEqual(out.body, { tag: 'inline', val: new TextEncoder().encode('{"amount":100}') });
 });
 
+test('query parameters match the SDK contract', () => {
+  const q = (query: string, name: string) =>
+    new Request({
+      method: 'GET',
+      path: '/',
+      query,
+      params: [],
+      headers: [],
+      body: { tag: 'inline', val: new Uint8Array() },
+    }).queryParam(name);
+  assert.equal(q('q=a+b%2Fc', 'q'), 'a b/c');
+  assert.equal(q('x=%zz%4', 'x'), '%zz%4');
+  assert.equal(q('q=%ff', 'q'), undefined);
+  assert.equal(q('flag', 'flag'), '');
+  assert.equal(q('redir=http://x.com/p;jsessionid=1', 'redir'), 'http://x.com/p;jsessionid=1');
+  assert.equal(q('ok=1&q=%ff', 'ok'), '1');
+  assert.equal(q('ok=1&q=%ff', 'q'), undefined);
+});
+
 // ComponentizeJS hands over list<u8> values from another realm.
 test('bytes from another realm are bytes', () => {
   const foreign = runInNewContext('new Uint8Array([0, 1, 2, 3, 4]).subarray(1, 4)') as Uint8Array;

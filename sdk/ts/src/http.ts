@@ -149,6 +149,43 @@ export function json<T>(bytes: Uint8Array, what: string, topic: string): T {
   }
 }
 
+/** `%XX` and `+` (a space). A malformed `%` stays. Missing if not UTF-8. */
+function percentDecode(s: string): string | undefined {
+  // URLSearchParams turns invalid UTF-8 into U+FFFD instead of missing.
+  const bytes = encoder.encode(s);
+  const out = new Uint8Array(bytes.length);
+  let n = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if (b === 0x2b) {
+      out[n++] = 0x20;
+    } else if (b === 0x25 && i + 2 < bytes.length) {
+      const high = hexDigit(bytes[i + 1]);
+      const low = hexDigit(bytes[i + 2]);
+      if (high !== undefined && low !== undefined) {
+        out[n++] = (high << 4) | low;
+        i += 2;
+        continue;
+      }
+      out[n++] = 0x25;
+    } else {
+      out[n++] = b;
+    }
+  }
+  try {
+    return decoder.decode(out.subarray(0, n));
+  } catch {
+    return undefined;
+  }
+}
+
+function hexDigit(b: number): number | undefined {
+  if (b >= 0x30 && b <= 0x39) return b - 0x30;
+  if (b >= 0x41 && b <= 0x46) return b - 0x37;
+  if (b >= 0x61 && b <= 0x66) return b - 0x57;
+  return undefined;
+}
+
 /** An HTTP request routed to the actor by one of its manifest's routes. */
 export class Request {
   readonly method: string;
@@ -190,9 +227,18 @@ export class Request {
     return this.params[name];
   }
 
-  /** The first query parameter called `name`, decoded. */
+  /**
+   * The first query parameter called `name`, percent-decoded (`+` is a space).
+   * A malformed `%` stays and `;` is data. Missing if absent or not UTF-8.
+   */
   queryParam(name: string): string | undefined {
-    return new URLSearchParams(this.query).get(name) ?? undefined;
+    for (const pair of this.query.split('&')) {
+      const eq = pair.indexOf('=');
+      const rawName = eq < 0 ? pair : pair.slice(0, eq);
+      const rawValue = eq < 0 ? '' : pair.slice(eq + 1);
+      if (percentDecode(rawName) === name) return percentDecode(rawValue);
+    }
+    return undefined;
   }
 
   /** The first header called `name`, ignoring case. */
