@@ -109,7 +109,8 @@ impl Rate {
 /// A parsed capability string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Capability {
-    /// `http:<host>` or `http:*.<suffix>`.
+    /// `http:<host>` or `http:*.<suffix>`. An IPv6 literal is stored without
+    /// brackets. A port is not part of the capability.
     Http(String),
     Foreign(String),
     Secret(String),
@@ -129,15 +130,7 @@ impl Capability {
             return None;
         }
         match kind {
-            "http" => {
-                let host = target.to_ascii_lowercase();
-                let bare = host.strip_prefix("*.").unwrap_or(&host);
-                let ok = !bare.is_empty()
-                    && bare
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'));
-                ok.then_some(Capability::Http(host))
-            }
+            "http" => http_target(target).ok().map(Capability::Http),
             "foreign" => {
                 let name = target.to_ascii_lowercase();
                 crate::foreign::valid_name(&name).then_some(Capability::Foreign(name))
@@ -165,16 +158,136 @@ impl Capability {
 
 /// How specifically an `http:` pattern matches `host`: `None` for no match,
 /// higher is more specific (exact beats any wildcard, longer suffixes beat
-/// shorter ones). A wildcard never matches its apex.
+/// shorter ones). A wildcard never matches its apex. Brackets on an IPv6
+/// literal are ignored, so a grant and a fetch name the same host.
 pub fn http_match(pattern: &str, host: &str) -> Option<usize> {
-    let host = host.to_ascii_lowercase();
+    let host = http_capability_host(host);
     match pattern.strip_prefix("*.") {
-        Some(suffix) => (host.len() > suffix.len() + 1
-            && host.ends_with(suffix)
-            && host.as_bytes()[host.len() - suffix.len() - 1] == b'.')
-            .then_some(suffix.len()),
-        None => (pattern == host).then_some(usize::MAX),
+        Some(suffix) => {
+            let suffix = http_capability_host(suffix);
+            (host.len() > suffix.len() + 1
+                && host.ends_with(suffix.as_str())
+                && host.as_bytes()[host.len() - suffix.len() - 1] == b'.')
+                .then_some(suffix.len())
+        }
+        None => (http_capability_host(pattern) == host).then_some(usize::MAX),
     }
+}
+
+/// Host spelling of an `http:` grant. `Authority::host` keeps the brackets of
+/// an IPv6 literal; grants and denials do not, so both spell the host the same way.
+pub fn http_capability_host(host: &str) -> String {
+    let host = host.to_ascii_lowercase();
+    match host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        // `[example.com]` is not an IPv6 literal; stripping it would widen `http:example.com`.
+        Some(inner) if ipv6_literal(inner) => inner.to_owned(),
+        _ => host,
+    }
+}
+
+/// `Some` when `capability` is an `http:` target a grant must refuse because
+/// it names a port. The message says ports are not part of the capability.
+pub fn http_capability_rejection(capability: &str) -> Option<String> {
+    let target = capability.strip_prefix("http:")?;
+    matches!(http_target(target), Err(HttpReject::Port))
+        .then(|| format!("{capability:?} includes a port; ports are not part of the capability"))
+}
+
+enum HttpReject {
+    Port,
+    Invalid,
+}
+
+/// `http:` target, lowercased, with IPv6 brackets removed. A `:port` suffix
+/// on a hostname or a bracketed literal is [`HttpReject::Port`].
+fn http_target(target: &str) -> Result<String, HttpReject> {
+    let host = target.to_ascii_lowercase();
+    let (wildcard, body) = if let Some(rest) = host.strip_prefix("*.") {
+        if rest.is_empty() {
+            return Err(HttpReject::Invalid);
+        }
+        (true, rest)
+    } else {
+        (false, host.as_str())
+    };
+    if let Some(inner) = body.strip_prefix('[') {
+        if wildcard {
+            return Err(HttpReject::Invalid);
+        }
+        let Some((inner, after)) = inner.split_once(']') else {
+            return Err(HttpReject::Invalid);
+        };
+        if !after.is_empty() {
+            return Err(if port_suffix(after) {
+                HttpReject::Port
+            } else {
+                HttpReject::Invalid
+            });
+        }
+        if !ipv6_literal(inner) {
+            return Err(HttpReject::Invalid);
+        }
+        return Ok(inner.to_owned());
+    }
+    if body.contains(['[', ']']) {
+        return Err(HttpReject::Invalid);
+    }
+    if host_port(body) {
+        return Err(HttpReject::Port);
+    }
+    if !host_body(body) {
+        return Err(HttpReject::Invalid);
+    }
+    if wildcard {
+        Ok(format!("*.{body}"))
+    } else {
+        Ok(body.to_owned())
+    }
+}
+
+fn port_suffix(after: &str) -> bool {
+    after
+        .strip_prefix(':')
+        .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A hostname or IPv4 address with one `:` and a numeric port. An IPv6
+/// literal has more than one colon, so it is not a port.
+fn host_port(body: &str) -> bool {
+    let Some((name, port)) = body.split_once(':') else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.contains(':')
+        && !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn host_body(body: &str) -> bool {
+    if body.contains('%') {
+        return ipv6_literal(body);
+    }
+    !body.is_empty()
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))
+}
+
+// Zone id kept as the http crate spells it (`%25eth0`), not decoded.
+fn ipv6_literal(body: &str) -> bool {
+    let (addr, zone) = match body.split_once('%') {
+        Some((addr, zone)) => (addr, Some(zone)),
+        None => (body, None),
+    };
+    addr.parse::<std::net::Ipv6Addr>().is_ok()
+        && zone.is_none_or(|z| {
+            !z.is_empty()
+                && z.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'%'))
+        })
 }
 
 /// What a fork does with an unmatched `crypto.hmac-sha256` or
@@ -788,6 +901,67 @@ mod tests {
         assert!(Capability::parse("connection:send").is_none());
         assert_eq!(Delivery::default_for("get"), Delivery::ReplaySafe);
         assert_eq!(Delivery::default_for("POST"), Delivery::Unsafe);
+    }
+
+    /// An IPv6 literal is the same capability with or without brackets, and
+    /// a port is not a capability. Lookup uses the fetch host, brackets included.
+    #[test]
+    fn ipv6_literals_match_and_ports_are_rejected() {
+        assert_eq!(
+            Capability::parse("http:[::1]").map(|c| c.render()),
+            Some("http:::1".into())
+        );
+        assert_eq!(
+            Capability::parse("http:[2001:DB8::1]").map(|c| c.render()),
+            Some("http:2001:db8::1".into())
+        );
+        assert_eq!(
+            Capability::parse("http:::1").map(|c| c.render()),
+            Some("http:::1".into())
+        );
+        assert_eq!(
+            Capability::parse("http:[fe80::1%25eth0]").map(|c| c.render()),
+            Some("http:fe80::1%25eth0".into())
+        );
+        for cap in [
+            "http:example.com:8443",
+            "http:[::1]:8443",
+            "http:127.0.0.1:9",
+            "http:*.example.com:443",
+        ] {
+            assert!(Capability::parse(cap).is_none(), "{cap}");
+            let why = http_capability_rejection(cap).unwrap_or_default();
+            assert!(
+                why.contains("ports are not part of the capability"),
+                "{cap}: {why}"
+            );
+        }
+        assert!(Capability::parse("http:[example.com]").is_none());
+        assert!(Capability::parse("http:[foo:bar]").is_none());
+        assert!(Capability::parse("http:foo%bar").is_none());
+        assert_eq!(
+            Capability::parse("http:[::ffff:127.0.0.1]").map(|c| c.render()),
+            Some("http:::ffff:127.0.0.1".into())
+        );
+        assert_eq!(http_capability_host("[example.com]"), "[example.com]");
+        assert!(http_match("example.com", "[example.com]").is_none());
+        assert!(http_capability_rejection("http:ftp").is_none());
+        let fetched = crate::http::parse_url("http://[::1]/").unwrap().host;
+        assert_eq!(http_capability_host(&fetched), "::1");
+        let zone = crate::http::parse_url("http://[fe80::1%25eth0]/")
+            .unwrap()
+            .host;
+        assert_eq!(http_capability_host(&zone), "fe80::1%25eth0");
+        assert_eq!(http_match("fe80::1%25eth0", &zone), Some(usize::MAX));
+        assert_eq!(http_match("::1", &fetched), Some(usize::MAX));
+        assert_eq!(http_match("[::1]", "::1"), Some(usize::MAX));
+        let mut c = Config::default();
+        c.apply(&grant(1, "http:::1", pb::GrantOp::Grant, None));
+        assert_eq!(
+            c.http_grant("billing", &fetched).unwrap().capability,
+            "http:::1"
+        );
+        assert!(c.http_grant("billing", "[2001:db8::1]").is_none());
     }
 
     #[test]

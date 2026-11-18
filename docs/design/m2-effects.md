@@ -43,8 +43,11 @@ turn's gate:
 1. **Capability.** The grant is looked up in the configuration of the
    turn's epoch (`TurnBegin.config_epoch`), so re-runs and forks see the
    same answer. `http-client.fetch` needs `http:<host>` (exact, or the most
-   specific `*.suffix` wildcard; a wildcard never matches the apex);
-   a secret header or `crypto.*` needs `secret:<name>`; `secrets.reveal`
+   specific `*.suffix` wildcard; a wildcard never matches the apex). An
+   IPv6 literal is matched without URI brackets, so `http:[::1]` and a
+   fetch to `http://[::1]/` are the capability `http:::1`. A port in the
+   capability is refused: ports are not part of it. A secret header or
+   `crypto.*` needs `secret:<name>`; `secrets.reveal`
    needs `secret-reveal:<name>`. Without it the guest gets
    `denied("CAPABILITY_NOT_GRANTED")` and an `EffectRecord`
    with status `DENIED` goes into the turn record (deterministic from the

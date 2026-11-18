@@ -1436,7 +1436,15 @@ impl TurnFx {
                 .cloned()
         };
         let Some(grant) = grant else {
-            let e = not_granted(&cap_target);
+            let named = if foreign {
+                cap_target.clone()
+            } else {
+                format!(
+                    "http:{}",
+                    kronik_effects::config::http_capability_host(&target.host)
+                )
+            };
+            let e = not_granted(&named);
             let withheld = if foreign {
                 "foreign:[withheld]"
             } else {
