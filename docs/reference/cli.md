@@ -145,7 +145,7 @@ without a file the defaults below apply.
 | `--http-listen <ADDR>` | `server.http_listen` | `127.0.0.1:8080`; `$KRONIK_HTTP_LISTEN` |
 | `--api-socket <PATH>` | `server.api_socket` | `/run/kronik/api.sock`; `$KRONIK_API_SOCKET` |
 | `--api-listen <ADDR>` | `server.api_listen` | off; `$KRONIK_API_LISTEN` (the JSON API and MCP over TCP, every request with a bearer token) |
-| `--admin-listen <ADDR>` | `server.admin_listen` | `127.0.0.1:9464`; `$KRONIK_ADMIN_LISTEN` (`/metrics` and `/healthz`) |
+| `--admin-listen <ADDR>` | `server.admin_listen` | `127.0.0.1:9464`; `$KRONIK_ADMIN_LISTEN`. With TLS: `/ui/`, same-origin `/v1`, `/metrics` and `/healthz` on the gateway certificate. Plain HTTP: `/metrics` and `/healthz` only |
 | `--gateway-timeout-ms <MS>` | `gateway.timeout` | 30 seconds |
 | `--master-key-file <PATH>` | `keys.master_key_file` | For the file source: `<data dir>/keys/master.key`; `$KRONIK_MASTER_KEY_FILE`. `$KRONIK_MASTER_KEY`, when set, is the key itself (64 hex characters) and no file is read or created. File flags and the variable conflict; KMS sources refuse both. Configure KMS with `[keys] source` and its provider table, not this flag |
 | `--disk-reserve <SIZE>` | `log.disk_reserve` | `512MiB`; `$KRONIK_DISK_RESERVE`. Below this much free space new inputs and changes are refused; `0B` turns it off |
@@ -174,11 +174,14 @@ $ kronik serve --api-listen 0.0.0.0:7443
 2026-10-25T05:51:41.350726Z ERROR kronik: kronik serve stopped error="server.api_listen = \"0.0.0.0:7443\" is not a loopback address and [tls] is off: bearer tokens would cross the network in the clear; turn TLS on or listen on 127.0.0.1"
 ```
 
-**Metrics and health (M6).** `GET /healthz` on the admin address answers
-200 with `{"applied_lsn","status":"ok"}` while the node runs (plus
-`"low_disk":true` below `[log] disk_reserve`), and 503 after a storage
-failure. `GET /metrics` gives the Prometheus text format. When the admin
-port is taken, Kronik serves anyway and logs a warning.
+**Metrics and health (M6).** With TLS, the admin address serves the embedded
+`/ui/`, the same-origin public `/v1` router, `/metrics` and `/healthz`, using
+the gateway certificate. Plain HTTP serves only `/metrics` and `/healthz`. A
+bind failure is fatal when OIDC is configured; otherwise the daemon warns and
+continues without this listener. `GET /healthz` answers 200 with
+`{"applied_lsn","status":"ok"}` while the node runs (plus `"low_disk":true`
+below `[log] disk_reserve`), and 503 after a storage failure. `GET /metrics`
+gives the Prometheus text format.
 
 ```text
 $ curl -s http://127.0.0.1:9464/healthz

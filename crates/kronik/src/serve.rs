@@ -31,7 +31,10 @@ pub struct ServeArgs {
     /// Address of the HTTP gateway [file: server.http_listen].
     #[arg(long, env = "KRONIK_HTTP_LISTEN")]
     http_listen: Option<SocketAddr>,
-    /// Address of embedded UI, /metrics and /healthz [file: server.admin_listen].
+    /// Admin listener [file: server.admin_listen]. With TLS: /ui/, same-origin
+    /// /v1, /metrics and /healthz on the gateway certificate. Plain HTTP:
+    /// /metrics and /healthz only. A bind failure is fatal when OIDC is
+    /// configured; otherwise the daemon warns and continues.
     #[arg(long, env = "KRONIK_ADMIN_LISTEN")]
     admin_listen: Option<SocketAddr>,
     /// Unix socket of the JSON API, mode 0660 [file: server.api_socket].
