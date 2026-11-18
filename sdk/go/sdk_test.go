@@ -152,6 +152,35 @@ func TestBodiesAndRequests(t *testing.T) {
 	}
 }
 
+func TestQueryParamContract(t *testing.T) {
+	req := func(query string) *Request {
+		return newRequest(&types.HTTPRequest{
+			Method: "GET", Path: "/", Query: query,
+			Params:  cm.ToList([][2]string{}),
+			Headers: cm.ToList([]types.Header{}),
+			Body:    types.HTTPBodyInline(cm.ToList([]byte{})),
+		}, nil)
+	}
+	cases := []struct {
+		query, name, want string
+		ok                bool
+	}{
+		{"q=a+b%2Fc", "q", "a b/c", true},
+		{"x=%zz%4", "x", "%zz%4", true},
+		{"q=%ff", "q", "", false},
+		{"flag", "flag", "", true},
+		{"redir=http://x.com/p;jsessionid=1", "redir", "http://x.com/p;jsessionid=1", true},
+		{"ok=1&q=%ff", "ok", "1", true},
+		{"ok=1&q=%ff", "q", "", false},
+	}
+	for _, c := range cases {
+		got, ok := req(c.query).QueryParam(c.name)
+		if ok != c.ok || got != c.want {
+			t.Errorf("QueryParam(%q) %q = %q, %v; want %q, %v", c.query, c.name, got, ok, c.want, c.ok)
+		}
+	}
+}
+
 func TestDescribe(t *testing.T) {
 	a := &Actor{Kind: "counter", SchemaVersion: 1, Routes: []Route{{"GET", "/c/{key}"}}}
 	m := a.describe()
