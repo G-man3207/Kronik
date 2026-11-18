@@ -656,6 +656,180 @@ impl Store {
     }
 }
 
+static NEXT_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
+static NEXT_CURSOR: AtomicU64 = AtomicU64::new(1);
+
+/// One read-only image of a snapshot directory. Replay workers open cursors
+/// on it; a page is copied only when that cursor writes (#197).
+pub struct SnapshotImage {
+    id: u64,
+    share: std::sync::Arc<crate::sql::CowShare>,
+    state: std::sync::Arc<[u8]>,
+    actors: Vec<(String, std::sync::Arc<[u8]>)>,
+    image_bytes: u64,
+}
+
+impl SnapshotImage {
+    /// A consistent image of `dir`, including a WAL a raw file read would miss.
+    pub fn load(dir: &Path) -> Result<SnapshotImage, StoreError> {
+        let state = std::sync::Arc::<[u8]>::from(consistent_image(&dir.join("state.db"))?);
+        let names = actor_names(&dir.join("state.db"))?;
+        let mut actors = Vec::with_capacity(names.len());
+        let mut image_bytes = state.len() as u64;
+        for name in names {
+            let file = actor_file(&dir.join("sql"), &name);
+            let bytes = std::sync::Arc::<[u8]>::from(consistent_image(&file)?);
+            image_bytes += bytes.len() as u64;
+            actors.push((name, bytes));
+        }
+        Ok(SnapshotImage {
+            id: NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed),
+            share: std::sync::Arc::new(crate::sql::CowShare::new()),
+            state,
+            actors,
+            image_bytes,
+        })
+    }
+
+    /// Bytes of the shared image. Workers must not multiply this by their count.
+    pub fn image_bytes(&self) -> u64 {
+        self.image_bytes
+    }
+
+    /// Pages copied because a cursor wrote. Shared across every cursor of this image.
+    pub fn private_bytes(&self) -> u64 {
+        self.share.private_bytes()
+    }
+
+    /// A writable cursor. Its unmodified pages stay in [`Self::image_bytes`].
+    pub fn open(&self) -> Result<std::sync::Arc<Store>, StoreError> {
+        let tag = NEXT_CURSOR.fetch_add(1, Ordering::Relaxed);
+        let state_path = format!("kcow{}c{tag}s", self.id);
+        self.share.bind(&state_path, self.state.clone());
+        let conn = Connection::open_with_flags_and_vfs(
+            &state_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            crate::sql::cow_vfs_name(),
+        )
+        .map_err(sqlite)?;
+        conn.execute_batch(
+            "PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=MEMORY; PRAGMA mmap_size=0;",
+        )
+        .map_err(sqlite)?;
+        let opener = CowOpener {
+            share: self.share.clone(),
+            id: self.id,
+            tag,
+            actors: self.actors.iter().cloned().collect(),
+        };
+        Store::open_in(
+            conn,
+            crate::sql::SqlPool::new(
+                std::sync::Arc::new(opener),
+                crate::sql::Limits::default(),
+                usize::MAX,
+            ),
+            Some(self.share.clone()),
+        )
+    }
+}
+
+struct CowOpener {
+    share: std::sync::Arc<crate::sql::CowShare>,
+    id: u64,
+    tag: u64,
+    actors: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
+}
+
+impl crate::sql::SqliteOpener for CowOpener {
+    fn open(&self, actor: &str, vfs: &str) -> rusqlite::Result<Connection> {
+        let path = format!(
+            "kcow{}c{}a{}",
+            self.id,
+            self.tag,
+            blake3::hash(actor.as_bytes()).to_hex()
+        );
+        // An actor created after the snapshot has no image. An empty
+        // database is what an in-memory cursor opened for it.
+        if let Some(bytes) = self.actors.get(actor) {
+            self.share.bind(&path, bytes.clone());
+        }
+        crate::sql::arm_cow_vfs(vfs).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let conn = Connection::open_with_flags_and_vfs(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            vfs,
+        )?;
+        conn.execute_batch(
+            "PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=MEMORY; PRAGMA mmap_size=0;",
+        )?;
+        Ok(conn)
+    }
+
+    fn exists(&self, actor: &str) -> bool {
+        self.actors.contains_key(actor)
+    }
+}
+
+fn consistent_image(path: &Path) -> Result<Vec<u8>, StoreError> {
+    let src = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(sqlite)?;
+    let mut mem = Connection::open_in_memory().map_err(sqlite)?;
+    {
+        let backup = rusqlite::backup::Backup::new(&src, &mut mem).map_err(sqlite)?;
+        backup
+            .run_to_completion(64, std::time::Duration::ZERO, None)
+            .map_err(sqlite)?;
+    }
+    crate::sql::serialize_main(&mem).map_err(StoreError::Corrupt)
+}
+
+fn actor_names(state_db: &Path) -> Result<Vec<String>, StoreError> {
+    let conn = Connection::open_with_flags(state_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(sqlite)?;
+    let mut st = conn
+        .prepare("SELECT kind, key FROM actors WHERE sql = 1 ORDER BY kind, key")
+        .map_err(sqlite)?;
+    let rows = st
+        .query_map([], |r| {
+            Ok(format!(
+                "{}/{}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?
+            ))
+        })
+        .map_err(sqlite)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(sqlite)
+}
+
+#[cfg(test)]
+mod shared_image {
+    use super::*;
+
+    #[test]
+    fn four_cursors_do_not_copy_the_snapshot_four_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = vec![0xABu8; 2 << 20];
+        crate::db::StateDb::write_blob_db(&dir.path().join("state.db"), &blob).unwrap();
+        let image = SnapshotImage::load(dir.path()).unwrap();
+        assert!(image.image_bytes() >= blob.len() as u64);
+        let cursors: Vec<_> = (0..4).map(|_| image.open().unwrap()).collect();
+        for store in &cursors {
+            assert_eq!(store.db().blob_for_test().unwrap(), blob);
+        }
+        let private = image.private_bytes();
+        assert!(
+            private < image.image_bytes(),
+            "4 cursors copied the snapshot: private {private} image {}",
+            image.image_bytes()
+        );
+    }
+}
+
 /// The subject keys the snapshot's state needs ([`crate::db::sealed_keys`]),
 /// read without changing the snapshot.
 pub fn sealed_keys(snapshot: &Path) -> Result<crate::db::SubjectKeys, StoreError> {

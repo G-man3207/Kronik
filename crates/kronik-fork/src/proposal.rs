@@ -750,7 +750,6 @@ impl Proposals {
         head: Lsn,
         window_ms: u64,
     ) -> Result<(Lsn, Option<diff::WindowCut>), ApiError> {
-        // Every root input the log (or its oldest usable snapshot) holds.
         let rebase = self.node.last_rebase()?;
         let base = crate::pick_base(&self.data, self.node.branch(), head, true, rebase)
             .map_err(|m| ApiError::new(ErrorCode::BadRequest, m))?;
@@ -762,14 +761,18 @@ impl Proposals {
                 .find(|(_, m)| m.lsn == b.lsn)
                 .map(|(_, m)| m.logical_time_ms)
         });
-        let index = ProductionIndex::load_from(self.node.reader(), base, from, head)
-            .await
-            .map_err(internal)?;
-        let Some(newest) = index.roots.last() else {
+        // Segment marks say which closed segments are older than the window.
+        // The tail read finds the newest root; the retained span is not decoded.
+        let segments = self.node.store().db().segments().map_err(internal)?;
+        let found =
+            crate::window::discover_window(self.node.reader(), &segments, head, window_ms, from)
+                .await
+                .map_err(internal)?;
+        let Some(newest) = found.roots.last() else {
             return Ok((head, None));
         };
         let start = newest.logical_time_ms.saturating_sub(window_ms);
-        let mut fork_lsn = index
+        let mut fork_lsn = found
             .roots
             .iter()
             .find(|r| r.logical_time_ms >= start)
@@ -785,7 +788,7 @@ impl Proposals {
         // oldest point a fork may take.
         if let Some(cutoff) = self.node.retention_cutoff()?
             && start < cutoff
-            && let Some(first) = index.roots.iter().find(|r| r.logical_time_ms >= cutoff)
+            && let Some(first) = found.roots.iter().find(|r| r.logical_time_ms >= cutoff)
         {
             let before = first.start_lsn - 1;
             let at = match self.node.logical_time_at(before).await? {

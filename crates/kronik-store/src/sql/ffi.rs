@@ -7,7 +7,8 @@
 //!   `localtime`/`utc` date modifiers do not depend on the host's time zone;
 //! - the session extension with `SQLITE_SESSION_OBJCONFIG_ROWID`, table
 //!   filters, `sqlite3changeset_apply_v2` flags, and
-//!   `sqlite3changegroup_add_change` for splitting a changeset per subject.
+//!   `sqlite3changegroup_add_change` for splitting a changeset per subject;
+//! - a copy-on-write VFS so replay workers share one snapshot image (#197).
 //!
 //! Every function here takes or returns plain Rust data; no SQLite pointer
 //! escapes this module except inside the RAII types defined here.
@@ -15,11 +16,11 @@
 // Allowlisted: SQLite's session, VFS and localtime APIs have no safe binding.
 #![allow(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
-use std::sync::Once;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Once};
 
 use rusqlite::Connection;
 use rusqlite::ffi;
@@ -519,4 +520,514 @@ pub fn tables(cs: &[u8]) -> rusqlite::Result<std::collections::BTreeSet<String>>
         }
     }
     Ok(out)
+}
+
+// ------------------------------------------------------- shared snapshot
+
+/// Page copied into a worker when it writes. The shared image is never written.
+const COW_PAGE: u64 = 4096;
+
+struct BoundImage {
+    bytes: Arc<[u8]>,
+    private: Arc<AtomicU64>,
+}
+
+struct CowBytes {
+    base: Option<Arc<[u8]>>,
+    dirty: HashMap<u64, Box<[u8; COW_PAGE as usize]>>,
+    size: u64,
+}
+
+struct CowInner {
+    bytes: Mutex<CowBytes>,
+    private: Option<Arc<AtomicU64>>,
+}
+
+impl Drop for CowInner {
+    fn drop(&mut self) {
+        let Some(counter) = &self.private else {
+            return;
+        };
+        let pages = self
+            .bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dirty
+            .len() as u64;
+        counter.fetch_sub(pages * COW_PAGE, Ordering::Relaxed);
+    }
+}
+
+#[repr(C)]
+struct CowFile {
+    base: ffi::sqlite3_file,
+    inner: *const CowInner,
+}
+
+fn image_map() -> &'static Mutex<HashMap<String, BoundImage>> {
+    static MAP: LazyLock<Mutex<HashMap<String, BoundImage>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    &MAP
+}
+
+fn lock_images() -> std::sync::MutexGuard<'static, HashMap<String, BoundImage>> {
+    image_map().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Shared private-byte counter for one snapshot image. Paths bound through
+/// it stay registered until the last clone drops, which is after every
+/// connection that opened them.
+pub(crate) struct CowShare {
+    private: Arc<AtomicU64>,
+    paths: Mutex<Vec<String>>,
+}
+
+impl CowShare {
+    pub(crate) fn new() -> CowShare {
+        CowShare {
+            private: Arc::new(AtomicU64::new(0)),
+            paths: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn private_bytes(&self) -> u64 {
+        self.private.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn bind(&self, path: &str, bytes: Arc<[u8]>) {
+        lock_images().insert(
+            path.to_owned(),
+            BoundImage {
+                bytes,
+                private: self.private.clone(),
+            },
+        );
+        self.paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(path.to_owned());
+    }
+}
+
+impl Drop for CowShare {
+    fn drop(&mut self) {
+        let mut images = lock_images();
+        for path in self
+            .paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            images.remove(&path);
+        }
+    }
+}
+
+fn counter_for(path: &str) -> Option<Arc<AtomicU64>> {
+    lock_images()
+        .iter()
+        .filter(|(key, _)| path.starts_with(key.as_str()))
+        .max_by_key(|(key, _)| key.len())
+        .map(|(_, bound)| bound.private.clone())
+}
+
+fn c_name(name: *const c_char) -> Option<String> {
+    if name.is_null() {
+        return None;
+    }
+    // SAFETY: SQLite passes a NUL-terminated path, or NULL which we rejected.
+    Some(
+        unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+fn write_at(bytes: &mut CowBytes, offset: u64, src: &[u8], private: &Option<Arc<AtomicU64>>) {
+    let end = offset + src.len() as u64;
+    if end > bytes.size {
+        bytes.size = end;
+    }
+    for (i, byte) in src.iter().enumerate() {
+        let at = offset + i as u64;
+        let page = at / COW_PAGE;
+        let within = (at % COW_PAGE) as usize;
+        if let std::collections::hash_map::Entry::Vacant(slot) = bytes.dirty.entry(page) {
+            let mut buf = Box::new([0u8; COW_PAGE as usize]);
+            if let Some(base) = &bytes.base {
+                let start = (page * COW_PAGE) as usize;
+                if start < base.len() {
+                    let n = (base.len() - start).min(COW_PAGE as usize);
+                    buf[..n].copy_from_slice(&base[start..start + n]);
+                }
+            }
+            if let Some(counter) = private {
+                counter.fetch_add(COW_PAGE, Ordering::Relaxed);
+            }
+            slot.insert(buf);
+        }
+        if let Some(buf) = bytes.dirty.get_mut(&page) {
+            buf[within] = *byte;
+        }
+    }
+}
+
+fn byte_at(bytes: &CowBytes, offset: u64) -> u8 {
+    let page = offset / COW_PAGE;
+    let within = (offset % COW_PAGE) as usize;
+    if let Some(buf) = bytes.dirty.get(&page) {
+        return buf[within];
+    }
+    bytes
+        .base
+        .as_ref()
+        .and_then(|base| base.get(offset as usize).copied())
+        .unwrap_or(0)
+}
+
+unsafe extern "C" fn cow_close(file: *mut ffi::sqlite3_file) -> c_int {
+    // SAFETY: `file` is a `CowFile` we wrote in `cow_open`; the inner Arc
+    // was leaked into the pointer and is rebuilt once here.
+    unsafe {
+        let inner = (*file.cast::<CowFile>()).inner;
+        if !inner.is_null() {
+            drop(Arc::from_raw(inner));
+        }
+    }
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn cow_read(
+    file: *mut ffi::sqlite3_file,
+    dst: *mut c_void,
+    amt: c_int,
+    offset: ffi::sqlite3_int64,
+) -> c_int {
+    if amt < 0 || offset < 0 {
+        return ffi::SQLITE_IOERR;
+    }
+    let amt = amt as usize;
+    let offset = offset as u64;
+    // SAFETY: SQLite passes a writable buffer of `amt` bytes and our file.
+    let out = unsafe { std::slice::from_raw_parts_mut(dst.cast::<u8>(), amt) };
+    let inner = unsafe { &*(*file.cast::<CowFile>()).inner };
+    let bytes = inner.bytes.lock().unwrap_or_else(|e| e.into_inner());
+    if offset >= bytes.size {
+        out.fill(0);
+        return ffi::SQLITE_IOERR_SHORT_READ;
+    }
+    let have = (bytes.size - offset) as usize;
+    let n = amt.min(have);
+    for (i, slot) in out.iter_mut().enumerate().take(n) {
+        *slot = byte_at(&bytes, offset + i as u64);
+    }
+    if n < amt {
+        out[n..].fill(0);
+        return ffi::SQLITE_IOERR_SHORT_READ;
+    }
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn cow_write(
+    file: *mut ffi::sqlite3_file,
+    src: *const c_void,
+    amt: c_int,
+    offset: ffi::sqlite3_int64,
+) -> c_int {
+    if amt < 0 || offset < 0 {
+        return ffi::SQLITE_IOERR;
+    }
+    let amt = amt as usize;
+    let offset = offset as u64;
+    // SAFETY: SQLite passes `amt` readable bytes and our file.
+    let input = unsafe { std::slice::from_raw_parts(src.cast::<u8>(), amt) };
+    let inner = unsafe { &*(*file.cast::<CowFile>()).inner };
+    let mut bytes = inner.bytes.lock().unwrap_or_else(|e| e.into_inner());
+    write_at(&mut bytes, offset, input, &inner.private);
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn cow_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3_int64) -> c_int {
+    if size < 0 {
+        return ffi::SQLITE_IOERR;
+    }
+    let inner = unsafe { &*(*file.cast::<CowFile>()).inner };
+    let mut bytes = inner.bytes.lock().unwrap_or_else(|e| e.into_inner());
+    bytes.size = size as u64;
+    let keep = bytes.size.div_ceil(COW_PAGE);
+    let before = bytes.dirty.len();
+    bytes.dirty.retain(|page, _| *page < keep);
+    let dropped = before.saturating_sub(bytes.dirty.len()) as u64;
+    if dropped > 0
+        && let Some(counter) = &inner.private
+    {
+        counter.fetch_sub(dropped * COW_PAGE, Ordering::Relaxed);
+    }
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn cow_sync(_file: *mut ffi::sqlite3_file, _flags: c_int) -> c_int {
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn cow_file_size(
+    file: *mut ffi::sqlite3_file,
+    out: *mut ffi::sqlite3_int64,
+) -> c_int {
+    let inner = unsafe { &*(*file.cast::<CowFile>()).inner };
+    let size = inner.bytes.lock().unwrap_or_else(|e| e.into_inner()).size;
+    // SAFETY: SQLite passes a writable i64.
+    unsafe { *out = size as ffi::sqlite3_int64 };
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn cow_lock(_file: *mut ffi::sqlite3_file, _level: c_int) -> c_int {
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn cow_unlock(_file: *mut ffi::sqlite3_file, _level: c_int) -> c_int {
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn cow_check_reserved(_file: *mut ffi::sqlite3_file, out: *mut c_int) -> c_int {
+    // SAFETY: SQLite passes a writable int.
+    unsafe { *out = 0 };
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn cow_file_control(
+    _file: *mut ffi::sqlite3_file,
+    op: c_int,
+    arg: *mut c_void,
+) -> c_int {
+    // Replay databases are ephemeral. Refuse mmap; ignore size hints.
+    if op == ffi::SQLITE_FCNTL_MMAP_SIZE && !arg.is_null() {
+        // SAFETY: SQLite passes an i64* for this opcode.
+        unsafe { *arg.cast::<ffi::sqlite3_int64>() = 0 };
+        return ffi::SQLITE_OK;
+    }
+    if op == ffi::SQLITE_FCNTL_HAS_MOVED && !arg.is_null() {
+        unsafe { *arg.cast::<c_int>() = 0 };
+        return ffi::SQLITE_OK;
+    }
+    if op == ffi::SQLITE_FCNTL_SIZE_HINT || op == ffi::SQLITE_FCNTL_PRAGMA {
+        return ffi::SQLITE_NOTFOUND;
+    }
+    ffi::SQLITE_NOTFOUND
+}
+
+unsafe extern "C" fn cow_sector_size(_file: *mut ffi::sqlite3_file) -> c_int {
+    512
+}
+
+unsafe extern "C" fn cow_device(_file: *mut ffi::sqlite3_file) -> c_int {
+    ffi::SQLITE_IOCAP_ATOMIC
+        | ffi::SQLITE_IOCAP_SAFE_APPEND
+        | ffi::SQLITE_IOCAP_POWERSAFE_OVERWRITE
+        | ffi::SQLITE_IOCAP_SEQUENTIAL
+}
+
+static COW_IO: ffi::sqlite3_io_methods = ffi::sqlite3_io_methods {
+    iVersion: 1,
+    xClose: Some(cow_close),
+    xRead: Some(cow_read),
+    xWrite: Some(cow_write),
+    xTruncate: Some(cow_truncate),
+    xSync: Some(cow_sync),
+    xFileSize: Some(cow_file_size),
+    xLock: Some(cow_lock),
+    xUnlock: Some(cow_unlock),
+    xCheckReservedLock: Some(cow_check_reserved),
+    xFileControl: Some(cow_file_control),
+    xSectorSize: Some(cow_sector_size),
+    xDeviceCharacteristics: Some(cow_device),
+    xShmMap: None,
+    xShmLock: None,
+    xShmBarrier: None,
+    xShmUnmap: None,
+    xFetch: None,
+    xUnfetch: None,
+};
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+
+unsafe extern "C" fn cow_open(
+    _vfs: *mut ffi::sqlite3_vfs,
+    name: ffi::sqlite3_filename,
+    file: *mut ffi::sqlite3_file,
+    _flags: c_int,
+    out_flags: *mut c_int,
+) -> c_int {
+    let path = c_name(name)
+        .unwrap_or_else(|| format!("kcow-tmp-{}", NEXT_TEMP.fetch_add(1, Ordering::Relaxed)));
+    let bound = lock_images().get(&path).map(|b| BoundImage {
+        bytes: b.bytes.clone(),
+        private: b.private.clone(),
+    });
+    let (base, size, private) = match bound {
+        Some(b) => (Some(b.bytes.clone()), b.bytes.len() as u64, Some(b.private)),
+        None => (None, 0, counter_for(&path)),
+    };
+    let inner = Arc::new(CowInner {
+        bytes: Mutex::new(CowBytes {
+            base,
+            dirty: HashMap::new(),
+            size,
+        }),
+        private,
+    });
+    // SAFETY: SQLite allocated `szOsFile` bytes, which we set to fit `CowFile`.
+    unsafe {
+        ptr::write(
+            file.cast::<CowFile>(),
+            CowFile {
+                base: ffi::sqlite3_file { pMethods: &COW_IO },
+                inner: Arc::into_raw(inner),
+            },
+        );
+        if !out_flags.is_null() {
+            *out_flags = ffi::SQLITE_OPEN_READWRITE;
+        }
+    }
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn cow_delete(
+    _vfs: *mut ffi::sqlite3_vfs,
+    _name: *const c_char,
+    _sync_dir: c_int,
+) -> c_int {
+    // Journals are memory. The shared image is not deleted: other workers
+    // still have it. A missing file is success.
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn cow_access(
+    _vfs: *mut ffi::sqlite3_vfs,
+    name: *const c_char,
+    _flags: c_int,
+    out: *mut c_int,
+) -> c_int {
+    let exists = c_name(name).is_some_and(|path| lock_images().contains_key(&path));
+    // SAFETY: SQLite passes a writable int.
+    unsafe { *out = c_int::from(exists) };
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn cow_fullpath(
+    vfs: *mut ffi::sqlite3_vfs,
+    name: *const c_char,
+    n_out: c_int,
+    out: *mut c_char,
+) -> c_int {
+    if name.is_null() || out.is_null() || n_out <= 0 {
+        return ffi::SQLITE_CANTOPEN;
+    }
+    // SAFETY: `name` is NUL-terminated; `out` has `n_out` bytes.
+    unsafe {
+        let len = CStr::from_ptr(name).to_bytes().len();
+        if len + 1 > n_out as usize {
+            return ffi::SQLITE_CANTOPEN;
+        }
+        ptr::copy_nonoverlapping(name, out, len + 1);
+        let _ = vfs;
+    }
+    ffi::SQLITE_OK
+}
+
+fn install_cow_methods(vfs: *mut ffi::sqlite3_vfs) {
+    // SAFETY: `vfs` is a registered VFS we own or a TimeVfs just created
+    // for this connection, not yet opened.
+    unsafe {
+        (*vfs).xOpen = Some(cow_open);
+        (*vfs).xDelete = Some(cow_delete);
+        (*vfs).xAccess = Some(cow_access);
+        (*vfs).xFullPathname = Some(cow_fullpath);
+        let need = std::mem::size_of::<CowFile>() as c_int;
+        if (*vfs).szOsFile < need {
+            (*vfs).szOsFile = need;
+        }
+        if (*vfs).mxPathname < 512 {
+            (*vfs).mxPathname = 512;
+        }
+    }
+}
+
+/// The process-wide VFS replay uses for `state.db`. The static owns the
+/// struct; SQLite keeps a pointer into it for the process.
+pub(crate) fn cow_vfs_name() -> &'static str {
+    static REGISTER: Once = Once::new();
+    REGISTER.call_once(|| {
+        // SAFETY: `COW_VFS` does not move after init. SQLite stores this
+        // pointer and may write `pNext`; Rust does not read the struct again.
+        unsafe {
+            let vfs = COW_VFS.0.get();
+            if (*vfs).zName.is_null() {
+                return;
+            }
+            install_cow_methods(vfs);
+            let _ = ffi::sqlite3_vfs_register(vfs, 0);
+        }
+    });
+    "kronik-cow"
+}
+
+struct SyncVfs(std::cell::UnsafeCell<ffi::sqlite3_vfs>);
+
+// SAFETY: the value stays in this static. SQLite, not Rust, uses the
+// pointer from any thread after register. The raw pointers inside are the
+// default VFS's, which SQLite already shares across threads.
+unsafe impl Send for SyncVfs {}
+unsafe impl Sync for SyncVfs {}
+
+static COW_VFS: LazyLock<SyncVfs> = LazyLock::new(|| {
+    // SAFETY: the default VFS, if any, lives for the process. Copied into
+    // the static before any connection uses the name.
+    unsafe {
+        let default = ffi::sqlite3_vfs_find(ptr::null());
+        let mut base = if default.is_null() {
+            std::mem::zeroed()
+        } else {
+            *default
+        };
+        base.pNext = ptr::null_mut();
+        base.zName = if default.is_null() {
+            ptr::null()
+        } else {
+            c"kronik-cow".as_ptr()
+        };
+        base.xDlOpen = None;
+        SyncVfs(std::cell::UnsafeCell::new(base))
+    }
+});
+
+/// Point a just-created TimeVfs at the shared snapshot methods, so an actor
+/// database opened on it copies pages only when that worker writes.
+pub(crate) fn arm_cow_vfs(name: &str) -> Result<(), String> {
+    let c_name = CString::new(name).map_err(|_| "vfs name has an interior nul".to_string())?;
+    // SAFETY: the name is the VFS `SqlActor` just registered.
+    unsafe {
+        let vfs = ffi::sqlite3_vfs_find(c_name.as_ptr());
+        if vfs.is_null() {
+            return Err("snapshot vfs is not registered".into());
+        }
+        install_cow_methods(vfs);
+    }
+    Ok(())
+}
+
+/// Bytes of `conn`'s main database, including a WAL a raw file read would miss.
+pub(crate) fn serialize_main(conn: &Connection) -> Result<Vec<u8>, String> {
+    // SAFETY: `handle` is the connection's live db; serialize's buffer is
+    // freed with `sqlite3_free` before we return.
+    unsafe {
+        let mut size: ffi::sqlite3_int64 = 0;
+        let ptr = ffi::sqlite3_serialize(conn.handle(), c"main".as_ptr(), &mut size, 0);
+        if ptr.is_null() || size < 0 {
+            return Err("sqlite3_serialize failed".into());
+        }
+        let bytes = std::slice::from_raw_parts(ptr, size as usize).to_vec();
+        ffi::sqlite3_free(ptr.cast());
+        Ok(bytes)
+    }
 }

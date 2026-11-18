@@ -317,9 +317,11 @@ read:
 
 1. `kronik upgrade check --window 6h [--data-dir DIR]` opens the log,
    snapshots and code read-only, picks the fork point 6 h of logical time
-   back from the newest root input, and runs an identity replay (both
-   modes) of `(fork point, HEAD]` with the same code hashes and this
-   binary's engine. Fuel is not compared (`fuel_threshold` infinite).
+   back from the newest root input (from `segments.last_time_ms` and a
+   short read of the log tail, not by decoding the retained span), and
+   runs an identity replay (both modes) of `(fork point, HEAD]` with the
+   same code hashes and this binary's engine. Fuel is not compared
+   (`fuel_threshold` infinite).
    Each matched turn uses its recorded code hash and configuration epoch:
    production deployments, grants, revocations and limits inside the window
    are history to reproduce, not engine differences. This upgrade-only

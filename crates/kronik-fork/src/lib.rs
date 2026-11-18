@@ -14,6 +14,7 @@ pub mod stubs;
 pub mod taint;
 pub mod upgrade;
 pub mod watch;
+pub mod window;
 
 use std::collections::BTreeMap;
 use std::path::Path;

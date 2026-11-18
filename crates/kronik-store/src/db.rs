@@ -448,6 +448,32 @@ impl StateDb {
         Ok(db)
     }
 
+    /// A file `state.db` holding `blob`, for the shared-snapshot test.
+    #[cfg(test)]
+    pub fn write_blob_db(path: &std::path::Path, blob: &[u8]) -> Result<(), StoreError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        }
+        let db = StateDb::open(Connection::open(path)?)?;
+        db.conn.execute(
+            "INSERT INTO kv (kind, key, k, value, subject, lsn, sealed) \
+             VALUES ('t', 'k', 'b', ?1, NULL, 1, 0)",
+            [blob],
+        )?;
+        db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        Ok(())
+    }
+
+    /// The blob [`Self::write_blob_db`] stored.
+    #[cfg(test)]
+    pub fn blob_for_test(&self) -> Result<Vec<u8>, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT value FROM kv WHERE kind = 't' AND key = 'k' AND k = 'b'",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Reads a caller-owned consistent copy without initializing or migrating it.
     /// This does not certify its source coverage or consumer compatibility.
     pub fn read_only(conn: Connection) -> Result<StateDb, StoreError> {
@@ -473,15 +499,22 @@ impl StateDb {
         Ok(n > 0)
     }
 
-    /// The database file, empty for an in-memory database.
+    /// The database file, empty for an in-memory database and for a shared
+    /// snapshot cursor (`kcow…`), which has no durable file.
     fn file_path(&self) -> String {
-        self.conn
+        let path: String = self
+            .conn
             .query_row(
                 "SELECT file FROM pragma_database_list WHERE name = 'main'",
                 [],
                 |r| r.get(0),
             )
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if path.is_empty() || path.starts_with("kcow") {
+            String::new()
+        } else {
+            path
+        }
     }
 
     /// Writes the bulk replay's applied LSN.
@@ -585,7 +618,7 @@ impl StateDb {
                 |r| r.get(0),
             )
             .unwrap_or_default();
-        if path.is_empty() {
+        if path.is_empty() || path.starts_with("kcow") {
             // An in-memory replay store (kronik-fork's cursors, production
             // and continuous stores). Its journal is "off", so it takes the
             // `CatchupRows` path, which writes `time_hwm` and `segments`

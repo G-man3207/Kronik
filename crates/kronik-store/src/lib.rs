@@ -161,10 +161,21 @@ pub struct Store {
     /// Reads sealed SQL changesets (docs/design/m8-privacy.md §4, §6);
     /// plain until the node sets its own.
     sealer: Mutex<Arc<kronik_privacy::sealer::Sealer>>,
+    /// Dropped last, so shared snapshot paths stay bound until connections close.
+    #[allow(dead_code)]
+    cow: Option<Arc<sql::CowShare>>,
 }
 
 impl Store {
     pub fn open(state: rusqlite::Connection, sql: sql::SqlPool) -> Result<Arc<Store>, StoreError> {
+        Self::open_in(state, sql, None)
+    }
+
+    pub(crate) fn open_in(
+        state: rusqlite::Connection,
+        sql: sql::SqlPool,
+        cow: Option<Arc<sql::CowShare>>,
+    ) -> Result<Arc<Store>, StoreError> {
         let db = StateDb::open(state)?;
         let applied = AppliedLsn::default();
         applied.set(db.applied_lsn()?);
@@ -175,6 +186,7 @@ impl Store {
             apply_lock: Mutex::new(()),
             apply_epoch: AtomicU64::new(0),
             sealer: Mutex::new(Arc::new(kronik_privacy::sealer::Sealer::plain())),
+            cow,
         });
         store.backfill_sql_subjects()?;
         Ok(store)

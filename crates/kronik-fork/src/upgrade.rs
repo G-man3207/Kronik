@@ -46,17 +46,6 @@ async fn head(reader: &LogReader, log_dir: &Path) -> Result<Lsn, String> {
     Ok(head)
 }
 
-/// The engine version of the newest turn in the window (what the data was
-/// written with).
-fn recorded_engine(index: &ProductionIndex) -> Option<String> {
-    index.records.iter().rev().find_map(|c| match &c.record {
-        kronik_proto::Record::TurnRecord(t) => Some(t.engine_version.clone()),
-        kronik_proto::Record::TurnBegin(t) => Some(t.engine_version.clone()),
-        kronik_proto::Record::EngineUpgrade(u) => Some(u.to_engine_version.clone()),
-        _ => None,
-    })
-}
-
 /// Replays `(fork point, head]` of `data`'s main, where the fork point is
 /// `window` of logical time before the newest root input (or the oldest
 /// point retention keeps), in both modes with the same code. `sealer` opens
@@ -104,27 +93,30 @@ pub async fn check_with_pool(
     if head == 0 {
         return Err(format!("{} holds no log", data.display()));
     }
-    // The fork point: every root input retention keeps, then the window.
-    // Offline (the daemon is stopped): the switch from the state database.
+    // The fork point from segment marks and a short tail read. Offline: the
+    // daemon may still be writing, so the segments table can lag the log
+    // tail, which the search still reads.
     let rebase = kronik_sched::snapshots::last_rebase_at(data, branch);
     let oldest = pick_base(data, branch, head, true, rebase)?;
-    let from = oldest.as_ref().map_or(0, |b| b.lsn);
-    let all = ProductionIndex::load_from(&reader, oldest, from, head)
+    let floor = oldest.as_ref().map_or(0, |b| b.lsn);
+    let state_db = data.join("branches").join(branch).join("state.db");
+    let segments = crate::window::read_segments(&state_db).unwrap_or_default();
+    let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+    let found = crate::window::discover_window(&reader, &segments, head, window_ms, floor)
         .await
         .map_err(|e| e.to_string())?;
-    let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
-    let fork_lsn = match all.roots.last() {
+    let fork_lsn = match found.roots.last() {
         Some(newest) => {
             let since = newest.logical_time_ms.saturating_sub(window_ms);
-            all.roots
+            found
+                .roots
                 .iter()
                 .find(|r| r.logical_time_ms >= since)
                 .map_or(head, |r| r.start_lsn - 1)
         }
         None => head,
     };
-    let from_engine = recorded_engine(&all).unwrap_or_else(|| ENGINE_VERSION.to_owned());
-    drop(all);
+    let from_engine = found.engine.unwrap_or_else(|| ENGINE_VERSION.to_owned());
     let base = pick_base(data, branch, fork_lsn, false, rebase)?;
     let mut index = ProductionIndex::load_from(&reader, base, fork_lsn, head)
         .await
