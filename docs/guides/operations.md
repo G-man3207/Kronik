@@ -488,6 +488,17 @@ new traffic, and clients reconnect: reconnect with jittered backoff.
 |---|---|---|
 | `max_size_per_actor` | `"1GiB"` | The SQL size limit for a kind that has no `sql_bytes_per_actor` in a `Limits` record. `kronik limits set --sql-size` still wins for that kind |
 
+The daemon keeps one open connection per SQL actor, starting at 256 and
+growing with the actors it has opened. Each connection is the database file
+and its WAL, and a 512 KiB page cache. Growth stops when two descriptors per
+actor would leave fewer than 1024 for the log, `state.db` and the listeners.
+Past that cap the least recently used connection is closed; the next turn of
+that actor opens it again, before the apply lock, so one cold actor does not
+stall every other actor's apply. `kronik serve` raises the soft open-file
+limit to the hard one first; the shipped unit sets `LimitNOFILE=65536`. A
+deployment with more SQL actors than the cap holds needs a higher limit, not
+a larger page cache.
+
 ### [blobs]
 
 The blob store, `<data_dir>/blobs`, is always on; see [blobs](#blobs).

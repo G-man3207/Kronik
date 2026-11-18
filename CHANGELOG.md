@@ -5,6 +5,10 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- The live SQL pool grows with the actors it has opened, up to the open-file
+  budget, instead of staying at 256. A cold open no longer runs under the
+  apply lock or while the pool mutex is held, so one actor's first database
+  does not stall every other actor's apply (ADR 0156).
 - `privacy.subject_from` is refused at start unless `[gateway] trusted_proxies`
   is non-empty. An empty list no longer treats every peer as a proxy, so a
   client cannot forge a subject and replay that subject's saved response.

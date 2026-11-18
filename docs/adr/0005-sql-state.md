@@ -323,8 +323,9 @@ Limits:
     fsynced. An LRU miss then cost 4.7 ms at p50 (187 turns/s over 10k
     actors on the development machine), against 0.94 ms with it (1,052 turns/s).
 - **Connections** sit in an LRU, sized by file descriptors (2 per open
-  actor, db + wal) and memory (`cache_size=-512`). 256 in the prototype;
-  thousands are realistic with a raised `LimitNOFILE`.
+  actor, db + wal) and memory (`cache_size=-512`). The prototype kept 256.
+  The live pool now grows from that floor with the actors it has opened,
+  up to the open-file budget (ADR 0156).
 - **Footprint:** 24 KiB per actor for the database file, 68 KiB including
   the WAL that stays when there is no checkpoint on close. A periodic
   `wal_checkpoint(TRUNCATE)` of idle actors reclaims the WAL part. 10,000

@@ -1124,3 +1124,34 @@ fn a_failed_erasure_statement_rolls_the_savepoint_back() {
     assert_eq!(a.applied_lsn().unwrap(), 4);
     assert!(a.conn.is_autocommit());
 }
+
+#[test]
+fn a_small_pool_still_evicts_when_nothing_asks_it_to_grow() {
+    let pool = SqlPool::new(Arc::new(MemOpener), Limits::default(), 1);
+    drop(pool.get("a/1").unwrap());
+    drop(pool.get("b/1").unwrap());
+    let open = &pool.inner.lock().unwrap().open;
+    assert_eq!(open.len(), 1);
+    assert!(open.contains_key("b/1"));
+    assert!(!open.contains_key("a/1"));
+}
+
+#[test]
+fn retain_opened_keeps_actors_past_the_constructed_capacity() {
+    let pool = SqlPool::new(Arc::new(MemOpener), Limits::default(), 1);
+    pool.retain_opened(3);
+    for name in ["a/1", "b/1", "c/1"] {
+        drop(pool.get(name).unwrap());
+    }
+    let g = pool.inner.lock().unwrap();
+    assert_eq!(g.open.len(), 3);
+    assert!(g.capacity >= 3);
+}
+
+#[test]
+fn the_live_pool_can_grow_past_256() {
+    let pool = SqlPool::for_node(Arc::new(MemOpener), Limits::default());
+    let g = pool.inner.lock().unwrap();
+    assert_eq!(g.capacity, 256);
+    assert!(g.retain_max.is_some_and(|n| n >= 256));
+}

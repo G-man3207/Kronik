@@ -154,3 +154,4 @@
 - [ADR 0153: Integrity hash off the apply lock](adr/0153-integrity-hash-off-the-apply-lock.md)
 - [ADR 0154: Exceptions for unmaintained chrono and humantime](adr/0154-unmaintained-chrono-humantime.md)
 - [ADR 0155: `subject_from` requires a trusted proxy](adr/0155-subject-from-requires-a-trusted-proxy.md)
+- [ADR 0156: The SQL pool grows with the actors opened](adr/0156-sql-pool-grows-with-actors.md)

@@ -426,12 +426,11 @@ pub async fn start_local_locked(
     snapshots::prepare_state(data, &config.branch).map_err(StartError::Corrupt)?;
     let state = rusqlite::Connection::open(branch_dir.join("state.db"))
         .map_err(|e| StartError::Store(e.into()))?;
-    let pool = SqlPool::new(
+    let pool = SqlPool::for_node(
         Arc::new(FileOpener {
             root: branch_dir.join("sql"),
         }),
         Limits::default(),
-        256,
     );
     let store = Store::open(state, pool)?;
     // Room for the node's turns, and for the forks, replays and previews
