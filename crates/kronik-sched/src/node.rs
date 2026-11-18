@@ -3837,7 +3837,8 @@ impl Node {
                 let mut removed = false;
                 for slot in lock(&self.actors).values_mut() {
                     slot.queue.retain(|job| {
-                        let matches = matches!(&job.input.kind, Some(pb::input::Kind::Message(message)) if message.message_id == root);
+                        // A connection resend's root id is the causal key, not message_id (#193).
+                        let matches = job.causal_key.root == root && job.causal_key.path.is_empty();
                         if matches && let Some(lsn) = job.resend_of() { lock(&self.resending).remove(&lsn); }
                         removed |= matches;
                         !matches

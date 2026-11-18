@@ -344,6 +344,174 @@ async fn revoked_resend_queued_behind_drain_releases_its_reservation() {
     assert!(node.fatal().is_none());
 }
 
+const ROOM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/room.wasm");
+
+/// A failed frame turn of the room guest: a connection dead letter.
+async fn connection_dead_letter(node: &Node) -> u64 {
+    let bytes = std::fs::read(ROOM).unwrap();
+    node.deploy(&bytes, audit(), false, common::lease())
+        .await
+        .unwrap();
+    let (id, waiter) = node
+        .connection_open(
+            ActorRef::parse("room/lobby").unwrap(),
+            pb::HttpInput {
+                method: "GET".into(),
+                path: "/room/lobby/ws".into(),
+                query: "user=ada".into(),
+                params: vec![pb::Param {
+                    name: "key".into(),
+                    value: "lobby".into(),
+                    sealed_value: None,
+                }],
+                headers: vec![pb::Header {
+                    name: "sec-websocket-protocol".into(),
+                    value: Some(pb::Sealable {
+                        subject: None,
+                        value: Some(pb::sealable::Value::Plain(b"room.v1".to_vec())),
+                    }),
+                }],
+                route: "/room/{key}/ws".into(),
+                ..Default::default()
+            },
+            pb::ConnectionProtocol::Websocket,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+    let opened = waiter.wait().await.unwrap();
+    assert!(opened.committed(), "{opened:?}");
+    crate::connections::RecordingTransport::attach(node.hub(), &id).unwrap();
+    node.hub()
+        .incoming(
+            &id,
+            pb::Frame {
+                kind: pb::frame::Kind::Text as i32,
+                data: Some(pb::Sealable {
+                    subject: None,
+                    value: Some(pb::sealable::Value::Plain(b"fail".to_vec())),
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(row) = node
+                .store()
+                .db()
+                .dead_letters(0, 10)
+                .unwrap()
+                .into_iter()
+                .next()
+            {
+                return row.lsn;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the failed frame is a dead letter")
+}
+
+/// Issue #193: cancelling authority while a connection resend is still
+/// queued removes it, clears `resending`, and applies no turn. A later
+/// resend still runs, as a message resend does.
+#[tokio::test(flavor = "current_thread")]
+async fn revoked_connection_resend_queued_behind_drain_releases_its_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _) = node(dir.path()).await;
+    let dead = connection_dead_letter(&node).await;
+    let drain = node.drain(Duration::from_secs(5)).await.unwrap();
+    let before = node.applied_lsn();
+    let authority = common::Revocable::new();
+    let mut request = Box::pin(node.resend(dead, audit(), false, authority.lease()));
+    std::future::poll_fn(|cx| {
+        assert!(request.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    authority.revoke();
+    let error = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, kronik_core::error::ErrorCode::Unauthenticated);
+    assert_eq!(error.message, "queued request revoked");
+    assert_eq!(node.applied_lsn(), before);
+    assert_eq!(
+        node.store()
+            .db()
+            .dead_letter(dead)
+            .unwrap()
+            .unwrap()
+            .resent_as,
+        None
+    );
+    drop(drain);
+    let resent = node
+        .resend(dead, audit(), false, common::lease())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        node.store()
+            .db()
+            .dead_letter(dead)
+            .unwrap()
+            .unwrap()
+            .resent_as,
+        Some(resent.turn_id.lsn)
+    );
+    assert!(node.fatal().is_none());
+}
+
+/// A connection resend a worker has already admitted still completes after
+/// the authority is revoked (#193). Revoking before the append is admitted
+/// refuses that append; this is the later window.
+#[tokio::test(flavor = "current_thread")]
+async fn a_started_connection_resend_completes_after_revoke() {
+    struct RevokeAfterAdmit(Arc<common::Revocable>);
+    impl kronik_core::authority::Authority for RevokeAfterAdmit {
+        fn check(&self) -> Result<(), ApiError> {
+            kronik_core::authority::Authority::check(self.0.as_ref())
+        }
+        fn cancelled(&self) -> kronik_core::env::BoxFuture<'static, ()> {
+            kronik_core::authority::Authority::cancelled(self.0.as_ref())
+        }
+        fn admit(&self, effect: &mut dyn FnMut() -> Result<(), ApiError>) -> Result<(), ApiError> {
+            kronik_core::authority::Authority::admit(self.0.as_ref(), effect)?;
+            self.0.revoke();
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _) = node(dir.path()).await;
+    let dead = connection_dead_letter(&node).await;
+    let authority = Arc::new(RevokeAfterAdmit(common::Revocable::new()));
+    let resent = node
+        .resend(dead, audit(), false, authority.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(kronik_core::authority::Authority::check(authority.0.as_ref()).is_err());
+    assert!(
+        !resent.committed(),
+        "the resent frame still fails, but the turn completed: {resent:?}"
+    );
+    assert_eq!(
+        node.store()
+            .db()
+            .dead_letter(dead)
+            .unwrap()
+            .unwrap()
+            .resent_as,
+        Some(resent.turn_id.lsn)
+    );
+    assert!(node.fatal().is_none());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn approval_keeps_original_lease_through_actual_final_log_admission() {
     struct RevokeAtAdmission(Arc<common::Revocable>);

@@ -5,6 +5,10 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- Revoking the caller's authority while a connection dead-letter resend is
+  still queued removes the job, clears the resend reservation, and returns
+  `UNAUTHENTICATED`, as a message or timer resend already did. The frame or
+  close does not run. A resend a worker has already started is left to finish.
 - The admin UI no longer treats Enter in a mutation reason field as a
   real change. Dry run starts checked. A real promotion is the button
   whose name includes the proposal and "production will change"; that
