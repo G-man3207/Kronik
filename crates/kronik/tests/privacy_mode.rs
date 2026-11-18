@@ -33,7 +33,7 @@ impl Daemon {
         std::fs::write(
             &config,
             format!(
-                "[server]\ndata_dir = {:?}\n\n[privacy]\nsubject_from = \"header:x-user-id\"\n",
+                "[server]\ndata_dir = {:?}\n\n[gateway]\ntrusted_proxies = [\"127.0.0.1\"]\n\n[privacy]\nsubject_from = \"header:x-user-id\"\n",
                 dir.join("data")
             ),
         )

@@ -454,7 +454,7 @@ master_key_file = {master_key}   # secret store and privacy keystore
 
 [privacy]
 keystore_backup_retention = "30d"
-# subject_from = "header:x-user-id"
+# subject_from = "header:x-user-id"  # refused unless trusted_proxies is non-empty
 
 [replay]
 default_mode = "both"                 # isolated, continuous or both

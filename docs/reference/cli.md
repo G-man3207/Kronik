@@ -2481,8 +2481,10 @@ A value gets its subject from the message's `subject`, from the SDK's
 `kronik.toml`. That setting is `header:<name>` (the value of a request
 header) or `jwt:<claim>`, usually `jwt:sub`: that claim of a bearer JWT.
 The gateway does not verify the JWT's signature; it only reads the claim.
-So whoever reaches the gateway chooses the subject: it tags data for
-sealing and erasure and authenticates nothing. A missing header, token or
+The subject tags data for sealing and erasure and authenticates nothing.
+`subject_from` is refused at start unless `[gateway] trusted_proxies` lists
+the proxy that may set it; a peer that is not listed gets 400 `BAD_REQUEST`
+and not another subject's saved response. A missing header, token or
 claim gives no subject; one that can't be used gives 400 `BAD_REQUEST`.
 
 ```text

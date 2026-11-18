@@ -2,10 +2,10 @@
 //! from a request header (`header:x-user-id`) or from a claim of the bearer
 //! JWT in `Authorization` (`jwt:sub`).
 //!
-//! Kronik v0.1 does not verify the JWT's signature, it only reads the claim.
-//! Whoever can send a request can therefore choose its subject. The subject
-//! tags data for privacy mode (sealing, erasure); it does not authenticate
-//! anyone.
+//! Kronik does not verify the JWT's signature, it only reads the claim. The
+//! subject tags data for privacy mode (sealing, erasure); it does not
+//! authenticate anyone. Only a peer in `[gateway] trusted_proxies` may carry
+//! it, and an empty list trusts nobody.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

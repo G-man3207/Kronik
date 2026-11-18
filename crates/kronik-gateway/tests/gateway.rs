@@ -254,10 +254,12 @@ async fn the_subject_from_a_header_or_jwt_tags_the_root_input() {
         node.clone(),
         GatewayConfig {
             subject_from: SubjectFrom::parse("header:x-user-id"),
+            trusted_proxies: vec![kronik_gateway::IpNet::parse("10.0.0.0/8").unwrap()],
             ..GatewayConfig::default()
         },
     );
     let mut req = post("/counter/a/increment", None, b"hello");
+    req.peer = Some("10.1.2.3".parse().unwrap());
     req.headers.push(("X-User-Id".into(), "user:123".into()));
     let http = recorded(&by_header.handle(req).await).await;
     let pb::body::Value::Inline(body) = http.body.unwrap().value.unwrap() else {
@@ -284,6 +286,7 @@ async fn the_subject_from_a_header_or_jwt_tags_the_root_input() {
 
     // An unusable subject is the client's error.
     let mut req = post("/counter/a/increment", None, b"");
+    req.peer = Some("10.1.2.3".parse().unwrap());
     req.headers.push(("x-user-id".into(), "two words".into()));
     let r = by_header.handle(req).await;
     assert_eq!((r.status, code(&r)), (400, "BAD_REQUEST".to_string()));
@@ -293,10 +296,12 @@ async fn the_subject_from_a_header_or_jwt_tags_the_root_input() {
         node.clone(),
         GatewayConfig {
             subject_from: SubjectFrom::parse("jwt:sub"),
+            trusted_proxies: vec![kronik_gateway::IpNet::parse("10.0.0.0/8").unwrap()],
             ..GatewayConfig::default()
         },
     );
     let mut req = post("/counter/b/increment", None, b"x");
+    req.peer = Some("10.1.2.3".parse().unwrap());
     // {"alg":"none"}.{"sub":"user:7"}.forged
     req.headers.push((
         "Authorization".into(),
@@ -375,6 +380,185 @@ async fn only_trusted_proxies_set_the_subject_when_configured() {
     let mut plain = post("/counter/a/increment", None, b"");
     plain.peer = Some("192.0.2.9".parse().unwrap());
     assert_eq!(subject_of(gw.handle(plain).await).await, None);
+}
+
+/// An empty proxy list trusts nobody, so a client cannot forge a subject and
+/// take that subject's saved response. A listed proxy's own retry, with the
+/// same subject and a rotated token, is still a replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_untrusted_peer_cannot_replay_another_subjects_saved_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node(dir.path()).await;
+    let proxies = vec![kronik_gateway::IpNet::parse("10.0.0.0/8").unwrap()];
+    let by_header = Gateway::new(
+        node.clone(),
+        GatewayConfig {
+            subject_from: SubjectFrom::parse("header:x-user-id"),
+            trusted_proxies: proxies.clone(),
+            ..GatewayConfig::default()
+        },
+    );
+    let mut saved = post("/counter/a/increment", Some("k-subject"), b"x");
+    saved.headers.push(("x-user-id".into(), "user:1".into()));
+    saved
+        .headers
+        .push(("Authorization".into(), "Bearer victim".into()));
+    saved.peer = Some("10.1.2.3".parse().unwrap());
+    let first = by_header.handle(saved).await;
+    assert_eq!(
+        first.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&first.body)
+    );
+    assert_eq!(first.body, b"1");
+
+    let mut forged = post("/counter/a/increment", Some("k-subject"), b"x");
+    forged.headers.push(("x-user-id".into(), "user:1".into()));
+    forged.peer = Some("192.0.2.9".parse().unwrap());
+    let stolen = by_header.handle(forged).await;
+    assert_eq!(
+        (stolen.status, code(&stolen)),
+        (400, "BAD_REQUEST".to_string())
+    );
+    assert_ne!(stolen.body, first.body);
+    assert!(String::from_utf8_lossy(&stolen.body).contains("trusted_proxies"));
+    assert_eq!(
+        node.store()
+            .db()
+            .actor("counter", "a")
+            .unwrap()
+            .unwrap()
+            .turns,
+        1
+    );
+
+    let mut retry = post("/counter/a/increment", Some("k-subject"), b"x");
+    retry.headers.push(("x-user-id".into(), "user:1".into()));
+    retry
+        .headers
+        .push(("Authorization".into(), "Bearer refreshed".into()));
+    retry.peer = Some("10.9.9.9".parse().unwrap());
+    let again = by_header.handle(retry).await;
+    assert_eq!(again, first);
+    assert_eq!(
+        node.store()
+            .db()
+            .actor("counter", "a")
+            .unwrap()
+            .unwrap()
+            .turns,
+        1
+    );
+
+    let by_jwt = Gateway::new(
+        node.clone(),
+        GatewayConfig {
+            subject_from: SubjectFrom::parse("jwt:sub"),
+            trusted_proxies: proxies,
+            ..GatewayConfig::default()
+        },
+    );
+    let token = "Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyOjcifQ.forged";
+    let mut jwt_saved = post("/counter/b/increment", Some("k-jwt"), b"x");
+    jwt_saved
+        .headers
+        .push(("Authorization".into(), token.into()));
+    jwt_saved.peer = Some("10.1.2.3".parse().unwrap());
+    let jwt_first = by_jwt.handle(jwt_saved).await;
+    assert_eq!(
+        jwt_first.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&jwt_first.body)
+    );
+    let mut jwt_forged = post("/counter/b/increment", Some("k-jwt"), b"x");
+    jwt_forged
+        .headers
+        .push(("Authorization".into(), token.into()));
+    jwt_forged.peer = Some("192.0.2.9".parse().unwrap());
+    let jwt_stolen = by_jwt.handle(jwt_forged).await;
+    assert_eq!(
+        (jwt_stolen.status, code(&jwt_stolen)),
+        (400, "BAD_REQUEST".to_string())
+    );
+    assert_ne!(jwt_stolen.body, jwt_first.body);
+    assert_eq!(
+        node.store()
+            .db()
+            .actor("counter", "b")
+            .unwrap()
+            .unwrap()
+            .turns,
+        1
+    );
+}
+
+/// A library config can still omit the list. That must not mean every peer
+/// is a proxy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_proxy_list_trusts_no_subject() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node(dir.path()).await;
+    let gw = Gateway::new(
+        node.clone(),
+        GatewayConfig {
+            subject_from: SubjectFrom::parse("header:x-user-id"),
+            ..GatewayConfig::default()
+        },
+    );
+    let mut req = post("/counter/a/increment", Some("k"), b"");
+    req.headers.push(("x-user-id".into(), "user:1".into()));
+    req.peer = Some("127.0.0.1".parse().unwrap());
+    let r = gw.handle(req).await;
+    assert_eq!((r.status, code(&r)), (400, "BAD_REQUEST".to_string()));
+    assert_eq!(
+        node.store()
+            .db()
+            .actor("counter", "a")
+            .unwrap()
+            .map(|a| a.turns)
+            .unwrap_or(0),
+        0
+    );
+    let mut plain = post("/counter/a/increment", None, b"");
+    plain.peer = Some("127.0.0.1".parse().unwrap());
+    let r = gw.handle(plain).await;
+    assert_eq!((r.status, r.body.as_slice()), (200, b"1".as_slice()));
+}
+
+/// Without `subject_from`, a saved response is still bound to `Authorization`,
+/// and an anonymous retry is still a replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_subject_from_authorization_still_binds_the_requester() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node(dir.path()).await;
+    let gw = Gateway::new(node, GatewayConfig::default());
+    let mut first = post("/counter/a/increment", Some("k-auth"), b"x");
+    first
+        .headers
+        .push(("Authorization".into(), "Bearer a".into()));
+    let a = gw.handle(first).await;
+    assert_eq!(a.status, 200, "{}", String::from_utf8_lossy(&a.body));
+    let mut other = post("/counter/a/increment", Some("k-auth"), b"x");
+    other
+        .headers
+        .push(("Authorization".into(), "Bearer b".into()));
+    let reused = gw.handle(other).await;
+    assert_eq!(
+        (reused.status, code(&reused)),
+        (422, "IDEMPOTENCY_KEY_REUSED".to_string())
+    );
+    assert_ne!(reused.body, a.body);
+
+    let anon = gw
+        .handle(post("/counter/b/increment", Some("k-anon"), b"x"))
+        .await;
+    assert_eq!(anon.status, 200, "{}", String::from_utf8_lossy(&anon.body));
+    let again = gw
+        .handle(post("/counter/b/increment", Some("k-anon"), b"x"))
+        .await;
+    assert_eq!(again, anon);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

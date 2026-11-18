@@ -406,10 +406,12 @@ retention is what makes erasure complete (§6.7).
 - A missing header, token or claim means no subject. A present but unusable
   one (not a JWT, bad base64url or JSON, a claim that is neither a string
   nor an integer, not a valid subject) is `400 BAD_REQUEST` with the reason.
-- **Kronik v0.1 does not verify the JWT, it only reads the claim.** Whoever
-  can reach the gateway can choose the subject. The subject tags data; it
-  does not authenticate. Put an authenticating proxy in front, or derive the
-  subject in the actor. The documentation must say this.
+- **Kronik does not verify the JWT, it only reads the claim.** The subject
+  tags data; it does not authenticate. `subject_from` requires a non-empty
+  `[gateway] trusted_proxies` (ADR 0155): an empty list trusts no peer, and
+  `kronik serve` refuses that combination. A subject header or `jwt:` claim
+  from any other peer is `400 BAD_REQUEST`. Put an authenticating proxy in
+  front, or derive the subject in the actor. The documentation must say this.
 
 ## 12. API and CLI
 

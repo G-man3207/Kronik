@@ -651,7 +651,7 @@ EXAMPLES = {
 # The configuration an example needs beyond the defaults (a kronik.toml).
 CONFIG: dict[str, str] = {
     # Subjects from a header, for privacy mode.
-    "media-ts-private": "[privacy]\nsubject_from = \"header:x-user-id\"\n",
+    "media-ts-private": "[gateway]\ntrusted_proxies = [\"127.0.0.1\"]\n\n[privacy]\nsubject_from = \"header:x-user-id\"\n",
 }
 
 

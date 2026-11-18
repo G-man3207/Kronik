@@ -1228,12 +1228,25 @@ impl Config {
         {
             return Err(format!("[gateway] trusted_proxies: {e}"));
         }
-        if let Some(from) = &self.privacy.subject_from
-            && SubjectFrom::parse(from).is_none()
-        {
-            return Err(format!(
-                "[privacy] subject_from = {from:?}: use \"header:<name>\" or \"jwt:sub\""
-            ));
+        if let Some(from) = &self.privacy.subject_from {
+            if SubjectFrom::parse(from).is_none() {
+                return Err(format!(
+                    "[privacy] subject_from = {from:?}: use \"header:<name>\" or \"jwt:sub\""
+                ));
+            }
+            // An empty list used to mean every peer is a proxy. The
+            // idempotency hash then treats that client-chosen subject as the
+            // only requester identity, so a forged subject replays the saved
+            // response. Require a proxy instead.
+            if self.gateway.trusted_proxies.is_empty() {
+                return Err(
+                    "[privacy] subject_from needs a non-empty [gateway] trusted_proxies: an empty \
+                     list would let any client choose the subject and replay that subject's saved \
+                     response. List the authenticating proxy's address (as it connects), or unset \
+                     subject_from."
+                        .into(),
+                );
+            }
         }
         if let Some(d) = self.foreign.layout_dirs.iter().find(|d| !d.is_absolute()) {
             return Err(format!(
@@ -1579,7 +1592,7 @@ master_key_file = "/etc/kronik/master.key"   # secret store and privacy keystore
 
 [privacy]
 keystore_backup_retention = "30d"
-subject_from = "header:x-user-id"
+# subject_from = "header:x-user-id"  # needs a non-empty [gateway] trusted_proxies
 
 [replay]
 default_mode = "both"                 # isolated, continuous or both
@@ -1622,10 +1635,7 @@ gc_interval = "1h"
             config.keys.key_path(&config.server.data_dir),
             PathBuf::from("/etc/kronik/master.key")
         );
-        assert_eq!(
-            config.privacy.subject_from.as_deref(),
-            Some("header:x-user-id")
-        );
+        assert_eq!(config.privacy.subject_from.as_deref(), None);
         assert_eq!(config.replay.sample, Percent(100.0));
         assert_eq!(config.promote.catch_up_timeout, Dur::secs(300));
         assert_eq!(config.foreign.platform, Platform::Auto);
@@ -1693,6 +1703,23 @@ gc_interval = "1h"
         assert_eq!(c.gateway.trusted_proxies.len(), 3);
         let e = parse("[gateway]\ntrusted_proxies = [\"10.0.0.0/33\"]\n").unwrap_err();
         assert!(e.to_string().contains("trusted_proxies"), "{e}");
+    }
+
+    #[test]
+    fn subject_from_needs_a_non_empty_trusted_proxy_list() {
+        for text in [
+            "[privacy]\nsubject_from = \"header:x-user-id\"\n",
+            "[privacy]\nsubject_from = \"jwt:sub\"\n[gateway]\ntrusted_proxies = []\n",
+        ] {
+            let e = parse(text).unwrap_err();
+            assert!(e.message.contains("trusted_proxies"), "{text}: {e}");
+        }
+        let c = parse(
+            "[privacy]\nsubject_from = \"header:x-user-id\"\n[gateway]\ntrusted_proxies = [\"10.0.0.0/8\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.privacy.subject_from.as_deref(), Some("header:x-user-id"));
+        assert_eq!(c.gateway.trusted_proxies, ["10.0.0.0/8"]);
     }
 
     #[test]

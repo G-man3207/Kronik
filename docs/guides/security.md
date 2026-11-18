@@ -405,9 +405,11 @@ Long-lived connections ([Connections](connections.md), M24):
   position, never its value. Callers with `pii:read` also see that value,
   resolved from the request, and a stored secret in it is scrubbed.
 - **Subjects.** As for HTTP, only `[gateway] trusted_proxies` may set the
-  subject of an open. An actor that learns its user from a token sets the
-  connection's subject in its accept; the API shows a connection's subject
-  only with `pii:read`.
+  subject of an open, and an empty list trusts nobody. `privacy.subject_from`
+  is refused at start unless that list is non-empty, so a client cannot forge
+  a subject and replay that subject's saved response. An actor that learns
+  its user from a token sets the connection's subject in its accept; the API
+  shows a connection's subject only with `pii:read`.
 - **Caps and memory.** Connections are capped in total, per actor and per
   client (the forwarded client behind a trusted proxy, an IPv6 /64), and
   their buffers per connection and node-wide (`[connections]`). A client
