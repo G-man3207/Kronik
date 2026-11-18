@@ -390,6 +390,11 @@ fn config_file(
         .as_deref()
         .map(|endpoint| format!("\n[otel]\nendpoint = {}\n", quote(endpoint)))
         .unwrap_or_default();
+    let admin_comment = if domains.is_empty() {
+        "/metrics and /healthz"
+    } else {
+        "/ui/, same-origin /v1, /metrics and /healthz"
+    };
     Ok(format!(
         r#"# Kronik's server settings, written by `kronik serve --init`. Only the
 # server's basics live here: grants, limits, policy, privacy mode and foreign
@@ -400,7 +405,7 @@ fn config_file(
 data_dir = {data_dir}
 api_socket = {api_socket}
 http_listen = "{http_listen}"{api_listen}
-admin_listen = "{admin_listen}"      # /metrics and /healthz
+admin_listen = "{admin_listen}"      # {admin_comment}
 
 [tls]
 {tls}
@@ -2009,6 +2014,32 @@ mod tests {
         assert_eq!(plain.retention, defaults.retention);
         assert_eq!(plain.promote, defaults.promote);
         assert_eq!(plain.log, defaults.log);
+    }
+
+    /// The generated comment must not call a TLS admin listener metrics-only.
+    #[test]
+    fn the_generated_admin_comment_matches_whether_tls_is_on() {
+        use super::*;
+        let comment = |domains: &[&str]| {
+            let names = domains.iter().map(|d| (*d).to_owned()).collect::<Vec<_>>();
+            let email = (!names.is_empty()).then_some("ops@example.com");
+            config_file(&names, email, &Default::default())
+                .unwrap()
+                .lines()
+                .find(|line| line.contains("admin_listen"))
+                .unwrap()
+                .to_owned()
+        };
+        let tls = comment(&["app.example.com"]);
+        assert!(
+            tls.contains("/ui/") && tls.contains("/v1") && !tls.contains("# /metrics and /healthz"),
+            "{tls}"
+        );
+        let plain = comment(&[]);
+        assert!(
+            plain.contains("# /metrics and /healthz") && !plain.contains("/ui/"),
+            "{plain}"
+        );
     }
 
     /// F-3: every flag `serve` takes for a configuration value is written
