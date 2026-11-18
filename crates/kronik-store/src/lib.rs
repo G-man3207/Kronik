@@ -31,6 +31,9 @@ thread_local! {
     /// Actor WAL checkpoints after an erasure. A test asserts this moved.
     pub(crate) static ACTOR_ERASURE_CHECKPOINTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static APPLY_LOCK_ENTER: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    static APPLY_LOCK_HOLD_NS: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -45,6 +48,29 @@ pub(crate) fn apply_lock_acquires() -> usize {
     APPLY_LOCK_ACQUIRES.with(|c| c.get())
 }
 
+/// How long this thread has held the apply lock since the last take.
+/// Test instrumentation only: daemon time comes from `Env::clock`.
+#[cfg(test)]
+pub(crate) fn take_apply_lock_hold() -> std::time::Duration {
+    let ns = APPLY_LOCK_HOLD_NS.with(|c| c.replace(0));
+    std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+fn mark_lock_enter() {
+    APPLY_LOCK_ENTER.with(|c| c.set(Some(std::time::Instant::now())));
+}
+
+#[cfg(test)]
+fn mark_lock_exit() {
+    let Some(start) = APPLY_LOCK_ENTER.with(std::cell::Cell::take) else {
+        return;
+    };
+    let elapsed = start.elapsed().as_nanos();
+    APPLY_LOCK_HOLD_NS.with(|c| c.set(c.get().saturating_add(elapsed)));
+}
+
 /// The apply lock. Dropping it publishes the even epoch a state-hash copy
 /// waits for, and in tests clears the depth a checkpoint asserts.
 pub(crate) struct ApplyLock<'a> {
@@ -57,7 +83,10 @@ impl Drop for ApplyLock<'_> {
         // Even: the writes under the lock are visible to a copy that sees this.
         self.epoch.fetch_add(1, Ordering::Release);
         #[cfg(test)]
-        APPLY_LOCK_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+        {
+            mark_lock_exit();
+            APPLY_LOCK_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+        }
     }
 }
 
@@ -200,6 +229,7 @@ impl Store {
         {
             APPLY_LOCK_DEPTH.with(|c| c.set(c.get() + 1));
             APPLY_LOCK_ACQUIRES.with(|c| c.set(c.get() + 1));
+            mark_lock_enter();
         }
         ApplyLock {
             _guard: guard,
@@ -216,8 +246,10 @@ impl Store {
     /// databases first (each tracks its own applied LSN, so a record is
     /// applied to an actor database at most once even when `state.db` is
     /// ahead or behind it), then `state.db` in one transaction (records at or
-    /// below its applied LSN are skipped), then wakes waiters. An erasure's
-    /// actor-database WAL checkpoints run after this releases the apply lock.
+    /// below its applied LSN are skipped), then wakes waiters. Actor databases
+    /// are opened before the apply lock, so a cold open does not stall other
+    /// actors. An erasure's actor-database WAL checkpoints run after the lock
+    /// is released.
     pub fn apply(&self, batch: &[Committed]) -> Result<(), StoreError> {
         let Some(last) = batch.last() else {
             return Ok(());
@@ -228,24 +260,35 @@ impl Store {
                 c.lsn
             )));
         }
-        let checkpoint = {
-            let _apply = self.apply_lock();
-            let mut actors = Vec::new();
-            for (i, c) in batch.iter().enumerate() {
-                match &c.record {
-                    Record::TurnRecord(t) => self.apply_sql(c.lsn, t)?,
-                    Record::Erasure(e) => {
-                        actors.extend(self.erase_sql(c.lsn, &e.subject, &batch[..i])?);
-                    }
-                    _ => {}
+        let checkpoint = loop {
+            let names = self.sql_targets(batch)?;
+            let pinned = self.pin_sql(names.iter())?;
+            let actors = {
+                let _apply = self.apply_lock();
+                // A concurrent apply may have created an actor this erasure
+                // must open. Drop the lock and pin it; do not open under it.
+                if self.sql_targets(batch)? != names {
+                    continue;
                 }
-            }
-            self.db().apply(batch)?;
-            if batch.iter().any(|c| matches!(c.record, Record::Erasure(_))) {
-                self.db().checkpoint();
-            }
-            self.applied.set(self.applied.get().max(last.lsn));
-            actors
+                let mut actors = Vec::new();
+                for (i, c) in batch.iter().enumerate() {
+                    match &c.record {
+                        Record::TurnRecord(t) => self.apply_sql(c.lsn, t)?,
+                        Record::Erasure(e) => {
+                            actors.extend(self.erase_sql(c.lsn, &e.subject, &batch[..i])?);
+                        }
+                        _ => {}
+                    }
+                }
+                self.db().apply(batch)?;
+                if batch.iter().any(|c| matches!(c.record, Record::Erasure(_))) {
+                    self.db().checkpoint();
+                }
+                self.applied.set(self.applied.get().max(last.lsn));
+                actors
+            };
+            drop(pinned);
+            break actors;
         };
         self.checkpoint_erased(&checkpoint);
         Ok(())
@@ -274,8 +317,12 @@ impl Store {
                 let lost = self.lost_copies(c.lsn, sw)?;
                 if !lost.is_empty() {
                     let s = shadow(c)?;
-                    let _apply = self.apply_lock();
-                    self.copy_actors(c.lsn, &lost, &s)?;
+                    let pinned = self.pin_copies(&lost, &s)?;
+                    {
+                        let _apply = self.apply_lock();
+                        self.copy_actors(c.lsn, &lost, &s)?;
+                    }
+                    drop(pinned);
                 }
             }
             start = k + 1;
@@ -322,11 +369,17 @@ impl Store {
         sw: &pb::RebaseSwitch,
         shadow: &Store,
     ) -> Result<(), StoreError> {
-        let _apply = self.apply_lock();
         let actors = self.db().rebase_actors(&shadow.db(), sw.base_lsn, c.lsn)?;
-        self.copy_actors(c.lsn, &actors, shadow)?;
-        self.db().apply_switch(c, sw, &shadow.db(), &actors)?;
-        self.applied.set(self.applied.get().max(c.lsn));
+        let pinned = self.pin_copies(&actors, shadow)?;
+        {
+            let _apply = self.apply_lock();
+            // shortcut: one applier, so this list cannot change before the
+            // lock; re-read if apply becomes concurrent
+            self.copy_actors(c.lsn, &actors, shadow)?;
+            self.db().apply_switch(c, sw, &shadow.db(), &actors)?;
+            self.applied.set(self.applied.get().max(c.lsn));
+        }
+        drop(pinned);
         Ok(())
     }
 
@@ -629,29 +682,116 @@ impl Store {
     /// the fork's state loses what production's lost there (ADR 0109).
     /// Actor-database WAL checkpoints run after the apply lock is released.
     pub fn erase_again(&self, subject: &str, key_version: u32) -> Result<(), StoreError> {
-        let checkpoint = {
-            let _apply = self.apply_lock();
-            let mut checkpoint = Vec::new();
-            for name in self.db().sql_actors()? {
-                let db = self.sql.get(&name)?;
-                let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
-                let applied = db.applied_lsn()?;
-                let (_n, needs) = db
-                    .erase_subject_at(subject, applied)
-                    .map_err(|e| StoreError::Corrupt(format!("erasure in {name}: {e}")))?;
-                if needs {
-                    checkpoint.push(name);
+        let checkpoint = loop {
+            let names = self.db().sql_actors()?;
+            let pinned = self.pin_sql(names.iter())?;
+            let checkpoint = {
+                let _apply = self.apply_lock();
+                let now = self.db().sql_actors()?;
+                if now != names {
+                    continue;
                 }
-            }
-            // At this place: after every record applied here, so an actor's
-            // blobs of the subject count until its next turn (ADR 0119).
-            self.db()
-                .erase_subject_rows(subject, key_version, self.applied.get() + 1)?;
-            checkpoint
+                let mut checkpoint = Vec::new();
+                for name in &now {
+                    let db = self.sql.get(name)?;
+                    let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+                    let applied = db.applied_lsn()?;
+                    let (_n, needs) = db
+                        .erase_subject_at(subject, applied)
+                        .map_err(|e| StoreError::Corrupt(format!("erasure in {name}: {e}")))?;
+                    if needs {
+                        checkpoint.push(name.clone());
+                    }
+                }
+                // At this place: after every record applied here, so an actor's
+                // blobs of the subject count until its next turn (ADR 0119).
+                self.db()
+                    .erase_subject_rows(subject, key_version, self.applied.get() + 1)?;
+                checkpoint
+            };
+            drop(pinned);
+            break checkpoint;
         };
         self.checkpoint_erased(&checkpoint);
         Ok(())
     }
+
+    /// Actors `apply` will open: committed SQL turns, and, when the batch
+    /// erases, every actor database plus any turn in the batch that wrote SQL.
+    fn sql_targets(&self, batch: &[Committed]) -> Result<BTreeSet<String>, StoreError> {
+        let mut names = BTreeSet::new();
+        let mut erasure = false;
+        for c in batch {
+            match &c.record {
+                Record::TurnRecord(t) if turn_committed(t) && turn_has_sql(t) => {
+                    if let Some(name) = turn_actor(t) {
+                        names.insert(name);
+                    }
+                }
+                Record::Erasure(_) => erasure = true,
+                _ => {}
+            }
+        }
+        if erasure {
+            names.extend(self.db().sql_actors()?);
+            for c in batch {
+                if let Record::TurnRecord(t) = &c.record
+                    && turn_has_sql(t)
+                    && let Some(name) = turn_actor(t)
+                {
+                    names.insert(name);
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    fn pin_sql<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a String>,
+    ) -> Result<Vec<Arc<Mutex<sql::SqlActor>>>, StoreError> {
+        let mut pinned = Vec::new();
+        for name in names {
+            pinned.push(self.sql.get(name)?);
+        }
+        Ok(pinned)
+    }
+
+    /// The connections [`Self::copy_actors`] would open, held so that walk
+    /// does not open under the apply lock.
+    fn pin_copies(
+        &self,
+        actors: &[(String, String)],
+        shadow: &Store,
+    ) -> Result<Vec<Arc<Mutex<sql::SqlActor>>>, StoreError> {
+        let mut pinned = Vec::new();
+        for (kind, key) in actors {
+            let name = format!("{kind}/{key}");
+            let shadow_sql = shadow.db().actor(kind, key)?.is_some_and(|a| a.sql);
+            if !shadow_sql && !self.sql.exists(&name) {
+                continue;
+            }
+            pinned.push(self.sql.get(&name)?);
+            if shadow_sql {
+                pinned.push(shadow.sql.get(&name)?);
+            }
+        }
+        Ok(pinned)
+    }
+}
+
+fn turn_actor(t: &pb::TurnRecord) -> Option<String> {
+    t.actor.as_ref().map(|a| format!("{}/{}", a.kind, a.key))
+}
+
+fn turn_has_sql(t: &pb::TurnRecord) -> bool {
+    !t.sql_changes.is_empty() || !t.sql_schema.is_empty()
+}
+
+fn turn_committed(t: &pb::TurnRecord) -> bool {
+    t.outcome
+        .as_ref()
+        .is_some_and(|o| o.kind == pb::OutcomeKind::Committed as i32)
 }
 
 #[cfg(test)]
@@ -721,5 +861,242 @@ mod erasure_lock_tests {
             assert_eq!(c.get(), 1, "the actor database was not checkpointed");
         });
         assert!(!apply_lock_held());
+    }
+}
+
+#[cfg(test)]
+mod sql_pool_apply_tests {
+    #![allow(clippy::disallowed_methods)]
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    use rusqlite::Connection;
+
+    use super::*;
+    use crate::sql::{Limits, MemOpener, SqlPool, SqliteOpener};
+
+    struct Counting {
+        inner: MemOpener,
+        opens_under_lock: AtomicUsize,
+    }
+
+    impl SqliteOpener for Counting {
+        fn open(&self, actor: &str, vfs: &str) -> rusqlite::Result<Connection> {
+            if apply_lock_held() {
+                self.opens_under_lock.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.open(actor, vfs)
+        }
+
+        fn exists(&self, actor: &str) -> bool {
+            self.inner.exists(actor)
+        }
+    }
+
+    struct Gate {
+        inner: MemOpener,
+        entered: AtomicBool,
+        release: Mutex<bool>,
+        cv: Condvar,
+    }
+
+    impl SqliteOpener for Gate {
+        fn open(&self, actor: &str, vfs: &str) -> rusqlite::Result<Connection> {
+            if actor == "cold/a" {
+                self.entered.store(true, Ordering::Release);
+                let mut release = self.release.lock().unwrap();
+                while !*release {
+                    release = self.cv.wait(release).unwrap();
+                }
+            }
+            self.inner.open(actor, vfs)
+        }
+
+        fn exists(&self, _actor: &str) -> bool {
+            false
+        }
+    }
+
+    fn store(capacity: usize, retain: Option<usize>) -> (Arc<Store>, Arc<Counting>) {
+        let counting = Arc::new(Counting {
+            inner: MemOpener,
+            opens_under_lock: AtomicUsize::new(0),
+        });
+        let pool = SqlPool::new(counting.clone(), Limits::default(), capacity);
+        if let Some(n) = retain {
+            pool.retain_opened(n);
+        }
+        (
+            Store::open(Connection::open_in_memory().unwrap(), pool).unwrap(),
+            counting,
+        )
+    }
+
+    fn sql_turn(lsn: u64, key: &str, statement: &str) -> Committed {
+        Committed {
+            lsn,
+            pos: kronik_log::Position {
+                segment: 0,
+                offset: 0,
+            },
+            record: Record::TurnRecord(pb::TurnRecord {
+                actor: Some(pb::ActorRef {
+                    kind: "notes".into(),
+                    key: key.into(),
+                }),
+                causal_key: Some(kronik_core::causal::root(format!("r{lsn}"))),
+                input: Some(pb::Input {
+                    kind: Some(pb::input::Kind::Http(pb::HttpInput::default())),
+                }),
+                outcome: Some(pb::Outcome {
+                    kind: pb::OutcomeKind::Committed as i32,
+                    ..Default::default()
+                }),
+                sql_schema: vec![pb::SqlSchemaChange {
+                    statement: statement.into(),
+                }],
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn apply_round(store: &Store, start: u64, n: usize, statement: &str) {
+        for i in 0..n {
+            store
+                .apply(&[sql_turn(start + i as u64, &format!("a{i}"), statement)])
+                .unwrap();
+        }
+    }
+
+    /// Issue #195: a round-robin of 1 000 SQL actors does not open SQLite
+    /// while the apply lock is held, and that hold stays with a warm run.
+    #[test]
+    fn a_thousand_sql_actors_do_not_open_under_the_apply_lock() {
+        let (warm, _) = store(64, None);
+        apply_round(&warm, 1, 64, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+        let _ = take_apply_lock_hold();
+        apply_round(&warm, 65, 64, "CREATE TABLE t2 (id INTEGER PRIMARY KEY)");
+        let warm_per = take_apply_lock_hold() / 64u32;
+
+        let (cold, counting) = store(256, None);
+        apply_round(&cold, 1, 1_000, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+        assert_eq!(
+            counting.opens_under_lock.load(Ordering::Relaxed),
+            0,
+            "a cold open ran under the apply lock"
+        );
+        let cold_per = take_apply_lock_hold() / 1_000u32;
+        assert!(
+            cold_per < Duration::from_millis(5),
+            "apply-lock hold {cold_per:?} per turn includes a SQLite open; warm 64 was {warm_per:?}"
+        );
+        assert!(
+            cold_per < warm_per.saturating_mul(8) + Duration::from_millis(1),
+            "1000-actor hold {cold_per:?} is not within a small factor of warm 64 {warm_per:?}"
+        );
+    }
+
+    #[test]
+    fn the_live_pool_keeps_a_thousand_actors_open() {
+        let counting = Arc::new(Counting {
+            inner: MemOpener,
+            opens_under_lock: AtomicUsize::new(0),
+        });
+        // Count every open, including the first.
+        let opens = Arc::new(AtomicUsize::new(0));
+        struct CountOpens {
+            inner: Arc<Counting>,
+            opens: Arc<AtomicUsize>,
+        }
+        impl SqliteOpener for CountOpens {
+            fn open(&self, actor: &str, vfs: &str) -> rusqlite::Result<Connection> {
+                self.opens.fetch_add(1, Ordering::Relaxed);
+                self.inner.open(actor, vfs)
+            }
+            fn exists(&self, actor: &str) -> bool {
+                self.inner.exists(actor)
+            }
+        }
+        let pool = SqlPool::new(
+            Arc::new(CountOpens {
+                inner: counting.clone(),
+                opens: opens.clone(),
+            }),
+            Limits::default(),
+            256,
+        );
+        pool.retain_opened(1_000);
+        let store = Store::open(Connection::open_in_memory().unwrap(), pool).unwrap();
+        apply_round(&store, 1, 1_000, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+        let opened = opens.load(Ordering::Relaxed);
+        apply_round(
+            &store,
+            1_001,
+            1_000,
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY)",
+        );
+        assert_eq!(
+            opens.load(Ordering::Relaxed),
+            opened,
+            "a retained actor was opened again on the next turn"
+        );
+        assert_eq!(counting.opens_under_lock.load(Ordering::Relaxed), 0);
+    }
+
+    /// A miss must not hold the pool mutex across `open`: another actor's
+    /// apply has to finish while that open is still blocked.
+    #[test]
+    fn a_miss_does_not_stall_another_actors_apply() {
+        let gate = Arc::new(Gate {
+            inner: MemOpener,
+            entered: AtomicBool::new(false),
+            release: Mutex::new(false),
+            cv: Condvar::new(),
+        });
+        let store = Store::open(
+            Connection::open_in_memory().unwrap(),
+            SqlPool::new(gate.clone(), Limits::default(), 8),
+        )
+        .unwrap();
+        store
+            .apply(&[sql_turn(
+                1,
+                "warm",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+            )])
+            .unwrap();
+
+        let blocked = store.clone();
+        std::thread::spawn(move || {
+            let _ = blocked.sql.get("cold/a");
+        });
+        let start = std::time::Instant::now();
+        while !gate.entered.load(Ordering::Acquire) {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "the cold open did not start"
+            );
+            std::thread::yield_now();
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let applying = store.clone();
+        std::thread::spawn(move || {
+            applying
+                .apply(&[sql_turn(
+                    2,
+                    "warm",
+                    "CREATE TABLE t2 (id INTEGER PRIMARY KEY)",
+                )])
+                .unwrap();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("a warm apply stalled while another actor was opening");
+
+        *gate.release.lock().unwrap() = true;
+        gate.cv.notify_all();
     }
 }
