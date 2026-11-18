@@ -88,6 +88,10 @@ CREATE TABLE IF NOT EXISTS segments (
   start INTEGER PRIMARY KEY, last_lsn INTEGER NOT NULL, last_time_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS erasures (
   subject TEXT PRIMARY KEY, key_version INTEGER NOT NULL, lsn INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS sql_subjects (
+  subject TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL,
+  PRIMARY KEY (subject, kind, key)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS sql_subjects_actor ON sql_subjects (kind, key);
 CREATE TABLE IF NOT EXISTS secret_versions (
   name TEXT NOT NULL, version INTEGER NOT NULL CHECK(version > 0 AND version <= 9007199254740991),
   phase INTEGER NOT NULL, record BLOB NOT NULL,
@@ -391,12 +395,14 @@ fn rerun_unavailable_key(branch: &str, execution_id: &str) -> String {
     format!("rerun-unavailable:{branch}:{execution_id}")
 }
 
-/// Deletes [`StateDb::compact`] runs under the store lock, and the probe
-/// that decides whether the hourly pass must run them. Tests explain these,
-/// so a scan cannot return unnoticed (#162).
+/// Deletes [`StateDb::compact`] runs under the store lock, and the probes
+/// that decide whether the hourly pass must run them. Tests explain these,
+/// so a scan cannot return unnoticed (#162, #196).
 const COMPACT_TREES: &str = "DELETE FROM trees WHERE lsn < ?1";
 const COMPACT_INGRESS: &str = "DELETE FROM ingress_keys WHERE logical_time_ms < ?1";
+const COMPACT_DELIVERIES: &str = "DELETE FROM deliveries WHERE lsn < ?1";
 const INGRESS_BEFORE: &str = "SELECT 1 FROM ingress_keys WHERE logical_time_ms < ?1 LIMIT 1";
+const DELIVERIES_BEFORE: &str = "SELECT 1 FROM deliveries WHERE lsn < ?1 LIMIT 1";
 
 impl StateDb {
     /// Prepares `conn` (WAL, NORMAL) and creates the schema.
@@ -694,6 +700,11 @@ impl StateDb {
     /// stays in the WAL. Skipped in an overlay and in a bulk replay
     /// (journal off), where there is no WAL to clear.
     pub fn checkpoint(&self) {
+        #[cfg(test)]
+        assert!(
+            !crate::apply_lock_held(),
+            "state.db WAL checkpoint ran under the apply lock"
+        );
         if !self.bulk && self.conn.is_autocommit() {
             checkpoint_truncate(&self.conn, "state.db");
         }
@@ -1162,6 +1173,7 @@ impl StateDb {
                 "timers",
                 "connections",
                 "connection_history",
+                "sql_subjects",
             ] {
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE kind = ?1 AND key = ?2"),
@@ -1807,11 +1819,24 @@ impl StateDb {
             .is_some())
     }
 
+    /// Whether a saved call outcome is below `before`. `deliveries_lsn`
+    /// makes this a search, not a scan (#196).
+    pub fn has_deliveries_before(&self, before: Lsn) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .prepare_cached(DELIVERIES_BEFORE)?
+            .query_row([i(before)], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
     /// Compaction (m6-storage §5): forgets index rows of LSNs below
-    /// `first_lsn` (their segments are gone) and ingress keys older than
-    /// `ingress_before_ms`. The `trees` and `ingress_keys` deletes use
-    /// `trees_lsn` and `ingress_keys_time`, not a table scan (#162).
+    /// `first_lsn` (their segments are gone), ingress keys older than
+    /// `ingress_before_ms`, and saved call outcomes below the history floor.
+    /// A delivery an open turn began before stays, so a re-run can still
+    /// find the saved answer (ADR 0120, ADR 0157). The deletes search (#162, #196).
     pub fn compact(&mut self, first_lsn: Lsn, ingress_before_ms: u64) -> Result<(), StoreError> {
+        let deliveries_before = self.delivery_delete_before(first_lsn)?;
         let tx = self.conn.savepoint()?;
         tx.execute(
             "DELETE FROM turn_index WHERE lsn < ?1",
@@ -1830,8 +1855,21 @@ impl StateDb {
             params![i(first_lsn)],
         )?;
         tx.execute(COMPACT_INGRESS, params![i(ingress_before_ms)])?;
+        tx.execute(COMPACT_DELIVERIES, params![i(deliveries_before)])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// `deliveries` rows with `lsn` strictly below this are past the history
+    /// floor and no open turn began before them (ADR 0120 pin 5).
+    fn delivery_delete_before(&self, floor: Lsn) -> Result<Lsn, StoreError> {
+        let earliest: Option<i64> =
+            self.conn
+                .query_row("SELECT min(lsn) FROM open_turns", [], |r| r.get(0))?;
+        Ok(match earliest {
+            Some(lsn) if (lsn as u64) < floor => (lsn as u64).saturating_add(1),
+            _ => floor,
+        })
     }
 
     /// The turns of a causal tree (root id), in LSN order.
@@ -2367,6 +2405,61 @@ impl StateDb {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Actors recorded as having rows of `subject` ("kind/key"). A search
+    /// on `sql_subjects`, not a scan of every SQL actor (#196).
+    pub(crate) fn sql_actors_for_subject(&self, subject: &str) -> Result<Vec<String>, StoreError> {
+        let mut st = self.conn.prepare_cached(SQL_SUBJECT_ACTORS)?;
+        let rows = st.query_map([subject], |r| {
+            Ok(format!(
+                "{}/{}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// `(kind, key)` of every SQL actor, for the one-time subject backfill.
+    pub(crate) fn sql_actor_refs(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT kind, key FROM actors WHERE sql = 1 ORDER BY kind, key")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub(crate) fn sql_subjects_ready(&self) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT 1 FROM meta WHERE k = 'sql_subjects'")?
+            .query_row([], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    pub(crate) fn mark_sql_subjects_ready(&self) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (k, v) VALUES ('sql_subjects', 1)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn note_actor_subjects(
+        &self,
+        kind: &str,
+        key: &str,
+        subjects: &[String],
+    ) -> Result<(), StoreError> {
+        let mut st = self.conn.prepare_cached(
+            "INSERT OR IGNORE INTO sql_subjects (subject, kind, key) VALUES (?1, ?2, ?3)",
+        )?;
+        for subject in subjects {
+            st.execute(params![subject, kind, key])?;
+        }
+        Ok(())
+    }
+
     /// Whether any turn of `kind` exists (a deploy over history needs
     /// verification).
     pub fn kind_has_history(&self, kind: &str) -> Result<bool, StoreError> {
@@ -2427,6 +2520,32 @@ fn dead_letter(raw: DeadLetterRaw) -> Result<DeadLetterRow, StoreError> {
     })
 }
 
+/// Actors that have written a subject's SQL rows. Erasure opens these,
+/// not every SQL actor (#196). A later delete of the rows leaves the
+/// entry: opening an actor that no longer has the subject deletes nothing.
+fn note_sql_subjects(
+    tx: &Connection,
+    kind: &str,
+    key: &str,
+    t: &pb::TurnRecord,
+) -> Result<(), StoreError> {
+    for change in &t.sql_changes {
+        let Some(subject) = change
+            .changeset
+            .as_ref()
+            .and_then(|s| s.subject.as_deref())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        tx.prepare_cached(
+            "INSERT OR IGNORE INTO sql_subjects (subject, kind, key) VALUES (?1, ?2, ?3)",
+        )?
+        .execute(params![subject, kind, key])?;
+    }
+    Ok(())
+}
+
 fn apply_turn(
     tx: &Connection,
     c: &Committed,
@@ -2462,6 +2581,9 @@ fn apply_turn(
         committed && has_sql,
         committed
     ])?;
+    if committed {
+        note_sql_subjects(tx, kind, key, t)?;
+    }
     blobs::settle_charges(tx, kind, key, lsn)?;
     tx.prepare_cached(
         "INSERT INTO turn_index (lsn, kind, key, segment, offset, outcome) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -3387,10 +3509,7 @@ fn erase_rows(
     // subject become the erasure's tombstone. A caller that fails after the
     // call still owes the orphan and the compensation (ADR 0124).
     let saved: Vec<(String, Vec<u8>)> = tx
-        .prepare_cached(
-            "SELECT message_id, outcome FROM deliveries \
-             WHERE subject = ?1 AND outcome IS NOT NULL",
-        )?
+        .prepare_cached(DELIVERIES_SUBJECT)?
         .query_map([subject], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     for (message_id, bytes) in saved {
@@ -3449,6 +3568,7 @@ fn erase_rows(
             .execute(params![id, ordinal, effect.encode_to_vec()])?;
         }
     }
+    tx.prepare_cached(SQL_SUBJECT_CLEAR)?.execute([subject])?;
     Ok(())
 }
 
@@ -3521,6 +3641,13 @@ const TIMER_SUBJECT_PROBE: &str = "SELECT kind, key, timer_id, msg FROM timers W
 
 const MAILBOX_SUBJECT_PROBE: &str = "SELECT message_id, input FROM mailbox WHERE subject = ?1";
 
+const DELIVERIES_SUBJECT: &str =
+    "SELECT message_id, outcome FROM deliveries WHERE subject = ?1 AND outcome IS NOT NULL";
+
+const SQL_SUBJECT_ACTORS: &str = "SELECT kind, key FROM sql_subjects WHERE subject = ?1";
+
+const SQL_SUBJECT_CLEAR: &str = "DELETE FROM sql_subjects WHERE subject = ?1";
+
 /// `timers.subject` and `mailbox.subject` name the queued body's subject so
 /// an erasure tombstones that subject's rows. Added on open to a database
 /// from before the column; not part of the state hash (the body already is).
@@ -3578,7 +3705,9 @@ fn ensure_subject_indexes(conn: &Connection) -> Result<(), StoreError> {
          CREATE INDEX IF NOT EXISTS ingress_keys_subject ON ingress_keys (subject);
          CREATE INDEX IF NOT EXISTS dead_letters_subject ON dead_letters (subject);
          CREATE INDEX IF NOT EXISTS timers_subject ON timers (subject);
-         CREATE INDEX IF NOT EXISTS mailbox_subject ON mailbox (subject);",
+         CREATE INDEX IF NOT EXISTS mailbox_subject ON mailbox (subject);
+         CREATE INDEX IF NOT EXISTS deliveries_subject ON deliveries (subject);
+         CREATE INDEX IF NOT EXISTS deliveries_lsn ON deliveries (lsn);",
     )?;
     Ok(())
 }
@@ -6260,21 +6389,28 @@ mod tests {
         for sql in [
             super::COMPACT_TREES,
             super::COMPACT_INGRESS,
+            super::COMPACT_DELIVERIES,
             super::INGRESS_BEFORE,
+            super::DELIVERIES_BEFORE,
         ] {
             assert_search_at(&db.conn, sql, 1);
         }
+        assert_search(&db.conn, super::DELIVERIES_SUBJECT);
         db.conn
             .execute_batch(
                 "INSERT INTO trees (root, lsn) VALUES ('a', 1), ('a', 5), ('b', 9);
                  INSERT INTO ingress_keys
                    (kind, key, idem_key, request_hash, lsn, logical_time_ms, outcome)
                  VALUES ('counter', 'a', 'old', x'', 1, 10, x''),
-                        ('counter', 'a', 'new', x'', 2, 100, x'');",
+                        ('counter', 'a', 'new', x'', 2, 100, x'');
+                 INSERT INTO deliveries (message_id, lsn, outcome, subject)
+                 VALUES ('old', 1, NULL, 'user:1'), ('new', 9, NULL, 'user:1');",
             )
             .unwrap();
         assert!(db.has_ingress_before(50).unwrap());
         assert!(!db.has_ingress_before(10).unwrap());
+        assert!(db.has_deliveries_before(5).unwrap());
+        assert!(!db.has_deliveries_before(1).unwrap());
         db.compact(5, 50).unwrap();
         let lsns: Vec<i64> = db
             .conn
@@ -6294,6 +6430,40 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(times, [100]);
+        let kept: Vec<String> = db
+            .conn
+            .prepare("SELECT message_id FROM deliveries")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(kept, ["new".to_owned()]);
+    }
+
+    /// Issue #196: deliveries below the floor go, except one an open turn
+    /// began before (a re-run may repeat that call).
+    #[test]
+    fn compaction_keeps_a_delivery_an_open_turn_may_repeat() {
+        let mut db = StateDb::open(Connection::open_in_memory().unwrap()).unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO open_turns (execution_id, lsn, kind, key, segment, offset) \
+                 VALUES ('e', 4, 'notes', 'n', 1, 0);
+                 INSERT INTO deliveries (message_id, lsn, subject) \
+                 VALUES ('before', 2, 'user:1'), ('at', 4, 'user:1'), ('after', 6, 'user:1');",
+            )
+            .unwrap();
+        db.compact(8, 0).unwrap();
+        let ids: Vec<String> = db
+            .conn
+            .prepare("SELECT message_id FROM deliveries")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(ids, ["after".to_owned()]);
     }
 
     /// An existing database gains the compaction indexes on open.

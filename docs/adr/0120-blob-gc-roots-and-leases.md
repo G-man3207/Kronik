@@ -1,6 +1,6 @@
 # 0120. Collecting blobs: roots, leases and a two-phase sweep
 
-- **Status:** Accepted (2026-11-13)
+- **Status:** Accepted (2026-11-13), amended 2026-11-18
 - **Date:** 2026-11-13
 
 ## Context
@@ -26,7 +26,8 @@ Facts the decision builds on:
 - `state.db` is derived and written only by the single applier, in LSN
   order (m1-core §2). It holds `mailbox`, `timers`, `dead_letters`
   (with `resent_as`), `ingress_keys` (deleted after `idempotency_ttl` by the
-  retention pass), `deliveries` (saved `call` outcomes, never deleted),
+  retention pass), `deliveries` (saved `call` outcomes; deleted below the
+  history floor, except a row an open turn began before, [ADR 0157](0157-erasure-scans-matching-rows.md)),
   `open_turns` and `open_effects`.
 - Retention deletes closed segments once a kept snapshot covers them and
   they are older than `history` (m6-storage §5). A fork can be created only

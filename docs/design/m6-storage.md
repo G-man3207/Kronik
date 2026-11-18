@@ -253,11 +253,14 @@ before anything moves into place.
 - **Index compaction.** Rows of `turn_index` and `trees` for deleted LSNs
   are deleted; `history` and `trace` end at the oldest retained LSN.
   Dead letters keep their input (they don't need the segment); ingress
-  keys past their TTL are deleted in the same pass. `DELETE FROM trees
-  WHERE lsn < ?` and `DELETE FROM ingress_keys WHERE logical_time_ms < ?`
-  use `trees_lsn` and `ingress_keys_time`, so they search rather than scan
-  under the store lock. A pass that deletes no segment and has no ingress
-  key past TTL does not run them.
+  keys past their TTL are deleted in the same pass. Saved call outcomes
+  (`deliveries`) below the history floor are deleted in the same pass,
+  except a row an open turn began before (ADR 0120, ADR 0157). `DELETE FROM trees
+  WHERE lsn < ?`, `DELETE FROM ingress_keys WHERE logical_time_ms < ?` and
+  `DELETE FROM deliveries WHERE lsn < ?`
+  use `trees_lsn`, `ingress_keys_time` and `deliveries_lsn`, so they search
+  rather than scan under the store lock. A pass that deletes no segment, has
+  no ingress key past TTL, and has no delivery below the floor does not run them.
 - Reseal for privacy mode rides on compaction in M8.
 
 ## 6. Restore
