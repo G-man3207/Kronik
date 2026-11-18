@@ -130,7 +130,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent.parent
 SCOPES = ["read", "fork", "propose", "approve", "promote", "operate", "pii:read", "admin"]
-MODES = {"valid", "issuer", "audience", "nonce", "state", "keys", "signature", "expired", "reader", "unmapped", "revoked"}
+MODES = {"valid", "issuer", "audience", "nonce", "state", "keys", "signature", "expired", "algorithm", "reader", "unmapped", "revoked"}
 
 
 def require(condition, message):
@@ -313,7 +313,9 @@ class Provider:
                     claims.update(iat=now - 600, exp=now - 300)
                 header = {"typ": "JWT", "kid": "unknown-key" if mode == "keys" else "fixture-key"}
                 signing_key = fixture.other_key if mode == "signature" else fixture.key
-                token = jwt.encode(claims, signing_key, algorithm="RS256", headers=header)
+                # RS384 parses as a JWT algorithm; the daemon allows only RS256.
+                algorithm = "RS384" if mode == "algorithm" else "RS256"
+                token = jwt.encode(claims, signing_key, algorithm=algorithm, headers=header)
                 return self.reply(200, {"token_type": "Bearer", "access_token": secrets.token_urlsafe(32), "expires_in": 300, "id_token": token})
 
         class EffectHandler(Handler):

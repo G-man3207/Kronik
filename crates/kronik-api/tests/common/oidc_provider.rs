@@ -36,7 +36,7 @@ with fixture['Provider'](root, port, origin) as provider:
     opener = urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler({}),
         urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=str(root / 'ca.pem'))))
     allowed = {provider.issuer, origin}
-    print(json.dumps({'issuer': provider.issuer}), flush=True)
+    print(json.dumps({'issuer': provider.issuer, 'control': provider.control}), flush=True)
     while True:
         line = sys.stdin.buffer.readline(1048577)
         if not line:
@@ -72,6 +72,7 @@ pub struct OwnedOidc {
     root: tempfile::TempDir,
     pub issuer: String,
     pub origin: String,
+    control: String,
 }
 
 pub struct BrowserLogin {
@@ -112,11 +113,16 @@ impl OwnedOidc {
             root,
             issuer: String::new(),
             origin,
+            control: String::new(),
         };
         let ready = owned.receive();
         owned.issuer = ready["issuer"]
             .as_str()
             .expect("real owned OIDC provider readiness")
+            .to_owned();
+        owned.control = ready["control"]
+            .as_str()
+            .expect("real owned OIDC provider control")
             .to_owned();
         owned
     }
@@ -156,19 +162,44 @@ impl OwnedOidc {
         self.receive()
     }
 
-    pub fn login(&mut self) -> BrowserLogin {
+    /// Switches the next authorization code's ID token and returns the
+    /// provider's exchange counters.
+    pub fn set_mode(&mut self, mode: &str) -> Value {
+        let result = self.request(
+            "POST",
+            &format!("{}/fixture/control", self.issuer),
+            json!({
+                "Content-Type": "application/json",
+                "Authorization": format!("Bearer {}", self.control),
+            }),
+            Some(json!({"mode": mode})),
+        );
+        assert_eq!(result["status"], 200, "OIDC fixture rejected mode {mode}");
+        let body: Value = serde_json::from_str(result["body"].as_str().unwrap()).unwrap();
+        assert_eq!(body["mode"], mode);
+        body["stats"].clone()
+    }
+
+    /// Login redirect, authorize, and the callback response. Does not require
+    /// the callback to succeed: a rejected ID token answers here.
+    pub fn exchange(&mut self) -> Value {
         let origin = self.origin.clone();
         let start = self.request("GET", &format!("{origin}/v1/auth/login"), json!({}), None);
-        assert_eq!(start["status"], 303);
+        assert_eq!(start["status"], 303, "OIDC login did not redirect");
         let bound = cookie(&start, "__Host-kronik-login");
         let authorize = self.request("GET", &header(&start, "location"), json!({}), None);
-        assert_eq!(authorize["status"], 302);
-        let callback = self.request(
+        assert_eq!(authorize["status"], 302, "OIDC authorize did not redirect");
+        self.request(
             "GET",
             &header(&authorize, "location"),
             json!({"Cookie": bound}),
             None,
-        );
+        )
+    }
+
+    pub fn login(&mut self) -> BrowserLogin {
+        let origin = self.origin.clone();
+        let callback = self.exchange();
         assert_eq!(callback["status"], 303);
         let cookie = cookie(&callback, "__Host-kronik-session");
         let info = self.request(
