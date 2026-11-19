@@ -1425,6 +1425,13 @@ async fn bao_node() -> (tempfile::TempDir, Arc<Node>, Arc<Bao>) {
 async fn bao_node_with_fetch_timeout(
     fetch_timeout: Duration,
 ) -> (tempfile::TempDir, Arc<Node>, Arc<Bao>) {
+    bao_node_allowing(fetch_timeout, vec!["secret/".into()]).await
+}
+
+async fn bao_node_allowing(
+    fetch_timeout: Duration,
+    allowed_refs: Vec<String>,
+) -> (tempfile::TempDir, Arc<Node>, Arc<Bao>) {
     use std::os::unix::fs::PermissionsExt;
     let data = tempfile::tempdir().unwrap();
     let token = data.path().join("bao.token");
@@ -1442,7 +1449,7 @@ async fn bao_node_with_fetch_timeout(
         "bao".into(),
         Definition::Openbao {
             address: "http://127.0.0.1:8200".into(),
-            allowed_refs: vec!["secret/".into()],
+            allowed_refs,
             auth: "token".into(),
             token_file: Some(token),
             role_id_file: None,
@@ -1499,6 +1506,89 @@ async fn begin(node: &Node) {
     }))
     .await
     .unwrap();
+}
+
+/// Link and resolve of a ref outside `allowed_refs` must not ask the provider.
+/// An empty allowlist denies every ref. A ref under the prefix still links.
+///
+/// Resolve of a link this node does not trust is `SECRET_VERSION_GONE`: the
+/// effect gate records that as unavailable. `SECRET_REF_NOT_ALLOWED` is the
+/// link gate, and it is what fails if `Source::allows` always returns true.
+async fn assert_ref_not_fetched(node: &Node, bao: &Bao, name: &str, reference: &str) {
+    let calls = bao.calls.load(Ordering::SeqCst);
+    for dry_run in [false, true] {
+        let error = node
+            .secret_link(name, "bao", reference, &audit(), dry_run, test_auth())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::SecretRefNotAllowed, "{reference}");
+        assert_eq!(bao.calls.load(Ordering::SeqCst), calls, "{reference}");
+    }
+    let binding = node
+        .secret_backends()
+        .into_iter()
+        .find(|status| status.id == "bao")
+        .unwrap()
+        .binding;
+    let mut config = Config::default();
+    config.apply(&Record::SecretLink(pb::SecretLink {
+        name: name.into(),
+        backend: "bao".into(),
+        r#ref: reference.into(),
+        binding,
+        generation: 1,
+        canonical_ref: reference.into(),
+        epoch: 1,
+        audit: Some(audit()),
+    }));
+    let error = node
+        .resolve_secret(name, None, &config, test_auth())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::SecretVersionGone, "{reference}");
+    assert_eq!(bao.calls.load(Ordering::SeqCst), calls, "{reference}");
+    assert!(node.config_now().secret_link(name).is_none());
+}
+
+#[tokio::test]
+async fn a_ref_outside_allowed_refs_is_refused_without_a_fetch() {
+    let (_data, node, bao) = bao_node_allowing(
+        Settings::default().fetch_timeout,
+        vec!["secret/payments/".into()],
+    )
+    .await;
+    assert_eq!(bao.calls.load(Ordering::SeqCst), 0);
+    assert_ref_not_fetched(&node, &bao, "other", "secret/other#k").await;
+
+    let calls = bao.calls.load(Ordering::SeqCst);
+    let (linked, lsn) = node
+        .secret_link(
+            "token",
+            "bao",
+            "secret/payments/first#token",
+            &audit(),
+            false,
+            test_auth(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(linked.r#ref, "secret/payments/first#token");
+    assert!(lsn.is_some());
+    assert!(bao.calls.load(Ordering::SeqCst) > calls);
+    assert_eq!(
+        node.resolve_secret("token", None, &node.config_now(), test_auth())
+            .await
+            .unwrap()
+            .unwrap()
+            .value,
+        b"first-credential-1"
+    );
+
+    let (_empty, empty, empty_bao) =
+        bao_node_allowing(Settings::default().fetch_timeout, Vec::new()).await;
+    assert_eq!(empty_bao.calls.load(Ordering::SeqCst), 0);
+    assert_ref_not_fetched(&empty, &empty_bao, "other", "secret/other#k").await;
+    assert_ref_not_fetched(&empty, &empty_bao, "pay", "secret/payments/first#token").await;
 }
 
 #[tokio::test]
