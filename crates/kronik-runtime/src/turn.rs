@@ -434,12 +434,6 @@ enum Answer {
     Open(conn_wit::OpenReply),
 }
 
-/// Whether `subject` can be a subject: 1 to 256 bytes of printable ASCII
-/// without spaces, such as `user:123` (the keystore's rule, m8-privacy §1).
-fn valid_subject(subject: &str) -> bool {
-    !subject.is_empty() && subject.len() <= 256 && subject.bytes().all(|b| b.is_ascii_graphic())
-}
-
 /// The outcome of an open turn that answered (M24 §4.2). An accept is
 /// checked before the turn is recorded: its subprotocol is one the client
 /// offered (none for SSE), its headers are valid and its subject is one. A
@@ -508,11 +502,12 @@ fn open_outcome(
                 }
             }
             if let Some(s) = &accept.subject
-                && !valid_subject(s)
+                && !kronik_proto::blobs::valid_subject(s)
             {
                 return bad(format!(
-                    "the open's accept sets the subject {s:?}, which is not one: 1 to 256 \
-                     printable ASCII characters without spaces, such as user:123"
+                    "the open's accept sets the subject {s:?}, which is not one: 1 to {} \
+                     printable ASCII characters without spaces, such as user:123",
+                    kronik_proto::blobs::MAX_SUBJECT_BYTES
                 ));
             }
             pb::Outcome {
@@ -943,4 +938,91 @@ fn input_to_wit(input: &pb::Input) -> Result<types::Input, RunError> {
         }
         None => return Err(RunError::Input("input has no case".into())),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{conn_wit, open_outcome, pb};
+
+    fn accept(subject: Option<&str>) -> pb::Outcome {
+        open_outcome(
+            conn_wit::OpenReply::Accept(conn_wit::Accept {
+                subprotocol: None,
+                headers: Vec::new(),
+                subject: subject.map(str::to_owned),
+            }),
+            &[],
+            conn_wit::Protocol::Websocket,
+            None,
+            0,
+            None,
+        )
+    }
+
+    /// Connection accept and the keystore both use
+    /// [`kronik_proto::blobs::valid_subject`]. A subject one rejects, the
+    /// other rejects, and the error names [`kronik_proto::blobs::MAX_SUBJECT_BYTES`].
+    #[test]
+    fn an_open_accepts_only_a_subject_the_shared_rule_accepts() {
+        let limit = kronik_proto::blobs::MAX_SUBJECT_BYTES;
+        let max = "a".repeat(limit);
+        let over = "a".repeat(limit + 1);
+        let samples = [
+            "",
+            "a",
+            "user:123",
+            "!",
+            "~",
+            max.as_str(),
+            over.as_str(),
+            " ",
+            "user 1",
+            "\t",
+            "\n",
+            "\u{7f}",
+            "é",
+            "user:123 ",
+        ];
+        for subject in samples {
+            let outcome = accept(Some(subject));
+            if kronik_proto::blobs::valid_subject(subject) {
+                assert_eq!(
+                    outcome.kind,
+                    pb::OutcomeKind::Committed as i32,
+                    "{subject:?} {outcome:?}"
+                );
+                let Some(pb::outcome::Output::Accept(got)) = &outcome.output else {
+                    panic!("{subject:?} {outcome:?}");
+                };
+                assert_eq!(got.subject.as_deref(), Some(subject));
+            } else {
+                assert_eq!(
+                    outcome.kind,
+                    pb::OutcomeKind::Trap as i32,
+                    "{subject:?} {outcome:?}"
+                );
+                assert_eq!(outcome.error_code, "TURN_FAILED");
+                assert!(
+                    outcome.message.contains(&format!("1 to {limit} printable")),
+                    "error text must track MAX_SUBJECT_BYTES ({limit}): {}",
+                    outcome.message
+                );
+                assert!(
+                    outcome.message.contains(&format!("{subject:?}")),
+                    "{}",
+                    outcome.message
+                );
+            }
+        }
+        let outcome = accept(None);
+        assert_eq!(
+            outcome.kind,
+            pb::OutcomeKind::Committed as i32,
+            "{outcome:?}"
+        );
+        assert!(matches!(
+            &outcome.output,
+            Some(pb::outcome::Output::Accept(got)) if got.subject.is_none()
+        ));
+    }
 }

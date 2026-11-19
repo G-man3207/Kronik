@@ -128,7 +128,8 @@ impl Node {
             return Err(ApiError::new(
                 ErrorCode::BadRequest,
                 format!(
-                    "{subject:?} is not a subject (1 to 256 printable ASCII characters without spaces)"
+                    "{subject:?} is not a subject (1 to {} printable ASCII characters without spaces)",
+                    kronik_proto::blobs::MAX_SUBJECT_BYTES
                 ),
             ));
         }
@@ -361,6 +362,63 @@ impl Node {
                 progress
             }
             None => crate::ResealProgress::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kronik_core::env::Env;
+    use kronik_core::error::ErrorCode;
+    use kronik_proto::log::v1 as pb;
+
+    fn audit() -> pb::Audit {
+        pb::Audit {
+            token_id: "test".into(),
+            reason: "test".into(),
+            wall_time_ms: 0,
+        }
+    }
+
+    /// Erasure uses the same subject rule as the log format, and the refusal
+    /// names [`kronik_proto::blobs::MAX_SUBJECT_BYTES`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn erasure_uses_the_shared_subject_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = crate::start_local(
+            Env::real(tokio::runtime::Handle::current()),
+            dir.path(),
+            crate::NodeConfig::default(),
+        )
+        .await
+        .unwrap();
+        let authority = node.local_operator_authority().unwrap();
+        let limit = kronik_proto::blobs::MAX_SUBJECT_BYTES;
+        let max = "a".repeat(limit);
+        let over = "a".repeat(limit + 1);
+        for subject in ["", " ", "user 1", "\n", "é", over.as_str()] {
+            assert!(
+                !kronik_proto::blobs::valid_subject(subject),
+                "{subject:?} must be one the shared rule rejects"
+            );
+            let err = node
+                .erase_subject(subject, audit(), true, authority.clone())
+                .await
+                .expect_err(subject);
+            assert_eq!(err.code, ErrorCode::BadRequest, "{subject:?} {err}");
+            assert!(
+                err.message.contains(&format!("1 to {limit} printable")),
+                "{subject:?}: {}",
+                err.message
+            );
+        }
+        for subject in ["user:1", max.as_str()] {
+            assert!(kronik_proto::blobs::valid_subject(subject), "{subject:?}");
+            node.erase_subject(subject, audit(), true, authority.clone())
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("{subject:?} is a subject, erasure rejected it: {err}")
+                });
         }
     }
 }
