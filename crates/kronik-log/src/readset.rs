@@ -129,6 +129,7 @@ impl CapturedLogReadset {
                 through,
                 segment.last,
                 expected,
+                None,
                 &mut consume,
             )
             .await?;
@@ -142,11 +143,74 @@ impl CapturedLogReadset {
         }
         Ok(())
     }
+
+    /// Reads from a known file offset. `Ok(false)` when the bytes at `at`
+    /// are not record `expected`: a reseal moved them, and the offset must
+    /// not be trusted. Does not read earlier records in the segment.
+    pub async fn read_from_offset(
+        &self,
+        at: Position,
+        expected: Lsn,
+        through: Lsn,
+        mut consume: impl FnMut(&str, Committed) -> Result<bool, LogError>,
+    ) -> Result<bool, LogError> {
+        if expected < self.from || through > self.through {
+            return Err(corrupt(
+                "the requested range exceeds its fixed captured log readset",
+            ));
+        }
+        if expected > through || through == 0 {
+            return Ok(true);
+        }
+        let Some(index) = self.files.iter().position(|file| file.start == at.segment) else {
+            // The next record rolled into the segment that starts at it.
+            if self.files.iter().any(|file| file.start == expected) {
+                self.read_while_with_namespace(expected, through, consume)
+                    .await?;
+                return Ok(true);
+            }
+            return Ok(false);
+        };
+        let mut chain = None;
+        let mut resume = Some((at.offset, expected));
+        for segment in self.files.iter().skip(index) {
+            if segment.start > through {
+                break;
+            }
+            let progress = read_segment(
+                segment.file.as_ref(),
+                segment.length,
+                &segment.header,
+                &segment.path,
+                segment.start,
+                expected,
+                through,
+                segment.last,
+                chain,
+                resume.take(),
+                &mut consume,
+            )
+            .await?;
+            if progress.moved {
+                return Ok(false);
+            }
+            if progress.stopped {
+                return Ok(true);
+            }
+            chain = Some(progress.next_lsn);
+        }
+        if chain.is_none_or(|next| next <= through) {
+            return Err(corrupt(format!("log has no record at lsn {through}")));
+        }
+        Ok(true)
+    }
 }
 
 pub(super) struct SegmentProgress {
     pub(super) next_lsn: Lsn,
     pub(super) stopped: bool,
+    /// The resume offset does not hold the expected record. Not a torn tail.
+    pub(super) moved: bool,
 }
 
 /// Shared with the live LogReader, not a second decoder or a pathname reopen.
@@ -163,6 +227,7 @@ pub(super) async fn read_segment(
     through: Lsn,
     last: bool,
     expected: Option<Lsn>,
+    resume_at: Option<(u64, Lsn)>,
     consume: &mut impl FnMut(&str, Committed) -> Result<bool, LogError>,
 ) -> Result<SegmentProgress, LogError> {
     if let Some(expected) = expected
@@ -173,13 +238,34 @@ pub(super) async fn read_segment(
             path.display()
         )));
     }
-    let mut next_lsn = start;
-    let mut off = header.len as u64;
+    let (mut off, mut next_lsn) = match resume_at {
+        Some((offset, lsn)) => (offset, lsn),
+        None => (header.len as u64, start),
+    };
+    if let Some((offset, lsn)) = resume_at
+        && offset < file_len
+    {
+        let envelope = file.read_at(offset, ENVELOPE_LEN).await?;
+        let moved = if envelope.len() != ENVELOPE_LEN {
+            true
+        } else {
+            let kind = envelope[16];
+            kind != FOOTER_KIND && u64_at(&envelope, 8).is_none_or(|got| got != lsn)
+        };
+        if moved {
+            return Ok(SegmentProgress {
+                next_lsn: lsn,
+                stopped: true,
+                moved: true,
+            });
+        }
+    }
     while off < file_len {
         if next_lsn > through {
             return Ok(SegmentProgress {
                 next_lsn,
                 stopped: true,
+                moved: false,
             });
         }
         if file_len - off < ENVELOPE_LEN as u64 {
@@ -256,6 +342,7 @@ pub(super) async fn read_segment(
                 return Ok(SegmentProgress {
                     next_lsn,
                     stopped: true,
+                    moved: false,
                 });
             }
         } else if kind == 0 || !kronik_proto::kind::ALL.contains(&kind) {
@@ -273,6 +360,7 @@ pub(super) async fn read_segment(
     Ok(SegmentProgress {
         next_lsn,
         stopped: false,
+        moved: false,
     })
 }
 

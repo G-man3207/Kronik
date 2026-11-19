@@ -539,6 +539,8 @@ struct SegmentScan {
     next_lsn: Lsn,
     /// The last valid entry is a footer, so the segment is closed.
     ends_with_footer: bool,
+    /// Last valid record `(lsn, file offset)`, when the image holds one.
+    last: Option<(Lsn, u64)>,
 }
 
 /// Parses entries of a segment whose header is valid and hands each record
@@ -555,6 +557,7 @@ fn scan_entries<E: From<LogError>>(
     let mut off = header.len;
     let mut expected = header.start_lsn;
     let mut ends_with_footer = false;
+    let mut last = None;
     while let Some(e) = parse_entry(image, off) {
         if e.kind == FOOTER_KIND {
             off = e.end;
@@ -570,9 +573,11 @@ fn scan_entries<E: From<LogError>>(
                 has_tail: false,
                 next_lsn: expected,
                 ends_with_footer,
+                last,
             });
         }
         ends_with_footer = false;
+        let record_off = off as u64;
         if e.lsn >= from {
             let record = Record::decode(e.kind, e.payload)
                 .map_err(|err| corrupt(format!("record at lsn {}: {err}", e.lsn)))?;
@@ -580,13 +585,14 @@ fn scan_entries<E: From<LogError>>(
                 lsn: e.lsn,
                 pos: Position {
                     segment: header.start_lsn,
-                    offset: off as u64,
+                    offset: record_off,
                 },
                 record,
             })?;
         } else if e.kind == 0 || !kronik_proto::kind::ALL.contains(&e.kind) {
             return Err(corrupt(format!("record at lsn {} has kind {}", e.lsn, e.kind)).into());
         }
+        last = Some((e.lsn, record_off));
         expected += 1;
         off = e.end;
     }
@@ -595,6 +601,7 @@ fn scan_entries<E: From<LogError>>(
         has_tail: off < image.len(),
         next_lsn: expected,
         ends_with_footer,
+        last,
     })
 }
 /// The callback of a scan that decodes no record (`from` past the end).
@@ -823,6 +830,36 @@ async fn read_file(env: &Env, path: PathBuf) -> Result<Vec<u8>, LogError> {
     Ok(file.read_at(0, len as usize).await?)
 }
 
+fn scanned_last(start: Lsn, scan: &SegmentScan) -> Option<(Lsn, Position)> {
+    scan.last.map(|(lsn, offset)| {
+        (
+            lsn,
+            Position {
+                segment: start,
+                offset,
+            },
+        )
+    })
+}
+
+async fn last_record_in(
+    env: &Env,
+    dir: &Path,
+    start: Lsn,
+) -> Result<Option<(Lsn, Position)>, LogError> {
+    let image = read_file(env, dir.join(segment_name(start))).await?;
+    let Some(header) = parse_header(&image) else {
+        return Ok(None);
+    };
+    if header.start_lsn != start {
+        return Ok(None);
+    }
+    Ok(scanned_last(
+        start,
+        &scan_entries(&image, &header, Lsn::MAX, Lsn::MAX, no_records)?,
+    ))
+}
+
 /// What `Log::open` found.
 #[derive(Debug, Clone)]
 pub struct Opened {
@@ -836,6 +873,9 @@ pub struct Opened {
     /// The first LSN the log holds (the oldest segment's start; later than
     /// 1 after compaction or for a fork's log).
     pub first_lsn: Lsn,
+    /// The last valid record at open, when the log holds one. After replay
+    /// drains to [`Self::next_lsn`] this is the applied head's file position.
+    pub last_record: Option<(Lsn, Position)>,
 }
 
 struct Append {
@@ -962,6 +1002,7 @@ impl Log {
         let mut truncated_bytes = 0;
         let mut recreated_active = false;
         let mut extra_segment = false;
+        let mut last_record = None;
         let (segment, next_lsn) = match starts.last() {
             None => {
                 extra_segment = true;
@@ -985,9 +1026,13 @@ impl Log {
                     }
                     None => {
                         // A torn header: the segment was being created and
-                        // can hold no acknowledged record.
+                        // can hold no acknowledged record. The head, if any,
+                        // is the previous segment's last record.
                         recreated_active = true;
                         truncated_bytes = image.len() as u64;
+                        if let Some(&prev) = starts.iter().rev().nth(1) {
+                            last_record = last_record_in(env, &cfg.dir, prev).await?;
+                        }
                         (create_segment(env, &cfg, start).await?, start)
                     }
                     Some(h) => {
@@ -1000,6 +1045,7 @@ impl Log {
                             )));
                         }
                         let scan = scan_entries(&image, &h, Lsn::MAX, Lsn::MAX, no_records)?;
+                        last_record = scanned_last(start, &scan);
                         if scan.ends_with_footer {
                             // Closed. Do not append after the footer. A torn
                             // tail after a valid footer is truncated so a
@@ -1093,6 +1139,7 @@ impl Log {
                 segments,
                 recreated_active,
                 first_lsn,
+                last_record,
             },
         ))
     }
@@ -1565,6 +1612,7 @@ impl LogReader {
                 upto,
                 index + 1 == starts.len(),
                 expected,
+                None,
                 &mut f,
             )
             .await?;

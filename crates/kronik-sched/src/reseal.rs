@@ -724,6 +724,17 @@ impl Node {
             #[cfg(test)]
             crate::durable::test_ops::point(&path, "resealed")
                 .map_err(|e| ApiError::new(ErrorCode::Internal, format!("reseal: {e}")))?;
+            if let Some((head, _)) = self.applied_cut.frame(Lsn::MAX)
+                && let Some(&(_, offset)) = rewritten.offsets.iter().find(|(lsn, _)| *lsn == head)
+            {
+                self.applied_cut.moved(
+                    head,
+                    kronik_log::Position {
+                        segment: start,
+                        offset,
+                    },
+                );
+            }
             self.store()
                 .db()
                 .fix_reseal(start, &rewritten.offsets, &turns, &effects)

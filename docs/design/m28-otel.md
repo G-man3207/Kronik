@@ -735,7 +735,9 @@ the export cursor equals the applied LSN.
 ### 4.6 Delivery and order
 
 - **Batches:** the exporter reads from its cursor, builds a batch, delivers
-  it to the sink, then advances the cursor.
+  it to the sink, then advances the cursor. A batch resumes at the last
+  consumed file offset: it does not CRC-walk records already exported, and
+  it does not hold the snapshot lock across that read.
 - **Native admission (current source, not a new runtime receipt):** startup
   captures the genuine local operator once before exporter awaits; configured
   exporters retain that same original. Operator rewinds use the actual request
