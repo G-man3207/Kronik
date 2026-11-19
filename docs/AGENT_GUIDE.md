@@ -36,10 +36,11 @@ personal data unless your token has `pii:read`.
 - A failed call returns `{"error": {"code", "message", "hint", "docs"}}`. The
   `code` is stable. Read the `hint` first: it usually holds the exact next
   step. `explain` with the code as `topic` gives the full explanation.
-- Forks make no live effects. An effect in a fork is answered from the
-  recordings, or denied. The one exception is a GET without secrets to a
-  host the operator allowlisted. So nothing you do in a fork charges a card
-  or sends a mail.
+- Forks make no live effects but one. An effect in a fork is answered from
+  the recordings, or denied. The exception is a GET without secret headers
+  to a host in `[fork] live_allowlist` whose grant's effective delivery
+  class is `replay-safe`, which goes out live. So nothing you do in a fork
+  charges a card or sends a mail.
 
 ## The golden path
 
@@ -295,7 +296,7 @@ deletes what nothing keeps, and the bytes are for an operator
 | `inspect_blob` | `read` | A blob's state, size and what keeps it, by its hash; never its bytes |
 | `list_connections` | `read` | WebSocket and SSE connections, or one by `id`; closing one is an operator's command |
 | `blob_gc_plan` | `read` | The blob files nothing keeps, with why (`loose`, `released`, `out-of-retention`, `erased`); deletes nothing |
-| `create_fork`, `send_to_fork` | `fork` | Forks and messages into them; never live effects |
+| `create_fork`, `send_to_fork` | `fork` | Forks and messages into them; only a secretless `GET` whose grant is `replay-safe`, to an allowlisted host, leaves |
 | `propose_change` | `propose` | Replays recent traffic through new code; returns the proposal and its diff summary |
 | `get_diff` | `read` | The whole behavior diff of a proposal or a fork |
 | `request_approval` | `propose` | A pending request with the exact command for a human |

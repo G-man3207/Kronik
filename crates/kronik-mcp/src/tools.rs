@@ -276,8 +276,10 @@ const TOOLS: &[Spec] = &[
         name: "create_fork",
         title: "Create a fork",
         scope: "fork",
-        description: "Fork main at a point in its history. A fork makes no live effects. \
-            A token without the pii:read scope always gets a fork without personal data.",
+        description: "Fork main at a point in its history. Only a GET without secret \
+            headers to a host in `[fork] live_allowlist` whose grant is `replay-safe` \
+            leaves the fork. A token without the pii:read scope always gets a fork \
+            without personal data.",
         mutates: true,
         dry_run: true,
         destructive: false,

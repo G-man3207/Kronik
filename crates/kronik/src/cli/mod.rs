@@ -261,7 +261,9 @@ pub struct SendArgs {
     #[arg(long)]
     content_type: Option<String>,
     /// Send the message to the actor in this fork instead of main: it runs
-    /// under the fork's code, without live effects, and has no dry run.
+    /// under the fork's code. A live effect leaves only as a GET without
+    /// secret headers to a `[fork] live_allowlist` host whose grant is
+    /// `replay-safe`. No dry run.
     #[arg(long, conflicts_with = "dry_run")]
     fork: Option<String>,
     #[command(flatten)]

@@ -679,10 +679,12 @@ Next     kronik dead-letters resend main:6 --reason "..."
 ```
 
 With `--fork`, the message goes to the actor in a fork instead (M3): it
-runs under the fork's code, on the fork's state from the fork point on,
-without live effects, and the output lists the turn's effects, with the
-version of each secret they used in a `SECRETS` column when there is one
-(as in `kronik history`). A message into a fork has no dry run.
+runs under the fork's code, on the fork's state from the fork point on.
+A live effect leaves only as a GET without secret headers to a host in
+`[fork] live_allowlist` whose grant's effective delivery class is
+`replay-safe`. The output lists the turn's effects, with the version of
+each secret they used in a `SECRETS` column when there is one (as in
+`kronik history`). A message into a fork has no dry run.
 
 ```text
 $ kronik send counter/a increment --fork try --reason "try it"
@@ -1457,8 +1459,11 @@ kronik keys enroll --config /etc/kronik/kronik.toml --json
 
 Creates a fork (M3): a branch of the history from an LSN, with main's state
 at that point and a log of its own from there on. A fork makes no live
-effects. `--at` is an LSN, `now`, or a logical time in RFC 3339, which
-means the last turn at or before it. The name is generated without
+effects (I7) but one: a fetch without a stub is denied, except a GET
+without secret headers to a host in `[fork] live_allowlist` whose grant's
+effective delivery class is `replay-safe`, which goes out live. `--at` is
+an LSN, `now`, or a logical time in RFC 3339, which means the last turn at
+or before it. The name is generated without
 `--name`. `--no-pii` makes a fork without access to personal data, and a
 token without `pii:read` always gets one: the flag is recorded on the
 fork, and in every privacy mode its actors read each value tagged with a
