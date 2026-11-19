@@ -5,6 +5,10 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- The offered WebSocket subprotocols are split in one place. The guest, the
+  101 response and a turn's JSON name the same value at the recorded index,
+  including when a piece is empty or padded and one value is a bearer token
+  (#248).
 - The operations troubleshooting row for `STORAGE_CORRUPT` no longer says
   to rebuild every case by moving `state.db` aside. When the applied LSN
   is past the end of the log, that deletes the only copy of acknowledged

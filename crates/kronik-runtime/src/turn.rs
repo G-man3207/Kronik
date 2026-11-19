@@ -837,21 +837,6 @@ fn frame_to_wit(f: Option<&pb::Frame>) -> Result<conn_wit::Frame, RunError> {
 pub const MAX_ACCEPT_HEADERS: usize = 64;
 pub const MAX_ACCEPT_HEADER_BYTES: usize = 16 << 10;
 
-/// The subprotocols a WebSocket client offered: its `Sec-WebSocket-Protocol`
-/// headers in order, each split at commas and trimmed (RFC 6455 §4.1). They
-/// come from the recorded request, whose headers are sealable, because
-/// browsers put bearer tokens there (M24 §8); the log keeps no other copy.
-fn offered_subprotocols(headers: &[types::Header]) -> Vec<String> {
-    headers
-        .iter()
-        .filter(|h| h.name.eq_ignore_ascii_case("sec-websocket-protocol"))
-        .flat_map(|h| h.value.split(','))
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
 /// The `connection-handler` call of a connection input (M24): the open's
 /// request, an incoming frame, or the close; a host close's reason is its
 /// cause, such as `restart`.
@@ -872,7 +857,13 @@ fn connection_to_wit(c: &pb::ConnectionInput) -> Result<ConnCall, RunError> {
                 http_to_wit(o.request.as_ref().ok_or_else(|| {
                     RunError::Input("a connection open without its request".into())
                 })?)?;
-            let subprotocols = offered_subprotocols(&request.headers);
+            let subprotocols = kronik_proto::connection::offered_subprotocols(
+                request
+                    .headers
+                    .iter()
+                    .filter(|h| h.name.eq_ignore_ascii_case("sec-websocket-protocol"))
+                    .map(|h| h.value.as_str()),
+            );
             ConnCall::Open(conn_wit::OpenRequest {
                 connection: c.connection.clone(),
                 protocol,

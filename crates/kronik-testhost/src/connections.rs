@@ -607,4 +607,56 @@ mod flow {
             );
         });
     }
+
+    /// #248: the guest, the 101 and turn JSON share one split of
+    /// `Sec-WebSocket-Protocol`. A leading empty piece, surrounding spaces
+    /// and a bearer token must not move the value the actor accepted.
+    #[test]
+    fn offered_subprotocols_agree_in_the_guest_the_101_and_turn_json() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let host = host().await;
+            const TOKEN: &str = "bearer.tok-secret";
+            let header = format!(" , {TOKEN} ,  room.v1 , ");
+            let answer = host
+                .open_connection(
+                    "/room/lobby/ws?user=ada",
+                    vec![("sec-websocket-protocol".into(), header)],
+                    "websocket",
+                )
+                .await
+                .unwrap();
+            assert_eq!(answer.response.status, 101, "{answer:?}");
+            let selected = answer
+                .response
+                .headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case("sec-websocket-protocol"))
+                .map(|(_, v)| v.as_str());
+            // The room selects `room.v1` by name. Index 1 means the leading
+            // empty piece was dropped; anything else here is the token.
+            assert_eq!(selected, Some("room.v1"), "{answer:?}");
+            let turn = answer
+                .response
+                .headers
+                .iter()
+                .find(|(n, _)| n == kronik_gateway::TURN_ID_HEADER)
+                .map(|(_, v)| v.clone())
+                .unwrap();
+            let res = host
+                .api("GET", &format!("/v1/turns/{turn}"), "", Vec::new())
+                .await;
+            assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+            let t: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
+            assert_eq!(t["output"]["accept"]["subprotocol_index"], 1, "{t}");
+            assert_eq!(t["output"]["accept"]["subprotocol"], "room.v1", "{t}");
+            assert!(
+                t["input"]["request"].to_string().contains(TOKEN),
+                "the token was offered: {t}"
+            );
+        });
+    }
 }
