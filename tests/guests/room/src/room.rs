@@ -126,7 +126,12 @@ fn messages_after(after: u64) -> Vec<(u64, String, String)> {
 
 fn stream(conn: &str, n: u32, safe: bool) -> Result<(), HandlerError> {
     for i in 0..n {
-        match connections::send_now(conn, &Frame::Text(format!("tok {i}"))) {
+        let token = if cfg!(feature = "frame-v2") {
+            format!("tok {i} v2")
+        } else {
+            format!("tok {i}")
+        };
+        match connections::send_now(conn, &Frame::Text(token)) {
             Ok(()) => {}
             Err(SendError::Closed) => break,
             Err(SendError::Denied(m)) => {

@@ -51,6 +51,10 @@
 //! Feature `bare` (room-bare.wasm) builds the same manifest for the world
 //! `actor`, without the `connection-handler` export: deploy must refuse it
 //! (ADR 0113).
+//!
+//! Feature `frame-v2` (room-frame-v2.wasm) appends ` v2` to each `send-now`
+//! token and changes nothing else: a crash re-run whose recorded frame
+//! differs.
 
 #[cfg(not(feature = "bare"))]
 include!("room.rs");
