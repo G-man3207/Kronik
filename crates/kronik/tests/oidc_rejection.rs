@@ -1,9 +1,9 @@
 //! Rejected OIDC ID tokens mint no browser session.
 //!
 //! `verify` turns off the JWT library's expiry and `nbf` checks and enforces
-//! issuer, audience, `azp`, skew, expiry, nonce and algorithm itself. The
-//! browser script covers that path, and no CI step runs it. This test
-//! completes the code exchange against `kronik serve`.
+//! issuer, audience, `azp`, `nbf`, skew, expiry, nonce, algorithm and a header
+//! without `jku` itself. The browser script covers that path, and no CI step
+//! runs it. This test completes the code exchange against `kronik serve`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
@@ -23,14 +23,19 @@ use serde_json::{Value, json};
 const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 
 /// Modes the fixture can mint, and that the callback must reject. `signature`
-/// is a key that is not the published one. `algorithm` is RS384.
-const REJECTED: [&str; 6] = [
+/// is a key that is not the published one. `algorithm` is RS384. `azp` lists
+/// this client and another audience and authorizes the other client. `nbf` is
+/// still in the future. `jku` is a header on an otherwise valid token.
+const REJECTED: [&str; 9] = [
     "expired",
     "issuer",
     "audience",
     "nonce",
     "signature",
     "algorithm",
+    "azp",
+    "nbf",
+    "jku",
 ];
 
 fn command() -> Command {
