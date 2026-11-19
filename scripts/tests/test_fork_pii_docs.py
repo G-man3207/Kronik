@@ -1,10 +1,10 @@
-"""SECURITY.md matches who gets personal data in a fork.
+"""SECURITY.md and the security guide match who gets personal data in a fork.
 
 `no_pii` is true when the caller asks, or when the caller lacks
 `pii:read`. `Caller::local` is every scope, and the Unix socket without a
-token uses it. The policy used to say forks have no personal data by
-default, so an operator on that socket could share a fork that still
-holds production subject values.
+token uses it. The policy and the threat table used to say forks have no
+personal data by default, so an operator on that socket could share a fork
+that still holds production subject values.
 """
 
 from pathlib import Path
@@ -14,6 +14,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 POLICY = (ROOT / "SECURITY.md").read_text()
+GUIDE = (ROOT / "docs/guides/security.md").read_text()
 AUTH = (ROOT / "crates/kronik-api/src/auth.rs").read_text()
 M3 = (ROOT / "crates/kronik-api/src/m3.rs").read_text()
 FORK = (ROOT / "crates/kronik/src/cli/fork.rs").read_text()
@@ -50,6 +51,15 @@ def agents_bullet():
         "security policy has no agents bullet",
     )
     return " ".join(found.group(0).split())
+
+
+def agents_threat_cell():
+    found = must(
+        r"\| Agents with too much power \| ([^|]+) \|",
+        GUIDE,
+        "security guide has no agents threat row",
+    )
+    return " ".join(found.group(1).split())
 
 
 class ForkPiiDocsTest(unittest.TestCase):
@@ -126,3 +136,23 @@ class ForkPiiDocsTest(unittest.TestCase):
         )
         self.assertNotIn("personal data by default", POLICY)
         self.assertNotIn("forks have no access to personal data", POLICY)
+
+    def test_threat_table_names_token_and_socket_rules(self):
+        scope = pii_scope()
+        flag = fork_create_flag()
+        cell = agents_threat_cell()
+        self.assertNotIn("by default", cell)
+        self.assertNotIn("exclude personal data by default", cell)
+        self.assertIn(
+            f"A caller without `{scope}` cannot receive personal data in a fork",
+            cell,
+        )
+        self.assertIn(
+            f"A token without `{scope}` always gets a fork without personal data",
+            cell,
+        )
+        self.assertIn(
+            "a Unix-socket caller without a token keeps subject values unless "
+            f"`{flag}`",
+            cell,
+        )

@@ -5,6 +5,11 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- The security guide's threat table no longer says forks exclude personal
+  data by default. A caller without `pii:read` still cannot receive
+  personal data in a fork. A token without that scope always gets one; a
+  Unix-socket caller without a token keeps subject values unless
+  `--no-pii` (#246).
 - Paging the actor list or the dead-letter list in the admin UI keeps
   keyboard focus on that section. Next and First no longer drop focus to
   the top of the page. Opening a view still moves focus to the heading,
