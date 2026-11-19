@@ -5,6 +5,10 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- The security guide no longer says the gateway listens on `127.0.0.1:8080`
+  unless `--http-listen` says otherwise. A config-less `kronik serve` does.
+  `serve --init` without `--domain` writes and binds `0.0.0.0:80` with TLS
+  off. The bind is unchanged (#225).
 - A timer fire already queued no longer deletes a later schedule of the
   same timer id. The queued turn runs, and applying it removes the row,
   only when the stored due time is still the one that fired. The

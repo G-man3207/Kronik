@@ -318,13 +318,21 @@ that a turn generated from `random-bytes`.
   success claim. An owned task preserves the durable replay request after
   caller cancellation. Configuration observations remain source-audited
   even if the export cursor cache is unavailable.
-- **The gateway** serves plain HTTP, on `127.0.0.1:8080` unless
-  `--http-listen` says otherwise, or HTTPS when `[tls]` in `kronik.toml`
-  sets `mode = "files"` (a certificate and key, reloaded every 12 hours) or
+- **The gateway** does not authenticate requests: every deployed route is
+  open to whoever can reach the port. A config-less `kronik serve` listens
+  on `127.0.0.1:8080` (no file, so `[tls]` is off). With a file, the bound
+  address is `server.http_listen` when set, else `127.0.0.1:8080` with
+  `[tls]` off and `0.0.0.0:443` with `[tls]` `files` or `acme`.
+  `--http-listen` overrides the file. `kronik serve --init` without
+  `--domain` and without `--http-listen` writes
+  `http_listen = "0.0.0.0:80"` and `[tls] mode = "off"`, and binds that, not
+  the loopback port of a config-less start. With `--domain` it writes
+  `0.0.0.0:443` and ACME, unless `--http-listen` names another address,
+  which is written into the file instead. HTTPS is on when `[tls]` sets
+  `mode = "files"` (a certificate and key, reloaded every 12 hours) or
   `mode = "acme"` (a certificate for `domains` by ACME TLS-ALPN-01 on the
   gateway's own port, renewed 30 days before expiry), since M6
-  ([ADR 0009](../adr/0009-acme-instant-acme.md)). It does not authenticate
-  requests: every deployed route is open to whoever can reach the port. A
+  ([ADR 0009](../adr/0009-acme-instant-acme.md)). A
   client has 10 s to send a request head. A kind whose code does not import
   `blobs` accepts a body of at most 1 MiB, and that body must arrive within
   30 s. A kind whose code imports `blobs` (the actor world does, so an SDK
