@@ -26,6 +26,10 @@ const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/guests/counter.wasm"
 );
+const COUNTER_BODY_V2: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/guests/counter-body-v2.wasm"
+);
 
 // ---------------------------------------------------------------- test server
 
@@ -560,6 +564,184 @@ fn recorded_result_is_not_requested_again_and_the_rerun_is_identical() {
         "{}",
         reply_of(&t)
     );
+}
+
+/// Crash after a recorded POST, then restart on guest code that builds a
+/// different body for that ordinal. The gate must trap `REPLAY_DIVERGED`
+/// and must not send the call again. `RecordedMatch` is unit-tested; this
+/// is the gate. Returning `Ok(None)` from `EffectGate::recorded` on a
+/// mismatch still passes that unit test and fails this one.
+///
+/// A re-run loads `TurnBegin.code_hash`, so a deploy would not change the
+/// guest. The test installs `counter-body-v2` (the same actor, with `" v2"`
+/// appended to fetch bodies) and points the open turn at that hash.
+/// An identical re-run is
+/// `recorded_result_is_not_requested_again_and_the_rerun_is_identical`.
+#[test]
+fn a_crash_rerun_with_a_different_body_traps_and_is_not_sent_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start();
+    let armed = dir.path().join("hold-armed");
+    let reached = dir.path().join("hold-reached");
+    std::fs::write(&armed, b"armed").unwrap();
+    let p = start_with(
+        dir.path(),
+        NodeConfig {
+            concurrency: 8,
+            test_hold: Some(kronik_sched::TestHold {
+                point: kronik_sched::HoldPoint::BeforeCommit,
+                armed: armed.clone(),
+                reached: reached.clone(),
+            }),
+            ..NodeConfig::default()
+        },
+    );
+    p.deploy();
+    // POST's default delivery is unsafe. A mismatch must still trap, not
+    // become outcome-unknown and not go out again.
+    p.grant("http:127.0.0.1", None, None);
+    let spec = format!("POST {}\n\nfirst", server.url("/ok"));
+    p.send_detached("counter/a", msg("fetch", &spec));
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let open = loop {
+        // `db()`'s guard lives to the semicolon; locking it again here deadlocks.
+        let turns = p.node.store().db().open_turns().unwrap();
+        let ready = turns.into_iter().find(|t| {
+            reached.exists()
+                && p.node
+                    .store()
+                    .db()
+                    .open_effects(&t.execution_id)
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.kind == "http.fetch" && e.status == pb::EffectStatus::Ok as i32)
+        });
+        if let Some(turn) = ready {
+            break turn;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the turn never parked with a recorded POST"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    server.wait_for("/ok", 1);
+    assert_eq!(server.seen("/ok")[0].body, b"first");
+    let execution_id = open.execution_id.clone();
+    drop(p);
+
+    let v2 = std::fs::read(COUNTER_BODY_V2).unwrap();
+    let hash = install_component(dir.path(), &v2);
+    point_open_turn_at(dir.path(), &execution_id, &hash, open.lsn, open.pos.segment);
+    let begin = log_records(dir.path())
+        .into_iter()
+        .find_map(|r| match r {
+            Record::TurnBegin(b) if b.execution_id == execution_id => Some(b),
+            _ => None,
+        })
+        .expect("the rewritten TurnBegin");
+    assert_eq!(begin.code_hash, hash);
+
+    let p = start(dir.path());
+    // Close, then assert the code. Waiting only for REPLAY_DIVERGED hides a
+    // gate that treats the mismatch as unrecorded and closes another way.
+    p.wait_until("the re-run to close", |p| {
+        turn_records(&p.records())
+            .iter()
+            .any(|t| t.execution_id == execution_id)
+    });
+    let t = turn_records(&p.records())
+        .into_iter()
+        .find(|t| t.execution_id == execution_id)
+        .unwrap();
+    let outcome = t.outcome.as_ref().unwrap();
+    assert_eq!(outcome.kind, pb::OutcomeKind::Trap as i32, "{outcome:?}");
+    assert_eq!(outcome.error_code, "REPLAY_DIVERGED", "{outcome:?}");
+    assert!(
+        outcome.message.contains("http.fetch")
+            && outcome
+                .message
+                .contains("differs from the recorded request"),
+        "{}",
+        outcome.message
+    );
+    assert!(
+        t.effects
+            .iter()
+            .all(|e| e.status != pb::EffectStatus::OutcomeUnknown as i32),
+        "a mismatch was treated as an unrecorded unsafe effect: {t:?}"
+    );
+    assert!(p.node.store().db().open_turns().unwrap().is_empty());
+    let seen = server.seen("/ok");
+    assert_eq!(seen.len(), 1, "the diverged POST was sent again: {seen:?}");
+    assert_eq!(seen[0].method, "POST");
+    assert_eq!(seen[0].body, b"first");
+}
+
+fn install_component(dir: &Path, bytes: &[u8]) -> Vec<u8> {
+    let hash = kronik_core::ids::CodeHash::of(bytes);
+    let code = dir.join("code");
+    std::fs::create_dir_all(&code).unwrap();
+    std::fs::write(code.join(format!("{}.wasm", hash.hex())), bytes).unwrap();
+    hash.0.to_vec()
+}
+
+/// Points the open turn's `TurnBegin` at `code_hash` and keeps `state.db`'s
+/// offsets on the rewritten segment.
+fn point_open_turn_at(dir: &Path, execution_id: &str, code_hash: &[u8], lsn: u64, segment: u64) {
+    let log = dir.join("branches/main/log");
+    let mut found = false;
+    for start in kronik_log::segment_starts(&log).unwrap() {
+        let path = log.join(kronik_log::segment_name(start));
+        let rewritten = kronik_log::rewrite_segment(&path, |_lsn, record| {
+            let Record::TurnBegin(begin) = record else {
+                return Ok(false);
+            };
+            if begin.execution_id != execution_id {
+                return Ok(false);
+            }
+            begin.code_hash = code_hash.to_vec();
+            found = true;
+            Ok(true)
+        })
+        .unwrap_or_else(|e| panic!("rewrite {}: {e}", path.display()));
+        if !found {
+            continue;
+        }
+        let db = rusqlite::Connection::open(dir.join("branches/main/state.db")).unwrap();
+        for (at, offset) in &rewritten.offsets {
+            db.execute(
+                "UPDATE turn_index SET offset = ?1 WHERE lsn = ?2 AND segment = ?3",
+                rusqlite::params![*offset as i64, *at as i64, start as i64],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE open_turns SET offset = ?1 WHERE lsn = ?2 AND segment = ?3",
+                rusqlite::params![*offset as i64, *at as i64, start as i64],
+            )
+            .unwrap();
+        }
+        let pointed = db
+            .query_row(
+                "SELECT offset FROM open_turns WHERE execution_id = ?1 AND segment = ?2",
+                rusqlite::params![execution_id, segment as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let expected = rewritten
+            .offsets
+            .iter()
+            .find(|(at, _)| *at == lsn)
+            .map(|(_, offset)| *offset as i64)
+            .expect("the rewritten segment lost the TurnBegin");
+        assert_eq!(
+            pointed, expected,
+            "the open turn no longer points at its TurnBegin"
+        );
+        break;
+    }
+    assert!(found, "open turn {execution_id} was not in the log");
 }
 
 #[test]
