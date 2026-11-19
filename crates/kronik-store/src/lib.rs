@@ -641,6 +641,7 @@ impl Store {
             ddl: t.sql_schema.iter().map(|s| s.statement.clone()).collect(),
             changesets,
             vm_steps: 0,
+            // Not in the log. apply combines `changesets` (ADR 0160).
             whole: Vec::new(),
         };
         db.apply(&turn, lsn, &BTreeSet::new())

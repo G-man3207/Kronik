@@ -5,6 +5,14 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- A SQL turn that writes both sides of a foreign key for different subjects
+  no longer fails apply and takes the node down on every restart. The child
+  was applied before the parent when its subject sorted first, and the
+  delete of a parent whose subject sorted first failed the same way. Apply
+  combines the turn's per-subject changesets and checks foreign keys once,
+  after every subject's changes. A conflict that is still there is an error
+  and rolls back; it does not abort the process. The log still keeps one
+  changeset per subject for erasure and sealing (#242).
 - `kronik privacy erase` of a subject whose rows share a foreign key no
   longer deletes the parent first, fails the apply, and leaves a durable
   `Erasure` that every later start dies on. Foreign-key checks wait until

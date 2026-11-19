@@ -21,7 +21,7 @@ use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_store::Store;
 use kronik_store::StoreError;
-use kronik_store::sql::{Limits, MemOpener, SqlActor, TurnOpts};
+use kronik_store::sql::{Limits, MemOpener, SqlActor, TurnOpts, TurnSql, changeset_rows};
 
 const SCHEMA: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
      _subject TEXT DEFAULT (kronik_subject()))";
@@ -535,4 +535,280 @@ fn a_cross_subject_reference_is_not_a_corrupt_erasure() {
         "a refused erasure deleted the parent"
     );
     assert_eq!(actor_applied(&live), 2);
+}
+
+const FK_SCHEMA: &[&str] = &[
+    "CREATE TABLE account (id INTEGER PRIMARY KEY, _subject TEXT)",
+    "CREATE TABLE line (id INTEGER PRIMARY KEY, \
+     account_id INTEGER NOT NULL REFERENCES account(id), _subject TEXT)",
+];
+
+type FkRows = (Vec<(i64, String)>, Vec<(i64, i64, String)>);
+
+fn guest_turns(turns: &[&[&str]]) -> Vec<TurnSql> {
+    let mut actor = SqlActor::open(&MemOpener, "notes/n", Limits::default()).unwrap();
+    let mut out = Vec::new();
+    for (i, stmts) in turns.iter().enumerate() {
+        let migrate = i == 0;
+        actor
+            .begin_turn(&turn_opts(
+                (i + 1) as u8,
+                (!migrate).then_some("user:1"),
+                migrate,
+            ))
+            .unwrap();
+        for statement in *stmts {
+            actor
+                .query(statement, &[])
+                .unwrap_or_else(|e| panic!("{statement}: {e:?}"));
+        }
+        let mut recorded = actor.end_turn(true).unwrap();
+        actor
+            .apply(&recorded, (i + 1) as u64, &BTreeSet::new())
+            .unwrap_or_else(|e| panic!("guest apply: {e}"));
+        recorded.whole.clear();
+        out.push(recorded);
+    }
+    out
+}
+
+fn subject_names(changes: &[(Option<String>, Vec<u8>)]) -> Vec<Option<&str>> {
+    changes
+        .iter()
+        .map(|(subject, _)| subject.as_deref())
+        .collect()
+}
+
+fn read_fk(conn: &rusqlite::Connection) -> FkRows {
+    let accounts = conn
+        .prepare("SELECT id, _subject FROM account ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let lines = conn
+        .prepare("SELECT id, account_id, _subject FROM line ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    (accounts, lines)
+}
+
+fn store_fk(store: &Store) -> FkRows {
+    let db = store.sql.get("notes/n").unwrap();
+    let actor = db.lock().unwrap();
+    actor.set_host();
+    read_fk(&actor.conn)
+}
+
+fn direct_fk(statements: &[&str]) -> FkRows {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    for statement in statements {
+        conn.execute(statement, []).unwrap();
+    }
+    read_fk(&conn)
+}
+
+fn seal_changes(sealer: &Sealer, changes: &[(Option<String>, Vec<u8>)]) -> Vec<pb::SqlChangeset> {
+    changes
+        .iter()
+        .map(|(subject, cs)| {
+            let mut value = pb::Sealable {
+                subject: subject.clone(),
+                value: Some(pb::sealable::Value::Plain(cs.clone())),
+            };
+            sealer
+                .seal_value(&mut value, &|b: &mut [u8]| b.fill(9), 2)
+                .unwrap();
+            assert!(
+                matches!(value.value, Some(pb::sealable::Value::Sealed(_))),
+                "sealing must keep a per-subject ciphertext"
+            );
+            pb::SqlChangeset {
+                changeset: Some(value),
+            }
+        })
+        .collect()
+}
+
+/// Issue #242: a parent for `z` and a child for `a` in one turn. Apply used
+/// to insert `a` first and fail the foreign-key check after the record was
+/// durable. The rows match a direct execution, a restart, and an erasure of
+/// the child still opens only that subject's changeset.
+#[test]
+fn a_cross_subject_parent_insert_commits_and_survives_restart() {
+    let inserts = [
+        "INSERT INTO account(id, _subject) VALUES (1, 'z')",
+        "INSERT INTO line(id, account_id, _subject) VALUES (1, 1, 'a')",
+    ];
+    let turns = guest_turns(&[FK_SCHEMA, &inserts]);
+    let changes = &turns[1].changesets;
+    assert_eq!(subject_names(changes), [Some("a"), Some("z")]);
+    for (subject, cs) in changes {
+        let rows = changeset_rows(cs).unwrap();
+        assert_eq!(rows.len(), 1, "{subject:?}");
+        assert_eq!(rows[0].op, "insert");
+        assert_eq!(
+            rows[0].table,
+            match subject.as_deref() {
+                Some("a") => "line",
+                Some("z") => "account",
+                other => panic!("unexpected subject {other:?}"),
+            }
+        );
+    }
+    let master = MasterKey::from_bytes([9; 32]).unwrap();
+    let sealer = Arc::new(Sealer::new(Arc::new(
+        Keystore::open_memory(&master).unwrap(),
+    )));
+    sealer.set_on(true);
+    let sealed = seal_changes(&sealer, changes);
+    assert_eq!(
+        sealed
+            .iter()
+            .map(|c| c.changeset.as_ref().and_then(|v| v.subject.as_deref()))
+            .collect::<Vec<_>>(),
+        [Some("a"), Some("z")]
+    );
+    let mut log = vec![
+        turn(1, &turns[0].ddl, Vec::new()),
+        turn(2, &[], sealed.clone()),
+    ];
+    let expect = direct_fk(&[FK_SCHEMA[0], FK_SCHEMA[1], inserts[0], inserts[1]]);
+    let live = store_after(&sealer, &log);
+    assert_eq!(store_fk(&live), expect, "live apply");
+    assert_eq!(
+        store_fk(&store_after(&sealer, &from_log(&log))),
+        expect,
+        "restart"
+    );
+    let blocked = live.erasure_blocked("z").unwrap().unwrap();
+    assert!(blocked.contains("line"), "{blocked}");
+    assert!(live.erasure_blocked("a").unwrap().is_none());
+
+    let key_version = sealer.erase("a", 3).unwrap();
+    log.push(committed(
+        3,
+        Record::Erasure(pb::Erasure {
+            subject: "a".into(),
+            key_version,
+            ..Default::default()
+        }),
+    ));
+    live.apply(&log[2..])
+        .expect("erasing the child must still apply");
+    assert_eq!(store_fk(&live), (vec![(1, "z".into())], vec![]));
+    for change in &sealed {
+        let value = change.changeset.as_ref().unwrap();
+        match sealer.open(value) {
+            Opened::Value(bytes) => {
+                assert_eq!(value.subject.as_deref(), Some("z"));
+                let rows = changeset_rows(&bytes).unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].table, "account");
+            }
+            Opened::Erased { subject } => assert_eq!(subject, "a"),
+            Opened::Unreadable { subject, why } => panic!("{subject}: {why}"),
+        }
+    }
+    assert_eq!(
+        store_fk(&store_after(&sealer, &from_log(&log))),
+        store_fk(&live),
+        "restart after erasure"
+    );
+}
+
+/// Issue #242: delete the child for `z` and the parent for `a` in one turn.
+/// Apply used to delete `a` first. A row of another subject stays.
+#[test]
+fn a_cross_subject_parent_delete_commits_and_survives_restart() {
+    let setup = [
+        "INSERT INTO account(id, _subject) VALUES (1, 'a')",
+        "INSERT INTO line(id, account_id, _subject) VALUES (1, 1, 'z')",
+        "INSERT INTO account(id, _subject) VALUES (2, 'keep')",
+    ];
+    let deletes = [
+        "DELETE FROM line WHERE id = 1",
+        "DELETE FROM account WHERE id = 1",
+    ];
+    let turns = guest_turns(&[FK_SCHEMA, &setup, &deletes]);
+    let delete = &turns[2].changesets;
+    assert_eq!(subject_names(delete), [Some("a"), Some("z")]);
+    for (subject, cs) in delete {
+        let rows = changeset_rows(cs).unwrap();
+        assert_eq!(rows.len(), 1, "{subject:?}");
+        assert_eq!(rows[0].op, "delete");
+        assert_eq!(
+            rows[0].table,
+            match subject.as_deref() {
+                Some("a") => "account",
+                Some("z") => "line",
+                other => panic!("unexpected subject {other:?}"),
+            }
+        );
+    }
+    let log: Vec<Committed> = turns
+        .iter()
+        .enumerate()
+        .map(|(i, t)| turn(i as u64 + 1, &t.ddl, sealable_changes(t.changesets.clone())))
+        .collect();
+    let expect = direct_fk(&[
+        FK_SCHEMA[0],
+        FK_SCHEMA[1],
+        setup[0],
+        setup[1],
+        setup[2],
+        deletes[0],
+        deletes[1],
+    ]);
+    let sealer = Arc::new(Sealer::plain());
+    assert_eq!(store_fk(&store_after(&sealer, &log)), expect, "live apply");
+    assert_eq!(
+        store_fk(&store_after(&sealer, &from_log(&log))),
+        expect,
+        "restart"
+    );
+    assert_eq!(expect.0, [(2, "keep".into())]);
+    assert!(expect.1.is_empty());
+}
+
+/// Issue #242: combining the changesets must not hide a conflict that is
+/// still there. The apply rolls back, and a restart of that record fails
+/// the same way.
+#[test]
+fn a_combined_changeset_conflict_fails_closed() {
+    let turns = guest_turns(&[
+        FK_SCHEMA,
+        &["INSERT INTO account(id, _subject) VALUES (99, 'z')"],
+        &[
+            "INSERT INTO account(id, _subject) VALUES (1, 'z')",
+            "INSERT INTO line(id, account_id, _subject) VALUES (1, 99, 'a')",
+        ],
+    ]);
+    assert_eq!(subject_names(&turns[2].changesets), [Some("a"), Some("z")]);
+    let sealer = Arc::new(Sealer::plain());
+    let log = [
+        turn(1, &turns[0].ddl, Vec::new()),
+        turn(2, &[], sealable_changes(turns[2].changesets.clone())),
+    ];
+    let live = store_after(&sealer, &log[..1]);
+    let again = from_log(&log[1..]);
+    for record in [&log[1..], again.as_slice()] {
+        let err = live.apply(record).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Corrupt(msg) if msg.contains("FOREIGN_KEY")),
+            "a remaining foreign-key conflict must fail closed: {err}"
+        );
+        assert_eq!(store_fk(&live), (vec![], vec![]));
+        assert_eq!(actor_applied(&live), 1);
+        let db = live.sql.get("notes/n").unwrap();
+        assert!(
+            db.lock().unwrap().conn.is_autocommit(),
+            "a failed apply left a transaction open"
+        );
+    }
 }
