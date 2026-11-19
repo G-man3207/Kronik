@@ -130,7 +130,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent.parent
 SCOPES = ["read", "fork", "propose", "approve", "promote", "operate", "pii:read", "admin"]
-MODES = {"valid", "issuer", "audience", "nonce", "state", "keys", "signature", "expired", "algorithm", "reader", "unmapped", "revoked"}
+MODES = {"valid", "issuer", "audience", "nonce", "state", "keys", "signature", "expired", "algorithm", "azp", "nbf", "jku", "reader", "unmapped", "revoked"}
 
 
 def require(condition, message):
@@ -311,7 +311,16 @@ class Provider:
                     claims["nonce"] = "wrong-nonce"
                 if mode == "expired":
                     claims.update(iat=now - 600, exp=now - 300)
+                if mode == "azp":
+                    # This client is in aud; a different client is the authorized party.
+                    claims["aud"] = ["kronik-ui", "other-client"]
+                    claims["azp"] = "other-client"
+                if mode == "nbf":
+                    claims["nbf"] = now + 300
                 header = {"typ": "JWT", "kid": "unknown-key" if mode == "keys" else "fixture-key"}
+                if mode == "jku":
+                    # Otherwise valid; verify must not accept a token-provided JWKS URL.
+                    header["jku"] = "https://fixture.invalid/jwks"
                 signing_key = fixture.other_key if mode == "signature" else fixture.key
                 # RS384 parses as a JWT algorithm; the daemon allows only RS256.
                 algorithm = "RS384" if mode == "algorithm" else "RS256"
