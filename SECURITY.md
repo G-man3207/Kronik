@@ -57,8 +57,14 @@ known gaps.
   `--isolation trusted` instead, which runs an image with plain `runc` on the
   host kernel and says so with a warning.
 - **Agents and operators** use tokens with scopes. Policy and approvals gate
-  changes, forks have no access to personal data by default, and every
-  mutation requires a reason and is recorded.
+  changes. A caller without `pii:read` cannot receive personal data in a
+  fork: the fork excludes it when the caller passes `--no-pii`, and always
+  when the caller lacks that scope, so a token without `pii:read` always
+  gets such a fork. A caller on the Unix socket without a token has every
+  scope, including `pii:read`, so `kronik fork create` keeps production
+  subject values unless `--no-pii`. That flag is how a local operator opts
+  into a fork without personal data. Every mutation requires a reason and
+  is recorded.
 - **Secrets are handles.** The host inserts a secret value at the effect
   boundary, so it never reaches guest code or the log. Revealing a raw value
   requires the capability `secret-reveal:<name>`; exact occurrences are then
