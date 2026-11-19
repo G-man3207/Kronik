@@ -158,6 +158,9 @@ codes! {
     EngineVersionMismatch = "ENGINE_VERSION_MISMATCH", 409, "M6",
         "The engine version differs from the recorded one",
         "Run the recorded engine version, or verify the new one with `kronik upgrade check`.";
+    ErasureBlocked = "ERASURE_BLOCKED", 409, "M8",
+        "Another subject's row references a row this erasure would delete",
+        "Delete or reassign that row, then run `kronik privacy erase <subject> --reason '...'` again. Nothing was erased.";
     ExportNotConfigured = "EXPORT_NOT_CONFIGURED", 409, "M28",
         "The export stream is off",
         "Turn it on in kronik.toml ([audit] sink or [otel] endpoint) and restart; see `kronik export status`.";

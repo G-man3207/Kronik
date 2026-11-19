@@ -20,6 +20,7 @@ use kronik_privacy::sealer::{Opened, Sealer};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_store::Store;
+use kronik_store::StoreError;
 use kronik_store::sql::{Limits, MemOpener, SqlActor, TurnOpts};
 
 const SCHEMA: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
@@ -401,4 +402,137 @@ fn quoted_rows(store: &Store) -> Vec<(String, String)> {
 fn actor_applied(store: &Store) -> u64 {
     let db = store.sql.get("notes/n").unwrap();
     db.lock().unwrap().applied_lsn().unwrap()
+}
+
+type SubjectChanges = Vec<(Option<String>, Vec<u8>)>;
+
+fn fk_changesets(schema: &[&str], inserts: &[&str]) -> (Vec<String>, SubjectChanges) {
+    let mut actor = SqlActor::open(&MemOpener, "notes/n", Limits::default()).unwrap();
+    actor.begin_turn(&turn_opts(1, None, true)).unwrap();
+    for statement in schema {
+        actor.query(statement, &[]).unwrap();
+    }
+    let schema_turn = actor.end_turn(true).unwrap();
+    actor.apply(&schema_turn, 1, &BTreeSet::new()).unwrap();
+    actor
+        .begin_turn(&turn_opts(2, Some("user:1"), false))
+        .unwrap();
+    for statement in inserts {
+        actor.query(statement, &[]).unwrap();
+    }
+    let dml = actor.end_turn(true).unwrap();
+    (schema_turn.ddl, dml.changesets)
+}
+
+fn sealable_changes(changes: SubjectChanges) -> Vec<pb::SqlChangeset> {
+    changes
+        .into_iter()
+        .map(|(subject, cs)| pb::SqlChangeset {
+            changeset: Some(pb::Sealable {
+                subject,
+                value: Some(pb::sealable::Value::Plain(cs)),
+            }),
+        })
+        .collect()
+}
+
+fn account_line(store: &Store) -> Vec<(i64, String)> {
+    let db = store.sql.get("notes/n").unwrap();
+    let actor = db.lock().unwrap();
+    actor.set_host();
+    let mut st = actor
+        .conn
+        .prepare("SELECT id, _subject FROM account ORDER BY id")
+        .unwrap();
+    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// Issue #241: applying the `Erasure` record deletes a parent and its child
+/// of the same subject, leaves the other subject, and a rebuild (what a
+/// restart applies) does not report the record corrupt.
+#[test]
+fn a_parent_child_erasure_applies_and_a_rebuild_stays_up() {
+    let schema = [
+        "CREATE TABLE account (id INTEGER PRIMARY KEY, _subject TEXT)",
+        "CREATE TABLE line (id INTEGER PRIMARY KEY, \
+         account_id INTEGER NOT NULL REFERENCES account(id), _subject TEXT)",
+    ];
+    let inserts = [
+        "INSERT INTO account(id, _subject) VALUES (1, 'user:1')",
+        "INSERT INTO line(id, account_id, _subject) VALUES (1, 1, 'user:1')",
+        "INSERT INTO account(id, _subject) VALUES (2, 'user:2')",
+        "INSERT INTO line(id, account_id, _subject) VALUES (2, 2, 'user:2')",
+    ];
+    let (ddl, changes) = fk_changesets(&schema, &inserts);
+    let sealer = Arc::new(Sealer::plain());
+    let log = [
+        turn(1, &ddl, Vec::new()),
+        turn(2, &[], sealable_changes(changes)),
+        committed(
+            3,
+            Record::Erasure(pb::Erasure {
+                subject: "user:1".into(),
+                ..Default::default()
+            }),
+        ),
+    ];
+    let live = store_after(&sealer, &log[..2]);
+    assert!(live.erasure_blocked("user:1").unwrap().is_none());
+    live.apply(&log[2..])
+        .expect("same-subject erasure must apply; a corrupt apply marks the node fatal");
+    assert_eq!(account_line(&live), [(2, "user:2".into())]);
+    assert_eq!(actor_applied(&live), 3);
+
+    let rebuilt = store_after(&sealer, &from_log(&log));
+    assert_eq!(account_line(&rebuilt), account_line(&live));
+    assert_eq!(actor_applied(&rebuilt), 3);
+}
+
+/// A cross-subject reference is not `STORAGE_CORRUPT`. Apply refuses it,
+/// leaves the rows, and a second apply (a restart of that record) does too.
+#[test]
+fn a_cross_subject_reference_is_not_a_corrupt_erasure() {
+    let schema = [
+        "CREATE TABLE account (id INTEGER PRIMARY KEY, _subject TEXT)",
+        "CREATE TABLE line (id INTEGER PRIMARY KEY, \
+         account_id INTEGER NOT NULL REFERENCES account(id), _subject TEXT)",
+    ];
+    let inserts = [
+        "INSERT INTO account(id, _subject) VALUES (1, 'user:1')",
+        "INSERT INTO line(id, account_id, _subject) VALUES (1, 1, 'user:2')",
+    ];
+    let (ddl, changes) = fk_changesets(&schema, &inserts);
+    let sealer = Arc::new(Sealer::plain());
+    let log = [
+        turn(1, &ddl, Vec::new()),
+        turn(2, &[], sealable_changes(changes)),
+        committed(
+            3,
+            Record::Erasure(pb::Erasure {
+                subject: "user:1".into(),
+                ..Default::default()
+            }),
+        ),
+    ];
+    let live = store_after(&sealer, &log[..2]);
+    let blocked = live.erasure_blocked("user:1").unwrap().unwrap();
+    assert!(blocked.contains("line"), "{blocked}");
+    assert!(blocked.contains("user:1"), "{blocked}");
+    for _ in 0..2 {
+        let err = live.apply(&log[2..]).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Constraint(_)),
+            "foreign-key failure must not be STORAGE_CORRUPT: {err}"
+        );
+        assert!(!err.to_string().contains("STORAGE_CORRUPT"), "{err}");
+    }
+    assert_eq!(
+        account_line(&live),
+        [(1, "user:1".into())],
+        "a refused erasure deleted the parent"
+    );
+    assert_eq!(actor_applied(&live), 2);
 }

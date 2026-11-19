@@ -787,3 +787,223 @@ fn a_lost_call_of_an_erased_subject_closes_with_the_tombstone() {
         });
     }
 }
+
+fn fk_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+type SubjectChanges = Vec<(Option<String>, Vec<u8>)>;
+
+fn fk_changes(schema: &[&str], inserts: &[&str]) -> (Vec<String>, SubjectChanges) {
+    use kronik_store::sql::{Limits, MemOpener, SqlActor, TurnOpts};
+    let opts = |seed: u8, subject: Option<&str>, migrate: bool| TurnOpts {
+        seed: [seed; 32],
+        time_ms: i64::from(seed),
+        default_subject: subject.map(str::to_owned),
+        migrate,
+        sql_budget: 50_000_000,
+        max_bytes: 0,
+    };
+    let mut actor = SqlActor::open(&MemOpener, "notes/n", Limits::default()).unwrap();
+    actor.begin_turn(&opts(1, None, true)).unwrap();
+    for statement in schema {
+        actor.query(statement, &[]).unwrap();
+    }
+    let schema_turn = actor.end_turn(true).unwrap();
+    actor
+        .apply(&schema_turn, 1, &std::collections::BTreeSet::new())
+        .unwrap();
+    actor.begin_turn(&opts(2, Some("user:1"), false)).unwrap();
+    for statement in inserts {
+        actor.query(statement, &[]).unwrap();
+    }
+    let dml = actor.end_turn(true).unwrap();
+    (schema_turn.ddl, dml.changesets)
+}
+
+fn sql_record(id: &str, ddl: Vec<String>, changes: SubjectChanges) -> Record {
+    Record::TurnRecord(pb::TurnRecord {
+        actor: Some(pb::ActorRef {
+            kind: "notes".into(),
+            key: "n".into(),
+        }),
+        causal_key: Some(kronik_core::causal::root(id.into())),
+        input: Some(pb::Input {
+            kind: Some(pb::input::Kind::Http(pb::HttpInput {
+                method: "POST".into(),
+                path: "/notes".into(),
+                body: Some(pb::Body {
+                    value: Some(pb::body::Value::Inline(pb::Sealable {
+                        subject: None,
+                        value: Some(pb::sealable::Value::Plain(Vec::new())),
+                    })),
+                }),
+                ..Default::default()
+            })),
+        }),
+        outcome: Some(pb::Outcome {
+            kind: pb::OutcomeKind::Committed as i32,
+            ..Default::default()
+        }),
+        sql_schema: ddl
+            .into_iter()
+            .map(|statement| pb::SqlSchemaChange { statement })
+            .collect(),
+        sql_changes: changes
+            .into_iter()
+            .map(|(subject, cs)| pb::SqlChangeset {
+                changeset: Some(pb::Sealable {
+                    subject,
+                    value: Some(pb::sealable::Value::Plain(cs)),
+                }),
+            })
+            .collect(),
+        ..Default::default()
+    })
+}
+
+fn fk_subjects(node: &Node, table: &str) -> Vec<String> {
+    let db = node.store().sql.get("notes/n").unwrap();
+    let actor = db.lock().unwrap();
+    actor.set_host();
+    let mut st = actor
+        .conn
+        .prepare(&format!("SELECT _subject FROM {table} ORDER BY id"))
+        .unwrap();
+    st.query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+async fn load_fk(node: &Node, schema: &[&str], inserts: &[&str]) {
+    let (ddl, changes) = fk_changes(schema, inserts);
+    node.commit(sql_record("fk-schema", ddl, Vec::new()))
+        .await
+        .unwrap();
+    node.commit(sql_record("fk-rows", Vec::new(), changes))
+        .await
+        .unwrap();
+}
+
+const FK_SCHEMA: &[&str] = &[
+    "CREATE TABLE account (id INTEGER PRIMARY KEY, _subject TEXT)",
+    "CREATE TABLE line (id INTEGER PRIMARY KEY, \
+     account_id INTEGER NOT NULL REFERENCES account(id), _subject TEXT)",
+];
+
+/// Issue #241: erasing `user:1` deletes its account and the line that
+/// references it, leaves `user:2`, and a restart applies that `Erasure`
+/// and stays up.
+#[test]
+fn a_parent_child_erasure_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let rt = fk_runtime();
+        rt.block_on(async {
+            let node = crate::start_local(
+                Env::real(tokio::runtime::Handle::current()),
+                dir.path(),
+                NodeConfig::default(),
+            )
+            .await
+            .unwrap();
+            let authority = node.local_operator_authority().unwrap();
+            load_fk(
+                &node,
+                FK_SCHEMA,
+                &[
+                    "INSERT INTO account(id, _subject) VALUES (1, 'user:1')",
+                    "INSERT INTO line(id, account_id, _subject) VALUES (1, 1, 'user:1')",
+                    "INSERT INTO account(id, _subject) VALUES (2, 'user:2')",
+                    "INSERT INTO line(id, account_id, _subject) VALUES (2, 2, 'user:2')",
+                ],
+            )
+            .await;
+            node.erase_subject("user:1", audit(), false, authority)
+                .await
+                .unwrap();
+            assert_eq!(node.fatal(), None);
+            assert_eq!(fk_subjects(&node, "account"), ["user:2".to_string()]);
+            assert_eq!(fk_subjects(&node, "line"), ["user:2".to_string()]);
+        });
+    }
+    let rt = fk_runtime();
+    rt.block_on(async {
+        let node = crate::start_local(
+            Env::real(tokio::runtime::Handle::current()),
+            dir.path(),
+            NodeConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(node.fatal(), None);
+        assert_eq!(fk_subjects(&node, "account"), ["user:2".to_string()]);
+        assert_eq!(fk_subjects(&node, "line"), ["user:2".to_string()]);
+    });
+}
+
+/// A row of another subject that references the parent blocks the API
+/// before the keys are destroyed. Restart stays up, and the rows remain.
+#[test]
+fn a_cross_subject_reference_does_not_append_an_erasure() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let rt = fk_runtime();
+        rt.block_on(async {
+            let node = crate::start_local(
+                Env::real(tokio::runtime::Handle::current()),
+                dir.path(),
+                NodeConfig::default(),
+            )
+            .await
+            .unwrap();
+            let authority = node.local_operator_authority().unwrap();
+            load_fk(
+                &node,
+                FK_SCHEMA,
+                &[
+                    "INSERT INTO account(id, _subject) VALUES (1, 'user:1')",
+                    "INSERT INTO line(id, account_id, _subject) VALUES (1, 1, 'user:2')",
+                ],
+            )
+            .await;
+            let err = node
+                .erase_subject("user:1", audit(), false, authority)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                kronik_core::error::ErrorCode::ErasureBlocked,
+                "{err}"
+            );
+            assert!(!err.to_string().contains("STORAGE_CORRUPT"), "{err}");
+            assert_eq!(node.fatal(), None);
+            assert!(
+                node.sealer().erasures().unwrap().is_empty(),
+                "keys were destroyed before the call failed"
+            );
+            assert!(node.store().db().erasures().unwrap().is_empty());
+            assert_eq!(fk_subjects(&node, "account"), ["user:1".to_string()]);
+            assert_eq!(fk_subjects(&node, "line"), ["user:2".to_string()]);
+        });
+    }
+    let rt = fk_runtime();
+    rt.block_on(async {
+        let node = crate::start_local(
+            Env::real(tokio::runtime::Handle::current()),
+            dir.path(),
+            NodeConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(node.fatal(), None);
+        assert_eq!(fk_subjects(&node, "account"), ["user:1".to_string()]);
+        assert_eq!(fk_subjects(&node, "line"), ["user:2".to_string()]);
+        assert!(node.sealer().erasures().unwrap().is_empty());
+    });
+}

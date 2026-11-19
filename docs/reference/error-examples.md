@@ -213,6 +213,16 @@ passing upgrade report. Run the candidate's real upgrade check first.
 kronik serve --config /owned/fixture/kronik.toml
 ```
 
+## ERASURE_BLOCKED
+
+Erase a subject whose SQL row is still referenced by another subject's row.
+Delete or reassign that row first. The command writes nothing: the keys
+stay, and no `Erasure` record is appended.
+
+```sh
+kronik privacy erase user:1 --reason "another subject's row still references this subject"
+```
+
 ## EXPORT_NOT_CONFIGURED
 
 Rewind an audit stream that is disabled in the owned configuration. Inspect

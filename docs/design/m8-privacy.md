@@ -184,6 +184,14 @@ Concretely:
 `kronik privacy erase user:123 --reason R [--dry-run]` →
 `POST /v1/privacy/erase {subject, reason, dry_run}` → `Node::erase_subject`:
 
+Before step 1, every actor that has the subject's rows is checked. If a
+row of another subject, or a row with no subject, references a row the
+erasure would delete, the call fails with `ERASURE_BLOCKED`. Nothing is
+written and the keys stay, so a restart does not replay a record it cannot
+apply. A parent and a child of the same subject are both deleted: foreign
+key checks are deferred until every delete of that subject has run
+([ADR 0159](../adr/0159-erasure-defers-foreign-keys.md)).
+
 1. `keystore.erase(subject, wall)` deletes the keys (durable: WAL with
    `synchronous = FULL`) and returns `last_version`. Doing this first means a
    crash before step 2 already leaves the data unreadable, and recovery sees
