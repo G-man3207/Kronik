@@ -5,6 +5,12 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- `kronik explain fork`, `kronik fork create` and the agent guide name the
+  same live-effect exception as `kronik preview create`: a `GET` without
+  secret headers, whose grant's effective delivery class is `replay-safe`,
+  to a host in `[fork] live_allowlist`. Allowlisting a host does not send
+  every effect, and a fork is not described as never sending one. The same
+  sentence is on `kronik send --fork` and the `create_fork` tool (#247).
 - The security guide's threat table no longer says forks exclude personal
   data by default. A caller without `pii:read` still cannot receive
   personal data in a fork. A token without that scope always gets one; a
