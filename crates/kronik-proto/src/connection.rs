@@ -1,6 +1,7 @@
 //! Long-lived connections in the log (M24, docs/design/m24-connections.md
-//! §6): connection ids and the names the API, the diff and the metrics use
-//! for the protocol, the close cause and the frame kind.
+//! §6): connection ids, the names the API, the diff and the metrics use for
+//! the protocol, the close cause and the frame kind, and the one split of an
+//! offered `Sec-WebSocket-Protocol` list.
 
 use crate::log::v1 as pb;
 
@@ -129,6 +130,23 @@ pub fn cause_name(cause: i32) -> &'static str {
         Ok(pb::CloseCause::Unavailable) => "unavailable",
         _ => "unspecified",
     }
+}
+
+/// The subprotocols a WebSocket client offered (RFC 6455 §4.1, M24 §8).
+///
+/// `values` are the `Sec-WebSocket-Protocol` header values, in order. Each is
+/// split at commas; surrounding spaces and empty pieces are dropped. Browsers
+/// put bearer tokens in this header, and the log keeps no other copy of the
+/// list, so the guest, the 101 response and turn JSON share this split: the
+/// accept stores only an index.
+pub fn offered_subprotocols<'a>(values: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    values
+        .into_iter()
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The bytes of a sealed value's AEAD tag: `Sealed` is XChaCha20-Poly1305

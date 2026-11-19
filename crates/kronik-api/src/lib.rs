@@ -800,7 +800,8 @@ fn connection_input_json(c: &pb::ConnectionInput) -> serde_json::Value {
 /// Fills in `output.accept.subprotocol` of an open turn's JSON for a caller
 /// with `pii:read` (M24 §8): the value at the recorded position among the
 /// subprotocols the open's request offered in `Sec-WebSocket-Protocol`, a
-/// credential header. Without `pii:read` it stays null.
+/// credential header, split by [`kronik_proto::connection::offered_subprotocols`].
+/// Without `pii:read` it stays null.
 pub(crate) fn accept_subprotocol(v: &mut serde_json::Value, t: &pb::TurnRecord, pii: bool) {
     let Some(pb::outcome::Output::Accept(a)) = t.outcome.as_ref().and_then(|o| o.output.as_ref())
     else {
@@ -819,7 +820,8 @@ pub(crate) fn accept_subprotocol(v: &mut serde_json::Value, t: &pb::TurnRecord, 
     let Some(request) = &open.request else {
         return;
     };
-    let offered: Vec<String> = request
+    // Sealable bytes first; the split is the one the guest and the 101 use.
+    let decoded: Vec<String> = request
         .headers
         .iter()
         .filter(|h| h.name.eq_ignore_ascii_case("sec-websocket-protocol"))
@@ -827,14 +829,9 @@ pub(crate) fn accept_subprotocol(v: &mut serde_json::Value, t: &pb::TurnRecord, 
             Some(pb::sealable::Value::Plain(b)) => Some(String::from_utf8_lossy(b).into_owned()),
             _ => None,
         })
-        .flat_map(|v| {
-            v.split(',')
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
         .collect();
+    let offered =
+        kronik_proto::connection::offered_subprotocols(decoded.iter().map(String::as_str));
     if let Some(p) = usize::try_from(index).ok().and_then(|i| offered.get(i)) {
         v["output"]["accept"]["subprotocol"] = serde_json::Value::String(p.clone());
     }

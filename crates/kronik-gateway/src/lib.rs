@@ -444,18 +444,6 @@ pub fn is_websocket_upgrade(req: &HttpRequest) -> bool {
         && header_has_token(req, "connection", "upgrade")
 }
 
-/// The subprotocols a WebSocket client offered: its `Sec-WebSocket-Protocol`
-/// headers in order, split at commas and trimmed, as the runtime derives
-/// them from the recorded request.
-fn offered_subprotocols(req: &HttpRequest) -> Vec<String> {
-    header_values(req, "sec-websocket-protocol")
-        .flat_map(|v| v.split(','))
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
 /// What [`Gateway::open_connection`] answers: the response for the client,
 /// and the connection's id when its owner accepted it. The caller then
 /// attaches the connection's transport to the hub, or abandons it
@@ -1524,7 +1512,10 @@ impl Gateway {
             }
             (pb::ConnectionProtocol::Sse, m, None)
         };
-        let offered = offered_subprotocols(&req);
+        let offered = kronik_proto::connection::offered_subprotocols(header_values(
+            &req,
+            "sec-websocket-protocol",
+        ));
         let (client, exempt) = self.client_address(&req);
         let Admitted {
             actor,
