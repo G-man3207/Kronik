@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use kronik_proto::connection::{MAX_CLOSE_REASON_BYTES, valid_close_code};
 use kronik_proto::log::v1 as pb;
 use wasmtime::bail;
 
@@ -35,8 +36,6 @@ pub const MAX_OPERATIONS: usize = 10_000;
 pub const MAX_TARGETS: usize = 100_000;
 /// Buffered frame payload bytes per turn, counted once per operation.
 pub const MAX_PAYLOAD_BYTES: usize = 16 << 20;
-/// The longest close reason, in bytes (RFC 6455: 123 in a close frame).
-pub const MAX_REASON_BYTES: usize = 123;
 
 /// What a turn may do with a connection id (ADR 0114, amended).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,12 +101,6 @@ impl TurnConnections {
         }
         ops
     }
-}
-
-/// Whether `code` may close a connection: 1000, 1001, 1003, 1007, 1008,
-/// 1009, 1011, or an application code from 3000 to 4999.
-pub fn valid_close_code(code: u16) -> bool {
-    matches!(code, 1000 | 1001 | 1003 | 1007 | 1008 | 1009 | 1011) || (3000..=4999).contains(&code)
 }
 
 impl TurnHost {
@@ -301,9 +294,9 @@ impl wit::Host for TurnHost {
                  1008, 1009, 1011 or 3000 to 4999"
             );
         }
-        if reason.len() > MAX_REASON_BYTES {
+        if reason.len() > MAX_CLOSE_REASON_BYTES {
             bail!(
-                "connections: a close reason is at most {MAX_REASON_BYTES} bytes, this one {}",
+                "connections: a close reason is at most {MAX_CLOSE_REASON_BYTES} bytes, this one {}",
                 reason.len()
             );
         }
@@ -391,13 +384,58 @@ impl wit::Host for TurnHost {
 mod tests {
     use super::*;
 
-    #[test]
-    fn close_codes() {
-        for ok in [1000, 1001, 1003, 1007, 1008, 1009, 1011, 3000, 4000, 4999] {
-            assert!(valid_close_code(ok), "{ok}");
-        }
-        for bad in [0, 999, 1002, 1004, 1005, 1006, 1010, 1012, 1015, 2999, 5000] {
-            assert!(!valid_close_code(bad), "{bad}");
+    #[tokio::test]
+    async fn an_actor_close_rejects_1010_and_a_124_byte_reason() {
+        let id = "c-0123456789abcdef0123456789abcdef";
+        let mut host = crate::host::TurnHost::new(crate::host::HostInit {
+            actor: kronik_core::ids::ActorRef {
+                kind: "room".into(),
+                key: "lobby".into(),
+            },
+            causal_key: kronik_core::causal::root("close".into()),
+            now_ms: 0,
+            seed: [0; 32],
+            limits: crate::host::TurnLimits::default(),
+            subject: None,
+            state: None,
+            sql: None,
+            gate: None,
+            blobs: None,
+            describe_only: false,
+        });
+        host.conns.opening = Some((id.to_owned(), pb::ConnectionProtocol::Websocket));
+
+        let Err(code) = wit::Host::close(&mut host, id.to_owned(), 1010, String::new()).await
+        else {
+            panic!("an actor close of 1010 was accepted");
+        };
+        assert!(code.to_string().contains("1010"), "{code}");
+        assert!(host.conns.ops.is_empty(), "a rejected close was recorded");
+
+        let Err(reason) = wit::Host::close(
+            &mut host,
+            id.to_owned(),
+            1000,
+            "x".repeat(MAX_CLOSE_REASON_BYTES + 1),
+        )
+        .await
+        else {
+            panic!("an actor close with a 124-byte reason was accepted");
+        };
+        assert!(reason.to_string().contains("124"), "{reason}");
+
+        // 1011 is the allowed neighbour of 1010; 123 bytes is the limit.
+        wit::Host::close(
+            &mut host,
+            id.to_owned(),
+            1011,
+            "x".repeat(MAX_CLOSE_REASON_BYTES),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("an allowed actor close failed: {e}"));
+        match host.conns.ops.last().and_then(|op| op.op.as_ref()) {
+            Some(pb::connection_op::Op::Close(close)) => assert_eq!(close.code, 1011),
+            other => panic!("expected a recorded close, got {other:?}"),
         }
     }
 

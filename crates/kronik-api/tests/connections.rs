@@ -355,6 +355,7 @@ async fn the_operator_closes_a_connection() {
     for (body, status, code) in [
         (json!({}), 400, "REASON_REQUIRED"),
         (json!({"reason": "x", "code": 1005}), 400, "BAD_REQUEST"),
+        (json!({"reason": "x", "code": 1010}), 400, "BAD_REQUEST"),
         (json!({"reason": "x", "code": 2000}), 400, "BAD_REQUEST"),
         (
             json!({"reason": "x", "message": "m".repeat(124)}),

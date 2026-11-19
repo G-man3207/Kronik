@@ -5,6 +5,9 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- An actor close and an operator close share one close-code rule. `1010`
+  and a 124-byte reason fail on both, and the allowed codes stay 1000,
+  1001, 1003, 1007, 1008, 1009, 1011, and 3000 to 4999 (#249).
 - The offered WebSocket subprotocols are split in one place. The guest, the
   101 response and a turn's JSON name the same value at the recorded index,
   including when a piece is empty or padded and one value is a bearer token
