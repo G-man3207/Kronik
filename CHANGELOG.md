@@ -5,6 +5,11 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- The security policy no longer says forks have no access to personal data
+  by default. A caller without `pii:read` still cannot receive personal
+  data in a fork. A Unix-socket caller without a token has every scope, so
+  `kronik fork create` keeps production subject values unless `--no-pii`.
+  The socket's scopes are unchanged (#226).
 - The security guide no longer says the gateway listens on `127.0.0.1:8080`
   unless `--http-listen` says otherwise. A config-less `kronik serve` does.
   `serve --init` without `--domain` writes and binds `0.0.0.0:80` with TLS
