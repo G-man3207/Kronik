@@ -5,6 +5,10 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- Paging the actor list or the dead-letter list in the admin UI keeps
+  keyboard focus on that section. Next and First no longer drop focus to
+  the top of the page. Opening a view still moves focus to the heading,
+  and choosing a row still moves focus to its detail (#251).
 - A real approve, promote, or resend in the admin UI is not cancelled by
   Refresh or a view change. The status line says Working… while it is in
   flight. If the form is gone when the POST settles, the page says the

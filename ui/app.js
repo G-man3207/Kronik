@@ -55,6 +55,16 @@
     return node;
   }
 
+  // Call before replacing children: a removed focused control returns here, a heading stays.
+  function keepSectionFocus(node) {
+    const focused = node.contains(document.activeElement);
+    return () => {
+      if (!focused) return;
+      node.setAttribute("tabindex", "-1");
+      node.focus();
+    };
+  }
+
   function table(parent, caption, columns, rows) {
     if (!rows.length) {
       parent.append(element("p", `${caption}: no entries.`));
@@ -336,6 +346,7 @@
       if (kind.value) query.set("kind", kind.value);
       if (after) query.set("after", after);
       const data = await request(`/v1/actors?${query}`, { signal });
+      const restore = keepSectionFocus(actors);
       actors.replaceChildren(element("h2", "Actors"));
       table(actors, "Actors in kind/key order", [
         ["Actor", (actor) => button(`${actor.kind}/${actor.key}`, () => loadActor(actor), { "data-testid": "actor-open" })],
@@ -343,6 +354,7 @@
       ], data.actors);
       if (after) actors.append(button("First actors", () => loadActors(), { id: "actors-first" }));
       if (data.next) actors.append(button("Next actors", () => loadActors(data.next), { id: "actors-next" }));
+      restore();
     }
     form.addEventListener("submit", (event) => { event.preventDefault(); perform(() => loadActors()); });
     await loadActors();
@@ -505,10 +517,12 @@
       const query = new URLSearchParams({ limit: "50" });
       if (after) query.set("after", after);
       const data = await request(`/v1/dead-letters?${query}`, { signal });
+      const restore = keepSectionFocus(listing);
       listing.replaceChildren(element("h2", "Dead letters"));
       table(listing, "Failed inputs and uncertain outcomes", [["ID", (letter) => button(letter.id, () => select(letter), { "data-testid": "deadletter-open" })], ["Actor", (letter) => letter.actor], ["Input", (letter) => `${letter.input.type}: ${letter.input.summary}`], ["Error", (letter) => `${letter.error_code}: ${letter.message}`], ["Resent as", (letter) => turnLink(letter.resent_as)]], data.dead_letters);
       if (after) listing.append(button("First dead letters", () => load(), { id: "deadletters-first" }));
       if (data.dead_letters.length === 50) listing.append(button("Next dead letters", () => load(data.dead_letters[data.dead_letters.length - 1].id), { id: "deadletters-next" }));
+      restore();
       if (id && !selectedLetter) {
         const match = data.dead_letters.find((letter) => letter.id === id);
         if (match) select(match);
