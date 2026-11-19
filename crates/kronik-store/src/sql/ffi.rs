@@ -6,8 +6,9 @@
 //! - a process-wide alternative `localtime()` that is UTC, so the
 //!   `localtime`/`utc` date modifiers do not depend on the host's time zone;
 //! - the session extension with `SQLITE_SESSION_OBJCONFIG_ROWID`, table
-//!   filters, `sqlite3changeset_apply_v2` flags, and
-//!   `sqlite3changegroup_add_change` for splitting a changeset per subject;
+//!   filters, `sqlite3changeset_apply_v2` flags,
+//!   `sqlite3changegroup_add_change` for splitting a changeset per subject,
+//!   and `sqlite3changegroup_add` for combining those changesets on apply;
 //! - a copy-on-write VFS so replay workers share one snapshot image (#197).
 //!
 //! Every function here takes or returns plain Rust data; no SQLite pointer
@@ -435,6 +436,47 @@ pub fn split<K: Ord + Clone>(
     }
 }
 
+/// Combines changesets into one. Applying that once checks foreign keys
+/// after every part, which separate applies do not. Changes of one primary
+/// key are merged; a turn's split never puts one row in two parts.
+pub fn combine(parts: &[&[u8]]) -> Result<Vec<u8>, String> {
+    struct Group(*mut ffi::sqlite3_changegroup);
+    impl Drop for Group {
+        fn drop(&mut self) {
+            // SAFETY: created by sqlite3changegroup_new, deleted once.
+            unsafe { ffi::sqlite3changegroup_delete(self.0) }
+        }
+    }
+    if parts.is_empty() {
+        return Ok(Vec::new());
+    }
+    // SAFETY: the group is freed in Drop; each part outlives the add.
+    unsafe {
+        let mut raw = ptr::null_mut();
+        let rc = ffi::sqlite3changegroup_new(&mut raw);
+        if rc != ffi::SQLITE_OK {
+            return Err(format!("sqlite3changegroup_new: {rc}"));
+        }
+        let group = Group(raw);
+        for part in parts {
+            let rc = ffi::sqlite3changegroup_add(
+                group.0,
+                part.len() as c_int,
+                part.as_ptr().cast_mut().cast(),
+            );
+            if rc != ffi::SQLITE_OK {
+                return Err(format!("sqlite3changegroup_add: {rc}"));
+            }
+        }
+        let (mut n, mut p) = (0, ptr::null_mut());
+        let rc = ffi::sqlite3changegroup_output(group.0, &mut n, &mut p);
+        if rc != ffi::SQLITE_OK {
+            return Err(format!("sqlite3changegroup_output: {rc}"));
+        }
+        Ok(take_buffer(p, n))
+    }
+}
+
 struct ApplyCtx {
     conflicts: Vec<String>,
 }
@@ -444,8 +486,8 @@ unsafe extern "C" fn on_conflict(
     kind: c_int,
     it: *mut ffi::sqlite3_changeset_iter,
 ) -> c_int {
-    // SAFETY: `ctx` is the ApplyCtx passed to apply_v2 below; `it` is valid
-    // for the duration of the callback.
+    // SAFETY: `ctx` is the ApplyCtx passed to apply_v2 below. `it` is a
+    // row iterator except for FOREIGN_KEY, which only reports a count.
     unsafe {
         let ctx = &mut *ctx.cast::<ApplyCtx>();
         let what = match kind {
@@ -456,10 +498,17 @@ unsafe extern "C" fn on_conflict(
             ffi::SQLITE_CHANGESET_FOREIGN_KEY => "FOREIGN_KEY",
             _ => "OTHER",
         };
-        let table = decode(it)
-            .map(|c| format!("{} {:?}", c.table, c.op))
-            .unwrap_or_default();
-        ctx.conflicts.push(format!("{what} on {table}"));
+        // A FOREIGN_KEY iterator has no row. Decoding it dereferences null.
+        let detail = if kind == ffi::SQLITE_CHANGESET_FOREIGN_KEY {
+            let mut n = 0;
+            let _ = ffi::sqlite3changeset_fk_conflicts(it, &mut n);
+            n.to_string()
+        } else {
+            decode(it)
+                .map(|c| format!("{} {:?}", c.table, c.op))
+                .unwrap_or_default()
+        };
+        ctx.conflicts.push(format!("{what} on {detail}"));
         // The target must be in exactly the expected state (production
         // apply, rebuild, roll-forward): any conflict is divergence.
         ffi::SQLITE_CHANGESET_ABORT

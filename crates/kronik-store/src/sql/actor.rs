@@ -75,10 +75,9 @@ pub struct TurnSql {
     pub changesets: Vec<(Option<String>, Vec<u8>)>,
     /// VM steps executed by the guest's statements.
     pub vm_steps: u64,
-    /// The unsplit changeset. Not written to the log, and the daemon never
-    /// applies it: the live apply, rebuilds, forks and replay all apply the
-    /// per-subject changesets of the record (ADR 0005, amended). `apply`
-    /// uses it when it is set, which only tests do.
+    /// The unsplit changeset. Not written to the log. `apply` uses it when
+    /// it is set, which only tests do. Production combines `changesets`
+    /// (ADR 0160).
     pub whole: Vec<u8>,
 }
 
@@ -1310,9 +1309,11 @@ impl SqlActor {
         Ok((split.into_iter().collect(), cs))
     }
 
-    /// Applies a turn's SQL (DDL, then each subject's changeset) and
-    /// advances `applied_lsn`, atomically. Subjects in `erased` are skipped:
-    /// their changesets are unreadable after erasure.
+    /// Applies a turn's SQL (DDL, then the changesets) and advances
+    /// `applied_lsn`, atomically. Subjects in `erased` are skipped: their
+    /// changesets are unreadable after erasure. The rest are combined into
+    /// one apply, so a foreign key that crosses subjects is checked after
+    /// every change (ADR 0160).
     pub fn apply(
         &mut self,
         t: &TurnSql,
@@ -1365,16 +1366,22 @@ impl SqlActor {
             }
             if erased.is_empty() && !t.whole.is_empty() {
                 ffi::apply(&self.conn, &t.whole)?;
-            }
-            for (subject, cs) in t
-                .changesets
-                .iter()
-                .filter(|_| !erased.is_empty() || t.whole.is_empty())
-            {
-                if subject.as_ref().is_some_and(|s| erased.contains(s)) {
-                    continue;
+            } else {
+                // One apply: the foreign-key check runs after every subject.
+                // The log still holds the per-subject bytes (ADR 0160).
+                let parts: Vec<&[u8]> = t
+                    .changesets
+                    .iter()
+                    .filter(|(subject, cs)| {
+                        !cs.is_empty() && !subject.as_ref().is_some_and(|s| erased.contains(s))
+                    })
+                    .map(|(_, cs)| cs.as_slice())
+                    .collect();
+                match parts.as_slice() {
+                    [] => {}
+                    [one] => ffi::apply(&self.conn, one)?,
+                    many => ffi::apply(&self.conn, &ffi::combine(many)?)?,
                 }
-                ffi::apply(&self.conn, cs)?;
             }
             self.conn
                 .prepare_cached("UPDATE _kronik_meta SET v = ?1 WHERE k = 'applied_lsn'")

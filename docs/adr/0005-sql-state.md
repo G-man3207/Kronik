@@ -497,4 +497,14 @@ built one path instead (`docs/design/m1-core.md` §7): the applier reads the
 turn record and applies its per-subject changesets, one
 `sqlite3changeset_apply_v2` call each, live as on a rebuild, so a live apply
 and a rebuild cannot differ. The unsplit changeset is not written to the log
-and only tests apply it. Applying it live remains a possible optimization.
+and only tests apply it. The one-call-each part is superseded by the
+amendment below.
+
+## Amendment (2026-11-19): one apply sees every subject's changes
+
+Applying each subject's changeset on its own fails a foreign key that
+crosses subjects: the child is applied before the parent when its subject
+sorts first, and the delete fails the other way. The record is already
+durable, so every restart dies on it. Apply now combines those changesets
+and applies that once, on the live path and on a rebuild
+([ADR 0160](0160-cross-subject-foreign-key-apply.md)). The log is unchanged.

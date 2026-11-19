@@ -380,9 +380,10 @@ draft still link). The WIT is frozen for v0.1 from here.
   leaves the mailbox and becomes a dead letter.
 - **`Deployment.effective_lsn = 0`** means "effective at this record's own
   LSN" (a deploy cannot know its LSN before the append).
-- **Live SQL apply uses the per-subject changesets** from the record (one
-  `apply_v2` per subject), the same path as a rebuild; ADR 0005's unsplit
-  live apply is an optimization left for later.
+- **Live SQL apply uses the per-subject changesets** from the record,
+  combined into one `apply_v2` so a foreign key across subjects is checked
+  after every subject's changes ([ADR 0160](../adr/0160-cross-subject-foreign-key-apply.md)).
+  A rebuild uses that same path. The unsplit changeset is not in the log.
 - **Torn tail.** In the active segment everything from the first invalid
   entry is truncated (ADR 0004): a torn batch can leave valid but
   unacknowledged entries after an invalid one. The brief's "a broken entry in
