@@ -1870,6 +1870,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capture_refuses_a_mismatched_or_cancelled_enrollment_guard() {
+        use crate::auth::Scope;
+        const MISMATCH: &str = "Fleet connection binding differs from original token authority";
+        const REVOKED: &str = "Fleet connection binding revoked";
+        let (_directory, fleet, network, _entropy) = setup().await;
+        network.reply.store(true, Ordering::SeqCst);
+        let accepted = fleet
+            .enroll(
+                "unix:uid=0",
+                request(Some("owned-once"), false),
+                authority(&fleet),
+            )
+            .await
+            .unwrap()
+            .state
+            .unwrap();
+        let name = token_name(&accepted).unwrap();
+        let api = crate::Api::new(fleet.node.clone())
+            .with_tokens(fleet.tokens.clone())
+            .unwrap()
+            .with_fleet(fleet.clone());
+        let receipt = fleet.tokens.fleet_token(&format!("token:{name}")).unwrap();
+        assert_eq!(receipt.epoch, accepted.epoch);
+        assert_eq!(receipt.request_id, accepted.request_id);
+        let live = fleet.authority.guard();
+        assert!(live.check().is_ok());
+
+        // These strings are returned before fleet.lease, so a refusal opens no lease.
+        let refuse = |guard: EpochGuard, message: &str| {
+            let denied = match api.capture_context(
+                fleet.tokens.capture_name(&name, Scope::Read).unwrap(),
+                Some(guard),
+            ) {
+                Err(denied) => denied,
+                Ok(_) => panic!("refused capture opened a lease"),
+            };
+            assert_eq!(denied.code, ErrorCode::Unauthenticated);
+            assert_eq!(denied.message, message);
+        };
+        let opened = api
+            .capture_context(
+                fleet.tokens.capture_name(&name, Scope::Read).unwrap(),
+                Some(live.clone()),
+            )
+            .unwrap();
+        opened.authority.check().unwrap();
+
+        // Foreign guards still pass check(); only the receipt comparison can refuse them.
+        let mut wrong_epoch = accepted.clone();
+        wrong_epoch.epoch = accepted.epoch.checked_add(1).unwrap();
+        let epoch_authority = EpochAuthority::new(0);
+        epoch_authority.publish(&wrong_epoch).unwrap();
+        let wrong_epoch = epoch_authority.guard();
+        assert!(wrong_epoch.check().is_ok());
+        assert_ne!(wrong_epoch.epoch(), receipt.epoch);
+        assert_eq!(wrong_epoch.request_id(), Some(receipt.request_id.as_str()));
+        refuse(wrong_epoch, MISMATCH);
+
+        let mut wrong_request = accepted.clone();
+        wrong_request.request_id = "cd".repeat(32);
+        assert_ne!(wrong_request.request_id, receipt.request_id);
+        let request_authority = EpochAuthority::new(accepted.epoch);
+        request_authority.publish(&wrong_request).unwrap();
+        let wrong_request = request_authority.guard();
+        assert!(wrong_request.check().is_ok());
+        assert_eq!(wrong_request.epoch(), receipt.epoch);
+        assert_ne!(
+            wrong_request.request_id(),
+            Some(receipt.request_id.as_str())
+        );
+        refuse(wrong_request, MISMATCH);
+
+        let cancelled_authority = EpochAuthority::new(0);
+        cancelled_authority.publish(&accepted).unwrap();
+        let cancelled = cancelled_authority.guard();
+        assert_eq!(cancelled.epoch(), receipt.epoch);
+        assert_eq!(cancelled.request_id(), Some(receipt.request_id.as_str()));
+        let mut revoked = accepted.clone();
+        revoked.phase = EnrollmentPhase::Revoked;
+        cancelled_authority.publish(&revoked).unwrap();
+        assert!(cancelled.check().is_err());
+        refuse(cancelled, REVOKED);
+
+        let still = api
+            .capture_context(
+                fleet.tokens.capture_name(&name, Scope::Read).unwrap(),
+                Some(live),
+            )
+            .unwrap();
+        still.authority.check().unwrap();
+        assert_eq!(fleet.record().unwrap().unwrap(), accepted);
+    }
+
+    #[tokio::test]
     async fn current_root_fleet_provider_rejects_another_actual_node_or_token_store() {
         let (directory, fleet, _network, _entropy) = setup().await;
         let api = crate::Api::new(fleet.node.clone())
