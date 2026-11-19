@@ -732,6 +732,12 @@ new records took a median of 6 ms while the segment held fewer than 20 000
 records, 25 ms up to 60 000, 67 ms up to 100 000 and 123 ms beyond (load
 average 15 to 40).
 
+Audit export used to repeat that walk on every batch: it opened the log from
+LSN 1 and CRC-checked the active segment up to the head, then again up to
+the cursor, while holding the snapshot lock. It now resumes at the last
+consumed file offset, opens only that segment, and reads the applied head
+with one `read_at`. The snapshot lock is not held across those reads.
+
 A start from a copy of the data directory of cycle 104 (14 056 records, with
 the invalid manifest v0.4.0 had left), measured on the same machine:
 

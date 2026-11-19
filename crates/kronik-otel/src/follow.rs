@@ -15,7 +15,7 @@ use kronik_core::env::{Env, JoinHandle};
 use kronik_core::ids::Lsn;
 use kronik_log::Committed;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{Node, ShardReader};
+use kronik_sched::{ExportResume, Node, ShardReader};
 
 use crate::cursor::{Control, Cursors, Entry, Generation, Rewind};
 
@@ -1659,6 +1659,8 @@ pub async fn follow<S: Sink + 'static>(
     let mut noticed = entry.lsn;
     let mut gap_backoff = FIRST_BACKOFF;
     let mut prepare_backoff = FIRST_BACKOFF;
+    // shortcut: resume offset is process-local, persist it on the export cursor if a restart walk of a long segment shows up
+    let mut resume: Option<ExportResume> = None;
     stream.update(|p| p.started_wall_ms = Some(env.clock.wall_ms()));
     let lag = |cursor: Lsn| {
         kronik_metrics::set(
@@ -1711,6 +1713,7 @@ pub async fn follow<S: Sink + 'static>(
                     Ok(saved) => {
                         entry = saved;
                         noticed = entry.lsn;
+                        resume = None;
                         prepare_backoff = FIRST_BACKOFF;
                     }
                     Err(code) => {
@@ -1779,6 +1782,7 @@ pub async fn follow<S: Sink + 'static>(
                 match checkpoint(&node, &stream, &sink, candidate, control.clone()).await {
                     Ok(saved) => {
                         entry = saved;
+                        resume = None;
                         continue 'records;
                     }
                     Err(code) => {
@@ -1803,7 +1807,7 @@ pub async fn follow<S: Sink + 'static>(
                 continue;
             }
         };
-        let reader = match node.capture_system_export_reader().await {
+        let reader = match node.capture_export_reader(resume).await {
             Ok(reader) => Arc::new(reader),
             Err(error) => {
                 failure(&stream, error.code.as_str().to_owned());
@@ -1884,6 +1888,7 @@ pub async fn follow<S: Sink + 'static>(
                 match checkpoint(&node, &stream, &sink, candidate, control.clone()).await {
                     Ok(saved) => {
                         entry = saved;
+                        resume = None;
                         continue 'records;
                     }
                     Err(code) => {
@@ -2069,6 +2074,9 @@ pub async fn follow<S: Sink + 'static>(
             match checkpoint(&node, &stream, &sink, candidate, retained.clone()).await {
                 Ok(saved) => {
                     entry = saved;
+                    resume = records
+                        .last()
+                        .map(|(_, record)| ExportResume::after(record));
                     break;
                 }
                 Err(code) => {
@@ -2219,7 +2227,7 @@ async fn reprepare<S: Sink>(
         .native_secret_snapshot_with_publication()
         .map_err(|error| error.code.as_str().to_owned())?;
     let reader = Arc::new(
-        node.capture_system_export_reader()
+        node.capture_export_reader(records.first().map(|(_, record)| ExportResume::at(record)))
             .await
             .map_err(|error| error.code.as_str().to_owned())?,
     );

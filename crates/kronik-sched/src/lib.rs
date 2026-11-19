@@ -56,9 +56,9 @@ use kronik_store::sql::{FileOpener, Limits, SqlPool};
 pub use erasure::Born;
 pub use gate::Drain;
 pub use node::{
-    BodyPolicy, CONNECTION_METHODS, CodeSwitch, DeployResult, Ingress, IngressExtras, METHODS,
-    Node, NodeParts, Probe, RouteEntry, ShardReadPoint, ShardReader, ShardRecordPage, StartError,
-    SystemAudit, Waiter, methods_conflict, normalize_pattern,
+    BodyPolicy, CONNECTION_METHODS, CodeSwitch, DeployResult, ExportResume, Ingress, IngressExtras,
+    METHODS, Node, NodeParts, Probe, RouteEntry, ShardReadPoint, ShardReader, ShardRecordPage,
+    StartError, SystemAudit, Waiter, methods_conflict, normalize_pattern,
 };
 pub use privacy::{ErasureDone, PrivacyModeChange};
 pub use reseal::{

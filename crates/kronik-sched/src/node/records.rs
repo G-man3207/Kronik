@@ -3,7 +3,7 @@
 use super::*;
 use kronik_core::authority::Authority as _;
 use kronik_core::ids::SourcePos;
-use kronik_log::CapturedLogReadset;
+use kronik_log::{CapturedLogReadset, Position};
 use prost::Message as _;
 use std::future::Future;
 
@@ -32,9 +32,107 @@ pub struct ShardReader {
     epoch: Arc<AtomicU64>,
     expected_epoch: u64,
     point: ShardReadPoint,
+    /// Next record's file offset, when the caller has one. A page that
+    /// starts there does not CRC-walk the segment prefix.
+    resume: Option<ExportResume>,
     // Absent only when this native constructor has no configured physical
     // storage. Its actual EnvFs handles are still retained by the readset.
     root_pin: Option<kronik_core::snapshot_resources::SnapshotRootPin>,
+}
+
+/// Where the next export read should start. The offset is the caller's,
+/// observed from a record it already consumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExportResume {
+    pub segment: Lsn,
+    pub offset: u64,
+    pub lsn: Lsn,
+}
+
+impl ExportResume {
+    /// The record itself.
+    pub fn at(record: &Committed) -> Self {
+        Self {
+            segment: record.pos.segment,
+            offset: record.pos.offset,
+            lsn: record.lsn,
+        }
+    }
+
+    /// The byte after `record`, where the next LSN should be.
+    pub fn after(record: &Committed) -> Self {
+        Self {
+            segment: record.pos.segment,
+            offset: record.pos.offset
+                + kronik_log::ENVELOPE_LEN as u64
+                + record.record.encoded_len() as u64,
+            lsn: record.lsn.saturating_add(1),
+        }
+    }
+}
+
+/// File position of the newest applied record whose position is known.
+/// The pending slot is staged before apply, so a waiter that sees the new
+/// applied LSN also sees the position and does not walk to find it.
+#[derive(Debug, Default)]
+pub(crate) struct AppliedCut {
+    visible: Mutex<Option<(Lsn, Position)>>,
+    pending: Mutex<Option<(Lsn, Position)>>,
+}
+
+impl AppliedCut {
+    pub(crate) fn stage(&self, lsn: Lsn, pos: Position) {
+        *lock(&self.pending) = Some((lsn, pos));
+    }
+
+    pub(crate) fn clear_staged(&self) {
+        *lock(&self.pending) = None;
+    }
+
+    pub(crate) fn publish(&self, lsn: Lsn, pos: Position) {
+        let mut visible = lock(&self.visible);
+        if visible.as_ref().is_none_or(|(known, _)| *known <= lsn) {
+            *visible = Some((lsn, pos));
+        }
+    }
+
+    pub(crate) fn publish_staged(&self) {
+        let staged = *lock(&self.pending);
+        let Some((lsn, pos)) = staged else {
+            return;
+        };
+        self.publish(lsn, pos);
+        let mut pending = lock(&self.pending);
+        if pending.as_ref().is_some_and(|(got, _)| *got == lsn) {
+            *pending = None;
+        }
+    }
+
+    /// A reseal moved this LSN. A later head is left alone.
+    pub(crate) fn moved(&self, lsn: Lsn, pos: Position) {
+        let mut visible = lock(&self.visible);
+        if let Some((known, at)) = visible.as_mut()
+            && *known == lsn
+        {
+            *at = pos;
+        }
+        let mut pending = lock(&self.pending);
+        if let Some((known, at)) = pending.as_mut()
+            && *known == lsn
+        {
+            *at = pos;
+        }
+    }
+
+    /// Newest published frame at or below `applied`.
+    pub(crate) fn frame(&self, applied: Lsn) -> Option<(Lsn, Position)> {
+        let pending = lock(&self.pending).filter(|(lsn, _)| *lsn <= applied);
+        let visible = lock(&self.visible).filter(|(lsn, _)| *lsn <= applied);
+        match (visible, pending) {
+            (Some(known), Some(staged)) => Some(if staged.0 >= known.0 { staged } else { known }),
+            (known, staged) => known.or(staged),
+        }
+    }
 }
 
 fn source_error(error: LogError) -> ApiError {
@@ -153,47 +251,68 @@ impl ShardReader {
         let mut records = Vec::new();
         let mut bytes = 0usize;
         let mut oversized = None;
-        let read = self.readset.read_while_with_namespace(
-            requested.max(first),
-            through,
-            |namespace, committed| {
-                let mut source = pb::ActorSource {
-                    shard: None,
-                    lsn: committed.lsn,
-                    branch: String::new(),
-                };
-                // ActorSource.branch is field 3; count its actual held header before
-                // allocating the owned string, as in the canonical member reader.
-                let source_bytes = source.encoded_len().saturating_add(
-                    1 + prost::length_delimiter_len(namespace.len()) + namespace.len(),
-                );
-                let record_bytes = committed.record.encoded_len();
-                let frame_bytes = 1
-                    + prost::length_delimiter_len(source_bytes)
-                    + source_bytes
-                    + 1
-                    + prost::encoding::encoded_len_varint(u64::from(committed.record.kind()))
-                    + 1
-                    + prost::length_delimiter_len(record_bytes)
-                    + record_bytes;
-                let size = 1 + prost::length_delimiter_len(frame_bytes) + frame_bytes;
-                if size > max_encoded_bytes.saturating_sub(bytes) && (!soft || !records.is_empty())
-                {
-                    if records.is_empty() && size > max_encoded_bytes {
-                        oversized = Some(committed.lsn);
-                    }
-                    return Ok(false);
+        let start = requested.max(first);
+        let mut consume = |namespace: &str, committed: Committed| -> Result<bool, LogError> {
+            let mut source = pb::ActorSource {
+                shard: None,
+                lsn: committed.lsn,
+                branch: String::new(),
+            };
+            // ActorSource.branch is field 3; count its actual held header before
+            // allocating the owned string, as in the canonical member reader.
+            let source_bytes = source
+                .encoded_len()
+                .saturating_add(1 + prost::length_delimiter_len(namespace.len()) + namespace.len());
+            let record_bytes = committed.record.encoded_len();
+            let frame_bytes = 1
+                + prost::length_delimiter_len(source_bytes)
+                + source_bytes
+                + 1
+                + prost::encoding::encoded_len_varint(u64::from(committed.record.kind()))
+                + 1
+                + prost::length_delimiter_len(record_bytes)
+                + record_bytes;
+            let size = 1 + prost::length_delimiter_len(frame_bytes) + frame_bytes;
+            if size > max_encoded_bytes.saturating_sub(bytes) && (!soft || !records.is_empty()) {
+                if records.is_empty() && size > max_encoded_bytes {
+                    oversized = Some(committed.lsn);
                 }
-                bytes += size;
-                scanned = committed.lsn;
-                source.branch = namespace.to_owned();
-                source
-                    .validate()
-                    .map_err(|error| LogError::Corrupt(error.to_string()))?;
-                records.push((source, committed));
-                Ok(records.len() < max_records && bytes < max_encoded_bytes)
-            },
-        );
+                return Ok(false);
+            }
+            bytes += size;
+            scanned = committed.lsn;
+            source.branch = namespace.to_owned();
+            source
+                .validate()
+                .map_err(|error| LogError::Corrupt(error.to_string()))?;
+            records.push((source, committed));
+            Ok(records.len() < max_records && bytes < max_encoded_bytes)
+        };
+        let read = async {
+            if let Some(resume) = self.resume
+                && resume.lsn == start
+            {
+                let anchored = self
+                    .readset
+                    .read_from_offset(
+                        Position {
+                            segment: resume.segment,
+                            offset: resume.offset,
+                        },
+                        resume.lsn,
+                        through,
+                        &mut consume,
+                    )
+                    .await?;
+                if anchored {
+                    return Ok(());
+                }
+                // shortcut: a reseal moved this offset, walk this page once and resume after it
+            }
+            self.readset
+                .read_while_with_namespace(start, through, &mut consume)
+                .await
+        };
         tokio::select! {
             biased;
             () = self.execution.cancelled() => return Err(ApiError::new(ErrorCode::Unavailable, "the original native source execution ended")),
@@ -220,6 +339,16 @@ impl Node {
     pub fn capture_system_export_reader(
         self: &Arc<Self>,
     ) -> impl Future<Output = Result<ShardReader, ApiError>> + Send + 'static {
+        self.capture_export_reader(None)
+    }
+
+    /// As [`Self::capture_system_export_reader`], resuming at `resume` when
+    /// the caller has the next record's file offset. The applied head is one
+    /// `read_at`. The snapshot lock is not held across either read.
+    pub fn capture_export_reader(
+        self: &Arc<Self>,
+        resume: Option<ExportResume>,
+    ) -> impl Future<Output = Result<ShardReader, ApiError>> + Send + 'static {
         let captured = (|| {
             self.native_execution.check()?;
             self.native_execution.native_source_start(self, &self.log)?;
@@ -234,80 +363,103 @@ impl Node {
             let (node, execution, epoch, expected_epoch) = captured?;
             let original: AuthLease = execution.clone();
             let _deploy = node.lock_deploy_authorized(&original).await?;
-            let _snapshot = tokio::select! {
-                biased;
-                () = original.cancelled() => return Err(ApiError::new(ErrorCode::Unavailable,
-                    "the original native source ended before retention capture")),
-                held = node.snapshot_lock.clone().lock_owned() => held,
+            let (through, head, root_pin) = {
+                let _snapshot = tokio::select! {
+                    biased;
+                    () = original.cancelled() => return Err(ApiError::new(ErrorCode::Unavailable,
+                        "the original native source ended before retention capture")),
+                    held = node.snapshot_lock.clone().lock_owned() => held,
+                };
+                original.check()?;
+                if epoch.load(Ordering::Acquire) != expected_epoch {
+                    return Err(ApiError::new(
+                        ErrorCode::Unavailable,
+                        "the original native source configuration changed before capture",
+                    ));
+                }
+                let root_pin = if node.cfg.storage.is_some() {
+                    let owner = node.clone();
+                    Some(
+                        node.env
+                            .blocking("native-record-reader-roots", move || {
+                                owner.retain_native_source_paths()
+                            })
+                            .await
+                            .ok_or_else(|| {
+                                ApiError::new(
+                                    ErrorCode::Unavailable,
+                                    "the original native source root capture was interrupted",
+                                )
+                            })??,
+                    )
+                } else {
+                    None
+                };
+                let applied = node.store.db().applied_lsn().map_err(store_err)?;
+                let head = node.applied_cut.frame(applied);
+                if applied > 0 && head.is_none() {
+                    return Err(ApiError::new(
+                        ErrorCode::Unavailable,
+                        "the applied head position is not published yet",
+                    ));
+                }
+                let through = head.map(|(lsn, _)| lsn).unwrap_or(0);
+                (through, head, root_pin)
             };
-            original.check()?;
-            if epoch.load(Ordering::Acquire) != expected_epoch {
-                return Err(ApiError::new(
-                    ErrorCode::Unavailable,
-                    "the original native source configuration changed before capture",
-                ));
-            }
-            let root_pin = if node.cfg.storage.is_some() {
-                let owner = node.clone();
-                Some(
-                    node.env
-                        .blocking("native-record-reader-roots", move || {
-                            owner.retain_native_source_paths()
-                        })
-                        .await
-                        .ok_or_else(|| {
-                            ApiError::new(
-                                ErrorCode::Unavailable,
-                                "the original native source root capture was interrupted",
-                            )
-                        })??,
-                )
-            } else {
-                None
-            };
-            let through = node.store.db().applied_lsn().map_err(store_err)?;
-            let readset = node
-                .reader
-                .capture_readset(1, through)
-                .await
-                .map_err(source_error)?;
-            let (branch, retained_from) = if through == 0 {
-                // An empty native writer has no positive frame. This is only
-                // its configured root label, not an invented ActorSource.
+            let (branch, retained_from, readset) = if through == 0 {
+                let readset = node
+                    .reader
+                    .capture_readset(1, 0)
+                    .await
+                    .map_err(source_error)?;
                 (
                     node.reader.branch().to_owned(),
                     readset.retained_from().unwrap_or(0),
+                    readset,
                 )
             } else {
-                let first = readset.retained_from().ok_or_else(|| {
+                let (_, pos) = head.ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::StorageCorrupt,
+                        "the native applied source has no published head position",
+                    )
+                })?;
+                let (branch, committed) = node
+                    .reader
+                    .read_at_with_namespace(pos)
+                    .await
+                    .map_err(source_error)?;
+                if committed.lsn != through {
+                    return Err(ApiError::new(
+                        ErrorCode::Unavailable,
+                        "the applied head moved before its position was read",
+                    ));
+                }
+                let actual = pb::ActorSource {
+                    shard: None,
+                    lsn: committed.lsn,
+                    branch: branch.clone(),
+                };
+                actual
+                    .validate()
+                    .map_err(|error| ApiError::new(ErrorCode::StorageCorrupt, error.to_string()))?;
+                let from = resume
+                    .map(|point| point.lsn.max(1))
+                    .unwrap_or(1)
+                    .min(through);
+                let starts = node.reader.starts().await.map_err(source_error)?;
+                let retained_from = starts.first().copied().ok_or_else(|| {
                     ApiError::new(
                         ErrorCode::StorageCorrupt,
                         "the native applied source has no retained segment",
                     )
                 })?;
-                let mut head = None;
-                readset
-                    .read_while_with_namespace(through, through, |namespace, committed| {
-                        let actual = pb::ActorSource {
-                            shard: None,
-                            lsn: committed.lsn,
-                            branch: namespace.to_owned(),
-                        };
-                        actual
-                            .validate()
-                            .map_err(|error| LogError::Corrupt(error.to_string()))?;
-                        head = Some(actual);
-                        Ok(false)
-                    })
+                let readset = node
+                    .reader
+                    .capture_readset(from, through)
                     .await
                     .map_err(source_error)?;
-                let head = head.ok_or_else(|| {
-                    ApiError::new(
-                        ErrorCode::StorageCorrupt,
-                        "the held native source has no frame at its acknowledged head",
-                    )
-                })?;
-                (head.branch, first)
+                (branch, retained_from, readset)
             };
             let reader = ShardReader {
                 readset,
@@ -315,6 +467,7 @@ impl Node {
                 epoch,
                 expected_epoch,
                 root_pin,
+                resume,
                 point: ShardReadPoint {
                     branch,
                     source: SourcePos::Actor {
@@ -330,5 +483,7 @@ impl Node {
     }
 }
 
+#[cfg(test)]
+mod export_reads;
 #[cfg(test)]
 mod tests;

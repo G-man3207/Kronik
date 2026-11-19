@@ -38,7 +38,7 @@ mod records;
 mod source_gc;
 #[cfg(test)]
 mod timer_replace;
-pub use records::{ShardReadPoint, ShardReader, ShardRecordPage};
+pub use records::{ExportResume, ShardReadPoint, ShardReader, ShardRecordPage};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -452,6 +452,8 @@ pub struct Node {
     /// Where turns start: the switch gate and the drain (crate::gate).
     pub(crate) gate: crate::gate::TurnGate,
     pub(crate) snapshot_lock: Arc<tokio::sync::Mutex<()>>,
+    /// File position of the applied head, so export does not walk to find it.
+    pub(crate) applied_cut: Arc<records::AppliedCut>,
     group_commit_window: Duration,
     fatal: Arc<Fatal>,
     /// Free bytes on the log's file system, refreshed every second while
@@ -953,6 +955,17 @@ impl Node {
             u64::MAX
         };
         let fatal = Arc::new(Fatal::new(publication.clone(), lifecycle.clone()));
+        let applied_cut = Arc::new(records::AppliedCut::default());
+        if last > 0 {
+            match opened.last_record {
+                Some((lsn, pos)) if lsn == last => applied_cut.publish(lsn, pos),
+                other => tracing::warn!(
+                    last,
+                    found = other.map(|(lsn, _)| lsn),
+                    "applied head position was not in the opened log"
+                ),
+            }
+        }
         let node = Arc::new_cyclic(|me| Node {
             permits: Semaphore::new(config.concurrency.max(1)),
             clock: LogicalClock::new(hwm),
@@ -971,6 +984,7 @@ impl Node {
             deploy_lock: Arc::new(tokio::sync::Mutex::new(())),
             gate: crate::gate::TurnGate::default(),
             snapshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+            applied_cut: applied_cut.clone(),
             group_commit_window,
             fatal: fatal.clone(),
             disk_free: AtomicU64::new(disk_free),
@@ -1043,6 +1057,7 @@ impl Node {
                     .test_hold
                     .clone()
                     .map(|hold| (hold, node.env.fs.clone())),
+                node.applied_cut.clone(),
             ),
         );
         if let Some(u) = upgrade {
@@ -6321,6 +6336,7 @@ fn undecodable(record: &mut pb::TurnRecord) -> Option<String> {
     checked.err().map(|e| e.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn applier(
     store: Arc<Store>,
     rebase: crate::rebase::RebaseCtx,
@@ -6329,6 +6345,7 @@ async fn applier(
     fatal: Arc<Fatal>,
     runtime: Option<Arc<crate::secrets::SecretRuntime>>,
     hold: Option<(crate::TestHold, Arc<dyn kronik_core::env::Fs>)>,
+    cut: Arc<records::AppliedCut>,
 ) {
     while let Some(first) = rx.recv().await {
         let mut batch = vec![first];
@@ -6381,10 +6398,15 @@ async fn applier(
             },
             None => None,
         };
+        if let Some(last) = batch.last() {
+            cut.stage(last.lsn, last.pos);
+        }
         if let Err(e) = rebase.apply(&store, &batch).await {
+            cut.clear_staged();
             fatal.set(format!("applying lsn {}: {e}", batch[0].lsn));
             return;
         }
+        cut.publish_staged();
         // The cache is the applied projection: applied secret rows register
         // into it as they apply (the certification's registry is fed by the
         // applier, not by later store queries racing the applier's lag).
