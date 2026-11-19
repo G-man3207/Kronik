@@ -7,6 +7,9 @@
   let token = "";
   let session = null;
   let controller = null;
+  let navGen = 0;
+  let navRunning = 0;
+  let pendingMutations = [];
   let authVersion = 0;
   let authCleared = false;
   let oidcEnabled = false;
@@ -212,6 +215,28 @@
     return reason;
   }
 
+  function revealMutations() {
+    if (!pendingMutations.length || navRunning !== 0) return;
+    const outcomes = pendingMutations.splice(0);
+    const current = $("status").textContent;
+    const note = outcomes.map((item) => item.status).join(" ");
+    const errors = outcomes.filter((item) => item.error);
+    if (errors.length) report(new Error(errors.map((item) => item.error.message).join("\n")));
+    $("status").textContent = current.endsWith("loaded.") ? `${current} ${note}` : note;
+  }
+
+  function keepMutation(outcome) {
+    pendingMutations.push(outcome);
+    if (navRunning === 0) revealMutations();
+  }
+
+  // No response is "was not sent"; an HTTP error is a recorded failure.
+  function mutationAway(label, error) {
+    const unsent = error.name === "AbortError" || error.message.startsWith("The API could not be reached");
+    const status = unsent ? `${label} was not sent.` : `${label} failed.`;
+    return { status: `${status} See the error above.`, error: unsent ? new Error(`${status} ${error.message}`) : error };
+  }
+
   function mutation(parent, name, label, scope, path, description, onSuccess, realLabel) {
     const area = section(parent, label, `${name}-section`);
     area.className = "mutation";
@@ -248,8 +273,14 @@
         const body = { reason: reasonValue(reason), dry_run: dry.checked };
         submit.disabled = true;
         $("error").hidden = true;
+        if (!body.dry_run) $("status").textContent = "Working…";
         try {
-          const data = await request(path, { method: "POST", body });
+          // The view signal aborts on Refresh. A real POST must finish: the server may already have accepted it.
+          const data = await request(path, { method: "POST", body, signal: body.dry_run ? controller?.signal : null });
+          if (!body.dry_run && !form.isConnected) {
+            keepMutation({ status: `${label} completed.` });
+            return;
+          }
           result.replaceChildren();
           result.append(element("h3", body.dry_run ? "Dry run result — nothing changed" : `${label} result`));
           result.append(fields(data || {}));
@@ -260,6 +291,12 @@
             if (completed) explanation.textContent = "This input has been resent. Select its new turn to inspect the outcome.";
             if (onSuccess) await onSuccess(data);
           }
+        } catch (error) {
+          if (!body.dry_run && !form.isConnected) {
+            keepMutation(mutationAway(label, error));
+            return;
+          }
+          throw error;
         } finally { submit.disabled = completed || !has(scope); }
       });
     });
@@ -528,6 +565,8 @@
   }
 
   async function navigate(focus = true) {
+    const gen = ++navGen;
+    navRunning = gen;
     controller?.abort();
     controller = new AbortController();
     const signal = controller.signal;
@@ -563,6 +602,8 @@
       if (!signal.aborted) $("status").textContent = `${titles[view]} loaded.`;
     } finally {
       if (!signal.aborted) content.setAttribute("aria-busy", "false");
+      if (navRunning === gen) navRunning = 0;
+      if (gen === navGen) revealMutations();
     }
   }
 

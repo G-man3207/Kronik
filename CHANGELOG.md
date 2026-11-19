@@ -5,6 +5,12 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- A real approve, promote, or resend in the admin UI is not cancelled by
+  Refresh or a view change. The status line says Working… while it is in
+  flight. If the form is gone when the POST settles, the page says the
+  action completed, failed, or was not sent, instead of only that the view
+  loaded. A failure still moves focus to the error. A dry run is still
+  cancelled with the view (#250).
 - An actor close and an operator close share one close-code rule. `1010`
   and a 124-byte reason fail on both, and the allowed codes stay 1000,
   1001, 1003, 1007, 1008, 1009, 1011, and 3000 to 4999 (#249).
