@@ -417,6 +417,11 @@ form is gone when it settles, the loaded page says the action completed,
 failed, or was not sent, and a failure moves focus to the error. A dry run
 is still cancelled with the view.
 
+Paging the actor list or the dead-letter list replaces that section. When
+keyboard focus was inside it, focus moves to the section, as older turns
+already do. Choosing a row still moves focus to that row's detail, and
+opening a view still moves focus to the view heading.
+
 `scripts/e2e-ui-oidc.py` runs the finite owned TLS/code/JWT fixture. Its browser
 observes actual network operations against generated OpenAPI, axe-core WCAG 2.2 AA
 and keyboard/focus semantics. Run it only in its documented OS-enforced sandbox.
