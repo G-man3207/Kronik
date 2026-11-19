@@ -660,14 +660,23 @@ impl Runner {
             self.flush_leaves()?;
             self.catch_up(&p)?;
             let root = p.key.path.is_empty();
-            // A timer the fork no longer has pending is skipped: still done.
+            // A timer fire runs only while the stored due time is still the
+            // one that was queued. Cancel, or a later schedule of the same
+            // id, skips it; the replacement stays queued.
             let skip = match &p.input.kind {
                 Some(pb::input::Kind::Timer(t)) => {
-                    lock(&self.timers).remove(&(p.actor.clone(), t.timer_id));
-                    !self
-                        .store
-                        .db()
-                        .timer_pending(&p.actor.kind, &p.actor.key, t.timer_id)?
+                    let still = self.store.db().timer_pending_at(
+                        &p.actor.kind,
+                        &p.actor.key,
+                        t.timer_id,
+                        t.due_ms,
+                    )?;
+                    let key = (p.actor.clone(), t.timer_id);
+                    let mut timers = lock(&self.timers);
+                    if timers.get(&key) == Some(&order) {
+                        timers.remove(&key);
+                    }
+                    !still
                 }
                 _ => false,
             } || self.resend_not_needed(&p)
@@ -893,7 +902,11 @@ impl Runner {
             .as_ref()
             .and_then(|m| m.body.as_ref())
             .and_then(|b| b.subject.clone());
-        lock(&self.timers).insert((actor.clone(), op.timer_id), order.clone());
+        // A later schedule of this id replaces the queued fire.
+        let old = lock(&self.timers).insert((actor.clone(), op.timer_id), order.clone());
+        if let Some(old) = old.filter(|old| old != &order) {
+            lock(&self.queue).remove(&old);
+        }
         self.push(
             order,
             Pending {

@@ -374,9 +374,12 @@ turn.
   timer is pending (committed or scheduled earlier in the turn). Applied
   with the turn record into `timers (kind, key, id, due_ms, msg, causal
   key)`. The timer wheel fires a timer as a turn with `TimerInput`, logical
-  time ≥ due, causal key `child(scheduling turn key, actor, ordinal)`; the
-  row is removed when that turn's record is applied, and a failed timer
-  turn is a dead letter. A timer is due when logical time
+  time ≥ due, causal key `child(scheduling turn key, actor, ordinal)`. The
+  turn runs, and applying it removes the row, only when the stored `due_ms`
+  is still the due time that fired. A later schedule of the same id replaces
+  the row and stays on the wheel; the fire already taken does not run.
+  Cancel still removes the row, so that fire does not run either. A failed
+  timer turn is a dead letter. A timer is due when logical time
   (`max(wall clock, high-water mark)`) reaches its due time, or when the
   delay it had left when the wheel took it (at commit, or at start for the
   rows in `state.db`: due less logical time then) has passed on the
