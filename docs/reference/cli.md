@@ -2542,7 +2542,10 @@ Next     kronik privacy mode off --reason "..."
 Erases a subject (M8), such as `user:42`, for a request under GDPR article
 17. It deletes the subject's keys, so its sealed values can't be read again
 anywhere: in the log, in the state, in replays and in forks. It also
-deletes the subject's SQL rows. An input that held a value of the subject
+deletes the subject's SQL rows. If another subject's row references one of
+those rows, the command fails with `ERASURE_BLOCKED` and writes nothing:
+the keys stay, and no `Erasure` record is appended. An input that held a
+value of the subject
 before the erasure fails its turn with `SUBJECT_ERASED` instead of
 reaching the actor, and a turn that runs across the erasure records the
 erased marker in place of the subject's values. An `Erasure` record keeps

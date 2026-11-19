@@ -5,6 +5,13 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- `kronik privacy erase` of a subject whose rows share a foreign key no
+  longer deletes the parent first, fails the apply, and leaves a durable
+  `Erasure` that every later start dies on. Foreign-key checks wait until
+  every delete of that subject has run. A row of another subject that still
+  references a row the erasure would delete fails the call with
+  `ERASURE_BLOCKED` before the keys are destroyed and before a record is
+  appended (#241).
 - The security policy no longer says forks have no access to personal data
   by default. A caller without `pii:read` still cannot receive personal
   data in a fork. A Unix-socket caller without a token has every scope, so

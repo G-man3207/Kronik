@@ -1440,6 +1440,13 @@ impl SqlActor {
     /// The deletes of [`erase_subject`] without the WAL checkpoint.
     /// `checkpoint` is true when the deletes ran and the connection is idle,
     /// so the caller can truncate the WAL after it releases the apply lock.
+    ///
+    /// A parent deleted before its child fails an immediate foreign-key
+    /// check. Checks are deferred until every delete of this subject has
+    /// run, then the savepoint is released only if they pass. A row of
+    /// another subject that references a row this would delete is refused
+    /// before any delete: `ON DELETE CASCADE` or `SET NULL` would change
+    /// that row, and turning foreign keys off would leave it dangling.
     pub(crate) fn erase_subject_at(
         &mut self,
         subject: &str,
@@ -1450,10 +1457,19 @@ impl SqlActor {
             return Ok((0, false));
         }
         lock(&self.shared).host = true;
+        if let Some(why) = other_subject_reference(&self.conn, subject)? {
+            return Err(erasure_constraint(&why));
+        }
         let tables = tables_with_subject_column(&self.conn)?;
         self.host_batch("SAVEPOINT kronik_apply")
             .map_err(|e| e.to_string())?;
         let deleted: Result<u64, String> = (|| {
+            // Inside the savepoint: the pragma resets on commit or rollback.
+            self.conn
+                .pragma_update(None, "defer_foreign_keys", "ON")
+                .map_err(|e| e.to_string())?;
+            // Nested RELEASE does not check; a violation already present is not this erasure's.
+            let before = foreign_key_violations(&self.conn)?;
             let mut n = 0u64;
             for t in &tables {
                 n += self
@@ -1468,17 +1484,49 @@ impl SqlActor {
                     [lsn as i64],
                 )
                 .map_err(|e| e.to_string())?;
+            if foreign_key_violations(&self.conn)?
+                .difference(&before)
+                .next()
+                .is_some()
+            {
+                return Err(erasure_constraint("FOREIGN KEY constraint failed"));
+            }
             Ok(n)
         })();
-        // A failed statement used to return with this savepoint open, so the
-        // logged erasure failed again on the next start.
-        let end = if deleted.is_ok() {
-            "RELEASE kronik_apply"
-        } else {
-            "ROLLBACK TO kronik_apply; RELEASE kronik_apply"
-        };
-        self.host_batch(end).map_err(|e| e.to_string())?;
-        Ok((deleted?, self.conn.is_autocommit()))
+        let closed = self.finish_erasure_savepoint(deleted.is_ok());
+        match (deleted, closed) {
+            (Ok(n), Ok(())) => Ok((n, self.conn.is_autocommit())),
+            (Err(e), Ok(())) => Err(e),
+            (Ok(_), Err(e)) => Err(e),
+            (Err(e), Err(close)) => Err(format!("{e}; savepoint: {close}")),
+        }
+    }
+
+    /// Rolls `kronik_apply` back when `release` is false, or when releasing
+    /// it fails, so a failed statement does not leave the savepoint open.
+    fn finish_erasure_savepoint(&self, release: bool) -> Result<(), String> {
+        if !release {
+            return self
+                .host_batch("ROLLBACK TO kronik_apply; RELEASE kronik_apply")
+                .map_err(|e| e.to_string());
+        }
+        if let Err(e) = self.host_batch("RELEASE kronik_apply") {
+            self.host_batch("ROLLBACK TO kronik_apply; RELEASE kronik_apply")
+                .map_err(|rb| rb.to_string())?;
+            let msg = e.to_string();
+            if msg.contains("FOREIGN KEY") {
+                return Err(erasure_constraint(&msg));
+            }
+            return Err(msg);
+        }
+        Ok(())
+    }
+
+    /// Why erasing `subject` would change or dangle a row that is not
+    /// theirs. `None` when every referencing row is also theirs.
+    pub(crate) fn erasure_blocked_by(&self, subject: &str) -> Result<Option<String>, String> {
+        lock(&self.shared).host = true;
+        other_subject_reference(&self.conn, subject)
     }
 
     /// H11: truncate the WAL after an erasure. A caller that holds the apply
@@ -2102,6 +2150,183 @@ fn tables_with_subject_column(conn: &Connection) -> Result<Vec<String>, String> 
 /// `DELETE` in [`SqlActor::erase_subject`], not this function.
 fn rows_without_subject_column(_conn: &Connection, _subject: &str) -> Result<u64, String> {
     Ok(0)
+}
+
+/// Prefix of an erasure error that is a foreign-key constraint, not a
+/// corrupt database. The store maps it off `STORAGE_CORRUPT`.
+pub(crate) fn erasure_constraint(why: &str) -> String {
+    format!("constraint: {why}")
+}
+
+type FkViolation = (String, Option<i64>, String, i64);
+
+fn foreign_key_violations(conn: &Connection) -> Result<BTreeSet<FkViolation>, String> {
+    let mut st = conn
+        .prepare("SELECT \"table\", rowid, parent, fkid FROM pragma_foreign_key_check")
+        .map_err(|e| e.to_string())?;
+    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|e| e.to_string())
+}
+
+struct ForeignKey {
+    parent: String,
+    pairs: Vec<(String, String)>,
+}
+
+fn foreign_keys(conn: &Connection, child: &str) -> Result<Vec<ForeignKey>, String> {
+    let mut st = conn
+        .prepare(
+            "SELECT id, \"table\", \"from\", \"to\" FROM pragma_foreign_key_list(?1) \
+             ORDER BY id, seq",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = st
+        .query_map([child], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < rows.len() {
+        let id = rows[start].0;
+        let mut end = start + 1;
+        while end < rows.len() && rows[end].0 == id {
+            end += 1;
+        }
+        let parent = rows[start].1.clone();
+        let pairs = rows[start..end]
+            .iter()
+            .map(|(_, _, from, to)| (from.clone(), to.clone()))
+            .collect();
+        out.push(ForeignKey {
+            parent: parent.clone(),
+            pairs: resolve_parent_columns(conn, &parent, pairs)?,
+        });
+        start = end;
+    }
+    Ok(out)
+}
+
+/// `REFERENCES parent` stores a NULL parent column: the primary key, or rowid.
+fn resolve_parent_columns(
+    conn: &Connection,
+    parent: &str,
+    pairs: Vec<(String, Option<String>)>,
+) -> Result<Vec<(String, String)>, String> {
+    let keys = if pairs.iter().all(|(_, to)| to.is_some()) {
+        Vec::new()
+    } else {
+        parent_key_columns(conn, parent)?
+    };
+    pairs
+        .into_iter()
+        .enumerate()
+        .map(|(i, (from, to))| {
+            let to = match to {
+                Some(to) => to,
+                None => keys
+                    .get(i)
+                    .cloned()
+                    .ok_or_else(|| format!("foreign key to {parent} has no parent column {i}"))?,
+            };
+            Ok((from, to))
+        })
+        .collect()
+}
+
+fn parent_key_columns(conn: &Connection, parent: &str) -> Result<Vec<String>, String> {
+    let mut st = conn
+        .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")
+        .map_err(|e| e.to_string())?;
+    let cols = st
+        .query_map([parent], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .map_err(|e| e.to_string())?;
+    if cols.is_empty() {
+        Ok(vec!["rowid".into()])
+    } else {
+        Ok(cols)
+    }
+}
+
+fn user_tables(conn: &Connection) -> Result<Vec<String>, String> {
+    let mut st = conn
+        .prepare(
+            "SELECT name FROM sqlite_schema WHERE type = 'table' \
+             AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+             AND name NOT LIKE '\\_kronik%' ESCAPE '\\' ORDER BY name",
+        )
+        .map_err(|e| e.to_string())?;
+    st.query_map([], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|e| e.to_string())
+}
+
+/// A row that is not `subject` references a row of `subject` that erasure
+/// would delete. That includes a table with no `_subject` column: its rows
+/// belong to nobody and are not deleted.
+fn other_subject_reference(conn: &Connection, subject: &str) -> Result<Option<String>, String> {
+    let parents = tables_with_subject_column(conn)?;
+    if parents.is_empty() {
+        return Ok(None);
+    }
+    let has = |name: &str| parents.iter().any(|t| t.eq_ignore_ascii_case(name));
+    for child in user_tables(conn)? {
+        let child_has_subject = has(&child);
+        for fk in foreign_keys(conn, &child)? {
+            if !has(&fk.parent) || fk.pairs.is_empty() {
+                continue;
+            }
+            if references_other(conn, subject, &child, child_has_subject, &fk)? {
+                return Ok(Some(format!(
+                    "a row that is not {subject} in {child} references {} of {subject}",
+                    fk.parent
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn references_other(
+    conn: &Connection,
+    subject: &str,
+    child: &str,
+    child_has_subject: bool,
+    fk: &ForeignKey,
+) -> Result<bool, String> {
+    let on = fk
+        .pairs
+        .iter()
+        .map(|(from, to)| format!("c.{} = p.{}", quote_ident(from), quote_ident(to)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let child_filter = if child_has_subject {
+        " AND (c._subject IS NULL OR c._subject != ?1)"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT 1 FROM {} AS c JOIN {} AS p ON {on} WHERE p._subject = ?1{child_filter} LIMIT 1",
+        quote_ident(child),
+        quote_ident(&fk.parent)
+    );
+    match conn.query_row(&sql, [subject], |_| Ok(())) {
+        Ok(()) => Ok(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[cfg(test)]

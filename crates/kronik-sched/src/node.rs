@@ -51,6 +51,7 @@ pub(crate) fn internal(e: impl std::fmt::Display) -> ApiError {
 pub(crate) fn store_err(e: StoreError) -> ApiError {
     match e {
         StoreError::Corrupt(m) => ApiError::new(ErrorCode::StorageCorrupt, m),
+        StoreError::Constraint(m) => ApiError::new(ErrorCode::ErasureBlocked, m),
         other => internal(other),
     }
 }

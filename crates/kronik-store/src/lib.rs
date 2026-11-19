@@ -98,6 +98,11 @@ pub enum StoreError {
     /// log (e.g. a changeset conflict).
     #[error("STORAGE_CORRUPT: {0}")]
     Corrupt(String),
+    /// An erasure cannot be applied: a foreign key would fail, or applying
+    /// it would change a row of another subject. Not a corrupt log. The
+    /// `Erasure` record must not be appended.
+    #[error("{0}")]
+    Constraint(String),
 }
 
 /// What [`Store::raise_idle_sql`] did.
@@ -110,6 +115,15 @@ pub struct IdleRaise {
     /// Databases that could not be raised or made durable (a turn open on
     /// them, a missing file): the log must not be deleted yet.
     pub blocked: Vec<String>,
+}
+
+fn erasure_store_error(context: &str, err: String) -> StoreError {
+    let msg = format!("{context}: {err}");
+    if err.starts_with("constraint:") {
+        StoreError::Constraint(msg)
+    } else {
+        StoreError::Corrupt(msg)
+    }
 }
 
 /// Tries to raise a database a turn has open, and to make a raise durable,
@@ -633,6 +647,27 @@ impl Store {
             .map_err(|e| StoreError::Corrupt(format!("SQL apply of {name} at lsn {lsn}: {e}")))
     }
 
+    /// Why `privacy erase` of `subject` must not append an `Erasure`
+    /// record: a row that is not theirs references a row the erasure would
+    /// delete. `Ok(None)` when the deletes can be applied.
+    ///
+    /// shortcut: a turn that commits such a reference after this check and
+    /// before apply can still append a record apply cannot finish. Close
+    /// that by holding SQL writers from the check through apply.
+    pub fn erasure_blocked(&self, subject: &str) -> Result<Option<String>, StoreError> {
+        for name in self.actors_for_erasure(subject, &[])? {
+            let db = self.sql.get(&name)?;
+            let db = db.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(blocked) = db
+                .erasure_blocked_by(subject)
+                .map_err(|e| StoreError::Corrupt(format!("erasure check in {name}: {e}")))?
+            {
+                return Ok(Some(format!("{name}: {blocked}")));
+            }
+        }
+        Ok(None)
+    }
+
     /// The erasure operation on the actor databases (§6.3): every row of
     /// the subject in a table with a `_subject` column is deleted, in every
     /// actor that has such a row (or a turn still open, which may be writing
@@ -657,7 +692,7 @@ impl Store {
             }
             let (_n, needs) = db
                 .erase_subject_at(subject, lsn)
-                .map_err(|e| StoreError::Corrupt(format!("erasure in {name} at lsn {lsn}: {e}")))?;
+                .map_err(|e| erasure_store_error(&format!("erasure in {name} at lsn {lsn}"), e))?;
             if needs {
                 checkpoint.push(name);
             }
@@ -752,7 +787,7 @@ impl Store {
                     let applied = db.applied_lsn()?;
                     let (_n, needs) = db
                         .erase_subject_at(subject, applied)
-                        .map_err(|e| StoreError::Corrupt(format!("erasure in {name}: {e}")))?;
+                        .map_err(|e| erasure_store_error(&format!("erasure in {name}"), e))?;
                     if needs {
                         checkpoint.push(name.clone());
                     }

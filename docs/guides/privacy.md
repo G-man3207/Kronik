@@ -259,7 +259,12 @@ The erasure itself:
    new key ([ADR 0123](../adr/0123-erasure-stops-plaintext-in-flight.md)).
 
 Other subjects are unaffected, also their values written in the same turn:
-each has its own key, its own changesets and its own rows.
+each has its own key, its own changesets and its own rows. If a row of
+another subject, or a row with no subject, references a row the erasure
+would delete, the call fails with `ERASURE_BLOCKED` before the keys are
+deleted and before an `Erasure` record is written. Delete or reassign that
+row and run the command again. A parent and a child that both belong to
+the subject are deleted together.
 
 The scrubbing of secrets reads the log too: to see which secret versions a
 turn used, it opens the sealed requests of the effects that can carry a

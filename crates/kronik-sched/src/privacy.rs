@@ -112,6 +112,10 @@ impl Node {
     ///    every actor database's tables with a `_subject` column (replayed
     ///    on every rebuild), and tombstones its queued values.
     ///
+    /// If a row that is not the subject's references a row the erasure
+    /// would delete, the call fails with `ERASURE_BLOCKED` before the keys
+    /// are deleted and before an `Erasure` record is appended.
+    ///
     /// Values of other subjects, also those written in the same turns, are
     /// separate and stay. Plain values the subject wrote in `off` mode stay
     /// readable in the log until a reseal (§8); they are counted.
@@ -141,6 +145,13 @@ impl Node {
             .clock
             .wall_ms()
             .saturating_add(self.cfg.keystore_backup_retention.as_millis() as u64);
+        if let Some(why) = self
+            .store()
+            .erasure_blocked(subject)
+            .map_err(crate::node::store_err)?
+        {
+            return Err(ApiError::new(ErrorCode::ErasureBlocked, why));
+        }
         if dry_run {
             return Ok(ErasureDone {
                 key_version: 0,

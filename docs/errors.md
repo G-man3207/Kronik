@@ -53,6 +53,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`EFFECT_OUTCOME_UNKNOWN`](#effect_outcome_unknown) | 500 | M2 | An unsafe effect may or may not have happened |
 | [`ENGINE_UPGRADE_DIVERGED`](#engine_upgrade_diverged) | 409 | M6 | The new engine version changes behavior |
 | [`ENGINE_VERSION_MISMATCH`](#engine_version_mismatch) | 409 | M6 | The engine version differs from the recorded one |
+| [`ERASURE_BLOCKED`](#erasure_blocked) | 409 | M8 | Another subject's row references a row this erasure would delete |
 | [`EXPORT_NOT_CONFIGURED`](#export_not_configured) | 409 | M28 | The export stream is off |
 | [`FOREIGN_EXISTS`](#foreign_exists) | 409 | M7 | A foreign actor with this name is already declared |
 | [`FOREIGN_NOT_FOUND`](#foreign_not_found) | 404 | M7 | No foreign actor with this name is declared |
@@ -478,6 +479,18 @@ To fix it, run a binary with the recorded engine version (`kronik --version` pri
     kronik upgrade check --window 6h
 
 See also: [`ENGINE_UPGRADE_DIVERGED`](#engine_upgrade_diverged).
+
+## ERASURE_BLOCKED
+
+HTTP status 409, milestone M8. Another subject's row references a row this erasure would delete.
+
+Default hint: Delete or reassign that row, then run `kronik privacy erase <subject> --reason '...'` again. Nothing was erased.
+
+`kronik privacy erase` would delete a row of the subject that another subject's row, or a row with no subject, still references. Deleting it would either fail the foreign-key check or, if the reference cascades or sets itself to null, change that other row. Nothing was written: the subject's keys are still there, and no `Erasure` record was appended.
+
+Find the referencing row (the error names the actor and the tables), delete it or point it at a row that stays, and run the erasure again. A parent and a child that both belong to the subject are deleted together; this code is only the other subject's reference.
+
+See also: [`SUBJECT_ERASED`](#subject_erased).
 
 ## EXPORT_NOT_CONFIGURED
 

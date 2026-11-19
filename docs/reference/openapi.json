@@ -4154,6 +4154,7 @@
                   "EFFECT_OUTCOME_UNKNOWN",
                   "ENGINE_UPGRADE_DIVERGED",
                   "ENGINE_VERSION_MISMATCH",
+                  "ERASURE_BLOCKED",
                   "EXPORT_NOT_CONFIGURED",
                   "FOREIGN_EXISTS",
                   "FOREIGN_NOT_FOUND",

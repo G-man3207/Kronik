@@ -1306,15 +1306,17 @@ fn quoted_bodies(a: &mut SqlActor) -> Vec<String> {
 }
 
 /// A statement that fails during erasure rolls `kronik_apply` back before
-/// the error is returned. The quoted parent name parses; the foreign-key
-/// check is what fails. Rows deleted earlier in the same erasure come back,
-/// the applied LSN does not move, and the connection can still take a turn
-/// and erase once the constraint is gone.
+/// the error is returned. The failure is a trigger, not parent-before-child
+/// order. Rows deleted earlier in the same erasure come back, the applied
+/// LSN does not move, the savepoint is not left open, and a later erasure
+/// of the same quoted parent and child still deletes both.
 #[test]
 fn a_failed_erasure_statement_rolls_the_savepoint_back() {
     let schema = [
         "CREATE TABLE early (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
          _subject TEXT DEFAULT (kronik_subject()))",
+        "CREATE TRIGGER block_early BEFORE DELETE ON early \
+         BEGIN SELECT RAISE(ABORT, 'erasure trigger'); END",
         "CREATE TABLE \"m\"\"parent\" (id INTEGER PRIMARY KEY, _subject TEXT)",
         "CREATE TABLE \"z\"\"child\" (id INTEGER PRIMARY KEY, \
          parent INTEGER NOT NULL REFERENCES \"m\"\"parent\"(id), _subject TEXT)",
@@ -1333,8 +1335,12 @@ fn a_failed_erasure_statement_rolls_the_savepoint_back() {
 
     let err = a.erase_subject("user:1", 3).unwrap_err();
     assert!(
-        err.contains("FOREIGN KEY"),
-        "the quoted parent name must parse; the statement then fails the constraint: {err}"
+        err.contains("erasure trigger"),
+        "the quoted names parse; a trigger, not delete order, fails the statement: {err}"
+    );
+    assert!(
+        !err.contains("FOREIGN KEY"),
+        "parent-before-child must not be the failure: {err}"
     );
     assert!(
         a.conn.is_autocommit(),
@@ -1354,17 +1360,223 @@ fn a_failed_erasure_statement_rolls_the_savepoint_back() {
         "the earlier delete in the same erasure was committed"
     );
 
-    let (_, res) = commit(
-        &mut a,
-        &as_subject(4, "user:1"),
-        &["DELETE FROM \"z\"\"child\" WHERE id = 1"],
-        3,
-    );
+    let (_, res) = commit(&mut a, &opts(4, 4, true), &["DROP TRIGGER block_early"], 3);
     assert!(res.iter().all(Result::is_ok), "{res:?}");
     let n = a.erase_subject("user:1", 4).unwrap();
-    assert!(n >= 2, "erasure after the rollback did not delete: {n}");
+    assert!(n >= 3, "erasure after the rollback did not delete: {n}");
     assert_eq!(a.applied_lsn().unwrap(), 4);
     assert!(a.conn.is_autocommit());
+    a.begin_turn(&opts(0, 0, false)).unwrap();
+    let left = a.query("SELECT body FROM early ORDER BY id", &[]).unwrap();
+    let parents = a.query("SELECT id FROM \"m\"\"parent\"", &[]).unwrap();
+    let children = a.query("SELECT id FROM \"z\"\"child\"", &[]).unwrap();
+    a.end_turn(false).unwrap();
+    assert_eq!(left.values, [[Value::Text("other".into())]]);
+    assert!(parents.values.is_empty() && children.values.is_empty());
+}
+
+/// Issue #241: a parent and child of the same subject erase together even
+/// though the parent table sorts first. The other subject's row stays. A
+/// fresh actor applying the same turns and erasure (a restart) matches.
+#[test]
+fn a_same_subject_parent_and_child_erase_together() {
+    let schema = [
+        "CREATE TABLE account (id INTEGER PRIMARY KEY, _subject TEXT)",
+        "CREATE TABLE line (id INTEGER PRIMARY KEY, \
+         account_id INTEGER NOT NULL REFERENCES account(id), _subject TEXT)",
+    ];
+    let inserts = [
+        "INSERT INTO account(id, _subject) VALUES (1, 'user:1')",
+        "INSERT INTO line(id, account_id, _subject) VALUES (1, 1, 'user:1')",
+        "INSERT INTO account(id, _subject) VALUES (2, 'user:2')",
+        "INSERT INTO line(id, account_id, _subject) VALUES (2, 2, 'user:2')",
+    ];
+    let mut live = actor("fk-live");
+    let (schema_turn, res) = commit(&mut live, &opts(1, 1, true), &schema, 1);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let (inserted, res) = commit(&mut live, &as_subject(2, "user:1"), &inserts, 2);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+
+    let n = live.erase_subject("user:1", 3).unwrap();
+    assert!(n >= 2, "parent and child were not both deleted: {n}");
+    assert_eq!(live.applied_lsn().unwrap(), 3);
+    assert!(live.conn.is_autocommit());
+    assert_eq!(fk_rows(&mut live), [(2, 2, "user:2".into())]);
+
+    let mut rebuilt = actor("fk-rebuilt");
+    rebuilt.apply(&schema_turn, 1, &BTreeSet::new()).unwrap();
+    rebuilt.apply(&inserted, 2, &BTreeSet::new()).unwrap();
+    rebuilt.erase_subject("user:1", 3).unwrap();
+    assert_eq!(rebuilt.applied_lsn().unwrap(), 3);
+    assert_eq!(fk_rows(&mut rebuilt), fk_rows(&mut live));
+}
+
+fn fk_rows(a: &mut SqlActor) -> Vec<(i64, i64, String)> {
+    a.begin_turn(&opts(0, 0, false)).unwrap();
+    let rows = a
+        .query(
+            "SELECT a.id, l.id, l._subject FROM line l JOIN account a ON a.id = l.account_id \
+             ORDER BY l.id",
+            &[],
+        )
+        .unwrap();
+    a.end_turn(false).unwrap();
+    rows.values
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [
+                Value::Integer(account),
+                Value::Integer(line),
+                Value::Text(subject),
+            ] => (*account, *line, subject.clone()),
+            other => panic!("unexpected row {other:?}"),
+        })
+        .collect()
+}
+
+/// A row of another subject that references the erased parent is not
+/// deleted, and the failure does not leave the savepoint open or advance
+/// the applied LSN. Cascade would otherwise delete that row.
+#[test]
+fn another_subjects_reference_blocks_erasure() {
+    let schema = [
+        "CREATE TABLE account (id INTEGER PRIMARY KEY, _subject TEXT)",
+        "CREATE TABLE line (id INTEGER PRIMARY KEY, \
+         account_id INTEGER REFERENCES account(id) ON DELETE CASCADE, _subject TEXT)",
+        "CREATE TABLE \"z\"\"child\" (id INTEGER PRIMARY KEY, \
+         account_id INTEGER REFERENCES account(id), _subject TEXT)",
+    ];
+    let inserts = [
+        "INSERT INTO account(id, _subject) VALUES (1, 'user:1')",
+        "INSERT INTO line(id, account_id, _subject) VALUES (1, 1, 'user:2')",
+        "INSERT INTO \"z\"\"child\"(id, account_id, _subject) VALUES (1, 1, 'user:2')",
+    ];
+    let mut a = actor("fk-blocked");
+    let (_, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let (_, res) = commit(&mut a, &as_subject(2, "user:1"), &inserts, 2);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+
+    let err = a.erase_subject("user:1", 3).unwrap_err();
+    assert!(
+        err.starts_with("constraint:"),
+        "a cross-subject reference is not a corrupt database: {err}"
+    );
+    assert!(a.conn.is_autocommit(), "savepoint left open after {err}");
+    assert_eq!(a.applied_lsn().unwrap(), 2);
+    a.begin_turn(&opts(0, 0, false)).unwrap();
+    let accounts = a.query("SELECT id, _subject FROM account", &[]).unwrap();
+    let lines = a.query("SELECT id, _subject FROM line", &[]).unwrap();
+    let quoted = a
+        .query("SELECT id, _subject FROM \"z\"\"child\"", &[])
+        .unwrap();
+    a.end_turn(false).unwrap();
+    assert_eq!(
+        accounts.values,
+        [[Value::Integer(1), Value::Text("user:1".into())]]
+    );
+    assert_eq!(
+        lines.values,
+        [[Value::Integer(1), Value::Text("user:2".into())]]
+    );
+    assert_eq!(
+        quoted.values,
+        [[Value::Integer(1), Value::Text("user:2".into())]]
+    );
+}
+
+/// `REFERENCES parent` leaves the parent column NULL, and an unquoted name
+/// may not match the table's spelling. Same-subject rows still erase. A
+/// cross-subject child is seen before any delete. A dangling key that was
+/// already there is not this erasure's failure.
+#[test]
+fn an_implicit_parent_key_erases_and_a_cross_subject_child_blocks() {
+    let schema = [
+        "CREATE TABLE Account (id INTEGER PRIMARY KEY, _subject TEXT)",
+        "CREATE TABLE line (id INTEGER PRIMARY KEY, \
+         account_id INTEGER NOT NULL REFERENCES account, _subject TEXT)",
+        "CREATE TABLE pair (a INTEGER NOT NULL, b INTEGER NOT NULL, _subject TEXT, \
+         PRIMARY KEY (a, b))",
+        "CREATE TABLE edge (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER, _subject TEXT, \
+         FOREIGN KEY (x, y) REFERENCES pair)",
+        "CREATE TABLE dangling (id INTEGER PRIMARY KEY, \
+         account_id INTEGER REFERENCES Account(id))",
+    ];
+    let mut live = actor("fk-implicit");
+    let (_, res) = commit(&mut live, &opts(1, 1, true), &schema, 1);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    live.set_host();
+    live.conn
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO dangling(id, account_id) VALUES (1, 99);
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+    let inserts = [
+        "INSERT INTO Account(id, _subject) VALUES (1, 'user:1')",
+        "INSERT INTO line(id, account_id, _subject) VALUES (1, 1, 'user:1')",
+        "INSERT INTO pair(a, b, _subject) VALUES (1, 2, 'user:1')",
+        "INSERT INTO edge(id, x, y, _subject) VALUES (1, 1, 2, 'user:1')",
+    ];
+    let (_, res) = commit(&mut live, &as_subject(2, "user:1"), &inserts, 2);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    live.erase_subject("user:1", 3).unwrap();
+    assert_eq!(live.applied_lsn().unwrap(), 3);
+    assert!(live.conn.is_autocommit());
+    live.begin_turn(&opts(0, 0, false)).unwrap();
+    let left = live
+        .query(
+            "SELECT (SELECT count(*) FROM Account) + (SELECT count(*) FROM line) \
+             + (SELECT count(*) FROM pair) + (SELECT count(*) FROM edge), \
+             (SELECT count(*) FROM dangling)",
+            &[],
+        )
+        .unwrap();
+    live.end_turn(false).unwrap();
+    assert_eq!(
+        left.values,
+        [[Value::Integer(0), Value::Integer(1)]],
+        "a pre-existing dangling key blocked erasure, or a subject row remained"
+    );
+
+    let blocked = [
+        (
+            "fk-case",
+            "line",
+            &[
+                "INSERT INTO Account(id, _subject) VALUES (1, 'user:1')",
+                "INSERT INTO line(id, account_id, _subject) VALUES (1, 1, 'user:2')",
+            ][..],
+        ),
+        (
+            "fk-composite",
+            "edge",
+            &[
+                "INSERT INTO pair(a, b, _subject) VALUES (1, 2, 'user:1')",
+                "INSERT INTO edge(id, x, y, _subject) VALUES (1, 1, 2, 'user:2')",
+            ][..],
+        ),
+    ];
+    for (name, needle, inserts) in blocked {
+        let mut a = actor(name);
+        let (_, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
+        assert!(res.iter().all(Result::is_ok), "{name}: {res:?}");
+        let (_, res) = commit(&mut a, &as_subject(2, "user:1"), inserts, 2);
+        assert!(res.iter().all(Result::is_ok), "{name}: {res:?}");
+        let why = a
+            .erasure_blocked_by("user:1")
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name}: pre-check missed the other subject's row"));
+        assert!(
+            why.contains(needle),
+            "{name}: pre-check did not name {needle}: {why}"
+        );
+        let err = a.erase_subject("user:1", 3).unwrap_err();
+        assert!(err.starts_with("constraint:"), "{name}: {err}");
+        assert!(a.conn.is_autocommit(), "{name}: {err}");
+        assert_eq!(a.applied_lsn().unwrap(), 2, "{name}");
+    }
 }
 
 #[test]
