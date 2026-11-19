@@ -26,6 +26,10 @@ const ROOM_BARE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/guests/room-bare.wasm"
 );
+const ROOM_FRAME_V2: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/guests/room-frame-v2.wasm"
+);
 
 struct Proc {
     rt: Runtime,
@@ -1256,4 +1260,294 @@ fn the_operator_closes_a_connection_with_its_audit() {
             .unwrap_err();
         assert_eq!(e.code, ErrorCode::ConnectionNotFound, "{conn}");
     }
+}
+
+/// Crash after a recorded `connection.send-now`, then restart. An identical
+/// re-run returns that `Ok` and does not write the frame again. A re-run on
+/// guest code that builds a different frame at that ordinal
+/// (`room-frame-v2.wasm`) traps `REPLAY_DIVERGED`, names
+/// `connection.send-now`, and does not write the new frame. The connection
+/// is still live in the turn's state: the restart close is queued after the
+/// re-run.
+///
+/// Returning `Ok(Closed)` or skipping `recorded` on a mismatch still passes
+/// the HTTP body test and fails this one. Not the crash before a result was
+/// recorded, and not issue #224.
+#[test]
+fn a_crash_rerun_with_a_different_send_now_frame_traps_and_is_not_written_again() {
+    for diverge in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let armed = dir.path().join("hold-armed");
+        let reached = dir.path().join("hold-reached");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let node = rt.block_on(async {
+            let env = Env::real(tokio::runtime::Handle::current());
+            let config = NodeConfig {
+                concurrency: 8,
+                test_hold: Some(kronik_sched::TestHold {
+                    point: kronik_sched::HoldPoint::BeforeCommit,
+                    armed: armed.clone(),
+                    reached: reached.clone(),
+                }),
+                ..NodeConfig::default()
+            };
+            start_local(env, dir.path(), config).await.unwrap()
+        });
+        let p = Proc { rt, node };
+        p.deploy(ROOM, false).unwrap();
+        grant_send_now(&p);
+        let (conn, client) = p.join("lobby", "ada");
+        p.until("the welcome", || client.recording().frames.len() == 1);
+        // After the open: an armed hold parks every turn, and join waits for it.
+        std::fs::write(&armed, b"armed").unwrap();
+        p.frame(&conn, "stream 1");
+
+        let mut open = None;
+        for _ in 0..500 {
+            // `db()`'s guard lives to the semicolon; locking it again here deadlocks.
+            let turns = p.node.store().db().open_turns().unwrap();
+            open = turns.into_iter().find(|t| {
+                reached.exists()
+                    && p.node
+                        .store()
+                        .db()
+                        .open_effects(&t.execution_id)
+                        .unwrap()
+                        .iter()
+                        .any(|e| {
+                            e.kind == "connection.send-now"
+                                && e.status == pb::EffectStatus::Ok as i32
+                        })
+            });
+            if open.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let open = open
+            .unwrap_or_else(|| panic!("{diverge}: the turn never parked with a recorded send-now"));
+        // The frame was handed to the client before the result was recorded.
+        let seen = frames(&client.recording());
+        assert_eq!(
+            seen.iter().filter(|(_, f)| f == "tok 0").count(),
+            1,
+            "{diverge}: {seen:?}"
+        );
+        assert!(
+            p.live(&conn),
+            "{diverge}: the connection closed before the crash"
+        );
+        let execution_id = open.execution_id.clone();
+        let (lsn, segment) = (open.lsn, open.pos.segment);
+        drop(p);
+
+        if diverge {
+            let hash = install_component(dir.path(), &std::fs::read(ROOM_FRAME_V2).unwrap());
+            point_open_turn_at(dir.path(), &execution_id, &hash, lsn, segment);
+            let begin = log_records(dir.path())
+                .into_iter()
+                .find_map(|r| match r {
+                    Record::TurnBegin(b) if b.execution_id == execution_id => Some(b),
+                    _ => None,
+                })
+                .expect("the rewritten TurnBegin");
+            assert_eq!(begin.code_hash, hash);
+        }
+        let before = send_now_results(&log_records(dir.path()), &execution_id);
+        assert_eq!(before.len(), 1, "{diverge}");
+        assert_eq!(send_now_request(&before[0]).data, b"tok 0".to_vec());
+        assert_eq!(send_now_request(&before[0]).seq, 1);
+
+        let p = start(dir.path());
+        let mut records = Vec::new();
+        for _ in 0..500 {
+            records = log(&p).into_iter().map(|(_, r)| r).collect();
+            if records
+                .iter()
+                .any(|r| matches!(r, Record::TurnRecord(t) if t.execution_id == execution_id))
+            {
+                break;
+            }
+            records.clear();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(r, Record::TurnRecord(t) if t.execution_id == execution_id)),
+            "{diverge}: the re-run never closed"
+        );
+        let t = records
+            .iter()
+            .find_map(|r| match r {
+                Record::TurnRecord(t) if t.execution_id == execution_id => Some(t),
+                _ => None,
+            })
+            .unwrap();
+        let outcome = t.outcome.as_ref().unwrap();
+        let results = send_now_results(&records, &execution_id);
+        let wrote_new = |effects: &[pb::EffectRecord]| {
+            effects
+                .iter()
+                .any(|e| e.kind == "connection.send-now" && send_now_request(e).data == b"tok 0 v2")
+        };
+        if diverge {
+            assert_eq!(outcome.kind, pb::OutcomeKind::Trap as i32, "{outcome:?}");
+            assert_eq!(outcome.error_code, "REPLAY_DIVERGED", "{outcome:?}");
+            assert!(
+                outcome.message.contains("connection.send-now")
+                    && outcome
+                        .message
+                        .contains("differs from the recorded request"),
+                "{}",
+                outcome.message
+            );
+            assert!(
+                t.effects.iter().all(|e| {
+                    e.status != pb::EffectStatus::OutcomeUnknown as i32
+                        && e.status != pb::EffectStatus::Closed as i32
+                }),
+                "a mismatch was treated as unrecorded or closed: {t:?}"
+            );
+            assert!(
+                !wrote_new(&t.effects) && !wrote_new(&results),
+                "the new frame was written: {t:?} {results:?}"
+            );
+        } else {
+            assert_eq!(
+                outcome.kind,
+                pb::OutcomeKind::Committed as i32,
+                "{outcome:?}"
+            );
+            assert_eq!(t.effects.len(), 1, "{t:?}");
+            let e = &t.effects[0];
+            assert_eq!(e.kind, "connection.send-now");
+            assert_eq!(e.status, pb::EffectStatus::Ok as i32, "{e:?}");
+            assert_eq!(send_now_request(e).data, b"tok 0".to_vec());
+        }
+        // A second write appends another EffectResult. The recorded path does not.
+        assert_eq!(
+            results.len(),
+            1,
+            "{diverge}: the frame was written again: {results:?}"
+        );
+        assert_eq!(send_now_request(&results[0]).data, b"tok 0".to_vec());
+        assert!(
+            !p.node
+                .store()
+                .db()
+                .open_turns()
+                .unwrap()
+                .iter()
+                .any(|row| row.execution_id == execution_id)
+        );
+        // The crashed client is gone with that process. This hub does not
+        // hold the connection, so a re-run has no client to write a frame to.
+        assert!(
+            RecordingTransport::attach(p.node.hub(), &conn).is_err(),
+            "{diverge}: the re-run could still hand a frame to a client"
+        );
+    }
+}
+
+fn send_now_results(records: &[Record], execution_id: &str) -> Vec<pb::EffectRecord> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            Record::EffectResult(e) if e.execution_id == execution_id => e.effect.clone(),
+            _ => None,
+        })
+        .filter(|e| e.kind == "connection.send-now")
+        .collect()
+}
+
+/// Every record in the log, read with a fresh runtime (the daemon is dead).
+fn log_records(dir: &Path) -> Vec<Record> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let env = Env::real(tokio::runtime::Handle::current());
+        let reader = kronik_log::LogReader::new(env, dir.join("branches/main/log"), "main");
+        let mut out = Vec::new();
+        reader
+            .read(1, u64::MAX, |c| {
+                out.push(c.record);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        out
+    })
+}
+
+fn install_component(dir: &Path, bytes: &[u8]) -> Vec<u8> {
+    let hash = kronik_core::ids::CodeHash::of(bytes);
+    let code = dir.join("code");
+    std::fs::create_dir_all(&code).unwrap();
+    std::fs::write(code.join(format!("{}.wasm", hash.hex())), bytes).unwrap();
+    hash.0.to_vec()
+}
+
+/// Points the open turn's `TurnBegin` at `code_hash` and keeps `state.db`'s
+/// offsets on the rewritten segment.
+fn point_open_turn_at(dir: &Path, execution_id: &str, code_hash: &[u8], lsn: u64, segment: u64) {
+    let log = dir.join("branches/main/log");
+    let mut found = false;
+    for start in kronik_log::segment_starts(&log).unwrap() {
+        let path = log.join(kronik_log::segment_name(start));
+        let rewritten = kronik_log::rewrite_segment(&path, |_lsn, record| {
+            let Record::TurnBegin(begin) = record else {
+                return Ok(false);
+            };
+            if begin.execution_id != execution_id {
+                return Ok(false);
+            }
+            begin.code_hash = code_hash.to_vec();
+            found = true;
+            Ok(true)
+        })
+        .unwrap_or_else(|e| panic!("rewrite {}: {e}", path.display()));
+        if !found {
+            continue;
+        }
+        let db = rusqlite::Connection::open(dir.join("branches/main/state.db")).unwrap();
+        for (at, offset) in &rewritten.offsets {
+            db.execute(
+                "UPDATE turn_index SET offset = ?1 WHERE lsn = ?2 AND segment = ?3",
+                rusqlite::params![*offset as i64, *at as i64, start as i64],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE open_turns SET offset = ?1 WHERE lsn = ?2 AND segment = ?3",
+                rusqlite::params![*offset as i64, *at as i64, start as i64],
+            )
+            .unwrap();
+        }
+        let pointed = db
+            .query_row(
+                "SELECT offset FROM open_turns WHERE execution_id = ?1 AND segment = ?2",
+                rusqlite::params![execution_id, segment as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let expected = rewritten
+            .offsets
+            .iter()
+            .find(|(at, _)| *at == lsn)
+            .map(|(_, offset)| *offset as i64)
+            .expect("the rewritten segment lost the TurnBegin");
+        assert_eq!(
+            pointed, expected,
+            "the open turn no longer points at its TurnBegin"
+        );
+        break;
+    }
+    assert!(found, "open turn {execution_id} was not in the log");
 }

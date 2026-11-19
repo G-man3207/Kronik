@@ -25,6 +25,9 @@ bare = []
 # Every open refused with 403, nothing else changed (room-refuse.wasm): a
 # fork that holds none of production's connections (M24 replay tests).
 refuse = []
+# `send-now` tokens carry ` v2` (room-frame-v2.wasm): a crash re-run that
+# builds a different frame at a recorded ordinal.
+frame-v2 = []
 
 [profile.release]
 opt-level = "s"
