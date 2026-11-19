@@ -2363,6 +2363,25 @@ impl StateDb {
             .is_some())
     }
 
+    /// Whether `id` is still the schedule that was fired at `due_ms`.
+    /// A cancel, or a later schedule of the same id, is not.
+    pub fn timer_pending_at(
+        &self,
+        kind: &str,
+        key: &str,
+        id: u64,
+        due_ms: u64,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT 1 FROM timers WHERE kind = ?1 AND key = ?2 AND timer_id = ?3 AND due_ms = ?4",
+            )?
+            .query_row(params![kind, key, id as i64, i(due_ms)], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
     /// Pending timers, earliest first; of one actor when given.
     pub fn timers(&self, actor: Option<(&str, &str)>) -> Result<Vec<TimerRow>, StoreError> {
         let (k, y) = actor.unwrap_or(("", ""));
@@ -2903,9 +2922,17 @@ fn apply_turn(
             }
         }
         Some(pb::input::Kind::Timer(tm)) => {
-            tx.prepare_cached("DELETE FROM timers WHERE kind = ?1 AND key = ?2 AND timer_id = ?3")?
-                .execute(params![kind, key, tm.timer_id as i64])?;
-            blobs::unpin_timer(tx, kind, key, tm.timer_id as i64, lsn)?;
+            // A fire deletes the row only when it is still the schedule that
+            // was taken. A later schedule of the same id has a new due.
+            let deleted = tx
+                .prepare_cached(
+                    "DELETE FROM timers WHERE kind = ?1 AND key = ?2 AND timer_id = ?3 \
+                     AND due_ms = ?4",
+                )?
+                .execute(params![kind, key, tm.timer_id as i64, i(tm.due_ms)])?;
+            if deleted > 0 {
+                blobs::unpin_timer(tx, kind, key, tm.timer_id as i64, lsn)?;
+            }
             if !committed {
                 dead_letter_insert(tx, lsn, kind, key, input, outcome)?;
             }
@@ -6540,5 +6567,81 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1, "the rebuild had a row to copy");
         assert_search_at(&db.conn, super::COMPACT_TREES, 1);
+    }
+
+    fn timer_fire(id: u64, due: u64) -> Option<pb::Input> {
+        Some(pb::Input {
+            kind: Some(pb::input::Kind::Timer(pb::TimerInput {
+                timer_id: id,
+                due_ms: due,
+                ..Default::default()
+            })),
+        })
+    }
+
+    fn timer_pins(db: &StateDb, hash: &str) -> i64 {
+        db.conn
+            .query_row(
+                "SELECT count(*) FROM blob_pins WHERE source = 2 AND hash = ?1",
+                [hash],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// #228: a timer turn deletes the row only when its due time is still
+    /// the one that fired. A later schedule of the same id stays, including
+    /// its blob pin; the matching fire then removes both.
+    #[test]
+    fn a_stale_timer_fire_does_not_delete_the_replacement() {
+        let mut db = StateDb::open(Connection::open_in_memory().unwrap()).unwrap();
+        let msg = |name: &str, hash: &str| pb::Message {
+            name: name.into(),
+            body: Some(pb::Sealable {
+                subject: None,
+                value: Some(pb::sealable::Value::Plain(name.as_bytes().to_vec())),
+            }),
+            blobs: vec![pb::BlobRef {
+                hash: hash.into(),
+                size: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let schedule = |exec: &str, due: u64, name: &str, hash: &str| {
+            let mut t = turn(exec, exec, http_input());
+            let Record::TurnRecord(r) = &mut t else {
+                unreachable!("turn() builds a TurnRecord");
+            };
+            r.timers.push(pb::TimerOp {
+                kind: pb::TimerOpKind::Schedule as i32,
+                timer_id: 7,
+                due_ms: due,
+                msg: Some(msg(name, hash)),
+                ordinal: 0,
+            });
+            t
+        };
+        db.apply(&[
+            committed(1, schedule("old", 10, "old", "blob-old")),
+            committed(2, schedule("new", 50, "new", "blob-new")),
+        ])
+        .unwrap();
+        assert!(db.timer_pending("counter", "a", 7).unwrap());
+        assert!(!db.timer_pending_at("counter", "a", 7, 10).unwrap());
+        assert!(db.timer_pending_at("counter", "a", 7, 50).unwrap());
+        db.apply(&[committed(3, turn("stale", "stale", timer_fire(7, 10)))])
+            .unwrap();
+        let row = db.timers(None).unwrap();
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0].timer_id, 7);
+        assert_eq!(row[0].due_ms, 50);
+        assert_eq!(row[0].msg.name, "new");
+        assert_eq!(timer_pins(&db, "blob-new"), 1);
+        assert_eq!(timer_pins(&db, "blob-old"), 0);
+        db.apply(&[committed(4, turn("current", "current", timer_fire(7, 50)))])
+            .unwrap();
+        assert!(db.timers(None).unwrap().is_empty());
+        assert_eq!(timer_pins(&db, "blob-new"), 0);
     }
 }

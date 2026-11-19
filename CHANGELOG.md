@@ -5,6 +5,12 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- A timer fire already queued no longer deletes a later schedule of the
+  same timer id. The queued turn runs, and applying it removes the row,
+  only when the stored due time is still the one that fired. The
+  replacement stays and fires at its own time with its own message.
+  Cancelling still suppresses the queued fire. A fork skips the same
+  stale fire.
 - `kronik restore` fsyncs each staged file before renaming it into place,
   and fsyncs the destination directory after. A power loss after restore
   returns no longer leaves `state.db`, an actor database, a log segment, or

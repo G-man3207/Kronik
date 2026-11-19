@@ -52,20 +52,25 @@ impl Wheel {
     }
 
     /// How long from `now` until the next timer is due, by either clock.
+    /// An id already firing is a later schedule of that id, not this wait:
+    /// [`Wheel::done`] wakes the loop when the taken fire finishes.
     pub fn next_wait(&self, now: Now) -> Option<Duration> {
         let logical = self
             .due
-            .first()
+            .iter()
+            .find(|(_, actor, id)| !self.firing.contains(&(actor.clone(), *id)))
             .map(|(due, _, _)| Duration::from_millis(due.saturating_sub(now.logical_ms)));
         let monotonic = self
             .deadlines
-            .first()
+            .iter()
+            .find(|(_, actor, id)| !self.firing.contains(&(actor.clone(), *id)))
             .map(|(deadline, _, _)| deadline.saturating_sub(now.monotonic));
         logical.into_iter().chain(monotonic).min()
     }
 
     /// Timers due at `now` by either clock, in order of due time, moved to
-    /// the firing set.
+    /// the firing set. An id already firing stays on the wheel: that entry
+    /// is a later schedule, not this fire.
     pub fn take_due(&mut self, now: Now) -> Vec<(ActorRef, u64, u64)> {
         let mut ready: BTreeSet<(u64, ActorRef, u64)> = self
             .due
@@ -84,17 +89,21 @@ impl Wheel {
         }
         let mut out = Vec::new();
         for (due, actor, id) in ready {
-            self.remove(&actor, id);
-            if self.firing.insert((actor.clone(), id)) {
-                out.push((actor, id, due));
+            if self.firing.contains(&(actor.clone(), id)) {
+                continue;
             }
+            self.remove(&actor, id);
+            self.firing.insert((actor.clone(), id));
+            out.push((actor, id, due));
         }
         out
     }
 
-    /// The timer's turn finished (or was skipped).
-    pub fn done(&mut self, actor: &ActorRef, id: u64) {
+    /// The timer's turn finished (or was skipped). True when a later
+    /// schedule of the same id is still on the wheel.
+    pub fn done(&mut self, actor: &ActorRef, id: u64) -> bool {
         self.firing.remove(&(actor.clone(), id));
+        self.by_id.contains_key(&(actor.clone(), id))
     }
 }
 
@@ -179,5 +188,31 @@ mod tests {
             vec![(a.clone(), 1, 50), (b.clone(), 2, 60)]
         );
         assert!(w.take_due(at(1_000, 10_000)).is_empty());
+    }
+
+    /// #228: a schedule after take keeps its due until the taken fire is done.
+    #[test]
+    fn a_reschedule_after_take_keeps_the_new_due() {
+        let a = ActorRef::parse("t/a").unwrap();
+        let mut w = Wheel::default();
+        w.add(a.clone(), 7, 10, at(0, 0));
+        assert_eq!(w.take_due(at(10, 10)), vec![(a.clone(), 7, 10)]);
+        w.add(a.clone(), 7, 50, at(10, 10));
+        assert!(w.take_due(at(50, 50)).is_empty());
+        assert_eq!(w.next_wait(at(50, 50)), None);
+        assert!(w.done(&a, 7));
+        assert_eq!(w.take_due(at(50, 50)), vec![(a.clone(), 7, 50)]);
+    }
+
+    /// Cancel while the fire is queued leaves nothing for a later take.
+    #[test]
+    fn cancel_while_firing_leaves_nothing_due() {
+        let a = ActorRef::parse("t/a").unwrap();
+        let mut w = Wheel::default();
+        w.add(a.clone(), 7, 10, at(0, 0));
+        w.take_due(at(10, 10));
+        w.remove(&a, 7);
+        assert!(!w.done(&a, 7));
+        assert!(w.take_due(at(1_000, 1_000)).is_empty());
     }
 }

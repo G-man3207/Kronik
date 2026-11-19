@@ -36,6 +36,8 @@ mod native_metadata_audit;
 mod native_subject_keys;
 mod records;
 mod source_gc;
+#[cfg(test)]
+mod timer_replace;
 pub use records::{ShardReadPoint, ShardReader, ShardRecordPage};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1586,7 +1588,7 @@ impl Node {
                 lock(&self.resending).remove(&lsn);
             }
             if let Some(id) = timer {
-                lock(&self.wheel).done(&actor, id);
+                self.timer_done(&actor, id);
             }
             if let Err(e) = &result {
                 tracing::warn!(actor = %actor, error = %e, "input not processed");
@@ -2152,7 +2154,7 @@ impl Node {
                     && !self
                         .store
                         .db()
-                        .timer_pending(&actor.kind, &actor.key, t.timer_id)
+                        .timer_pending_at(&actor.kind, &actor.key, t.timer_id, t.due_ms)
                         .map_err(store_err)? =>
             {
                 return Err(internal(format!(
@@ -5394,6 +5396,12 @@ impl Node {
         Ok((epoch, lsn))
     }
 
+    fn timer_done(&self, actor: &ActorRef, id: u64) {
+        if lock(&self.wheel).done(actor, id) {
+            self.wheel_notify.notify_one();
+        }
+    }
+
     fn fire_timer(&self, actor: ActorRef, id: u64, due_ms: u64) {
         let row = self
             .store
@@ -5402,9 +5410,14 @@ impl Node {
             .ok()
             .and_then(|rows| rows.into_iter().find(|t| t.timer_id == id));
         let Some(row) = row else {
-            lock(&self.wheel).done(&actor, id);
+            self.timer_done(&actor, id);
             return;
         };
+        if row.due_ms != due_ms {
+            // Replaced after take. The new due stays on the wheel.
+            self.timer_done(&actor, id);
+            return;
+        }
         let subject = body_subject(Some(&row.msg));
         let input = pb::Input {
             kind: Some(pb::input::Kind::Timer(pb::TimerInput {
