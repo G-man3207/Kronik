@@ -3,11 +3,11 @@
 //! The session extension records the rewritten rows, so the bytes
 //! `sqlite3changeset_apply` accepts are produced by SQLite rather than by a
 //! hand-rolled encoder. Integer and real values are copied through, including
-//! primary keys, so a later UPDATE still finds the row. A column whose every
-//! present text value is the changeset's subject is left unchanged: that is
-//! the `_subject` column, and erasure deletes by that id.
+//! primary keys, so a later UPDATE still finds the row. `skip` names the
+//! `_subject` column of each table, taken from the actor schema: erasure
+//! deletes by that id, and a text cell equal to the id is still rewritten.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, params_from_iter};
@@ -15,12 +15,13 @@ use rusqlite::{Connection, params_from_iter};
 use super::ffi::{self, Change, Op, Val};
 
 /// Replaces text and blob cell values in `cs` and returns a changeset that
-/// applies to the same schema. `rewrite` is the pseudonym of one cell; equal
-/// inputs must yield equal outputs so an UPDATE's old image matches the row
-/// a previous change inserted.
+/// applies to the same schema. `skip` is `(table, column index)` of
+/// `_subject` (any ASCII case of that name). `rewrite` is the pseudonym of
+/// one cell; equal inputs must yield equal outputs so an UPDATE's old image
+/// matches the row a previous change inserted.
 pub fn pseudonymize_changeset(
     cs: &[u8],
-    subject: &str,
+    skip: &BTreeSet<(String, usize)>,
     mut rewrite: impl FnMut(&[u8]) -> Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     if cs.is_empty() {
@@ -30,61 +31,14 @@ pub fn pseudonymize_changeset(
     if changes.is_empty() {
         return Ok(cs.to_vec());
     }
-    let skip = subject_columns(&changes, subject);
     let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
     create_tables(&conn, &changes)?;
-    preinsert(&conn, &changes, &skip, &mut rewrite)?;
+    preinsert(&conn, &changes, skip, &mut rewrite)?;
     let session = ffi::Session::new(&conn, true).map_err(|e| e.to_string())?;
     for change in &changes {
-        replay(&conn, change, &skip, &mut rewrite)?;
+        replay(&conn, change, skip, &mut rewrite)?;
     }
     session.changeset().map_err(|e| e.to_string())
-}
-
-/// Columns to leave unchanged: exactly one column per table whose every
-/// present text value is `subject` (the `_subject` column). More than one
-/// such column is ambiguous, so none of them is skipped.
-fn subject_columns(changes: &[Change], subject: &str) -> BTreeSet<(String, usize)> {
-    let mut by_table: BTreeMap<&str, Vec<&Change>> = BTreeMap::new();
-    for change in changes {
-        by_table
-            .entry(change.table.as_str())
-            .or_default()
-            .push(change);
-    }
-    let mut skip = BTreeSet::new();
-    for (table, group) in by_table {
-        let ncol = group
-            .iter()
-            .map(|c| c.pk.len().max(c.old.len()).max(c.new.len()))
-            .max()
-            .unwrap_or(0);
-        let mut candidates = Vec::new();
-        for col in 0..ncol {
-            let mut saw = false;
-            let mut all_subject = true;
-            for change in &group {
-                for image in [&change.old, &change.new] {
-                    let Some(Some(value)) = image.get(col) else {
-                        continue;
-                    };
-                    if let Val::Text(text) = value {
-                        saw = true;
-                        if text != subject {
-                            all_subject = false;
-                        }
-                    }
-                }
-            }
-            if saw && all_subject {
-                candidates.push(col);
-            }
-        }
-        if candidates.len() == 1 {
-            skip.insert((table.to_string(), candidates[0]));
-        }
-    }
-    skip
 }
 
 fn create_tables(conn: &Connection, changes: &[Change]) -> Result<(), String> {

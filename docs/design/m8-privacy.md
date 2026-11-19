@@ -695,11 +695,13 @@ Where the code differs from the sections above:
   `pii:read` (`SCOPE_MISSING`, `m3.rs` `require_fork_pii`).
 - **Forks.** The production index is revealed for the fork in place
   (`kronik-fork/src/privacy.rs`): plaintext, or pseudonyms for `--no-pii`.
-  Subject-tagged SQL changesets are unsealed and, for `--no-pii`, have
-  their text and blob cells pseudonymized before the fork store applies
-  them (`sql::pseudonymize_changeset`); a snapshot the cursor loads is
-  rewritten the same way. Integer and real values and the `_subject`
-  column stay. Changesets with no subject are applied as recorded. So a
+  Subject-tagged SQL changesets stay sealed in the index. The fork store
+  unseals them and, for `--no-pii`, pseudonymizes their text and blob cells
+  before writing them (`sql::pseudonymize_changeset`), skipping `_subject`
+  by name from the actor schema, including a text cell equal to the subject
+  id. A snapshot the cursor loads is rewritten the same way. Integer and
+  real values and the `_subject` column stay. Changesets with no subject
+  are applied as recorded. So a
   `--no-pii` turn that
   used SQL (`SqlTurn::end` returned something), called a turn that did, or
   was sent a message or timer by one is `ForkTurn::sql` (and masked): its

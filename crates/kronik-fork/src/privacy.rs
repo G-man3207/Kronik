@@ -13,10 +13,11 @@
 //!
 //! A fork turn that read such a value is *masked*: if it differs from
 //! production, the diff calls it `pii-masked`, not divergent. A `--no-pii`
-//! fork pseudonymizes text and blob cells of a subject-tagged SQL changeset
-//! before the store applies it, so the actor database the guest queries does
-//! not hold that plaintext. A turn that used SQL (or called a turn that did,
-//! or was sent a message by one) is still masked
+//! fork's store pseudonymizes text and blob cells of a subject-tagged SQL
+//! changeset when it applies it, skipping `_subject` by name, so the actor
+//! database the guest queries does not hold that plaintext. A turn that used
+//! SQL (or called a turn that did, or was sent a message by one) is still
+//! masked
 //! ([`crate::ForkTurn::sql`]): the diff shows its values like a subject's
 //! (hashed), and its reply and record are [`conceal_turn`]ed before any
 //! caller or file sees them. A value copied into a name, key or URL is not
@@ -120,9 +121,9 @@ impl ForkPrivacy {
     }
 
     /// [`ForkPrivacy::reveal`] over a turn record. SQL changesets are
-    /// unsealed so the store can apply them. In a `--no-pii` fork a
-    /// subject-tagged changeset's text and blob cells are pseudonymized
-    /// first (integer and real values, and the `_subject` column, stay).
+    /// unsealed so the store can apply them, except in a `--no-pii` fork,
+    /// where they stay sealed until the store pseudonymizes text and blob
+    /// cells (integer and real values, and the `_subject` column, stay).
     /// An erased subject's changeset stays sealed so the store skips it,
     /// and so does an erased state value: the store keeps it sealed, and a
     /// fork turn that reads it gets nothing and is marked as one that met
@@ -151,40 +152,16 @@ impl ForkPrivacy {
         masked
     }
 
-    /// Unseals one SQL changeset. On the `--no-pii` path, replaces text and
-    /// blob cells of a subject-tagged changeset with their pseudonym before
-    /// the fork store applies the bytes. An erased or unreadable changeset
-    /// is left sealed. A rewrite that fails does not leave plaintext for
-    /// the store to apply.
+    /// Unseals one SQL changeset so the store can apply it. A `--no-pii`
+    /// changeset stays sealed: the store unseals it and pseudonymizes text
+    /// and blob cells, skipping `_subject` by name from the actor schema,
+    /// and a failed rewrite never writes the plaintext. An erased or
+    /// unreadable changeset is left sealed either way.
     fn reveal_changeset(&self, cs: &mut pb::Sealable) {
-        let subject = cs.subject.clone();
+        if self.no_pii {
+            return;
+        }
         let _ = self.sealer.unseal_value(cs);
-        if !self.no_pii {
-            return;
-        }
-        let Some(subject) = subject else {
-            return;
-        };
-        let Some(pb::sealable::Value::Plain(bytes)) = cs.value.as_mut() else {
-            return;
-        };
-        if bytes.is_empty() {
-            return;
-        }
-        match kronik_store::sql::pseudonymize_changeset(bytes, &subject, |value| {
-            Self::sql_cell(&self.sealer, &subject, value)
-        }) {
-            Ok(rewritten) => *bytes = rewritten,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "refusing to apply a subject-tagged SQL changeset that could not be pseudonymized"
-                );
-                // Not a changeset: apply fails closed instead of writing plaintext.
-                bytes.clear();
-                bytes.push(0);
-            }
-        }
     }
 
     /// The pseudonym of one SQL cell of production's (a revealed changeset,
