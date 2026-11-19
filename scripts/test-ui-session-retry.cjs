@@ -2,8 +2,10 @@
 'use strict';
 /*
  * Admin UI session check for a non-auth first load (issue 167), a
- * policy 403 on promote (issue 190), and a real promote that is not
- * Enter in the reason field (issue 191).
+ * policy 403 on promote (issue 190), a real promote that is not
+ * Enter in the reason field (issue 191), and a real promote that
+ * outlives Refresh or a view change (issue 250). Approve and resend
+ * use the same mutation submit.
  * Run: node scripts/test-ui-session-retry.cjs
  * Chrome: $KRONIK_CHROME or /usr/bin/google-chrome. No package install.
  */
@@ -167,6 +169,11 @@ const cases = [
   { name: 'promote-hidden-failed', recipe: 'hide-promote', hash: '#proposals/p-1', session: () => okSession(), proposal: () => proposal('failed') },
   { name: 'promote-enter-reason', recipe: 'enter-promote', hash: '#proposals/p-1', session: () => okSession(), proposal: () => okProposal(), promote: () => ({ status: 200, body: { dry_run: true } }) },
   { name: 'promote-real-control', recipe: 'real-promote', hash: '#proposals/p-1', session: () => okSession(), proposal: () => okProposal(), promote: () => ({ status: 200, body: { dry_run: false, deployment: { epoch: 2, lsn: 3 } } }) },
+  { name: 'promote-refresh-completed', recipe: 'refresh-mutation', hash: '#proposals/p-1', hold: true, settle: 'during', outcome: 'completed', leave: 'refresh', session: () => okSession(), proposal: () => okProposal(), promote: () => ({ status: 200, body: { dry_run: false, deployment: { epoch: 2, lsn: 3 } } }) },
+  { name: 'promote-hash-failed', recipe: 'refresh-mutation', hash: '#proposals/p-1', hold: true, settle: 'after', outcome: 'failed', leave: 'hash', session: () => okSession(), proposal: () => okProposal(), actors: () => okActors(), promote: () => fail(500, 'UNAVAILABLE', 'Synthetic promote failure.') },
+  { name: 'promote-refresh-unsent', recipe: 'refresh-mutation', hash: '#proposals/p-1', hold: true, settle: 'during', outcome: 'unsent', leave: 'refresh', session: () => okSession(), proposal: () => okProposal(), promote: () => ({ status: 200, body: { dry_run: false } }) },
+  { name: 'promote-dry-refresh', recipe: 'refresh-mutation', hash: '#proposals/p-1', hold: true, settle: 'after', outcome: 'dry', leave: 'refresh', session: () => okSession(), proposal: () => okProposal(), promote: () => ({ status: 200, body: { dry_run: true } }) },
+  { name: 'promote-real-failed', recipe: 'real-failed', hash: '#proposals/p-1', session: () => okSession(), proposal: () => okProposal(), promote: () => fail(500, 'UNAVAILABLE', 'Synthetic real failure.') },
 ];
 
 function driver() {
@@ -177,12 +184,23 @@ const KEPT = ${JSON.stringify(KEPT)};
 const PRINCIPAL = ${JSON.stringify(PRINCIPAL)};
 const recipe = ${JSON.stringify(Object.fromEntries(cases.map((item) => [item.name, item.recipe])))}[CASE];
 const expected = ${JSON.stringify(Object.fromEntries(cases.filter((item) => item.code).map((item) => [item.name, item.code])))}[CASE];
+const detail = ${JSON.stringify(Object.fromEntries(cases.filter((item) => item.outcome).map((item) => [item.name, { outcome: item.outcome, settle: item.settle || '', leave: item.leave || 'refresh' }])))}[CASE] || {};
 const status = () => document.getElementById('session-status').textContent;
 const errorBox = () => document.getElementById('error');
 const field = () => document.getElementById('bearer-token');
 const refresh = () => document.getElementById('refresh-button');
 const signedOut = () => status().includes('Not signed in');
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function held(key) {
+  const start = performance.now();
+  for (;;) {
+    const reply = await fetch('/held');
+    const body = await reply.json();
+    if (body[key]) return;
+    if (performance.now() - start > 8000) throw new Error('timeout held ' + key);
+    await sleep(20);
+  }
+}
 async function waitFor(fn, detail) {
   const start = performance.now();
   for (;;) {
@@ -344,7 +362,72 @@ async function run() {
     } else {
       button.click();
       await waitFor(() => document.getElementById('promote-result').textContent.includes('Promote proposal result'), 'result');
+      assert(document.getElementById('status').textContent === 'Promote proposal completed.', 'same-view status');
     }
+  } else if (recipe === 'refresh-mutation') {
+    await waitFor(() => status().includes('OIDC: ' + PRINCIPAL), 'session');
+    await waitFor(() => {
+      const button = document.getElementById('promote-button');
+      return button && !button.disabled;
+    }, 'promote');
+    const dry = document.getElementById('promote-dry-run');
+    const real = detail.outcome !== 'dry';
+    if (real) {
+      dry.checked = false;
+      dry.dispatchEvent(new Event('change'));
+    }
+    document.getElementById('promote-reason').value = real ? 'Synthetic refresh promote' : 'Synthetic dry refresh';
+    document.getElementById('promote-form').requestSubmit();
+    if (real) await waitFor(() => document.getElementById('status').textContent === 'Working…', 'working');
+    await held('promote');
+    if (detail.leave === 'hash') location.hash = '#history';
+    else document.getElementById('refresh-button').click();
+    const loadedText = detail.leave === 'hash' ? 'History loaded.' : 'Proposals loaded.';
+    if (detail.settle === 'during') {
+      await held('proposal');
+      await release();
+      await waitFor(() => performance.getEntriesByType('resource').some((entry) => entry.name.includes('/promote') && entry.responseEnd > 0), 'promote settled');
+      await sleep(50);
+      const page = document.getElementById('status').textContent;
+      assert(page === 'Loading…', 'outcome replaced loading: ' + page);
+      assert(errorBox().hidden, 'error before the view finished');
+      const view = await fetch('/release-view', { method: 'POST' });
+      assert(view.ok, 'release-view failed');
+    } else {
+      await waitFor(() => document.getElementById('status').textContent.includes(loadedText), 'loaded before release');
+      await release();
+    }
+    if (detail.outcome === 'dry') {
+      await sleep(400);
+      assert(document.getElementById('status').textContent === 'Proposals loaded.', 'dry run status ' + document.getElementById('status').textContent);
+      assert(errorBox().hidden, 'dry run error');
+    } else {
+      const phrase = detail.outcome === 'completed' ? 'Promote proposal completed.' : detail.outcome === 'failed' ? 'Promote proposal failed.' : 'Promote proposal was not sent.';
+      await waitFor(() => {
+        const text = document.getElementById('status').textContent;
+        return text.includes(phrase) && text.includes(loadedText);
+      }, 'outcome');
+      if (detail.outcome === 'completed') assert(errorBox().hidden, 'success showed an error');
+      else {
+        const needle = detail.outcome === 'failed' ? 'UNAVAILABLE' : 'was not sent';
+        await waitFor(() => document.activeElement === errorBox() && errorBox().textContent.includes(needle), 'focused error');
+      }
+    }
+  } else if (recipe === 'real-failed') {
+    await waitFor(() => status().includes('OIDC: ' + PRINCIPAL), 'session');
+    await waitFor(() => {
+      const button = document.getElementById('promote-button');
+      return button && !button.disabled;
+    }, 'promote');
+    const dry = document.getElementById('promote-dry-run');
+    dry.checked = false;
+    dry.dispatchEvent(new Event('change'));
+    document.getElementById('promote-reason').value = 'Synthetic real failure';
+    document.getElementById('promote-form').requestSubmit();
+    await waitFor(() => document.activeElement === errorBox() && errorBox().textContent.includes('UNAVAILABLE'), 'focused error');
+    assert(document.getElementById('status').textContent.includes('failed'), 'failure not announced');
+    assert(document.getElementById('promote-form'), 'form gone');
+    assert(!document.getElementById('promote-button').disabled, 'button stayed disabled');
   } else throw new Error('unknown recipe');
   assert(performance.getEntriesByType('navigation').length === 1, 'page reloaded');
 }
@@ -379,6 +462,21 @@ function expects(item, seen) {
     const body = seen.promoteBodies && seen.promoteBodies[0];
     return none && seen.promote === 1 && seen.pages === 1 && body && body.dry_run === false
       && body.reason === 'Synthetic real promotion';
+  }
+  if (item.recipe === 'refresh-mutation') {
+    const body = seen.promoteBodies && seen.promoteBodies[0];
+    const real = item.outcome !== 'dry';
+    const reason = real ? 'Synthetic refresh promote' : 'Synthetic dry refresh';
+    if (!(none && seen.pages === 1 && seen.session >= 1 && seen.promote === 1 && body && body.dry_run === !real && body.reason === reason)) return false;
+    if (item.outcome === 'dry') return seen.promoteAborted && seen.proposal >= 2;
+    if (item.outcome === 'unsent') return seen.proposal >= 2 && seen.promoteAborted;
+    if (item.leave === 'hash') return seen.actors >= 1 && seen.proposal === 1 && seen.promoteReplied && !seen.promoteAborted;
+    return seen.proposal >= 2 && seen.promoteReplied && !seen.promoteAborted;
+  }
+  if (item.recipe === 'real-failed') {
+    const body = seen.promoteBodies && seen.promoteBodies[0];
+    return none && seen.promote === 1 && seen.proposal === 1 && seen.pages === 1 && body
+      && body.dry_run === false && body.reason === 'Synthetic real failure';
   }
   return false;
 }
@@ -417,7 +515,31 @@ async function runCase(origin, item) {
 async function main() {
   if (!fs.existsSync(chromeBin)) throw new Error(`chrome not found: ${chromeBin}`);
   let current = null;
-  const seen = { session: 0, actors: 0, proposal: 0, promote: 0, pages: 0, released: false, authorization: [], actorAuth: [], proposalAuth: [], promoteAuth: [], promoteBodies: [], served: { session: 0, actors: 0 }, servedAuth: { session: [], actors: [] } };
+  const seen = { session: 0, actors: 0, proposal: 0, promote: 0, pages: 0, released: false, promoteAborted: false, promoteReplied: false, heldPromote: null, heldProposal: null, viewReleased: false, token: {}, authorization: [], actorAuth: [], proposalAuth: [], promoteAuth: [], promoteBodies: [], served: { session: 0, actors: 0 }, servedAuth: { session: [], actors: [] } };
+  function replyHeld(held) {
+    if (!held || held.res.writableEnded || held.res.destroyed) return;
+    held.res.writeHead(held.reply.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    held.res.end(replyBytes(held.reply));
+  }
+  function releasePromote() {
+    const held = seen.heldPromote;
+    seen.heldPromote = null;
+    if (!held) return;
+    if (!current || current.outcome === 'unsent' || seen.promoteAborted) {
+      seen.promoteAborted = true;
+      held.res.destroy();
+      return;
+    }
+    seen.promoteReplied = true;
+    replyHeld(held);
+  }
+  function releaseView() {
+    const held = seen.heldProposal;
+    seen.heldProposal = null;
+    seen.viewReleased = true;
+    replyHeld(held);
+  }
+
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (req.method === 'GET' && (url.pathname === '/ui' || url.pathname === '/ui/')) {
@@ -442,8 +564,20 @@ async function main() {
       res.end(fs.readFileSync(path.join(ui, file)));
       return;
     }
+    if (req.method === 'GET' && url.pathname === '/held') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ promote: seen.promoteBodies.length > 0, proposal: Boolean(seen.heldProposal) }));
+      return;
+    }
     if (req.method === 'POST' && url.pathname === '/release') {
       seen.released = true;
+      releasePromote();
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/release-view') {
+      releaseView();
       res.writeHead(204);
       res.end();
       return;
@@ -525,6 +659,10 @@ async function main() {
       seen.served[route] += 1;
       seen.servedAuth[route].push(authorization);
     }
+    if (route === 'proposal' && current.settle === 'during' && seen.proposal > 1 && !seen.viewReleased) {
+      seen.heldProposal = { res, reply };
+      return;
+    }
     const send = () => {
       res.writeHead(reply.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       res.end(replyBytes(reply));
@@ -536,6 +674,15 @@ async function main() {
         if (route === 'promote') {
           try { seen.promoteBodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
           catch { seen.promoteBodies.push(null); }
+          if (current.hold) {
+            const token = seen.token;
+            res.on('close', () => {
+              if (seen.token !== token || seen.promoteReplied || res.writableEnded) return;
+              seen.promoteAborted = true;
+            });
+            seen.heldPromote = { res, reply };
+            return;
+          }
         }
         send();
       });
@@ -562,6 +709,12 @@ async function main() {
       seen.promoteAuth = [];
       seen.promoteBodies = [];
       seen.servedAuth = { session: [], actors: [] };
+      seen.promoteAborted = false;
+      seen.promoteReplied = false;
+      seen.heldPromote = null;
+      seen.heldProposal = null;
+      seen.viewReleased = false;
+      seen.token = {};
       const result = await runCase(origin, item);
       const network = result.seen ? expects(item, result.seen) : false;
       if (!result.ok || result.loads !== 1 || !network) {

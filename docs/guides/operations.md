@@ -411,6 +411,12 @@ description. Promote is not offered while the proposal is running or has
 failed. A dry-run promote that policy denies still returns `POLICY_DENIED`
 and leaves the proposal and its fork as they were.
 
+A real approve, promote, or resend is not cancelled by Refresh or a view
+change. The status line says Working… while that POST is in flight. If the
+form is gone when it settles, the loaded page says the action completed,
+failed, or was not sent, and a failure moves focus to the error. A dry run
+is still cancelled with the view.
+
 `scripts/e2e-ui-oidc.py` runs the finite owned TLS/code/JWT fixture. Its browser
 observes actual network operations against generated OpenAPI, axe-core WCAG 2.2 AA
 and keyboard/focus semantics. Run it only in its documented OS-enforced sandbox.
