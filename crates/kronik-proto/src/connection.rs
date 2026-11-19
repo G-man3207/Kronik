@@ -1,6 +1,7 @@
 //! Long-lived connections in the log (M24, docs/design/m24-connections.md
 //! §6): connection ids, the names the API, the diff and the metrics use for
-//! the protocol, the close cause and the frame kind, and the one split of an
+//! the protocol, the close cause and the frame kind, the close code and
+//! reason limit an actor and an operator share, and the one split of an
 //! offered `Sec-WebSocket-Protocol` list.
 
 use crate::log::v1 as pb;
@@ -66,6 +67,22 @@ pub fn valid_id(id: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
+}
+
+/// The longest close reason an actor or an operator may send, in bytes
+/// (RFC 6455 §5.5: a control frame carries at most 125 bytes, two of them
+/// the code).
+pub const MAX_CLOSE_REASON_BYTES: usize = 123;
+
+/// Whether `code` may close a connection, for an actor and for an operator
+/// (M24 §2.4): 1000, 1001, 1003, 1007, 1008, 1009, 1011, or 3000 to 4999.
+///
+/// A client may send a wider set. This is not that set.
+pub fn valid_close_code(code: u16) -> bool {
+    matches!(
+        code,
+        1000 | 1001 | 1003 | 1007 | 1008 | 1009 | 1011 | 3000..=4999
+    )
 }
 
 /// The id of the connection that the open input with root id `root`
@@ -219,6 +236,17 @@ mod tests {
         ] {
             assert!(!valid_id(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn close_codes() {
+        for ok in [1000, 1001, 1003, 1007, 1008, 1009, 1011, 3000, 4000, 4999] {
+            assert!(valid_close_code(ok), "{ok}");
+        }
+        for bad in [0, 999, 1002, 1004, 1005, 1006, 1010, 1012, 1015, 2999, 5000] {
+            assert!(!valid_close_code(bad), "{bad}");
+        }
+        assert_eq!(MAX_CLOSE_REASON_BYTES, 123);
     }
 
     #[test]

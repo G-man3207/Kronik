@@ -23,18 +23,6 @@ use crate::types::{
 };
 use crate::{Api, ApiResponse, AuthorizedRequest, Query, Result, bad, internal, json, ok, reason};
 
-/// The longest close frame reason (RFC 6455 §5.5: a control frame carries
-/// at most 125 bytes, two of them the code).
-const MAX_CLOSE_MESSAGE_BYTES: usize = 123;
-
-/// The codes an operator may close with: the ones an actor may (§2.4).
-fn valid_close_code(code: u16) -> bool {
-    matches!(
-        code,
-        1000 | 1001 | 1003 | 1007 | 1008 | 1009 | 1011 | 3000..=4999
-    )
-}
-
 /// How many target ids an operation's summary lists.
 const OP_TARGETS_SHOWN: usize = 20;
 
@@ -244,15 +232,16 @@ impl Api {
         reason(&r.reason)?;
         let id = connection_id(id)?;
         let code = r.code.unwrap_or(1008);
-        if !valid_close_code(code) {
+        if !conn::valid_close_code(code) {
             return Err(bad(format!(
                 "code {code} is not a close code an operator can send: use 1000, 1001, 1003, \
                  1007, 1008, 1009, 1011, or 3000 to 4999"
             )));
         }
-        if r.message.len() > MAX_CLOSE_MESSAGE_BYTES {
+        if r.message.len() > conn::MAX_CLOSE_REASON_BYTES {
             return Err(bad(format!(
-                "message must be at most {MAX_CLOSE_MESSAGE_BYTES} bytes, not {}",
+                "message must be at most {} bytes, not {}",
+                conn::MAX_CLOSE_REASON_BYTES,
                 r.message.len()
             )));
         }
