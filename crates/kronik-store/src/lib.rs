@@ -160,6 +160,9 @@ impl AppliedLsn {
     }
 }
 
+/// Pseudonym of one SQL cell: `(subject, value) -> bytes`.
+type SqlCellRewrite = Arc<dyn Fn(&str, &[u8]) -> Vec<u8> + Send + Sync>;
+
 /// `state.db` plus the SQL pool of one branch.
 pub struct Store {
     db: Mutex<StateDb>,
@@ -175,6 +178,10 @@ pub struct Store {
     /// Reads sealed SQL changesets (docs/design/m8-privacy.md §4, §6);
     /// plain until the node sets its own.
     sealer: Mutex<Arc<kronik_privacy::sealer::Sealer>>,
+    /// Set by a `--no-pii` fork. Subject-tagged SQL changesets are
+    /// pseudonymized with this as they are applied. Production leaves it
+    /// unset, so recorded cells are applied as they are.
+    sql_rewrite: Mutex<Option<SqlCellRewrite>>,
     /// Dropped last, so shared snapshot paths stay bound until connections close.
     #[allow(dead_code)]
     cow: Option<Arc<sql::CowShare>>,
@@ -200,6 +207,7 @@ impl Store {
             apply_lock: Mutex::new(()),
             apply_epoch: AtomicU64::new(0),
             sealer: Mutex::new(Arc::new(kronik_privacy::sealer::Sealer::plain())),
+            sql_rewrite: Mutex::new(None),
             cow,
         });
         store.backfill_sql_subjects()?;
@@ -218,6 +226,22 @@ impl Store {
     /// The sealer that opens sealed SQL changesets when they are applied.
     pub fn set_sealer(&self, sealer: Arc<kronik_privacy::sealer::Sealer>) {
         *self.sealer.lock().unwrap_or_else(|e| e.into_inner()) = sealer;
+    }
+
+    /// Pseudonymizes text and blob cells of subject-tagged SQL changesets
+    /// as they are applied. A `--no-pii` fork sets this; production does not.
+    pub fn set_sql_rewrite(
+        &self,
+        rewrite: impl Fn(&str, &[u8]) -> Vec<u8> + Send + Sync + 'static,
+    ) {
+        *self.sql_rewrite.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(rewrite));
+    }
+
+    fn sql_rewrite(&self) -> Option<SqlCellRewrite> {
+        self.sql_rewrite
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The sealer this store opens SQL changesets with.
@@ -644,8 +668,12 @@ impl Store {
             // Not in the log. apply combines `changesets` (ADR 0160).
             whole: Vec::new(),
         };
-        db.apply(&turn, lsn, &BTreeSet::new())
-            .map_err(|e| StoreError::Corrupt(format!("SQL apply of {name} at lsn {lsn}: {e}")))
+        let applied = if let Some(rewrite) = self.sql_rewrite() {
+            db.apply_rewriting(&turn, lsn, &BTreeSet::new(), rewrite.as_ref())
+        } else {
+            db.apply(&turn, lsn, &BTreeSet::new())
+        };
+        applied.map_err(|e| StoreError::Corrupt(format!("SQL apply of {name} at lsn {lsn}: {e}")))
     }
 
     /// Why `privacy erase` of `subject` must not append an `Erasure`

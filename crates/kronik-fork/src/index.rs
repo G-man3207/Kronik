@@ -189,7 +189,8 @@ pub struct ProductionIndex {
     /// (M8); plain unless the index was revealed for a fork.
     pub sealer: std::sync::Arc<kronik_privacy::sealer::Sealer>,
     /// Set by [`ProductionIndex::reveal`] for a `--no-pii` fork. The cursor
-    /// rewrites snapshot rows the same way revealed changesets were.
+    /// rewrites snapshot rows, and pseudonymizes changesets as it applies
+    /// them, skipping `_subject` by name.
     pub no_pii: bool,
     /// One snapshot image for every cursor of this index (#197).
     pub(crate) snapshot: std::sync::OnceLock<std::sync::Arc<kronik_store::snapshot::SnapshotImage>>,
@@ -342,8 +343,9 @@ impl ProductionIndex {
     /// Shows the index's user data as the fork may see it (M8 §5, §9):
     /// root inputs, recorded effects and turn records are revealed in place
     /// (plaintext, or pseudonyms for `--no-pii`). Subject-tagged SQL
-    /// changesets are unsealed and, for `--no-pii`, pseudonymized before
-    /// the cursor's store applies them.
+    /// changesets stay sealed for `--no-pii`: the cursor's store unseals
+    /// them and pseudonymizes text and blob cells, skipping `_subject` by
+    /// name, before it writes them.
     pub fn reveal(&mut self, privacy: &crate::privacy::ForkPrivacy) {
         self.sealer = privacy.sealer.clone();
         self.no_pii = privacy.no_pii;

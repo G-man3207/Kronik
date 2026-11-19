@@ -531,6 +531,9 @@ fn sql_err(e: rusqlite::Error, shared: &Mutex<Shared>) -> SqlError {
     }
 }
 
+type LoggedChangesets = Vec<(Option<String>, Vec<u8>)>;
+type CellRewrite<'a> = &'a dyn Fn(&str, &[u8]) -> Vec<u8>;
+
 impl SqlActor {
     pub fn open(opener: &dyn SqliteOpener, actor: &str, limits: Limits) -> rusqlite::Result<Self> {
         let vfs = ffi::TimeVfs::new()?;
@@ -1309,6 +1312,42 @@ impl SqlActor {
         Ok((split.into_iter().collect(), cs))
     }
 
+    /// Replaces text and blob cells of subject-tagged changesets. `_subject`,
+    /// any ASCII case, is left as recorded: its index comes from this
+    /// database after the turn's DDL, not from which cell equals the subject
+    /// id. A cell that does equal the id is rewritten.
+    fn rewrite_subject_changesets(
+        &mut self,
+        changesets: &[(Option<String>, Vec<u8>)],
+        rewrite: CellRewrite<'_>,
+    ) -> Result<LoggedChangesets, String> {
+        let mut out = Vec::with_capacity(changesets.len());
+        for (subject, cs) in changesets {
+            let Some(subject) = subject else {
+                out.push((None, cs.clone()));
+                continue;
+            };
+            if cs.is_empty() {
+                out.push((Some(subject.clone()), Vec::new()));
+                continue;
+            }
+            let changes = ffi::changes(cs).map_err(|e| e.to_string())?;
+            let mut skip = BTreeSet::new();
+            let mut seen = BTreeSet::new();
+            for change in &changes {
+                if !seen.insert(change.table.clone()) {
+                    continue;
+                }
+                if let Some(index) = self.subject_col(&change.table).map_err(|e| e.to_string())? {
+                    skip.insert((change.table.clone(), index));
+                }
+            }
+            let bytes = super::pseudonymize_changeset(cs, &skip, |value| rewrite(subject, value))?;
+            out.push((Some(subject.clone()), bytes));
+        }
+        Ok(out)
+    }
+
     /// Applies a turn's SQL (DDL, then the changesets) and advances
     /// `applied_lsn`, atomically. Subjects in `erased` are skipped: their
     /// changesets are unreadable after erasure. The rest are combined into
@@ -1319,6 +1358,29 @@ impl SqlActor {
         t: &TurnSql,
         lsn: u64,
         erased: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        self.apply_inner(t, lsn, erased, None)
+    }
+
+    /// [`Self::apply`] for a `--no-pii` fork. Subject-tagged changesets are
+    /// pseudonymized after this turn's DDL, using this database's schema to
+    /// find `_subject`.
+    pub(crate) fn apply_rewriting(
+        &mut self,
+        t: &TurnSql,
+        lsn: u64,
+        erased: &BTreeSet<String>,
+        rewrite: CellRewrite<'_>,
+    ) -> Result<(), String> {
+        self.apply_inner(t, lsn, erased, Some(rewrite))
+    }
+
+    fn apply_inner(
+        &mut self,
+        t: &TurnSql,
+        lsn: u64,
+        erased: &BTreeSet<String>,
+        rewrite: Option<CellRewrite<'_>>,
     ) -> Result<(), String> {
         // A savepoint, not BEGIN: applies nest inside an isolated-replay
         // overlay transaction that is rolled back afterwards.
@@ -1363,14 +1425,22 @@ impl SqlActor {
             if !t.ddl.is_empty() {
                 lock(&self.shared).host = true;
                 ensure_subject_indexes(&self.conn)?;
+                // The lookup below must see columns this DDL added.
+                self.subject_cols.clear();
             }
-            if erased.is_empty() && !t.whole.is_empty() {
+            let rewritten = match rewrite {
+                Some(rewrite) => Some(self.rewrite_subject_changesets(&t.changesets, rewrite)?),
+                None => None,
+            };
+            let changesets = rewritten.as_deref().unwrap_or(t.changesets.as_slice());
+            // `whole` is the unsplit changeset tests set. A fork rewrite uses
+            // the per-subject bytes, which are what the log holds.
+            if rewrite.is_none() && erased.is_empty() && !t.whole.is_empty() {
                 ffi::apply(&self.conn, &t.whole)?;
             } else {
                 // One apply: the foreign-key check runs after every subject.
                 // The log still holds the per-subject bytes (ADR 0160).
-                let parts: Vec<&[u8]> = t
-                    .changesets
+                let parts: Vec<&[u8]> = changesets
                     .iter()
                     .filter(|(subject, cs)| {
                         !cs.is_empty() && !subject.as_ref().is_some_and(|s| erased.contains(s))

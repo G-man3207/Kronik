@@ -403,15 +403,27 @@ fn a_rewritten_changeset_applies_pseudonyms_and_keeps_the_primary_key() {
     assert!(res.iter().all(Result::is_ok), "{res:?}");
     let (subject, cs) = t.changesets.first().expect("one changeset");
     assert_eq!(subject.as_deref(), Some("user:1"));
-    let rewritten = pseudonymize_changeset(cs, "user:1", |v| match v {
-        b"ROW-u1-5e2c" => b"pii:aaaa".to_vec(),
-        b"ROW-u1-5e2c-next" => b"pii:bbbb".to_vec(),
-        other => {
-            let mut out = b"pii:".to_vec();
-            out.extend_from_slice(&blake3::hash(other).as_bytes()[..6]);
-            out
-        }
-    })
+    let subject_at: i64 = live
+        .conn
+        .query_row(
+            "SELECT cid FROM pragma_table_info('notes') WHERE name = '_subject' COLLATE NOCASE",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let rewritten = pseudonymize_changeset(
+        cs,
+        &BTreeSet::from([("notes".to_string(), subject_at as usize)]),
+        |v| match v {
+            b"ROW-u1-5e2c" => b"pii:aaaa".to_vec(),
+            b"ROW-u1-5e2c-next" => b"pii:bbbb".to_vec(),
+            other => {
+                let mut out = b"pii:".to_vec();
+                out.extend_from_slice(&blake3::hash(other).as_bytes()[..6]);
+                out
+            }
+        },
+    )
     .unwrap();
     assert!(
         !rewritten
@@ -455,6 +467,96 @@ fn a_rewritten_changeset_applies_pseudonyms_and_keeps_the_primary_key() {
     assert_ne!(payload.as_slice(), &[1, 2]);
     assert!(payload.starts_with(b"pii:"), "{payload:?}");
     assert_eq!(rows.values[0][3], Value::Text("user:1".into()));
+}
+/// Issue #244: a text cell equal to the subject id is not the subject
+/// column. `_subject` is that column by name. An UPDATE whose body equals
+/// the subject, and an INSERT where both do, keep `_subject` and rewrite
+/// the body. Integer and real cells stay, so erasure still finds the row.
+#[test]
+fn a_text_cell_equal_to_the_subject_is_rewritten_and_subject_is_not() {
+    // `_subject` is not last, so a positional guess cannot pass this.
+    let schema = "CREATE TABLE notes (\
+        id INTEGER PRIMARY KEY, \
+        _subject TEXT DEFAULT (kronik_subject()), \
+        body TEXT NOT NULL, \
+        amount REAL NOT NULL)";
+    let mut live = actor("equal-subject-live");
+    let (_, res) = commit(&mut live, &opts(1, 1, true), &[schema], 1);
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let (inserted, res) = commit(
+        &mut live,
+        &as_subject(2, "user:1"),
+        &["INSERT INTO notes(body, amount) VALUES ('user:1', 1.5)"],
+        2,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let (seeded, res) = commit(
+        &mut live,
+        &as_subject(3, "user:2"),
+        &["INSERT INTO notes(body, amount) VALUES ('hello', 2.25)"],
+        3,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let (updated, res) = commit(
+        &mut live,
+        &as_subject(4, "user:3"),
+        &["UPDATE notes SET body = 'user:2' WHERE id = 2"],
+        4,
+    );
+    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    assert_eq!(updated.changesets[0].0.as_deref(), Some("user:2"));
+
+    let rewrite = |_: &str, value: &[u8]| {
+        let mut out = b"pii:".to_vec();
+        out.extend_from_slice(value);
+        out
+    };
+    let mut fork = actor("equal-subject-fork");
+    fork.apply(
+        &TurnSql {
+            ddl: vec![schema.to_string()],
+            ..TurnSql::default()
+        },
+        1,
+        &BTreeSet::new(),
+    )
+    .unwrap();
+    for (lsn, turn) in [(2, &inserted), (3, &seeded), (4, &updated)] {
+        fork.apply_rewriting(turn, lsn, &BTreeSet::new(), &rewrite)
+            .unwrap();
+    }
+    fork.begin_turn(&opts(0, 0, false)).unwrap();
+    let rows = fork
+        .query(
+            "SELECT id, body, amount, _subject FROM notes ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    fork.end_turn(false).unwrap();
+    assert_eq!(
+        rows.values,
+        [
+            vec![
+                Value::Integer(1),
+                Value::Text("pii:user:1".into()),
+                Value::Real(1.5),
+                Value::Text("user:1".into()),
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Text("pii:user:2".into()),
+                Value::Real(2.25),
+                Value::Text("user:2".into()),
+            ],
+        ],
+        "a body equal to the subject must be rewritten; _subject, id and amount stay"
+    );
+    assert_eq!(
+        fork.erase_subject("user:1", 5).unwrap(),
+        1,
+        "rewriting _subject would hide the row from erasure"
+    );
+    assert_eq!(fork.erase_subject("user:2", 6).unwrap(), 1);
 }
 
 const SUBJECT_TABLE: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \

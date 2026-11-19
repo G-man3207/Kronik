@@ -428,10 +428,13 @@ the same deterministic pseudonym as every other tagged value, so equal
 values stay equal. Old and new images are rewritten the same way, so a
 later UPDATE still matches the row. Integer and real values, including
 primary-key columns, are left unchanged so changeset apply can find the
-row. The `_subject` column stays the subject id, in any ASCII case of that
-name, so erasure still finds the row. A snapshot the fork continues is
-rewritten the same way before later changesets are applied. Changesets with
-no subject are not rewritten. Erased subjects stay skipped and unreadable.
+row. The `_subject` column is the one the actor schema names `_subject`,
+in any ASCII case, not whichever text cell equals the subject id. A text
+or blob cell whose value equals that id is still rewritten. The column
+itself stays the subject id, so erasure still finds the row. A snapshot the
+fork continues is rewritten the same way before later changesets are applied.
+Changesets with no subject are not rewritten. Erased subjects stay skipped
+and unreadable.
 
 Integer and real cells are not pseudonymized, key columns or not: a
 `--no-pii` fork's actors read a subject's numbers (an age, an amount, an

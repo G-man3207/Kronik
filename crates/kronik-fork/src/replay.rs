@@ -322,10 +322,16 @@ pub fn cursor(index: &ProductionIndex) -> Result<Arc<Store>, ReplayError> {
     };
 
     // Production's sealed SQL changesets are opened as they are applied.
+    // A `--no-pii` fork rewrites text and blob cells first, skipping
+    // `_subject` by name from the actor schema.
     store.set_sealer(index.sealer.clone());
     if index.no_pii {
+        let sealer = index.sealer.clone();
+        store.set_sql_rewrite(move |subject, value| {
+            crate::privacy::ForkPrivacy::sql_cell(&sealer, subject, value)
+        });
         // A snapshot already holds the rows. Rewrite them the same way
-        // revealed changesets were, before any later UPDATE is applied.
+        // applied changesets are, before any later UPDATE is applied.
         let actors = store.db().sql_actors()?;
         for name in actors {
             let db = store

@@ -5,6 +5,10 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- A `--no-pii` fork no longer treats a text cell equal to the subject id
+  as the `_subject` column. The column is the one the actor schema names
+  `_subject`. Every other text and blob cell is rewritten, including one
+  whose value is the subject id, and erasure still finds the row (#244).
 - A SQL turn that writes both sides of a foreign key for different subjects
   no longer fails apply and takes the node down on every restart. The child
   was applied before the parent when its subject sorted first, and the
