@@ -5,6 +5,13 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- The operations troubleshooting row for `STORAGE_CORRUPT` no longer says
+  to rebuild every case by moving `state.db` aside. When the applied LSN
+  is past the end of the log, that deletes the only copy of acknowledged
+  records the log no longer has. That case keeps the directory and
+  restores a shipped copy into a new one. Moving `state.db` aside is
+  only for a log that still holds every acknowledged record. The start's
+  refusal is unchanged (#245).
 - A `--no-pii` fork no longer treats a text cell equal to the subject id
   as the `_subject` column. The column is the one the actor schema names
   `_subject`. Every other text and blob cell is rewritten, including one
