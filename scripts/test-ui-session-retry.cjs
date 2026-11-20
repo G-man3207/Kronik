@@ -386,7 +386,13 @@ async function run() {
     if (detail.settle === 'during') {
       await held('proposal');
       await release();
-      await waitFor(() => performance.getEntriesByType('resource').some((entry) => entry.name.includes('/promote') && entry.responseEnd > 0), 'promote settled');
+      if (detail.outcome === 'unsent') {
+        // The destroyed socket leaves no responseEnd to observe, and the
+        // silent retry (killed in the fixture) needs a moment to die.
+        await sleep(500);
+      } else {
+        await waitFor(() => performance.getEntriesByType('resource').some((entry) => entry.name.includes('/promote') && entry.responseEnd > 0), 'promote settled');
+      }
       await sleep(50);
       const page = document.getElementById('status').textContent;
       assert(page === 'Loading…', 'outcome replaced loading: ' + page);
@@ -635,6 +641,14 @@ async function main() {
     if (!route) {
       res.writeHead(404, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify({ error: { code: 'NOT_FOUND', message: url.pathname } }));
+      return;
+    }
+    // Chrome can silently retry a POST whose socket died with no response
+    // byte (the unsent case's destroy), once per pooled socket. The retries
+    // are transport artifacts this fixture manufactures, not app behavior:
+    // kill them before they count, or the browser's fetch never settles.
+    if (route === 'promote' && current.outcome === 'unsent' && seen.released) {
+      res.destroy();
       return;
     }
     if (route !== 'diff') seen[route] += 1;

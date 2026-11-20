@@ -92,7 +92,7 @@ The full list is in `CONTRIBUTING.md`. In short:
 ## Running CI locally
 
 ```sh
-scripts/ci.sh                # fmt, clippy, keyhelper, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, s3, identity and action, as in CI
+scripts/ci.sh                # fmt, clippy, keyhelper, hygiene, test, docs, book, examples, ui, ts, sdks, dst, deny, musl, foreign, s3, identity and action, as in CI
 scripts/ci.sh clippy test    # selected steps
 ```
 
@@ -103,6 +103,9 @@ and `cargo-deny`. Some steps need more:
   `CONTRIBUTING.md` describes, in `KRONIK_TEST_PYTHON`. The step checks it
   first; the tests that need it fail without it, they do not skip.
 - `ts` needs Node.js 22.20 or later with npm and network access.
+- `ui` needs Node.js 22.20 or later and a Chrome for the UI scripts'
+  driver (`KRONIK_CHROME` names another binary than
+  `/usr/bin/google-chrome`).
 - `sdks` installs the pinned Python and Go toolchains with
   `scripts/install-sdk-tools.sh` on first use (Linux x86_64, `python3` with
   pip, network access).

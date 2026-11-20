@@ -250,7 +250,7 @@ jobs:
         run: scripts/ci.sh s3
 
   sdk-chain:
-    name: examples, ts, sdks, identity
+    name: examples, ui, ts, sdks, identity
     runs-on: ubuntu-24.04
     steps:
       # The runner's preinstalled SDKs that this job does not use, for disk.
@@ -291,6 +291,10 @@ jobs:
       # Each step runs the same command as scripts/ci.sh does locally.
       - name: examples
         run: scripts/ci.sh examples
+      # The admin UI: its scripts drive a real Chrome over CDP. The runner
+      # image ships Chrome; $KRONIK_CHROME names another binary.
+      - name: ui
+        run: scripts/ci.sh ui
       - name: ts
         run: scripts/ci.sh ts
       # The Python and Go SDKs: installs their pinned toolchains, builds and
