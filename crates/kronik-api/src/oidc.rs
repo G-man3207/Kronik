@@ -1951,6 +1951,8 @@ mod tests {
     // the direct calls are the harness, not daemon paths.
     #![allow(clippy::disallowed_methods)]
 
+    use std::sync::atomic::AtomicU64;
+
     use super::*;
 
     #[test]
@@ -4340,12 +4342,109 @@ mod tests {
                 .any(|(_, value)| value.contains("Max-Age=0"))
         );
         assert!(lease.check().is_err());
+
+        // The checks overlap; each is probed where no other one guards.
+        let (mut auth, credential, _, _fixture) = fixture().await;
+        let key = digest(&credential);
+        let session = auth.state().sessions[&key].clone();
+        let expires = session.expires;
+        let real = auth.env.clock.clone();
+        let at = |wall_ms| {
+            Arc::new(WallAt {
+                real: real.clone(),
+                wall_ms: AtomicU64::new(wall_ms),
+            })
+        };
+        let clock = at(expires - 1);
+        Arc::get_mut(&mut auth).unwrap().env.clock = clock.clone();
+        let req = request(credential);
+        let lease = auth.authority(&req, Scope::Read).unwrap();
+        let exchange = ProviderAuthority::new(
+            &auth,
+            &auth.state(),
+            auth.tokens
+                .authority_for_name("reader", Scope::Read)
+                .unwrap(),
+            expires,
+        );
+        let original = auth
+            .session_authority(&auth.state(), key, &session, None)
+            .unwrap();
+        assert_eq!(auth.expires_at_ms(&req), Some(expires));
+        assert!(auth.state().proof_for(key, &session, expires - 1).is_ok());
+        assert!(
+            auth.tokens
+                .capture_oidc(Scope::Read, original.clone(), at(expires - 1), None)
+                .is_ok()
+        );
+        assert!(lease.check().is_ok());
+        assert!(kronik_core::authority::Authority::check(&exchange).is_ok());
+        assert!(auth.caller(&req).is_ok());
+
+        assert!(auth.state().proof_for(key, &session, expires).is_err());
+        // The original lease still reads `expires - 1`; only the capture's clock moved.
+        assert!(
+            auth.tokens
+                .capture_oidc(Scope::Read, original, at(expires), None)
+                .is_err()
+        );
+        clock.wall_ms.store(expires, Ordering::SeqCst);
+        assert_eq!(auth.expires_at_ms(&req), None);
+        assert!(lease.check().is_err());
+        assert!(kronik_core::authority::Authority::check(&exchange).is_err());
+        assert!(auth.caller(&req).is_err());
+    }
+
+    #[tokio::test]
+    async fn full_session_table_evicts_only_expired_sessions() {
         let (auth, credential, _, _fixture) = fixture().await;
-        auth.state()
-            .sessions
-            .get_mut(&digest(&credential))
-            .unwrap()
-            .expires = 0;
-        assert!(auth.caller(&request(credential)).is_err());
+        let session = auth.state().sessions[&digest(&credential)].clone();
+        let now = session.expires - 1;
+        let fill = |expires| {
+            auth.state().sessions = (0..MAX_SESSIONS)
+                .map(|n| {
+                    (
+                        digest(&n.to_string()),
+                        Session {
+                            expires,
+                            ..session.clone()
+                        },
+                    )
+                })
+                .collect();
+        };
+        let insert = || {
+            BrowserAuth::insert_native_session(
+                &auth.state,
+                now,
+                digest("new"),
+                session.clone(),
+                &AtomicBool::new(true),
+            )
+        };
+        fill(now);
+        assert!(insert().is_ok());
+        assert_eq!(auth.state().sessions.len(), 1);
+        fill(now + 1);
+        assert!(insert().is_err());
+        assert_eq!(auth.state().sessions.len(), MAX_SESSIONS);
+    }
+
+    /// The real clock with its wall time held where a test puts it.
+    struct WallAt {
+        real: Arc<dyn kronik_core::env::Clock>,
+        wall_ms: AtomicU64,
+    }
+
+    impl kronik_core::env::Clock for WallAt {
+        fn wall_ms(&self) -> u64 {
+            self.wall_ms.load(Ordering::SeqCst)
+        }
+        fn monotonic(&self) -> Duration {
+            self.real.monotonic()
+        }
+        fn sleep(&self, d: Duration) -> kronik_core::env::BoxFuture<'static, ()> {
+            self.real.sleep(d)
+        }
     }
 }
