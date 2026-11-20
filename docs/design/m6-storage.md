@@ -284,7 +284,11 @@ is refused unless `--force`):
    taken after that read, and loses the source in between); such a
    manifest is skipped, named in the restore report's
    `snapshots_skipped`, and not downloaded. When no manifest is reached,
-   restore fails, naming the log's last LSN and the oldest snapshot.
+   restore fails, naming the log's last LSN and the oldest snapshot. A
+   manifest the listing names but the store cannot serve — a failed GET, or
+   bytes that no longer parse — fails the restore rather than silently
+   selecting an older snapshot; only a manifest that is gone (retention
+   deletes it first) is skipped as absent.
 2. Download every remote segment of the branch (the remote keeps the
    retention window, so history within it comes back) into
    `DIR/branches/main/log/`; segments must be contiguous and reach past `L`.

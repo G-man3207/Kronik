@@ -1715,15 +1715,21 @@ async fn stage_after_keys(
     let mut newest: Option<Manifest> = None;
     let mut all: Vec<Manifest> = Vec::new();
     for l in lsns {
-        let Ok(bytes) = remote
+        // A manifest the listing names but the store no longer has is
+        // skipped (retention deletes the manifest first, and listings are
+        // eventually consistent); any other failure to fetch or parse one
+        // fails the restore instead of silently installing an older
+        // snapshot.
+        let bytes = match remote
             .get(&format!("{branch}/snapshots/{l}/manifest.json"))
             .await
-        else {
-            continue;
+        {
+            Ok(bytes) => bytes,
+            Err(ShipError::Store(object_store::Error::NotFound { .. })) => continue,
+            Err(e) => return Err(e),
         };
-        let Ok(m) = serde_json::from_slice::<Manifest>(&bytes) else {
-            continue;
-        };
+        let m = serde_json::from_slice::<Manifest>(&bytes)
+            .map_err(|e| ShipError::Restore(format!("the manifest of snapshot {l}: {e}")))?;
         if newest.as_ref().is_none_or(|n| m.lsn > n.lsn) {
             newest = Some(m.clone());
         }

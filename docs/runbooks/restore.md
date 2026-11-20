@@ -40,6 +40,13 @@ existing encrypted store.
    (`log_last_lsn`), not the skipped snapshot. Record the skipped LSNs and the
    gap; do not treat the unshipped records as recovered.
 
+   A failure naming a snapshot's manifest (`the manifest of snapshot <L>`)
+   means the bucket lists an object it cannot serve intact: a failed GET, or
+   bytes that no longer parse. Restore refused rather than silently install
+   the older snapshot. Investigate the bucket and copy the object aside;
+   then repair it, or delete that manifest object — the state retention
+   leaves — to restore explicitly from the older snapshot.
+
 3. Refuse `MASTER_KEY_MISSING`, `MASTER_KEY_MISMATCH`, `KEY_SOURCE_UNAVAILABLE`
    or `KEYSTORE_INCOMPLETE` until the actual source/key problem is resolved.
    `--allow-missing-keys` and `--without-keystore` explicitly accept unreadable
