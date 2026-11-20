@@ -2,6 +2,8 @@ The secret value or complete retained-secret inventory needed by this operation 
 
 Typical causes include an unavailable external backend, denied access to a required immutable version, or a local secret-store value that cannot be decrypted. A successfully empty inventory is different from a failed or incomplete inventory.
 
+While the scrub inventory itself cannot be certified, records that carry operator free text (approvals, audit events, control operations, secret mutations) are refused with this code instead of being written with fields the node could not verify; fixed system receipts (restore, retention gaps, key source, fleet recovery) still record, with their reason withheld.
+
 Check `kronik doctor`, the configured backend and access to the required retained versions. Read-only operations can be retried after coverage is restored; a destroyed old version cannot be replaced with the backend's current value. If a mutation reply says it is already committed, wait for inventory availability and inspect its history before explicitly submitting another mutation; do not automatically repeat SET, DELETE, LINK, UNLINK or REFRESH. Metadata-only health and key status remain available, and turns that need no linked secret do not wait for provider recovery.
 
 This is not `KEY_SOURCE_UNAVAILABLE`: that code concerns loading the master seed. Do not switch master-key sources or create a fallback key to work around missing secret coverage.

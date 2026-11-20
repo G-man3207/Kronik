@@ -5011,7 +5011,9 @@ impl Node {
     }
 
     /// Writes an `Approval` record in this branch's log, its command
-    /// scrubbed of stored secret values and tokens (review M5).
+    /// scrubbed of stored secret values and tokens (review M5). Refused
+    /// with `SECRET_UNAVAILABLE` while the scrub inventory cannot be
+    /// certified (#268).
     pub async fn record_approval(
         &self,
         mut approval: pb::Approval,
@@ -5087,11 +5089,14 @@ impl Node {
                 ));
             }
         }
-        let secrets = self.secret_values().ok();
-        let patterns = secrets
-            .as_ref()
-            .map(|values| crate::effects::secret_patterns(values));
-        approval.command = crate::scrub::for_log(&approval.command, patterns.as_deref());
+        // The command is operator free text: while the scrub inventory
+        // cannot be certified the record is refused, never persisted
+        // unscrubbed (#268). A rebuild window is waited out first, as for
+        // a mutation reason, so only a failing keystore refuses.
+        self.wait_out_rebuild_window().await;
+        let secrets = self.secret_values()?;
+        let patterns = crate::effects::secret_patterns(&secrets);
+        approval.command = crate::scrub::for_log(&approval.command, Some(&patterns));
         self.commit_authorized(Record::Approval(approval), authority)
             .await
     }
@@ -5126,7 +5131,25 @@ impl Node {
         let (action, identity) = origin.identity();
         audit.token_id.clear();
         audit.token_id.push_str(identity);
-        let record = self.audit_event_record(action, target, details, audit)?;
+        // A fixed system producer keeps recording while the inventory
+        // cannot be read: the reason withholds and the structured fields
+        // stay, as for the metadata-gap receipt. Operator free text never
+        // flows through here; it goes through `audit_event_record`.
+        let secrets = match self.secret_values() {
+            Ok(values) => Some(values),
+            Err(error) => {
+                tracing::warn!(
+                    code = %error.code,
+                    "scrub inventory unreadable; recording the system event with its reason withheld"
+                );
+                None
+            }
+        };
+        let patterns = secrets
+            .as_ref()
+            .map(|values| crate::effects::secret_patterns(values));
+        let record =
+            self.audit_event_record_scrubbed(action, target, details, audit, patterns.as_deref())?;
         self.commit_authorized(record, authority).await
     }
 
@@ -5148,7 +5171,8 @@ impl Node {
     /// Builds an audit event after a bounded wait for a certified scrub
     /// inventory, scrubbing against the exact inventory it observed. The
     /// documented fail-closed windows close in milliseconds; on expiry the
-    /// reason is withheld (never plaintext), which is the safe direction.
+    /// record is refused (`SECRET_UNAVAILABLE`), never persisted with
+    /// unverified free text (#268).
     pub(crate) async fn audit_event_record_waiting(
         &self,
         action: &str,
@@ -5175,11 +5199,12 @@ impl Node {
         details: std::collections::BTreeMap<String, String>,
         audit: pb::Audit,
     ) -> Result<Record, ApiError> {
-        let secrets = self.secret_values().ok();
-        let patterns = secrets
-            .as_ref()
-            .map(|values| crate::effects::secret_patterns(values));
-        self.audit_event_record_scrubbed(action, target, details, audit, patterns.as_deref())
+        // Operator free text must be matched against a certified
+        // inventory: an unreadable one refuses the record rather than
+        // persisting fields the node could not verify (#268).
+        let secrets = self.secret_values()?;
+        let patterns = crate::effects::secret_patterns(&secrets);
+        self.audit_event_record_scrubbed(action, target, details, audit, Some(&patterns))
     }
 
     /// Builds an audit event against a proven scrub inventory. Callers that
@@ -5366,11 +5391,12 @@ impl Node {
         mut audit: pb::Audit,
     ) -> Result<Record, ApiError> {
         self.check_alive()?;
-        let secrets = self.secret_values().ok();
-        let patterns = secrets
-            .as_ref()
-            .map(|values| crate::effects::secret_patterns(values));
-        audit.reason = crate::scrub::for_log(&audit.reason, patterns.as_deref());
+        // An operator reason requires a certified inventory: an unreadable
+        // one refuses the control record (#268). Callers have waited out
+        // the rebuild window before taking their locks.
+        let secrets = self.secret_values()?;
+        let patterns = crate::effects::secret_patterns(&secrets);
+        audit.reason = crate::scrub::for_log(&audit.reason, Some(&patterns));
         let event = pb::AuditEvent {
             action: operation.action().into(),
             target: operation.target().into(),
