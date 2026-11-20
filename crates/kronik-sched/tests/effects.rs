@@ -1070,6 +1070,41 @@ fn timers_fire_survive_restart_and_cancel() {
     assert!(t.logical_time_ms >= input.due_ms);
 }
 
+/// Issue #280: a store error while reading a due timer's row must not take
+/// the id off the wheel. The read is retried until it recovers, and only
+/// then does the timer fire; before the fix the wake was silently dropped.
+#[test]
+fn a_failing_timers_read_does_not_drop_the_timer() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy();
+    p.send("counter/a", msg("schedule", "50 increment"));
+    // Rename the table so every `timers` read fails while the timer comes
+    // due, then rename it back: the row itself survives both.
+    p.node
+        .store()
+        .db()
+        .conn()
+        .execute_batch("ALTER TABLE timers RENAME TO timers_away")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        p.kv("counter/a", "n"),
+        None,
+        "the timer must not fire while its row cannot be read"
+    );
+    p.node
+        .store()
+        .db()
+        .conn()
+        .execute_batch("ALTER TABLE timers_away RENAME TO timers")
+        .unwrap();
+    p.wait_until("the timer after the read recovers", |p| {
+        p.kv("counter/a", "n").as_deref() == Some("1")
+    });
+    assert!(p.node.store().db().timers(None).unwrap().is_empty());
+}
+
 #[test]
 fn rate_limit_holds_across_turns() {
     let dir = tempfile::tempdir().unwrap();

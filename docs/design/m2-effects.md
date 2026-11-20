@@ -379,7 +379,9 @@ turn.
   is still the due time that fired. A later schedule of the same id replaces
   the row and stays on the wheel; the fire already taken does not run.
   Cancel still removes the row, so that fire does not run either. A failed
-  timer turn is a dead letter. A timer is due when logical time
+  timer turn is a dead letter. A store error while reading the row at fire
+  time is not a missing row: the timer stays on the wheel and the read is
+  retried, with a warning (#280). A timer is due when logical time
   (`max(wall clock, high-water mark)`) reaches its due time, or when the
   delay it had left when the wheel took it (at commit, or at start for the
   rows in `state.db`: due less logical time then) has passed on the
