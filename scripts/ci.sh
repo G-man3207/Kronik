@@ -3,8 +3,8 @@
 # commands. Exits non-zero as soon as a step fails.
 #
 # Usage: scripts/ci.sh [STEP...]
-# Steps: fmt, clippy, keyhelper, hygiene, test, docs, book, examples, ts, sdks,
-# dst, deny,
+# Steps: fmt, clippy, keyhelper, hygiene, test, docs, book, examples, ui, ts,
+# sdks, dst, deny,
 # musl (the release target, linked against the release's zig and musl),
 # foreign (needs root and runsc; skipped with a message otherwise, a failure
 # with KRONIK_FOREIGN_TESTS=require; the trusted actor also needs runc at
@@ -12,6 +12,8 @@
 # s3 (needs docker; skipped with a message otherwise, a failure with
 # KRONIK_TEST_S3=require),
 # identity (without libfaketime, todo-ts is skipped with a message too),
+# ui (the admin UI's Node+Chrome scripts; Chrome comes with the runner
+# image, and KRONIK_CHROME names another binary),
 # action.
 # Without arguments, all steps run in order.
 set -euo pipefail
@@ -602,6 +604,16 @@ step_musl() {
     PATH="$zig_dir:$tools/bin:$PATH" cargo zigbuild --locked -p kronik --target x86_64-unknown-linux-musl
 }
 
+# The admin UI: app.js must parse, and its Node+Chrome test scripts must
+# pass. The scripts need Node.js 22.20 or later (a global WebSocket, as the
+# ts step's tools) and a Chrome the runner image ships; KRONIK_CHROME names
+# another binary.
+step_ui() {
+    node --check ui/app.js
+    node scripts/test-ui-session-retry.cjs
+    node scripts/test-ui-paging-focus.cjs
+}
+
 # The GitHub Action and pure-Python boundary tests. Install the pinned,
 # checksum-verified actionlint rather than silently skipping it.
 step_action() {
@@ -614,14 +626,14 @@ step_action() {
 }
 
 if [ "$#" -eq 0 ]; then
-    set -- fmt clippy keyhelper hygiene test docs book examples ts sdks dst deny musl foreign s3 identity action
+    set -- fmt clippy keyhelper hygiene test docs book examples ui ts sdks dst deny musl foreign s3 identity action
 fi
 
 for step in "$@"; do
     case "$step" in
-        fmt | clippy | keyhelper | hygiene | test | docs | book | examples | ts | sdks | dst | deny | musl | foreign | s3 | identity | action) ;;
+        fmt | clippy | keyhelper | hygiene | test | docs | book | examples | ui | ts | sdks | dst | deny | musl | foreign | s3 | identity | action) ;;
         *)
-            echo "error: unknown step '$step'; expected fmt, clippy, keyhelper, hygiene, test, docs, book, examples, ts, sdks, dst, deny, musl, foreign, s3, identity or action" >&2
+            echo "error: unknown step '$step'; expected fmt, clippy, keyhelper, hygiene, test, docs, book, examples, ui, ts, sdks, dst, deny, musl, foreign, s3, identity or action" >&2
             exit 2
             ;;
     esac
