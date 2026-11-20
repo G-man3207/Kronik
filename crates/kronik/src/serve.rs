@@ -1294,7 +1294,19 @@ async fn record_key_source(
         })
         .await?;
     if !recorded {
-        let secrets = node.secret_values().ok();
+        // The marker's fields are fixed-schema data, not operator free
+        // text: while the inventory cannot be read they withhold (never
+        // plaintext), and the receipt still records at startup (#268).
+        let secrets = match node.secret_values() {
+            Ok(values) => Some(values),
+            Err(error) => {
+                tracing::warn!(
+                    code = %error.code,
+                    "scrub inventory unreadable; withholding the key-source receipt fields"
+                );
+                None
+            }
+        };
         let patterns = secrets
             .as_ref()
             .map(|values| kronik_sched::effects::secret_patterns(values));

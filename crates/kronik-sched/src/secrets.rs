@@ -1939,11 +1939,12 @@ impl Node {
             ));
         }
         let mut audit = audit.clone();
-        let inventory = self.secret_values().ok();
-        let patterns = inventory
-            .as_ref()
-            .map(|values| crate::effects::secret_patterns(values));
-        audit.reason = crate::scrub::for_log(&audit.reason, patterns.as_deref());
+        // An operator reason requires a certified inventory: an unreadable
+        // one refuses the mutation (#268). Callers have waited out the
+        // rebuild window before taking their locks.
+        let inventory = self.secret_values()?;
+        let patterns = crate::effects::secret_patterns(&inventory);
+        audit.reason = crate::scrub::for_log(&audit.reason, Some(&patterns));
         Ok(audit)
     }
     async fn secret_rows(&self, name: Option<&str>) -> Result<Vec<pb::SecretVersion>, ApiError> {

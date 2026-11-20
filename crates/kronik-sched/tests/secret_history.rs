@@ -213,3 +213,117 @@ async fn held_native_publication_cannot_enqueue_after_same_content_recertificati
         .unwrap();
     assert_eq!(receiver.recv().await.unwrap(), after.fingerprint);
 }
+
+/// #268: while the scrub inventory cannot be certified, operator records
+/// (approvals, audit events) are refused instead of persisted unscrubbed,
+/// and a fixed system producer still records with its reason withheld.
+#[tokio::test]
+async fn unreadable_scrub_inventory_refuses_operator_records_and_withholds_system_reasons() {
+    let data = tempfile::tempdir().unwrap();
+    let node = start_local(
+        Env::real(tokio::runtime::Handle::current()),
+        data.path(),
+        NodeConfig::default(),
+    )
+    .await
+    .unwrap();
+    let original = node.local_operator_authority().unwrap();
+    let audit = pb::Audit {
+        token_id: "operator".into(),
+        reason: "rotate the hunter2 credential".into(),
+        wall_time_ms: 1,
+    };
+    node.secret_set("cred", b"hunter2".to_vec(), &audit, false, original.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(node.secret_values().is_ok());
+    let before = node.applied_lsn();
+
+    // Damage the keystore: the certified inventory becomes unreadable.
+    rusqlite::Connection::open(data.path().join("keys/secrets.db"))
+        .unwrap()
+        .execute(
+            "UPDATE secrets SET ciphertext = x'00', version_hash = x'00'",
+            [],
+        )
+        .unwrap();
+    node.refresh_secret_inventory(original.clone())
+        .await
+        .unwrap_err();
+    assert!(node.secret_values().is_err());
+
+    // An approval's command is operator free text: the record is refused.
+    let error = node
+        .record_approval(
+            pb::Approval {
+                proposal_id: "damaged".into(),
+                diff_hash: vec![1; 32],
+                verified_through_lsn: before,
+                audit: Some(audit.clone()),
+                request: false,
+                command: "kronik approve damaged --note hunter2".into(),
+                verified_identity: None,
+            },
+            original.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::SecretUnavailable);
+
+    // An operator audit event is refused, never persisted unscrubbed.
+    let error = node
+        .record_audit_event_authorized(
+            "test.note",
+            "hunter2-target",
+            [("note".into(), "uses hunter2 here".into())]
+                .into_iter()
+                .collect(),
+            audit.clone(),
+            original.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::SecretUnavailable);
+    assert_eq!(node.applied_lsn(), before);
+
+    // A fixed system producer still records, its free-text reason withheld.
+    let lsn = node
+        .record_system_audit_event(
+            kronik_sched::SystemAudit::FleetRecovery,
+            "fleet-primary",
+            Default::default(),
+            audit,
+            original,
+        )
+        .await
+        .unwrap();
+    assert_eq!(lsn, before + 1);
+    node.reader()
+        .read(before + 1, lsn, |committed| {
+            let kronik_proto::Record::AuditEvent(event) = committed.record else {
+                panic!("missing the system audit event");
+            };
+            assert_eq!(
+                event.audit.unwrap().reason,
+                kronik_sched::scrub::WITHHELD,
+                "the reason must withhold, never record the raw free text"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // The refused operator records left nothing raw in the durable log.
+    node.reader()
+        .read(before, lsn, |committed| {
+            assert!(
+                !format!("{:?}", committed.record).contains("hunter2"),
+                "a secret value reached the durable log: {:?}",
+                committed.record
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+}

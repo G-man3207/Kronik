@@ -18,7 +18,19 @@ impl Node {
         }
         let (action, identity) = SystemAudit::RetentionGap.identity();
         let reason = {
-            let secrets = self.secret_values().ok();
+            // A fixed native reason keeps its receipt while the keystore is
+            // in an error state: the reason withholds (never plaintext),
+            // as the retention-gap receipt's own test pins (#268).
+            let secrets = match self.secret_values() {
+                Ok(values) => Some(values),
+                Err(error) => {
+                    tracing::warn!(
+                        code = %error.code,
+                        "scrub inventory unreadable; withholding the gap receipt reason"
+                    );
+                    None
+                }
+            };
             let patterns = secrets
                 .as_ref()
                 .map(|values| crate::effects::secret_patterns(values));
@@ -120,8 +132,19 @@ impl Node {
         }
         let (action, identity) = SystemAudit::ExportConfiguration.identity();
         let reason = {
-            let values = self.secret_values().ok();
-            let patterns = values
+            // Same fail-closed receipt as the retention gap above: a fixed
+            // native reason withholds while the inventory cannot be read.
+            let secrets = match self.secret_values() {
+                Ok(values) => Some(values),
+                Err(error) => {
+                    tracing::warn!(
+                        code = %error.code,
+                        "scrub inventory unreadable; withholding the webhook receipt reason"
+                    );
+                    None
+                }
+            };
+            let patterns = secrets
                 .as_ref()
                 .map(|values| crate::effects::secret_patterns(values));
             crate::scrub::for_log(
