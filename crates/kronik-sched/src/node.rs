@@ -5444,13 +5444,39 @@ impl Node {
         }
     }
 
+    /// Puts a timer whose row could not be read back on the wheel at its
+    /// original due time, so the next `take_due` retries the read (#280).
+    /// shortcut: retries at the timer loop's 1 ms floor while the read keeps
+    /// failing; give it a backoff if an outage ever makes that noisy.
+    fn timer_retry(&self, actor: &ActorRef, id: u64, due_ms: u64) {
+        let now = self.timer_now();
+        let mut w = lock(&self.wheel);
+        // done() ends this fire; a later schedule of the same id that a turn
+        // added meanwhile stays on the wheel and must not be clobbered.
+        if !w.done(actor, id) {
+            w.add(actor.clone(), id, due_ms, now);
+        }
+        drop(w);
+        self.wheel_notify.notify_one();
+    }
+
     fn fire_timer(&self, actor: ActorRef, id: u64, due_ms: u64) {
-        let row = self
-            .store
-            .db()
-            .timers(Some((&actor.kind, &actor.key)))
-            .ok()
-            .and_then(|rows| rows.into_iter().find(|t| t.timer_id == id));
+        let row = match self.store.db().timers(Some((&actor.kind, &actor.key))) {
+            Ok(rows) => rows.into_iter().find(|t| t.timer_id == id),
+            Err(error) => {
+                // A failed read is not a missing timer (#280): put the id
+                // back on the wheel so take_due retries, instead of
+                // silently dropping the wake until the process restarts.
+                tracing::warn!(
+                    actor = %actor,
+                    timer_id = id,
+                    error = %error,
+                    "reading the timer row failed; the timer stays scheduled"
+                );
+                self.timer_retry(&actor, id, due_ms);
+                return;
+            }
+        };
         let Some(row) = row else {
             self.timer_done(&actor, id);
             return;
