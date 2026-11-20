@@ -866,3 +866,121 @@ fn a_stale_active_segment_that_is_gone_from_the_bucket_does_not_stop_shipping() 
         "{state:?}"
     );
 }
+
+/// A bucket lifecycle rule can expire a shipped segment the shipping state
+/// still tracks. Deleting one that is gone already is the state wanted, not
+/// a reason to stop shipping for good.
+#[test]
+fn a_retention_pruned_segment_that_is_gone_from_the_bucket_does_not_stop_shipping() {
+    let src = tempdir("ship-seg-gone-");
+    let bucket = tempdir("ship-seg-gone-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let p = start(src.path(), Some(Duration::ZERO));
+    p.rt.block_on(p.node.deploy(
+        &guest("counter"),
+        audit(),
+        false,
+        p.node.local_operator_authority().unwrap(),
+    ))
+    .unwrap();
+    for i in 0..80 {
+        p.send(&format!("counter/k{}", i % 5), "increment", "");
+    }
+    p.ship(&remote, src.path());
+    // The bucket's oldest shipped object expired under the round's feet.
+    let expired = bucket_first(bucket.path());
+    std::fs::remove_file(bucket.path().join(format!(
+        "main/segments/{}.zst",
+        kronik_log::segment_name(expired)
+    )))
+    .unwrap();
+    // Retention drops it locally, so the next round prunes it remotely.
+    for _ in 0..3 {
+        p.send("counter/k0", "increment", "");
+        p.rt.block_on(
+            p.node
+                .snapshot("manual", p.node.local_operator_authority().unwrap()),
+        )
+        .unwrap();
+    }
+    let report = p.ship(&remote, src.path());
+    assert!(report.deleted > 0, "{report:?}");
+    let local = kronik_log::segment_starts(&src.path().join("branches/main/log")).unwrap();
+    assert_eq!(bucket_segments(bucket.path()), local);
+    let state = ShipState::load(src.path()).unwrap();
+    assert!(!state.segments.contains(&expired), "{state:?}");
+    // Nothing is left to do: the round after a NotFound is no wedge.
+    let again = p.ship(&remote, src.path());
+    assert_eq!((again.objects, again.deleted), (0, 0), "{again:?}");
+}
+
+/// A round that stopped after a pruned snapshot's manifest delete, before
+/// its state was saved, leaves the snapshot in the shipping state; the next
+/// round deletes the manifest again and must not wedge on the object being
+/// gone already.
+#[test]
+fn a_round_stopped_after_a_snapshot_manifest_delete_does_not_wedge_the_next() {
+    let src = tempdir("ship-man-");
+    let bucket = tempdir("ship-man-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let p = start(src.path(), Some(Duration::ZERO));
+    p.rt.block_on(p.node.deploy(
+        &guest("counter"),
+        audit(),
+        false,
+        p.node.local_operator_authority().unwrap(),
+    ))
+    .unwrap();
+    let snap = |p: &Proc| {
+        p.rt.block_on(
+            p.node
+                .snapshot("manual", p.node.local_operator_authority().unwrap()),
+        )
+        .unwrap();
+    };
+    p.send("counter/k0", "increment", "");
+    snap(&p);
+    p.ship(&remote, src.path());
+    let shipped = *ShipState::load(src.path())
+        .unwrap()
+        .snapshots
+        .first()
+        .unwrap();
+    // Snapshots kept are two: three more push the shipped one out locally.
+    for _ in 0..3 {
+        p.send("counter/k0", "increment", "");
+        snap(&p);
+    }
+    let mut st = ShipState::load(src.path()).unwrap();
+    let faulted = p.rt.block_on(kronik_ship::ship_once_with_fault(
+        &remote,
+        src.path(),
+        "main",
+        &mut st,
+        &|step| match step {
+            "snapshot-manifest-delete" => Err(std::io::Error::other("injected")),
+            _ => Ok(()),
+        },
+    ));
+    assert!(faulted.is_err(), "{faulted:?}");
+    assert!(
+        !bucket
+            .path()
+            .join(format!("main/snapshots/{shipped:020}/manifest.json"))
+            .exists()
+    );
+    // The next round completes and forgets the half-deleted snapshot.
+    let report = p.ship(&remote, src.path());
+    assert!(report.deleted > 0, "{report:?}");
+    let state = ShipState::load(src.path()).unwrap();
+    assert!(!state.snapshots.contains(&shipped), "{state:?}");
+    let remote_snapshots: Vec<_> = std::fs::read_dir(bucket.path().join("main/snapshots"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().join("manifest.json").exists())
+        .collect();
+    assert_eq!(remote_snapshots.len(), p.node.snapshots().unwrap().len());
+    // Nothing is left to do.
+    let again = p.ship(&remote, src.path());
+    assert_eq!((again.objects, again.deleted), (0, 0), "{again:?}");
+}
