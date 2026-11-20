@@ -399,14 +399,6 @@ impl Remote {
         ))
     }
 
-    async fn delete(&self, rel: &str) -> Result<(), ShipError> {
-        self.store
-            .delete(&self.key(rel))
-            .await
-            .map_err(|e| self.store_error(e))?;
-        Ok(())
-    }
-
     /// Object names directly under `rel/` and sub-directory names.
     pub async fn list(&self, rel: &str) -> Result<(Vec<String>, Vec<String>), ShipError> {
         let prefix = self.key(rel);
@@ -717,7 +709,8 @@ pub async fn ship_once(
 /// `reupload` after each resealed blob's upload, `blob` after each blob
 /// upload, `blob-deleted` after a blob's object is deleted and before its
 /// record goes, `segment` after each segment upload,
-/// `snapshot` after each snapshot upload, `snapshot-delete` and
+/// `snapshot` after each snapshot upload, `snapshot-manifest-delete`
+/// after a pruned snapshot's manifest delete, `snapshot-delete` and
 /// `segment-delete` after each remote deletion, `blob-delete` before the
 /// remote blobs gone locally are deleted. Tests stop a round anywhere with
 /// it (M26 §8).
@@ -758,10 +751,7 @@ pub async fn ship_once_with_fault(
     if let Some((stale, _)) = state.active
         && stale < first
     {
-        match remote.delete(&seg_rel(stale)).await {
-            Ok(()) | Err(ShipError::Store(object_store::Error::NotFound { .. })) => {}
-            Err(e) => return Err(e),
-        }
+        remote.delete_object(&seg_rel(stale)).await?;
         state.active = None;
         report.deleted += 1;
         state.save(data)?;
@@ -816,7 +806,7 @@ pub async fn ship_once_with_fault(
         .filter(|s| *s < first)
         .collect();
     for s in gone {
-        remote.delete(&seg_rel(s)).await?;
+        remote.delete_object(&seg_rel(s)).await?;
         state.segments.remove(&s);
         report.deleted += 1;
         state.save(data)?;
@@ -865,12 +855,17 @@ pub async fn ship_once_with_fault(
     let kept: BTreeSet<Lsn> = local.iter().map(|(_, m)| m.lsn).collect();
     let pruned: Vec<Lsn> = state.snapshots.difference(&kept).copied().collect();
     for lsn in pruned {
-        // Manifest first, so a half-deleted snapshot is never complete.
+        // Manifest first, so a half-deleted snapshot is never complete; one
+        // gone already (a lifecycle rule, a round that stopped here) is the
+        // state wanted.
         let base = format!("{branch}/snapshots/{lsn:020}");
-        remote.delete(&format!("{base}/manifest.json")).await?;
+        remote
+            .delete_object(&format!("{base}/manifest.json"))
+            .await?;
+        fault("snapshot-manifest-delete")?;
         let (files, _) = remote.list(&base).await?;
         for f in files {
-            remote.delete(&format!("{base}/{f}")).await?;
+            remote.delete_object(&format!("{base}/{f}")).await?;
         }
         state.snapshots.remove(&lsn);
         report.deleted += 1;
@@ -1003,9 +998,12 @@ pub async fn ship_keystore(
     let cutoff = wall_ms.saturating_sub(retention.as_millis() as u64);
     for w in walls {
         if w < cutoff && w != newest {
-            remote.delete(&format!("keystore/{w}.bin")).await?;
+            // An object gone already (a lifecycle rule) is the state wanted.
+            remote.delete_object(&format!("keystore/{w}.bin")).await?;
             if wrapped.is_some() {
-                remote.delete(&format!("keystore/{w}.wrapped")).await?;
+                remote
+                    .delete_object(&format!("keystore/{w}.wrapped"))
+                    .await?;
             }
             report.deleted += 1;
         }
