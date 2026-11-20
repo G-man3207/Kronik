@@ -348,6 +348,147 @@ fn restore_keeps_the_snapshot_the_bucket_log_reaches() {
     assert_eq!(q.send("counter/a", "increment", ""), count.to_string());
 }
 
+/// A manifest the bucket still lists but cannot serve intact — a corrupt
+/// byte, a failed GET — fails the restore instead of silently installing the
+/// previous snapshot: the restored `snapshot_lsn` would regress exactly when
+/// the bucket is degraded, the moment an operator most needs to know. Only a
+/// manifest that is gone (retention deletes it first) is skipped, which the
+/// next test covers.
+#[test]
+fn restore_fails_when_a_listed_manifest_cannot_be_read() {
+    let bucket = tempdir("ship-corrupt-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let src = tempdir("ship-corrupt-src-");
+    let p = start(src.path(), None);
+    p.rt.block_on(p.node.deploy(
+        &guest("counter"),
+        audit(),
+        false,
+        p.node.local_operator_authority().unwrap(),
+    ))
+    .unwrap();
+    for _ in 0..3 {
+        p.send("counter/a", "increment", "");
+    }
+    let old =
+        p.rt.block_on(
+            p.node
+                .snapshot("manual", p.node.local_operator_authority().unwrap()),
+        )
+        .unwrap();
+    p.ship(&remote, src.path());
+    p.send("counter/a", "increment", "");
+    let new =
+        p.rt.block_on(
+            p.node
+                .snapshot("manual", p.node.local_operator_authority().unwrap()),
+        )
+        .unwrap();
+    p.ship(&remote, src.path());
+    // The newest manifest is present and listed, but corrupt.
+    p.rt.block_on(remote.put(
+        &format!("main/snapshots/{:020}/manifest.json", new.lsn),
+        b"{".to_vec(),
+    ))
+    .unwrap();
+    let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
+    drop(p);
+
+    let dst = tempdir("ship-corrupt-dst-");
+    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
+    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
+    let rt = rt();
+    let e = rt
+        .block_on(restore(
+            &remote,
+            dst.path(),
+            "main",
+            false,
+            &Env::real(rt.handle().clone()),
+            &Default::default(),
+            KeystoreMode::Require,
+        ))
+        .unwrap_err();
+    assert!(
+        e.to_string()
+            .contains(&format!("the manifest of snapshot {:020}", new.lsn)),
+        "{e}"
+    );
+    assert!(new.lsn > old.lsn);
+    // The refusal wrote nothing.
+    assert!(!dst.path().join("branches").exists());
+    drop(rt);
+}
+
+/// A manifest the listing names but the store no longer holds is skipped as
+/// absent, as today: retention deletes a snapshot's manifest first, so a
+/// half-deleted snapshot must not stop a restore from the older one, and the
+/// complete log replays the newer records anyway.
+#[test]
+fn restore_proceeds_when_the_newest_manifest_is_gone() {
+    let bucket = tempdir("ship-gone-bucket-");
+    let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
+    let src = tempdir("ship-gone-src-");
+    let p = start(src.path(), None);
+    p.rt.block_on(p.node.deploy(
+        &guest("counter"),
+        audit(),
+        false,
+        p.node.local_operator_authority().unwrap(),
+    ))
+    .unwrap();
+    for _ in 0..3 {
+        p.send("counter/a", "increment", "");
+    }
+    let old =
+        p.rt.block_on(
+            p.node
+                .snapshot("manual", p.node.local_operator_authority().unwrap()),
+        )
+        .unwrap();
+    p.ship(&remote, src.path());
+    let count: u64 = p.send("counter/a", "increment", "").parse().unwrap();
+    let new =
+        p.rt.block_on(
+            p.node
+                .snapshot("manual", p.node.local_operator_authority().unwrap()),
+        )
+        .unwrap();
+    p.ship(&remote, src.path());
+    // Retention's order: the manifest goes first, the files follow.
+    p.rt.block_on(remote.delete_object(&format!("main/snapshots/{:020}/manifest.json", new.lsn)))
+        .unwrap();
+    let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
+    drop(p);
+
+    let dst = tempdir("ship-gone-dst-");
+    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
+    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
+    let rt = rt();
+    let report = rt
+        .block_on(restore(
+            &remote,
+            dst.path(),
+            "main",
+            false,
+            &Env::real(rt.handle().clone()),
+            &Default::default(),
+            KeystoreMode::Require,
+        ))
+        .unwrap();
+    assert_eq!(report.snapshot_lsn, old.lsn, "{report:?}");
+    assert!(report.snapshots_skipped.is_empty(), "{report:?}");
+    drop(rt);
+
+    // The log is complete, so the daemon starts and replays past the
+    // snapshot the restore could not use.
+    let q = start(dst.path(), None);
+    assert_eq!(
+        q.send("counter/a", "increment", ""),
+        (count + 1).to_string()
+    );
+}
+
 /// Without an older snapshot the log reaches, restore writes nothing: a
 /// bucket missing the segments after its only snapshot has lost records,
 /// and installing that snapshot produces a directory `kronik serve`
