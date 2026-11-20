@@ -1,4 +1,5 @@
-//! Rejected OIDC ID tokens mint no browser session.
+//! Rejected OIDC ID tokens mint no browser session, and an accepted one's
+//! session ends at its `exp`, at most an hour after login.
 //!
 //! `verify` turns off the JWT library's expiry and `nbf` checks and enforces
 //! issuer, audience, `azp`, `nbf`, skew, expiry, nonce, algorithm and a header
@@ -16,7 +17,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -242,11 +243,10 @@ fn count(stats: &Value, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("{name} missing from {stats}"))
 }
 
-#[test]
-fn rejected_id_tokens_complete_the_exchange_and_mint_no_session() {
+/// A daemon whose admitted OIDC configuration maps the fixture's reviewer.
+fn admitted() -> (oidc_provider::OwnedOidc, tempfile::TempDir, Daemon) {
     let port = common::free_port();
-    let origin = format!("https://localhost:{port}");
-    let mut provider = oidc_provider::OwnedOidc::start(origin.clone());
+    let provider = oidc_provider::OwnedOidc::start(format!("https://localhost:{port}"));
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path(), &provider, &format!("127.0.0.1:{port}"));
     daemon.api(
@@ -265,6 +265,13 @@ fn rejected_id_tokens_complete_the_exchange_and_mint_no_session() {
     );
     assert_eq!(admitted["active"], true, "{admitted}\n{}", daemon.log());
     assert_eq!(admitted["restart_required"], false, "{admitted}");
+    (provider, dir, daemon)
+}
+
+#[test]
+fn rejected_id_tokens_complete_the_exchange_and_mint_no_session() {
+    let (mut provider, _dir, _daemon) = admitted();
+    let origin = provider.origin.clone();
 
     for mode in REJECTED {
         let before = provider.set_mode(mode);
@@ -307,4 +314,52 @@ fn rejected_id_tokens_complete_the_exchange_and_mint_no_session() {
     );
     assert_eq!(actors["status"], 200, "{actors}");
     assert!(json_body(&actors)["actors"].is_array());
+}
+
+#[test]
+fn browser_session_ends_at_the_id_token_expiry_and_within_an_hour() {
+    let (mut provider, _dir, _daemon) = admitted();
+    let origin = provider.origin.clone();
+    let wall_ms = || {
+        u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+    };
+
+    provider.set_mode("long");
+    let login = provider.login();
+    let info = provider.request(
+        "GET",
+        &format!("{origin}/v1/auth/session"),
+        json!({"Cookie": login.cookie}),
+        None,
+    );
+    let expires = json_body(&info)["expires_at_ms"].as_u64().unwrap();
+    assert!(
+        expires <= wall_ms() + 3_600_000,
+        "a two-hour ID token outlived the one-hour session cap: {info}"
+    );
+
+    // The ID token expires 2 to 3 s after it was minted.
+    provider.set_mode("short");
+    let login = provider.login();
+    let mut actors = || {
+        provider.request(
+            "GET",
+            &format!("{origin}/v1/actors"),
+            json!({"Cookie": login.cookie}),
+            None,
+        )
+    };
+    let live = actors();
+    assert_eq!(live["status"], 200, "{live}");
+    std::thread::sleep(Duration::from_secs(3));
+    let expired = actors();
+    assert_eq!(expired["status"], 401, "{expired}");
+    assert_eq!(json_body(&expired)["error"]["code"], "UNAUTHENTICATED");
+    assert!(!minted_session(&expired), "re-minted a session: {expired}");
 }
