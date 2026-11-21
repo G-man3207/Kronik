@@ -255,8 +255,11 @@ fn parse_pattern(pattern: &str) -> Vec<Seg> {
 pub struct Gateway {
     node: Arc<Node>,
     cfg: GatewayConfig,
-    routes: Mutex<(Option<u64>, Vec<Route>)>,
+    routes: Mutex<(Option<u64>, Arc<Vec<Route>>)>,
     preview: Option<Arc<dyn PreviewRouter>>,
+    /// How often [`Gateway::route_table`] read the routes from the node.
+    #[cfg(test)]
+    route_reads: std::sync::atomic::AtomicUsize,
 }
 
 fn to_routes(entries: Vec<RouteEntry>) -> Vec<Route> {
@@ -903,8 +906,10 @@ impl Gateway {
         Gateway {
             node,
             cfg,
-            routes: Mutex::new((None, Vec::new())),
+            routes: Mutex::new((None, Arc::default())),
             preview: None,
+            #[cfg(test)]
+            route_reads: Default::default(),
         }
     }
 
@@ -915,14 +920,24 @@ impl Gateway {
         self
     }
 
-    fn matched(&self, method: &str, path: &str) -> Result<Matched, ApiError> {
-        let (epoch, entries) = self.node.routes();
+    /// The routes as of the node's configuration epoch. The epoch is
+    /// compared first: [`Node::routes`] copies every route under the kinds
+    /// lock, which only a new epoch pays for, not every request.
+    fn route_table(&self) -> Arc<Vec<Route>> {
+        let epoch = self.node.epoch();
         let mut cache = self.routes.lock().unwrap_or_else(|e| e.into_inner());
         if cache.0 != Some(epoch) {
-            cache.1 = to_routes(entries);
-            cache.0 = Some(epoch);
+            #[cfg(test)]
+            self.route_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (epoch, entries) = self.node.routes();
+            *cache = (Some(epoch), Arc::new(to_routes(entries)));
         }
-        find(&cache.1, method, path)
+        Arc::clone(&cache.1)
+    }
+
+    fn matched(&self, method: &str, path: &str) -> Result<Matched, ApiError> {
+        find(&self.route_table(), method, path)
     }
 
     /// Serves one request: route, admit the root input, wait for the turn
@@ -1489,15 +1504,7 @@ impl Gateway {
                         "a WebSocket upgrade needs a Sec-WebSocket-Key of 16 base64 bytes",
                     )
                 })?;
-            let m = {
-                let (epoch, entries) = self.node.routes();
-                let mut cache = self.routes.lock().unwrap_or_else(|e| e.into_inner());
-                if cache.0 != Some(epoch) {
-                    cache.1 = to_routes(entries);
-                    cache.0 = Some(epoch);
-                }
-                find_in(&cache.1, &["WEBSOCKET"], "WEBSOCKET", &req.path)?
-            };
+            let m = find_in(&self.route_table(), &["WEBSOCKET"], "WEBSOCKET", &req.path)?;
             (pb::ConnectionProtocol::Websocket, m, Some(key))
         } else {
             let m = self.matched(&req.method, &req.path)?;
@@ -2198,5 +2205,47 @@ mod tests {
         for bad in ["proxy", "10.0.0.0/33", "::1/129", "10.0.0.0/x"] {
             assert!(IpNet::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// #272: requests read the routes from the node only when the
+    /// configuration epoch moved, and a deploy in between is routed at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_node_is_asked_for_routes_once_per_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+        let node = kronik_sched::start_local(env, dir.path(), kronik_sched::NodeConfig::default())
+            .await
+            .unwrap();
+        let deploy = async |guest: &str| {
+            let path = format!(
+                "{}/../../tests/guests/{guest}.wasm",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let audit = pb::Audit {
+                token_id: "t".into(),
+                reason: "test".into(),
+                wall_time_ms: 0,
+            };
+            let authority = node.local_operator_authority().unwrap();
+            node.deploy(&std::fs::read(path).unwrap(), audit, false, authority)
+                .await
+                .unwrap();
+        };
+        deploy("counter").await;
+        let gw = Gateway::new(node.clone(), GatewayConfig::default());
+        let reads = || gw.route_reads.load(std::sync::atomic::Ordering::Relaxed);
+
+        for _ in 0..1000 {
+            assert_eq!(gw.handle(req("/counter/a", "x")).await.status, 200);
+        }
+        assert_eq!(reads(), 1);
+
+        let r = gw.handle(req("/notes/a", "x")).await;
+        assert_eq!(r.status, 404);
+        assert_eq!(reads(), 1);
+        deploy("notes").await;
+        assert_eq!(gw.handle(req("/notes/a", "x")).await.status, 200);
+        assert_eq!(gw.handle(req("/counter/a", "x")).await.status, 200);
+        assert_eq!(reads(), 2);
     }
 }
