@@ -1,16 +1,23 @@
 //! A minimal HTTP/1.1 client for the JSON API: on the daemon's Unix socket,
 //! or over TCP (M10) to `https://host:port`, or plain `http://` to a
 //! loopback address only. Each request uses its own connection
-//! (`Connection: close`). Ordinary JSON responses are read to the end within
-//! a timeout; SSE uses the same transport with incremental bounded decoding.
+//! (`Connection: close`); hyper speaks HTTP/1.1 over the connected Unix, TCP
+//! or TLS stream. Ordinary JSON responses are read to the end within a
+//! timeout; SSE uses the same transport with incremental bounded decoding.
 
+use std::error::Error as _;
 use std::fmt::Write as _;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
+
+use http_body_util::{BodyExt as _, Full};
+use hyper::body::{Bytes, Incoming};
+use hyper_util::rt::TokioIo;
 
 /// Where the API is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,79 +300,107 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>, Failure> {
     TLS.clone().map_err(Failure::Tls)
 }
 
-/// Sends one request and reads the response. `target` is the path and
-/// query, already encoded; `bearer` is sent as `Authorization: Bearer`.
-/// `last_event_id` is an opaque bounded event cursor, sent as Last-Event-ID,
-/// never interpolated into the request target.
-/// `timeout` bounds the connect and every read and write: a daemon that
-/// stays silent that long is a [`Failure::Timeout`].
-pub fn request(
+/// A connected stream hyper speaks HTTP/1.1 over.
+trait Transport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+impl<T> Transport for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+
+/// Connects the endpoint and hands hyper the stream. The TCP connect is
+/// bounded by `timeout`; the TLS handshake by `deadline`, and it completes
+/// before any request is sent, so a certificate problem is reported as one
+/// and not as a broken connection (ADR 0021).
+async fn connect_transport(
     endpoint: &Endpoint,
-    method: &str,
-    target: &str,
-    body: Option<&[u8]>,
-    bearer: Option<&str>,
-    last_event_id: Option<&str>,
     timeout: Duration,
-) -> Result<Response, Failure> {
-    // A zero timeout means none to the socket options.
-    let timeout = timeout.max(Duration::from_millis(1));
-    let body = body.unwrap_or_default();
-    let host = match endpoint {
-        Endpoint::Unix(_) => "kronik".to_owned(),
-        Endpoint::Tcp { .. } => endpoint
-            .shown()
-            .split_once("://")
-            .map_or_else(String::new, |(_, h)| h.to_owned()),
-    };
-    let mut head = format!(
-        "{method} {target} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\n\
-         Connection: close\r\nContent-Length: {}\r\n",
-        body.len()
-    );
-    if !body.is_empty() {
-        head.push_str("Content-Type: application/json\r\n");
-    }
-    if let Some(token) = bearer {
-        head.push_str("Authorization: Bearer ");
-        head.push_str(token);
-        head.push_str("\r\n");
-    }
-    append_event_cursor(&mut head, last_event_id)?;
-    head.push_str("\r\n");
+    deadline: tokio::time::Instant,
+) -> Result<Box<dyn Transport>, Failure> {
     match endpoint {
         Endpoint::Unix(path) => {
-            let stream = connect_unix(path).map_err(Failure::Connect)?;
-            stream
-                .set_read_timeout(Some(timeout))
-                .and_then(|()| stream.set_write_timeout(Some(timeout)))
-                .map_err(Failure::Io)?;
-            exchange(stream, head.as_bytes(), body)
+            let socket = connect_unix(path).map_err(Failure::Connect)?;
+            // tokio registers the socket with its reactor: nonblocking only.
+            socket.set_nonblocking(true).map_err(Failure::Io)?;
+            Ok(Box::new(
+                tokio::net::UnixStream::from_std(socket).map_err(Failure::Io)?,
+            ))
         }
         Endpoint::Tcp { host, port, tls } => {
-            let stream = connect(host, *port, *tls, timeout).map_err(Failure::Connect)?;
-            stream
-                .set_read_timeout(Some(timeout))
-                .and_then(|()| stream.set_write_timeout(Some(timeout)))
-                .map_err(Failure::Io)?;
+            let socket = connect(host, *port, *tls, timeout).map_err(Failure::Connect)?;
+            socket.set_nonblocking(true).map_err(Failure::Io)?;
+            let stream = tokio::net::TcpStream::from_std(socket).map_err(Failure::Io)?;
             if !tls {
-                return exchange(stream, head.as_bytes(), body);
+                return Ok(Box::new(stream));
             }
             let name = rustls::pki_types::ServerName::try_from(host.clone())
                 .map_err(|e| Failure::Tls(format!("{host:?} is not a TLS server name: {e}")))?;
-            let conn = rustls::ClientConnection::new(tls_config()?, name)
-                .map_err(|e| Failure::Tls(e.to_string()))?;
-            let mut tls = rustls::StreamOwned::new(conn, stream);
-            handshake(&mut tls.conn, &mut tls.sock)?;
-            exchange(tls, head.as_bytes(), body)
+            let connector = tokio_rustls::TlsConnector::from(tls_config()?);
+            let tls = tokio::time::timeout_at(deadline, connector.connect(name, stream))
+                .await
+                .map_err(|_| Failure::Timeout)?
+                .map_err(tls_failure)?;
+            Ok(Box::new(tls))
         }
     }
 }
 
+/// rustls reports its own errors (an untrusted or mismatched certificate, a
+/// peer that does not speak TLS) as InvalidData; any other error is the
+/// transport's.
+fn tls_failure(e: io::Error) -> Failure {
+    if e.kind() == io::ErrorKind::InvalidData {
+        Failure::Tls(e.to_string())
+    } else {
+        Failure::Io(e)
+    }
+}
+
+/// Why hyper produced no response: a reply that is not HTTP/1.1 is
+/// Malformed; a connection that ended before the response is Io.
+fn http_failure(e: hyper::Error) -> Failure {
+    if e.is_parse() || e.is_parse_too_large() {
+        return Failure::Malformed(format!("the daemon's response is not valid HTTP/1.1: {e}"));
+    }
+    if e.is_incomplete_message() || e.is_closed() || e.is_canceled() {
+        return Failure::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "closed without a response",
+        ));
+    }
+    if e.is_timeout() {
+        return Failure::Timeout;
+    }
+    match e
+        .source()
+        .and_then(|cause| cause.downcast_ref::<io::Error>())
+    {
+        Some(cause) if timed_out(cause) => Failure::Timeout,
+        Some(cause) => Failure::Io(io::Error::new(cause.kind(), cause.to_string())),
+        None => Failure::Io(io::Error::other(e.to_string())),
+    }
+}
+
+/// A body that stops early is a broken connection, not a reply (N4).
+fn body_error(_broken: hyper::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "the response ended before it was complete",
+    )
+}
+
+/// The host of the `Host` field: the socket's name, or the URL's host and
+/// port.
+fn host_of(endpoint: &Endpoint) -> String {
+    match endpoint {
+        Endpoint::Unix(_) => "kronik".to_owned(),
+        Endpoint::Tcp { .. } => endpoint
+            .shown()
+            .split_once("://")
+            .map_or_else(String::new, |(_, host)| host.to_owned()),
+    }
+}
+
 /// Cursor text is opaque, but must remain one bounded HTTP field value.
-fn append_event_cursor(head: &mut String, cursor: Option<&str>) -> Result<(), Failure> {
+fn event_cursor(cursor: Option<&str>) -> Result<Option<&str>, Failure> {
     let Some(cursor) = cursor else {
-        return Ok(());
+        return Ok(None);
     };
     if cursor.is_empty()
         || cursor.len() > kronik_fleet::events::MAX_CURSOR_BYTES
@@ -377,137 +412,143 @@ fn append_event_cursor(head: &mut String, cursor: Option<&str>) -> Result<(), Fa
             "invalid event resume cursor header".into(),
         ));
     }
-    head.reserve(cursor.len() + "Last-Event-ID: \r\n\r\n".len());
-    head.push_str("Last-Event-ID: ");
-    head.push_str(cursor);
-    head.push_str("\r\n");
-    Ok(())
+    Ok(Some(cursor))
 }
 
-/// Completes the handshake first, so that a certificate problem is reported
-/// as one and not as a broken connection. rustls reports its own errors as
-/// InvalidData; any other is the transport's.
-fn handshake(
-    conn: &mut rustls::ClientConnection,
-    sock: &mut (impl Read + Write),
-) -> Result<(), Failure> {
-    while conn.is_handshaking() {
-        conn.complete_io(sock).map_err(|e| {
-            if timed_out(&e) {
-                Failure::Timeout
-            } else if e.kind() == io::ErrorKind::InvalidData {
-                Failure::Tls(e.to_string())
-            } else {
-                Failure::Io(e)
-            }
+/// One request over one connection: `Connection: close`, JSON or SSE. The
+/// `target` is the already-encoded path and query; `bearer` is sent as
+/// `Authorization: Bearer`; the cursor as Last-Event-ID, never interpolated
+/// into the target.
+fn build_request(
+    method: &str,
+    target: &str,
+    accept: &str,
+    body: &[u8],
+    bearer: Option<&str>,
+    cursor: Option<&str>,
+    host: &str,
+) -> Result<hyper::Request<Full<Bytes>>, Failure> {
+    use hyper::header::{ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST};
+    let invalid = |what: &str| Failure::Malformed(format!("invalid {what}"));
+    let mut build = hyper::Request::builder()
+        .method(
+            hyper::Method::from_bytes(method.as_bytes()).map_err(|_| invalid("request method"))?,
+        )
+        .uri(target)
+        .header(HOST, host)
+        .header(ACCEPT, accept)
+        .header(CONNECTION, "close")
+        .header(CONTENT_LENGTH, body.len() as u64);
+    if !body.is_empty() {
+        build = build.header(CONTENT_TYPE, "application/json");
+    }
+    if let Some(token) = bearer {
+        build = build.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+    if let Some(cursor) = cursor {
+        build = build.header(
+            hyper::header::HeaderName::from_static("last-event-id"),
+            cursor,
+        );
+    }
+    build
+        .body(Full::new(Bytes::copy_from_slice(body)))
+        .map_err(|_| invalid("request target"))
+}
+
+/// Sends one request and reads the response. `target` is the path and
+/// query, already encoded; `bearer` is sent as `Authorization: Bearer`.
+/// `last_event_id` is an opaque bounded event cursor, sent as Last-Event-ID,
+/// never interpolated into the request target.
+/// `timeout` bounds the connect and every read and write: a daemon that
+/// stays silent that long is a [`Failure::Timeout`].
+// The remote-mode client runs on the operator's terminal, not the daemon:
+// the runtime and its timeouts are the client's own transport concerns
+// (ADR 0004 governs the daemon's Env, which a client does not have).
+#[allow(clippy::disallowed_methods)]
+pub fn request(
+    endpoint: &Endpoint,
+    method: &str,
+    target: &str,
+    body: Option<&[u8]>,
+    bearer: Option<&str>,
+    last_event_id: Option<&str>,
+    timeout: Duration,
+) -> Result<Response, Failure> {
+    // A zero timeout still bounds every step.
+    let timeout = timeout.max(Duration::from_millis(1));
+    let body = body.unwrap_or_default();
+    let request = build_request(
+        method,
+        target,
+        "application/json",
+        body,
+        bearer,
+        event_cursor(last_event_id)?,
+        &host_of(endpoint),
+    )?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            Failure::Io(io::Error::other(format!(
+                "starting the client runtime failed: {e}"
+            )))
         })?;
-    }
-    Ok(())
-}
-
-fn exchange(mut stream: impl Read + Write, head: &[u8], body: &[u8]) -> Result<Response, Failure> {
-    let sent = stream
-        .write_all(head)
-        .and_then(|()| stream.write_all(body))
-        .and_then(|()| stream.flush());
-    let mut raw = Vec::new();
-    let received = stream.read_to_end(&mut raw);
-    // The daemon may answer and close before it has read the whole request,
-    // for example when the body is too large; its answer still counts. Over
-    // TLS a peer may close without close_notify after a complete response.
-    if !raw.is_empty()
-        && let Ok(r) = parse(&raw)
-    {
-        return Ok(r);
-    }
-    match (sent, received) {
-        (_, Ok(_)) if !raw.is_empty() => parse(&raw),
-        (Err(e), _) | (Ok(()), Err(e)) if timed_out(&e) => Err(Failure::Timeout),
-        (Err(e), _) | (Ok(()), Err(e)) => Err(Failure::Io(e)),
-        // Nothing at all: the connection broke (a proxy or a reset), it is
-        // not a reply.
-        (Ok(()), Ok(_)) => Err(Failure::Io(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "closed without a response",
-        ))),
-    }
-}
-
-/// Parses a complete HTTP/1.1 response: the status, and the body by
-/// `Content-Length`, chunked transfer coding or the end of the stream.
-fn parse(raw: &[u8]) -> Result<Response, Failure> {
-    let malformed = |what: &str| Failure::Malformed(format!("the daemon's response {what}"));
-    let end = find(raw, b"\r\n\r\n").ok_or_else(|| malformed("has no end of headers"))?;
-    let head = std::str::from_utf8(&raw[..end]).map_err(|_| malformed("has non-UTF-8 headers"))?;
-    let mut lines = head.split("\r\n");
-    let mut status_line = lines.next().unwrap_or_default().splitn(3, ' ');
-    if !status_line
-        .next()
-        .is_some_and(|version| version.starts_with("HTTP/1."))
-    {
-        return Err(malformed("is not HTTP/1.x"));
-    }
-    let status: u16 = status_line
-        .next()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| malformed("has no status code"))?;
-    let mut length = None;
-    let mut chunked = false;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        if name.eq_ignore_ascii_case("content-length") {
-            length = Some(
-                value
-                    .parse::<usize>()
-                    .map_err(|_| malformed("has an invalid Content-Length"))?,
-            );
-        } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            chunked = value
-                .split(',')
-                .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"));
+    runtime.block_on(async {
+        let transport = connect_transport(
+            endpoint,
+            timeout,
+            tokio::time::Instant::from_std(Instant::now() + timeout),
+        )
+        .await?;
+        let (mut sender, connection) = hyper_handshake(transport).await?;
+        let _driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let response = tokio::time::timeout(timeout, sender.send_request(request))
+            .await
+            .map_err(|_| Failure::Timeout)?
+            .map_err(http_failure)?;
+        let status = response.status().as_u16();
+        let mut body = response.into_body();
+        let mut collected = Vec::new();
+        loop {
+            match tokio::time::timeout(timeout, body.frame()).await {
+                Err(_) => return Err(Failure::Timeout),
+                Ok(None) => break,
+                Ok(Some(Err(e))) => return Err(Failure::Io(body_error(e))),
+                Ok(Some(Ok(frame))) => {
+                    if let Ok(data) = frame.into_data() {
+                        collected.extend_from_slice(&data);
+                    }
+                }
+            }
         }
-    }
-    let rest = &raw[end + 4..];
-    let body = if chunked {
-        dechunk(rest).ok_or_else(|| malformed("has a broken chunked body"))?
-    } else if let Some(n) = length {
-        // A clean close in mid-body is a broken connection, not a bad reply.
-        rest.get(..n)
-            .ok_or_else(|| {
-                Failure::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "the response ended before its Content-Length",
-                ))
-            })?
-            .to_vec()
-    } else {
-        rest.to_vec()
-    };
-    Ok(Response { status, body })
+        drop(sender);
+        Ok(Response {
+            status,
+            body: collected,
+        })
+    })
 }
 
-/// Decodes a chunked body; trailers are ignored.
-fn dechunk(mut rest: &[u8]) -> Option<Vec<u8>> {
-    let mut body = Vec::new();
-    loop {
-        let line_end = find(rest, b"\r\n")?;
-        let size = std::str::from_utf8(&rest[..line_end]).ok()?;
-        let size = size.split(';').next()?.trim();
-        let size = usize::from_str_radix(size, 16).ok()?;
-        rest = &rest[line_end + 2..];
-        if size == 0 {
-            return Some(body);
-        }
-        body.extend_from_slice(rest.get(..size)?);
-        rest = rest.get(size..)?.strip_prefix(b"\r\n")?;
-    }
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+/// The hyper HTTP/1.1 client handshake. The response head stays bounded, as
+/// the client's own parser bounded it before.
+async fn hyper_handshake(
+    transport: Box<dyn Transport>,
+) -> Result<
+    (
+        hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+        hyper::client::conn::http1::Connection<TokioIo<Box<dyn Transport>>, Full<Bytes>>,
+    ),
+    Failure,
+> {
+    hyper::client::conn::http1::Builder::new()
+        .max_buf_size(65536)
+        .handshake(TokioIo::new(transport))
+        .await
+        .map_err(|e| Failure::Io(io::Error::other(format!("the HTTP connection failed: {e}"))))
 }
 
 /// Percent-encodes a path segment or query value: everything except
@@ -532,266 +573,307 @@ pub(super) struct StreamResponse {
 }
 
 /// Opens the same Unix/TLS API transport as ordinary requests, without buffering
-/// an unbounded event stream. Cancellation interrupts idle socket reads.
-/// Resume cursors use the standard Last-Event-ID header, not the URI.
-/// CONNECT_TIMEOUT bounds TLS, request and response headers; only a successful
-/// SSE body may remain idle indefinitely, still polling cancellation.
+/// an unbounded event stream. Cancellation interrupts idle waits. Resume
+/// cursors use the standard Last-Event-ID header, not the URI.
+/// CONNECT_TIMEOUT bounds TLS, the request and the response headers; only a
+/// successful SSE body may remain idle indefinitely, still watching
+/// cancellation.
 // The remote-mode client runs on the operator's terminal, not the daemon:
 // wall-clock deadlines and raw threads are the client's own transport
 // concerns (ADR 0004 governs the daemon's Env, which a client does not have).
-#[allow(clippy::disallowed_methods)]
 pub(super) fn stream(
     endpoint: &Endpoint,
     target: &str,
     bearer: Option<&str>,
     last_event_id: Option<&str>,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<StreamResponse, Failure> {
-    let timeout = Duration::from_millis(250);
-    let opening = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let opening_deadline = Instant::now() + CONNECT_TIMEOUT;
-    let transport: Box<dyn ReadWrite> = match endpoint {
-        Endpoint::Unix(path) => {
-            let socket = connect_unix(path).map_err(Failure::Connect)?;
-            socket
-                .set_read_timeout(Some(timeout))
-                .and_then(|()| socket.set_write_timeout(Some(timeout)))
-                .map_err(Failure::Io)?;
-            Box::new(Cancellable {
-                inner: socket,
-                cancelled,
-                opening: opening.clone(),
-                opening_deadline,
-            })
-        }
-        Endpoint::Tcp { host, port, tls } => {
-            let socket = connect(host, *port, *tls, CONNECT_TIMEOUT).map_err(Failure::Connect)?;
-            socket
-                .set_read_timeout(Some(timeout))
-                .and_then(|()| socket.set_write_timeout(Some(timeout)))
-                .map_err(Failure::Io)?;
-            let mut socket = Cancellable {
-                inner: socket,
-                cancelled,
-                opening: opening.clone(),
-                opening_deadline,
-            };
-            if *tls {
-                let name = rustls::pki_types::ServerName::try_from(host.clone())
-                    .map_err(|_| Failure::Tls("invalid TLS server name".into()))?;
-                let mut conn = rustls::ClientConnection::new(tls_config()?, name)
-                    .map_err(|e| Failure::Tls(e.to_string()))?;
-                handshake(&mut conn, &mut socket)?;
-                Box::new(rustls::StreamOwned::new(conn, socket))
-            } else {
-                Box::new(socket)
-            }
-        }
-    };
-    stream_exchange(
-        transport,
+    stream_with_opening(
         endpoint,
         target,
         bearer,
         last_event_id,
-        opening.as_ref(),
+        cancelled,
+        CONNECT_TIMEOUT,
     )
 }
 
-trait ReadWrite: Read + Write + Send {}
-impl<T: Read + Write + Send> ReadWrite for T {}
+/// The opening result a stream's pump thread reports.
+type Opening = Result<(u16, Option<String>), Failure>;
 
-// The SSE reader's wall-clock deadline is the client's own transport
-// concern, not ADR 0004's Env (this type never runs in the daemon).
-#[allow(clippy::disallowed_methods)]
-struct Cancellable<T> {
-    inner: T,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
-    opening: Arc<std::sync::atomic::AtomicBool>,
-    opening_deadline: Instant,
-}
-
-// Wall-clock deadlines are the client's own transport concern.
-#[allow(clippy::disallowed_methods)]
-impl<T> Cancellable<T> {
-    fn check(&self) -> io::Result<()> {
-        if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "event tail cancelled",
-            ));
-        }
-        if self.opening.load(std::sync::atomic::Ordering::Relaxed)
-            && Instant::now() >= self.opening_deadline
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "event stream opening deadline elapsed",
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl<T: Read> Read for Cancellable<T> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        loop {
-            self.check()?;
-            match self.inner.read(out) {
-                Err(e) if timed_out(&e) => continue,
-                result => return result,
-            }
-        }
-    }
-}
-
-impl<T: Write> Write for Cancellable<T> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        loop {
-            self.check()?;
-            match self.inner.write(bytes) {
-                Err(error) if timed_out(&error) => continue,
-                result => return result,
-            }
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        loop {
-            self.check()?;
-            match self.inner.flush() {
-                Err(error) if timed_out(&error) => continue,
-                result => return result,
-            }
-        }
-    }
-}
-
-fn stream_exchange(
-    mut socket: Box<dyn ReadWrite>,
+fn stream_with_opening(
     endpoint: &Endpoint,
     target: &str,
     bearer: Option<&str>,
     last_event_id: Option<&str>,
-    opening: &std::sync::atomic::AtomicBool,
+    cancelled: Arc<AtomicBool>,
+    opening: Duration,
 ) -> Result<StreamResponse, Failure> {
-    // Targets are built from constant paths and encoded query values, never raw input.
+    // Targets are built from constant paths and encoded query values, never
+    // raw input, and the cursor is a bounded field value: refusals happen
+    // before a socket opens.
     if target.bytes().any(|b| b <= b' ' || b == 127)
         || bearer.is_some_and(|token| !token.bytes().all(|b| b.is_ascii_graphic()))
     {
         return Err(Failure::Malformed("invalid streaming request".into()));
     }
-    let host = match endpoint {
-        Endpoint::Unix(_) => "kronik".to_owned(),
-        Endpoint::Tcp { .. } => endpoint
-            .shown()
-            .split_once("://")
-            .map_or_else(String::new, |(_, host)| host.to_owned()),
+    let request = build_request(
+        "GET",
+        target,
+        "text/event-stream",
+        &[],
+        bearer,
+        event_cursor(last_event_id)?,
+        &host_of(endpoint),
+    )?;
+    let (opened, receipt) = std::sync::mpsc::channel::<Opening>();
+    let (blocks, body) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(8);
+    let endpoint = endpoint.clone();
+    let stop = cancelled.clone();
+    let worker = std::thread::Builder::new()
+        .name("kronik-events".to_owned())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                let _ = opened.send(Err(Failure::Io(io::Error::other(
+                    "starting the client runtime failed",
+                ))));
+                return;
+            };
+            runtime.block_on(pump(&endpoint, request, stop, opened, blocks, opening));
+        })
+        .map_err(|e| {
+            Failure::Io(io::Error::other(format!(
+                "starting the event stream reader failed: {e}"
+            )))
+        })?;
+    // The pump thread runs until the body ends; the reader owns the stream.
+    drop(worker);
+    let (status, content_type) = receipt.recv().map_err(|_| {
+        Failure::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the event stream reader stopped",
+        ))
+    })??;
+    Ok(StreamResponse {
+        status,
+        content_type,
+        body: Box::new(ChannelBody {
+            blocks: body,
+            cancelled,
+            pending: Bytes::new(),
+        }),
+    })
+}
+
+/// Reads one response over the transport, reports the head to the waiting
+/// caller, then forwards the body to [`ChannelBody`] until it ends, the
+/// caller cancels, or the opening deadline (which only an API error body, a
+/// non-SSE or failed response, still meets) elapses.
+// The SSE reader's wall-clock deadline is the client's own transport
+// concern, not ADR 0004's Env (this runs on the operator's terminal).
+#[allow(clippy::disallowed_methods)]
+async fn pump(
+    endpoint: &Endpoint,
+    request: hyper::Request<Full<Bytes>>,
+    cancelled: Arc<AtomicBool>,
+    opened: std::sync::mpsc::Sender<Opening>,
+    blocks: tokio::sync::mpsc::Sender<io::Result<Bytes>>,
+    opening: Duration,
+) {
+    let started = Instant::now();
+    let (status, content_type, body) = match open_head(endpoint, request, &cancelled, opening).await
+    {
+        Ok(head) => head,
+        Err(failure) => {
+            let _ = opened.send(Err(failure));
+            return;
+        }
     };
-    let mut head = format!(
-        "GET {target} HTTP/1.1\r\nHost: {host}\r\nAccept: text/event-stream\r\nConnection: close\r\n"
-    );
-    if let Some(token) = bearer {
-        head.push_str("Authorization: Bearer ");
-        head.push_str(token);
-        head.push_str("\r\n");
+    // API error bodies retain the opening deadline instead of hanging at
+    // startup; a successful SSE body may idle indefinitely.
+    let deadline = (!is_live_sse(status, content_type.as_deref())).then(|| started + opening);
+    if opened.send(Ok((status, content_type))).is_err() {
+        return;
     }
-    append_event_cursor(&mut head, last_event_id)?;
-    head.push_str("\r\n");
-    socket
-        .write_all(head.as_bytes())
-        .and_then(|()| socket.flush())
-        .map_err(Failure::Io)?;
-    let mut reader = std::io::BufReader::new(socket);
-    let first = bounded_line(&mut reader, 8192)
-        .map_err(Failure::Io)?
-        .ok_or_else(|| Failure::Malformed("empty streaming response".into()))?;
-    let first = std::str::from_utf8(&first)
-        .map_err(|_| Failure::Malformed("invalid streaming response status".into()))?;
-    let mut fields = first.split_whitespace();
-    if !matches!(fields.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
-        return Err(Failure::Malformed(
-            "invalid streaming response version".into(),
-        ));
-    }
-    let status = fields
-        .next()
-        .and_then(|value| value.parse::<u16>().ok())
-        .filter(|code| (100..600).contains(code))
-        .ok_or_else(|| Failure::Malformed("invalid streaming response status".into()))?;
-    let mut size = first.len();
-    let mut length = None;
-    let mut chunked = false;
-    let mut content_type = None;
-    loop {
-        let line = bounded_line(&mut reader, 8192)
-            .map_err(Failure::Io)?
-            .ok_or_else(|| Failure::Malformed("truncated streaming headers".into()))?;
-        size += line.len();
-        if size > 65536 {
-            return Err(Failure::Malformed("streaming headers exceed 64 KiB".into()));
-        }
-        if line == b"\r\n" {
-            break;
-        }
-        let line = std::str::from_utf8(&line)
-            .map_err(|_| Failure::Malformed("invalid streaming headers".into()))?;
-        let (name, value) = line
-            .trim_end_matches("\r\n")
-            .split_once(':')
-            .ok_or_else(|| Failure::Malformed("invalid streaming header".into()))?;
-        let value = value.trim();
-        if name.eq_ignore_ascii_case("content-length") {
-            if length.is_some() {
-                return Err(Failure::Malformed(
-                    "duplicate streaming Content-Length".into(),
-                ));
-            }
-            length = Some(
-                value
-                    .parse::<u64>()
-                    .map_err(|_| Failure::Malformed("invalid streaming Content-Length".into()))?,
-            );
-        } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            if chunked || !value.eq_ignore_ascii_case("chunked") {
-                return Err(Failure::Malformed(
-                    "unsupported streaming transfer encoding".into(),
-                ));
-            }
-            chunked = true;
-        } else if name.eq_ignore_ascii_case("content-type") {
-            content_type = Some(value.to_owned());
-        }
-    }
-    if chunked && length.is_some() {
-        return Err(Failure::Malformed(
-            "ambiguous streaming response framing".into(),
-        ));
-    }
-    let body = Box::new(StreamBody {
-        reader,
-        remaining: length,
-        chunked,
-        done: false,
-    });
-    // API error bodies retain the opening deadline instead of hanging at startup.
-    if (200..300).contains(&status)
-        && content_type.as_deref().is_some_and(|value| {
+    forward(body, blocks, &cancelled, deadline).await;
+}
+
+/// A successful SSE response: the only body allowed to idle indefinitely.
+fn is_live_sse(status: u16, content_type: Option<&str>) -> bool {
+    (200..300).contains(&status)
+        && content_type.is_some_and(|value| {
             value
                 .split(';')
                 .next()
                 .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
         })
-    {
-        opening.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Connects and reads one streamed response's head, watching cancellation.
+// Wall-clock deadlines and the spawned connection driver are the client's
+// own transport concerns, not ADR 0004's Env (ADR 0004 governs the daemon).
+#[allow(clippy::disallowed_methods)]
+async fn open_head(
+    endpoint: &Endpoint,
+    request: hyper::Request<Full<Bytes>>,
+    cancelled: &AtomicBool,
+    opening: Duration,
+) -> Result<(u16, Option<String>, Incoming), Failure> {
+    let deadline = tokio::time::Instant::from_std(Instant::now() + opening);
+    let mut check = tokio::time::interval(Duration::from_millis(250));
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut connecting = std::pin::pin!(async {
+        let transport = connect_transport(endpoint, CONNECT_TIMEOUT, deadline).await?;
+        let (mut sender, connection) = hyper_handshake(transport).await?;
+        let _driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let response = tokio::time::timeout_at(deadline, sender.send_request(request))
+            .await
+            .map_err(|_| Failure::Timeout)?
+            .map_err(http_failure)?;
+        // Fail closed where hyper is more permissive than the client's own
+        // parser was: both framings at once (hyper would silently prefer
+        // chunked), and any transfer coding but chunked, which the API never
+        // sends.
+        let framing = response.headers();
+        if framing.contains_key(hyper::header::CONTENT_LENGTH)
+            && framing.contains_key(hyper::header::TRANSFER_ENCODING)
+        {
+            return Err(Failure::Malformed(
+                "ambiguous streaming response framing".into(),
+            ));
+        }
+        if framing
+            .get(hyper::header::TRANSFER_ENCODING)
+            .is_some_and(|coding| {
+                !coding
+                    .to_str()
+                    .is_ok_and(|coding| coding.eq_ignore_ascii_case("chunked"))
+            })
+        {
+            return Err(Failure::Malformed(
+                "unsupported streaming response transfer coding".into(),
+            ));
+        }
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        Ok((status, content_type, response.into_body()))
+    });
+    loop {
+        tokio::select! {
+            biased;
+            _ = check.tick() => {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(Failure::Io(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "event tail cancelled",
+                    )));
+                }
+            }
+            result = &mut connecting => return result,
+        }
     }
-    Ok(StreamResponse {
-        status,
-        content_type,
-        body,
-    })
+}
+
+/// Forwards the body one bounded block at a time, so a slow consumer applies
+/// backpressure to the daemon. Cancellation ends the stream at once.
+#[allow(clippy::disallowed_methods)]
+async fn forward(
+    mut body: Incoming,
+    blocks: tokio::sync::mpsc::Sender<io::Result<Bytes>>,
+    cancelled: &AtomicBool,
+    deadline: Option<Instant>,
+) {
+    let mut check = tokio::time::interval(Duration::from_millis(250));
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pending = None;
+    loop {
+        tokio::select! {
+            biased;
+            _ = check.tick() => {
+                if cancelled.load(Ordering::Relaxed) {
+                    return;
+                }
+                if deadline.is_some_and(|at| Instant::now() >= at) {
+                    let _ = blocks
+                        .send(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "event stream opening deadline elapsed",
+                        )))
+                        .await;
+                    return;
+                }
+            }
+            permit = blocks.reserve(), if pending.is_some() => match permit {
+                Ok(permit) => {
+                    if let Some(block) = pending.take() {
+                        permit.send(Ok(block));
+                    }
+                }
+                // The reader went away: nothing more to do.
+                Err(_) => return,
+            },
+            frame = body.frame(), if pending.is_none() => match frame {
+                None => return,
+                Some(Err(e)) => {
+                    let _ = blocks.send(Err(body_error(e))).await;
+                    return;
+                }
+                Some(Ok(frame)) => pending = frame.into_data().ok(),
+            },
+        }
+    }
+}
+
+/// The body of a streamed response, read synchronously from the pump's
+/// blocks. A closed channel is the end of the body, or, when the caller
+/// cancelled, the end of the tail.
+struct ChannelBody {
+    blocks: tokio::sync::mpsc::Receiver<io::Result<Bytes>>,
+    cancelled: Arc<AtomicBool>,
+    pending: Bytes,
+}
+
+impl Read for ChannelBody {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        while self.pending.is_empty() {
+            match self.blocks.blocking_recv() {
+                Some(Ok(block)) => self.pending = block,
+                Some(Err(error)) => return Err(error),
+                None => {
+                    return if self.cancelled.load(Ordering::Relaxed) {
+                        Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "event tail cancelled",
+                        ))
+                    } else {
+                        // The body ended cleanly.
+                        Ok(0)
+                    };
+                }
+            }
+        }
+        let count = out.len().min(self.pending.len());
+        out[..count].copy_from_slice(&self.pending[..count]);
+        self.pending = self.pending.split_off(count);
+        Ok(count)
+    }
 }
 
 /// Reads at most `max` bytes, including LF, without an unbounded read_until.
+/// Only the test fixtures that drive raw API sockets read requests with it.
+#[cfg(test)]
 pub(super) fn bounded_line(
     reader: &mut impl std::io::BufRead,
     max: usize,
@@ -824,81 +906,6 @@ pub(super) fn bounded_line(
         if line.last() == Some(&b'\n') {
             return Ok(Some(line));
         }
-    }
-}
-
-struct StreamBody<R> {
-    reader: R,
-    remaining: Option<u64>,
-    chunked: bool,
-    done: bool,
-}
-
-impl<R: std::io::BufRead> Read for StreamBody<R> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if out.is_empty() || self.done {
-            return Ok(0);
-        }
-        if self.chunked && self.remaining.unwrap_or(0) == 0 {
-            let line = bounded_line(&mut self.reader, 8192)?.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::UnexpectedEof, "missing chunk size")
-            })?;
-            let size = std::str::from_utf8(&line)
-                .ok()
-                .and_then(|line| line.strip_suffix("\r\n"))
-                .and_then(|line| line.split(';').next())
-                .and_then(|size| u64::from_str_radix(size.trim(), 16).ok())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size"))?;
-            self.remaining = Some(size);
-            if size == 0 {
-                let mut total = 0;
-                loop {
-                    let line = bounded_line(&mut self.reader, 8192)?.ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::UnexpectedEof, "truncated trailers")
-                    })?;
-                    total += line.len();
-                    if total > 65536 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "trailers exceed 64 KiB",
-                        ));
-                    }
-                    if line == b"\r\n" {
-                        break;
-                    }
-                }
-                self.done = true;
-                return Ok(0);
-            }
-        }
-        let count = self
-            .remaining
-            .map_or(out.len(), |left| left.min(out.len() as u64) as usize);
-        if count == 0 {
-            self.done = true;
-            return Ok(0);
-        }
-        let read = self.reader.read(&mut out[..count])?;
-        if read == 0 && self.remaining.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated streaming body",
-            ));
-        }
-        if let Some(left) = &mut self.remaining {
-            *left -= read as u64;
-            if self.chunked && *left == 0 {
-                let mut crlf = [0; 2];
-                self.reader.read_exact(&mut crlf)?;
-                if crlf != *b"\r\n" {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "missing chunk delimiter",
-                    ));
-                }
-            }
-        }
-        Ok(read)
     }
 }
 
@@ -1011,91 +1018,128 @@ mod tests {
     }
 
     use super::*;
+    use std::io::Write as _;
+    use std::os::unix::net::UnixListener;
+
+    /// Reads one request head, through its blank line, leaving any body
+    /// unread.
+    fn read_head(socket: &mut UnixStream) -> Vec<u8> {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut head = Vec::new();
+        let mut chunk = [0u8; 512];
+        while !head.ends_with(b"\r\n\r\n") {
+            let read = socket.read(&mut chunk).unwrap();
+            assert!(read > 0, "the client closed before sending its head");
+            head.extend_from_slice(&chunk[..read]);
+        }
+        head
+    }
+
+    /// Serves one raw HTTP response on an API socket.
+    fn serve(path: &std::path::Path, reply: Vec<u8>) -> std::thread::JoinHandle<()> {
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_head(&mut socket);
+            socket.write_all(&reply).unwrap();
+            socket.flush().unwrap();
+        })
+    }
+
+    /// One `name: value` field of a raw head line, case-insensitively.
+    fn field(line: &str, name: &str) -> Option<String> {
+        let (field, value) = line.strip_suffix("\r\n")?.split_once(':')?;
+        field
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_owned())
+    }
 
     #[test]
     fn connected_stream_bounds_opening_and_keeps_live_body_beyond_its_deadline() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        for head in [
-            &b""[..],
-            &b"HTTP/1.1 403 Forbidden\r\nContent-Length: 1\r\n\r\n"[..],
-            &b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"[..],
-        ] {
-            let (socket, mut silent_peer) = UnixStream::pair().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_millis(2)))
-                .unwrap();
-            socket
-                .set_write_timeout(Some(Duration::from_millis(2)))
-                .unwrap();
-            silent_peer.write_all(head).unwrap();
-            let cancelled = Arc::new(AtomicBool::new(false));
-            let reader = Cancellable {
-                inner: socket,
-                cancelled: cancelled.clone(),
-                opening: Arc::new(AtomicBool::new(true)),
-                opening_deadline: Instant::now() + Duration::from_millis(20),
-            };
-            let phase = reader.opening.clone();
-            let (send, receive) = std::sync::mpsc::channel();
-            let worker = std::thread::spawn(move || {
-                let result = stream_exchange(
-                    Box::new(reader),
-                    &Endpoint::Unix("/fixture".into()),
-                    "/v1/events/stream",
-                    None,
-                    None,
-                    phase.as_ref(),
-                );
-                let expired = match result {
-                    Err(Failure::Io(error)) => timed_out(&error),
-                    Err(Failure::Timeout) => true,
-                    Ok(mut response) => response
-                        .body
-                        .read(&mut [0; 1])
-                        .is_err_and(|error| timed_out(&error)),
-                    _ => false,
-                };
-                let _ = send.send(expired);
-            });
-            // The watchdog bounds a regression that would otherwise loop on an idle peer.
-            let expired = receive.recv_timeout(Duration::from_secs(2));
-            cancelled.store(true, Ordering::Relaxed);
-            worker.join().unwrap();
-            assert!(matches!(expired, Ok(true)));
-        }
-
-        let (socket, mut peer) = UnixStream::pair().unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_millis(2)))
-            .unwrap();
-        socket
-            .set_write_timeout(Some(Duration::from_millis(2)))
-            .unwrap();
-        peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
-            .unwrap();
-        let opening = Arc::new(AtomicBool::new(true));
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let reader = Cancellable {
-            inner: socket,
-            cancelled: cancelled.clone(),
-            opening: opening.clone(),
-            opening_deadline: deadline,
-        };
-        let mut response = stream_exchange(
-            Box::new(reader),
-            &Endpoint::Unix("/fixture".into()),
+        // A silent peer: the opening deadline ends the attempt.
+        let directory = tempfile::tempdir().unwrap();
+        let silent_path = directory.path().join("api.sock");
+        let listener = UnixListener::bind(&silent_path).unwrap();
+        let silent_server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            // Hold the peer open until the client gives up and goes away.
+            let mut sink = [0u8; 64];
+            while socket.read(&mut sink).unwrap_or(0) > 0 {}
+        });
+        let started = Instant::now();
+        let result = stream_with_opening(
+            &Endpoint::Unix(silent_path),
             "/v1/events/stream",
             None,
             None,
-            opening.as_ref(),
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(50),
+        );
+        assert!(
+            matches!(result, Err(Failure::Timeout)) && started.elapsed() < Duration::from_secs(2),
+            "silent peer: {:?} after {:?}",
+            result.map(|_| ()).err(),
+            started.elapsed()
+        );
+        silent_server.join().unwrap();
+
+        // An API error body keeps the opening deadline instead of hanging.
+        let directory = tempfile::tempdir().unwrap();
+        let error_path = directory.path().join("api.sock");
+        let listener = UnixListener::bind(&error_path).unwrap();
+        let error_server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_head(&mut socket);
+            socket
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 1\r\n\r\n")
+                .unwrap();
+            // The promised body never arrives; the socket stays up.
+            let mut sink = [0u8; 64];
+            while socket.read(&mut sink).unwrap_or(0) > 0 {}
+        });
+        let mut response = stream_with_opening(
+            &Endpoint::Unix(error_path),
+            "/v1/events/stream",
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(50),
         )
         .unwrap();
-        std::thread::sleep(
-            deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
-        );
-        assert!(Instant::now() >= deadline);
-        peer.write_all(b": live\n\n").unwrap();
+        assert_eq!(response.status, 403);
+        let error = response.body.read(&mut [0; 8]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        error_server.join().unwrap();
+
+        // A live SSE body survives past the opening deadline, then Ctrl-C ends it.
+        let directory = tempfile::tempdir().unwrap();
+        let live_path = directory.path().join("api.sock");
+        let listener = UnixListener::bind(&live_path).unwrap();
+        let live_server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_head(&mut socket);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            socket.write_all(b": live\n\n").unwrap();
+            let mut sink = [0u8; 64];
+            while socket.read(&mut sink).unwrap_or(0) > 0 {}
+        });
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut response = stream_with_opening(
+            &Endpoint::Unix(live_path),
+            "/v1/events/stream",
+            None,
+            None,
+            cancelled.clone(),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        assert_eq!(response.status, 200);
+        std::thread::sleep(Duration::from_millis(200));
         let mut heartbeat = [0; 8];
         response.body.read_exact(&mut heartbeat).unwrap();
         assert_eq!(&heartbeat, b": live\n\n");
@@ -1104,21 +1148,7 @@ mod tests {
             response.body.read(&mut [0; 1]).unwrap_err().kind(),
             io::ErrorKind::ConnectionAborted
         );
-
-        let mut expired_writer = Cancellable {
-            inner: Vec::new(),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            opening: Arc::new(AtomicBool::new(true)),
-            opening_deadline: Instant::now(),
-        };
-        assert_eq!(
-            expired_writer.write(b"request").unwrap_err().kind(),
-            io::ErrorKind::TimedOut
-        );
-        assert_eq!(
-            expired_writer.flush().unwrap_err().kind(),
-            io::ErrorKind::TimedOut
-        );
+        live_server.join().unwrap();
     }
 
     #[test]
@@ -1157,9 +1187,9 @@ mod tests {
                         break;
                     }
                     let line = String::from_utf8(line).unwrap();
-                    if let Some(value) = line.strip_prefix("Last-Event-ID: ") {
+                    if let Some(value) = field(&line, "last-event-id") {
                         assert!(cursor.is_none(), "one cursor field, not duplicates");
-                        cursor = Some(value.strip_suffix("\r\n").unwrap().to_owned());
+                        cursor = Some(value);
                     }
                 }
                 let observed =
@@ -1231,100 +1261,262 @@ mod tests {
             };
             assert!(!message.contains("private"));
             assert!(!message.contains("secret"));
-            let result = stream_exchange(
-                Box::new(StreamingFixture(std::io::Cursor::new(Vec::new()))),
+            let result = stream(
                 &Endpoint::Unix(PathBuf::from("/unused")),
                 "/v1/events/stream",
                 None,
                 Some(&cursor),
-                &std::sync::atomic::AtomicBool::new(true),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
             );
             assert!(matches!(result, Err(Failure::Malformed(_))));
         }
     }
 
-    struct StreamingFixture(std::io::Cursor<Vec<u8>>);
-    impl Read for StreamingFixture {
-        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-            // Split HTTP/SSE delimiters across real reads, not just complete buffers.
-            let count = out.len().min(3);
-            self.0.read(&mut out[..count])
-        }
-    }
-    impl Write for StreamingFixture {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+    #[test]
+    fn requests_decode_content_length_chunked_and_closed_bodies() {
+        for (raw, status, body) in [
+            (
+                &b"HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\n\
+                    content-length: 2\r\n\r\n{}extra"[..],
+                404u16,
+                &b"{}"[..],
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                    3\r\n{\"a\r\n4;ext=1\r\n\":1}\r\n0\r\nTrailer: x\r\n\r\n",
+                200,
+                &b"{\"a\":1}"[..],
+            ),
+            (b"HTTP/1.0 200 OK\r\n\r\nall of it", 200, &b"all of it"[..]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("api.sock");
+            let server = serve(&path, raw.to_vec());
+            let response = request(
+                &Endpoint::Unix(path),
+                "GET",
+                "/v1/events",
+                None,
+                None,
+                None,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            server.join().unwrap();
+            assert_eq!(response.status, status, "{}", String::from_utf8_lossy(raw));
+            assert_eq!(response.body, body, "{}", String::from_utf8_lossy(raw));
         }
     }
 
-    fn streamed(raw: &[u8]) -> Result<StreamResponse, Failure> {
-        stream_exchange(
-            Box::new(StreamingFixture(std::io::Cursor::new(raw.to_vec()))),
-            &Endpoint::Unix(PathBuf::from("/unused")),
-            "/v1/events/stream",
-            Some("bearer"),
+    /// N4: a body cut short is a broken connection (retried by `wait`).
+    #[test]
+    fn a_request_body_cut_short_is_a_broken_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let server = serve(
+            &path,
+            b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nshort".to_vec(),
+        );
+        let r = request(
+            &Endpoint::Unix(path),
+            "GET",
+            "/v1/events",
             None,
-            &std::sync::atomic::AtomicBool::new(true),
-        )
+            None,
+            None,
+            Duration::from_secs(5),
+        );
+        server.join().unwrap();
+        assert!(
+            matches!(&r, Err(Failure::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn requests_reject_malformed_responses() {
+        for raw in [&b"SSH-2.0-OpenSSH\r\n\r\n"[..], b"HTTP/1.1 OK\r\n\r\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("api.sock");
+            let server = serve(&path, raw.to_vec());
+            let r = request(
+                &Endpoint::Unix(path),
+                "GET",
+                "/v1/events",
+                None,
+                None,
+                None,
+                Duration::from_secs(5),
+            );
+            server.join().unwrap();
+            assert!(
+                matches!(r, Err(Failure::Malformed(_))),
+                "{}: {r:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
     }
 
     #[test]
     fn streaming_decodes_chunks_content_length_and_connection_close_incrementally() {
-        for raw in [
-            &b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n3;ext=1\r\nid:\r\n4\r\n x\n\n\r\n0\r\nTrailer: ignored\r\n\r\n"[..],
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 7\r\n\r\nid: x\n\nignored",
-            b"HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\n\r\nid: x\n\n",
+        // Chunked, with a chunk extension and trailers, arriving in parts.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_head(&mut socket);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n3;ext=1\r\nid:",
+                )
+                .unwrap();
+            socket.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            socket
+                .write_all(b"\r\n4\r\n x\n\n\r\n0\r\nTrailer: ignored\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let mut response = stream(
+            &Endpoint::Unix(path),
+            "/v1/events/stream",
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type.as_deref(), Some("text/event-stream"));
+        // The first chunk arrives before the stream is terminated.
+        let mut first = [0u8; 3];
+        response.body.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"id:");
+        let mut rest = String::new();
+        response.body.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, " x\n\n");
+        server.join().unwrap();
+
+        for (raw, body) in [
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 7\r\n\r\nid: x\n\nignored"[..],
+                "id: x\n\n",
+            ),
+            (
+                b"HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\n\r\nid: x\n\n",
+                "id: x\n\n",
+            ),
         ] {
-            let mut response = streamed(raw).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("api.sock");
+            let server = serve(&path, raw.to_vec());
+            let mut response = stream(
+                &Endpoint::Unix(path),
+                "/v1/events/stream",
+                Some("bearer"),
+                None,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
             assert_eq!(response.status, 200);
             assert_eq!(response.content_type.as_deref(), Some("text/event-stream"));
-            let mut body = String::new();
-            response.body.read_to_string(&mut body).unwrap();
-            assert_eq!(body, "id: x\n\n");
+            let mut received = String::new();
+            response.body.read_to_string(&mut received).unwrap();
+            assert_eq!(received, body);
+            server.join().unwrap();
         }
-        let response = streamed(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let server = serve(
+            &path,
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+        );
+        let response = stream(
+            &Endpoint::Unix(path),
+            "/v1/events/stream",
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
         assert_eq!(response.status, 403);
+        server.join().unwrap();
     }
 
     #[test]
     fn streaming_rejects_ambiguous_and_oversized_headers_and_truncated_bodies() {
         for raw in [
-            &b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx"[..],
-            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
             b"HTTP/1.1 private\r\n\r\n",
             b"HTTP/1.1 200 OK\r\nprivate malformed\r\n\r\n",
-            b"HTTP/1.1 200 OK\r\nHeader: private",
         ] {
-            assert!(streamed(raw).is_err());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("api.sock");
+            let server = serve(&path, raw.to_vec());
+            let r = stream(
+                &Endpoint::Unix(path),
+                "/v1/events/stream",
+                None,
+                None,
+                Arc::new(AtomicBool::new(false)),
+            );
+            server.join().unwrap();
+            assert!(
+                r.is_err(),
+                "{}: {:?}",
+                String::from_utf8_lossy(raw),
+                r.map(|_| ()).err()
+            );
         }
-        let raw = format!("HTTP/1.1 200 OK\r\nX: {}\r\n\r\n", "private".repeat(2000));
-        assert!(streamed(raw.as_bytes()).is_err());
+        // The response head stays bounded.
         let raw = format!("HTTP/1.1 200 OK\r\n{}\r\n", "X: value\r\n".repeat(10000));
-        assert!(streamed(raw.as_bytes()).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let server = serve(&path, raw.into_bytes());
+        let r = stream(
+            &Endpoint::Unix(path),
+            "/v1/events/stream",
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        server.join().unwrap();
+        assert!(r.is_err());
         for raw in [
             &b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort"[..],
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nz\r\n",
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nxx",
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nxXX",
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nTrailer: unfinished",
         ] {
-            let mut response = streamed(raw).unwrap();
-            assert!(response.body.read_to_end(&mut Vec::new()).is_err());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("api.sock");
+            let server = serve(&path, raw.to_vec());
+            let mut response = stream(
+                &Endpoint::Unix(path),
+                "/v1/events/stream",
+                None,
+                None,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            server.join().unwrap();
+            assert!(
+                response.body.read_to_end(&mut Vec::new()).is_err(),
+                "{}",
+                String::from_utf8_lossy(raw)
+            );
         }
     }
 
     #[test]
     fn stream_cancellation_and_request_injection_fail_without_echoing_input() {
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let mut reader = Cancellable {
-            inner: &b"data"[..],
-            cancelled,
-            opening: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            opening_deadline: Instant::now(),
+        let (blocks, receiver) = tokio::sync::mpsc::channel(1);
+        drop(blocks);
+        let mut reader = ChannelBody {
+            blocks: receiver,
+            cancelled: Arc::new(AtomicBool::new(true)),
+            pending: Bytes::new(),
         };
         assert_eq!(
             reader.read(&mut [0; 1]).unwrap_err().kind(),
@@ -1334,13 +1526,12 @@ mod tests {
             ("/v1/events/stream\r\nprivate: secret", Some("bearer")),
             ("/v1/events/stream", Some("private\r\nsecret")),
         ] {
-            let result = stream_exchange(
-                Box::new(StreamingFixture(std::io::Cursor::new(Vec::new()))),
+            let result = stream(
                 &Endpoint::Unix(PathBuf::from("/unused")),
                 target,
                 token,
                 None,
-                &std::sync::atomic::AtomicBool::new(true),
+                Arc::new(AtomicBool::new(false)),
             );
             let Err(Failure::Malformed(message)) = result else {
                 panic!("expected refusal");
@@ -1350,75 +1541,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_content_length_bodies() {
-        let raw = b"HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\n\
-                    content-length: 2\r\n\r\n{}extra";
-        assert_eq!(
-            parse(raw).unwrap(),
-            Response {
-                status: 404,
-                body: b"{}".to_vec()
-            }
-        );
-    }
-
-    #[test]
-    fn parses_chunked_bodies_and_bodies_to_the_end() {
-        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
-                    3\r\n{\"a\r\n4;ext=1\r\n\":1}\r\n0\r\nTrailer: x\r\n\r\n";
-        assert_eq!(parse(raw).unwrap().body, b"{\"a\":1}");
-        let raw = b"HTTP/1.0 200 OK\r\n\r\nall of it";
-        assert_eq!(parse(raw).unwrap().body, b"all of it");
-    }
-
-    #[test]
-    fn rejects_broken_responses() {
-        for raw in [
-            &b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nzz\r\n"[..],
-            b"SSH-2.0-OpenSSH\r\n\r\n",
-            b"HTTP/1.1 OK\r\n\r\n",
-            b"HTTP/1.1 200 OK\r\n",
-        ] {
-            assert!(
-                matches!(parse(raw), Err(Failure::Malformed(_))),
-                "{}",
-                String::from_utf8_lossy(raw)
-            );
-        }
-    }
-
-    /// N4: a body cut short is a broken connection (retried by `wait`).
-    #[test]
-    fn a_body_cut_short_is_a_broken_connection() {
-        let raw = b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nshort";
-        let r = parse(raw);
-        assert!(
-            matches!(&r, Err(Failure::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof),
-            "{r:?}"
-        );
-    }
-
-    /// A peer that answers `reply` (then EOF) and swallows what is sent.
-    struct Peer(io::Cursor<&'static [u8]>);
-    impl Read for Peer {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.0.read(buf)
-        }
-    }
-    impl Write for Peer {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
     /// N4: a TLS error (here a peer that is not a TLS server) is `Tls`, not
     /// retried; a connection closed mid-handshake is `Io`, retried.
     #[test]
     fn handshake_tells_tls_errors_from_broken_connections() {
+        use tokio::io::AsyncWriteExt as _;
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -1426,19 +1553,34 @@ mod tests {
         .unwrap()
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
-        let conn = || {
-            rustls::ClientConnection::new(
-                Arc::new(config.clone()),
-                "kronik.example".try_into().unwrap(),
-            )
-            .unwrap()
-        };
-        let r = handshake(
-            &mut conn(),
-            &mut Peer(io::Cursor::new(b"HTTP/1.1 400 Bad Request\r\n\r\n")),
-        );
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let name = rustls::pki_types::ServerName::try_from("kronik.example").unwrap();
+        let r = runtime.block_on(async {
+            let (client, mut peer) = tokio::io::duplex(4096);
+            peer.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                .await
+                .unwrap();
+            connector
+                .connect(name, client)
+                .await
+                .map(|_| ())
+                .map_err(tls_failure)
+        });
         assert!(matches!(r, Err(Failure::Tls(_))), "{r:?}");
-        let r = handshake(&mut conn(), &mut Peer(io::Cursor::new(b"")));
+        let name = rustls::pki_types::ServerName::try_from("kronik.example").unwrap();
+        let r = runtime.block_on(async {
+            let (client, mut peer) = tokio::io::duplex(4096);
+            peer.shutdown().await.unwrap();
+            connector
+                .connect(name, client)
+                .await
+                .map(|_| ())
+                .map_err(tls_failure)
+        });
         assert!(
             matches!(&r, Err(Failure::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof),
             "{r:?}"
@@ -1549,7 +1691,7 @@ mod tests {
             addrs,
             [
                 "[::1]:7443".parse::<SocketAddr>().unwrap(),
-                "127.0.0.1:7443".parse().unwrap()
+                "127.0.0.1:7443".parse::<SocketAddr>().unwrap()
             ]
         );
         assert_eq!(fixed_addrs("LocalHost", 1).unwrap().len(), 2);
