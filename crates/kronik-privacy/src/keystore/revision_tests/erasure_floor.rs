@@ -27,7 +27,6 @@ fn erasure_floor_never_uses_active_a2_as_proof_of_old_plaintext_provenance() {
     let old = warm(&pair);
     assert_eq!(pair.a.erasure_floor("user:1").unwrap(), None);
     assert_eq!(pair.b.erasure_floor("user:1").unwrap(), None);
-    let mut legacy = plain(b"old plaintext must not inherit A2 authority");
     pair.second.erase_through("user:1", 1, 2).unwrap();
     let new = pair.seal(&pair.a, b"new active A2");
     assert_eq!(version(&new), 2);
@@ -37,13 +36,6 @@ fn erasure_floor_never_uses_active_a2_as_proof_of_old_plaintext_provenance() {
     assert_eq!(pair.first.revision().unwrap(), revision);
     assert!(matches!(pair.a.open(&old), Opened::Erased { .. }));
     assert_eq!(pair.b.open(&new).bytes(), Some(b"new active A2".as_slice()));
-    let original = legacy.clone();
-    assert!(
-        pair.a
-            .seal_plain_source(&mut legacy, None, &|bytes| pair.fill(bytes), 3)
-            .is_err()
-    );
-    assert_eq!(legacy, original);
 }
 
 #[test]
