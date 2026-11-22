@@ -185,6 +185,9 @@ codes! {
     HostRedactionFailure = "HOST_REDACTION_FAILURE", 500, "M28",
         "The host could not safely disclose a recorded effect result",
         "Inspect the turn and its effects; repair the scrub inventory or reduce free output, and check the external system before resending.";
+    HttpPortRefused = "HTTP_PORT_REFUSED", 403, "M2",
+        "The fetch URL names a port, which no capability covers",
+        "Fetch the scheme's default port by omitting `:port`; ports are not part of the capability.";
     IdempotencyInFlight = "IDEMPOTENCY_IN_FLIGHT", 409, "M1",
         "The original request with this key is still running",
         "Retry later with the same Idempotency-Key and the same request.";
@@ -281,6 +284,9 @@ codes! {
     SecretBackendUnknown = "SECRET_BACKEND_UNKNOWN", 400, "M23",
         "The requested secret backend is not configured",
         "List configured backends with `kronik secret backends`, or ask an administrator to configure the intended backend.";
+    SecretCleartextRefused = "SECRET_CLEARTEXT_REFUSED", 403, "M2",
+        "A secret header would transit cleartext http",
+        "Use an https URL for this request, or a loopback host, or send the header without a secret.";
     SecretExternal = "SECRET_EXTERNAL", 409, "M23",
         "The secret is managed by an external backend",
         "Change the value in its backend, then run `kronik secret refresh <name> --reason '...'`.";

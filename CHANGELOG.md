@@ -5,6 +5,13 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- An `http:` capability names only a host, and the fetch gate now refuses
+  what a host-only grant cannot cover beyond loopback: a URL with an
+  explicit port is denied `HTTP_PORT_REFUSED`, and a secret header on a
+  cleartext `http` URL is denied `SECRET_CLEARTEXT_REFUSED` instead of
+  transmitting the value unencrypted. Loopback hosts (`localhost`,
+  `127.0.0.1`, `::1`) keep ports and cleartext secrets: local sidecars and
+  test servers never leave the machine (#269).
 - Enter in an admin UI mutation reason field (approve, promote, resend)
   moves focus to the form's button instead of doing nothing. It still does
   not submit; the button's name says what will change, so a second Enter is

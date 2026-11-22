@@ -13,7 +13,7 @@ use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, TurnId};
 use kronik_effects::http::{
     CompiledScrubber, ScrubError, fingerprint as legacy_http_fingerprint, fingerprint_v2,
-    parse_request_url, prepared_version,
+    is_loopback, parse_request_url, prepared_version,
 };
 use kronik_effects::simulator::{EffectRequest, RecordedMatch, ReplayContext};
 use kronik_effects::{Config, Delivery, KindLimits};
@@ -50,6 +50,30 @@ fn plain(bytes: Vec<u8>) -> Option<pb::Sealable> {
 
 fn not_granted(cap: &str) -> String {
     format!("{}: {cap}", ErrorCode::CapabilityNotGranted.as_str())
+}
+
+/// `Some` when a granted `http:` host still cannot cover the fetch target
+/// (#269): an explicit port names a service the host-only capability cannot
+/// express, and a secret header never transits cleartext `http`. Loopback is
+/// excepted: sidecars and test servers live there, and the bytes never leave
+/// the host.
+fn scheme_or_port_refusal(
+    scheme: &str,
+    host: &str,
+    port: Option<u16>,
+    secret_header: bool,
+) -> Option<String> {
+    if is_loopback(host) {
+        return None;
+    }
+    if let Some(port) = port {
+        return Some(format!(
+            "{}: {host}:{port}",
+            ErrorCode::HttpPortRefused.as_str()
+        ));
+    }
+    (scheme == "http" && secret_header)
+        .then(|| format!("{}: {host}", ErrorCode::SecretCleartextRefused.as_str()))
 }
 
 pub fn secret_ref(
@@ -1457,6 +1481,22 @@ impl TurnFx {
             let e = ErrorCode::ForeignNotFound.as_str().to_owned();
             self.note(self.denied(ordinal, kind, "foreign:[withheld]".into(), e.clone()))?;
             return Ok(FetchOutcome::Denied(e));
+        }
+        // #269: the capability names only the host, so the gate refuses
+        // what it cannot express: an explicit port, and a secret header
+        // over cleartext http, loopback excepted.
+        if !foreign
+            && let Some(error) = scheme_or_port_refusal(
+                &target.scheme,
+                &target.host,
+                target.port,
+                req.headers
+                    .iter()
+                    .any(|(_, value)| matches!(value, FetchHeader::Secret { .. })),
+            )
+        {
+            self.note(self.denied(ordinal, kind, cap_target.clone(), error.clone()))?;
+            return Ok(FetchOutcome::Denied(error));
         }
         for (header, value) in &req.headers {
             if header.eq_ignore_ascii_case("idempotency-key") {
@@ -3152,6 +3192,42 @@ impl EffectGate for Gate {
     ) -> BoxFuture<'static, Result<SendNowOutcome, GateError>> {
         let fx = self.0.clone();
         Box::pin(async move { fx.send_now(ordinal, req).await })
+    }
+}
+
+#[cfg(test)]
+mod target_rule_tests {
+    use super::scheme_or_port_refusal;
+
+    /// #269: beyond loopback an explicit port is refused for either scheme,
+    /// and cleartext http carries no secret; https without a port, and every
+    /// loopback target, pass.
+    #[test]
+    fn beyond_loopback_a_port_or_a_cleartext_secret_is_refused() {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            assert_eq!(
+                scheme_or_port_refusal("http", host, Some(8080), true),
+                None,
+                "{host}"
+            );
+        }
+        assert_eq!(
+            scheme_or_port_refusal("https", "example.com", Some(8443), false),
+            Some("HTTP_PORT_REFUSED: example.com:8443".into())
+        );
+        assert_eq!(
+            scheme_or_port_refusal("http", "example.com", None, true),
+            Some("SECRET_CLEARTEXT_REFUSED: example.com".into())
+        );
+        // Without a secret, and over https, the same host passes.
+        assert_eq!(
+            scheme_or_port_refusal("http", "example.com", None, false),
+            None
+        );
+        assert_eq!(
+            scheme_or_port_refusal("https", "example.com", None, true),
+            None
+        );
     }
 }
 

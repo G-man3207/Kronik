@@ -62,6 +62,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`FUEL_EXHAUSTED`](#fuel_exhausted) | 500 | M1 | The turn ran out of fuel |
 | [`GATEWAY_TIMEOUT`](#gateway_timeout) | 504 | M1 | The turn outlived the gateway timeout |
 | [`HOST_REDACTION_FAILURE`](#host_redaction_failure) | 500 | M28 | The host could not safely disclose a recorded effect result |
+| [`HTTP_PORT_REFUSED`](#http_port_refused) | 403 | M2 | The fetch URL names a port, which no capability covers |
 | [`IDEMPOTENCY_IN_FLIGHT`](#idempotency_in_flight) | 409 | M1 | The original request with this key is still running |
 | [`IDEMPOTENCY_KEY_REUSED`](#idempotency_key_reused) | 422 | M1 | The key was already used for a different request |
 | [`IMAGE_INVALID`](#image_invalid) | 400 | M7 | The image cannot be used |
@@ -94,6 +95,7 @@ entries are defined in [Concepts](concepts/glossary.md).
 | [`RUNSC_MISSING`](#runsc_missing) | 503 | M7 | gVisor's runsc is not installed |
 | [`SCOPE_MISSING`](#scope_missing) | 403 | M5 | The token lacks the scope for this operation |
 | [`SECRET_BACKEND_UNKNOWN`](#secret_backend_unknown) | 400 | M23 | The requested secret backend is not configured |
+| [`SECRET_CLEARTEXT_REFUSED`](#secret_cleartext_refused) | 403 | M2 | A secret header would transit cleartext http |
 | [`SECRET_EXTERNAL`](#secret_external) | 409 | M23 | The secret is managed by an external backend |
 | [`SECRET_NOT_FOUND`](#secret_not_found) | 404 | M2 | No such secret |
 | [`SECRET_REF_NOT_ALLOWED`](#secret_ref_not_allowed) | 403 | M23 | The secret reference is outside the configured allowlist |
@@ -623,6 +625,18 @@ Inspect the turn and its effects, then resolve the reported redaction resource o
 
 See also: [`EFFECT_OUTCOME_UNKNOWN`](#effect_outcome_unknown), [`SECRET_UNAVAILABLE`](#secret_unavailable), [`dead-letters`](concepts/glossary.md#dead-letters).
 
+## HTTP_PORT_REFUSED
+
+HTTP status 403, milestone M2. The fetch URL names a port, which no capability covers.
+
+Default hint: Fetch the scheme's default port by omitting `:port`; ports are not part of the capability.
+
+The fetch URL names an explicit port, for example `https://api.example.com:8443`. An `http:` capability names only a host — a grant that itself spells a port is refused, because ports are not part of it — so no grant can cover another port of that host: it may be a different service than the one the operator intended. The guest gets `denied`, and the attempt is recorded in the turn.
+
+To fix it, fetch the scheme's default port by omitting `:port` from the URL. If the service really is on another port, it needs its own host name (a name that resolves to it), granted as usual.
+
+See also: [`CAPABILITY_NOT_GRANTED`](#capability_not_granted), [`capability`](concepts/glossary.md#capability), [`effect`](concepts/glossary.md#effect).
+
 ## IDEMPOTENCY_IN_FLIGHT
 
 HTTP status 409, milestone M1. The original request with this key is still running.
@@ -1132,6 +1146,18 @@ The requested link names a backend that this installation has not configured. Ba
 Use `kronik secret backends` to inspect configured bindings without contacting providers. Select the intended backend, or have an administrator configure it and restart the installation deliberately. Link and unlink require `admin`; refreshing a configured name requires `operate`.
 
 An unknown backend publishes no link or secret version and does not fall back to the built-in store. Historical resolved references must retain the exact backend binding, canonical resource, link generation and immutable version; changing a name's current link does not rewrite those identities.
+
+## SECRET_CLEARTEXT_REFUSED
+
+HTTP status 403, milestone M2. A secret header would transit cleartext http.
+
+Default hint: Use an https URL for this request, or a loopback host, or send the header without a secret.
+
+The request carries a secret header (`{{secret:NAME}}`) and its URL is cleartext `http` to a host beyond loopback. The host inserts the value at the effect boundary and never shows it to the guest, but on cleartext it would transmit it unencrypted to that host, readable by anything on the path. The guest gets `denied`, and the attempt is recorded in the turn. Loopback hosts (`localhost`, `127.0.0.1`, `::1`) are the exception: their bytes never leave the machine, so local sidecars and test servers may take a secret over `http`.
+
+To fix it, use an `https` URL for the request, or send the header without a secret.
+
+See also: [`CAPABILITY_NOT_GRANTED`](#capability_not_granted), [`SECRET_UNAVAILABLE`](#secret_unavailable), [`capability`](concepts/glossary.md#capability), [`effect`](concepts/glossary.md#effect).
 
 ## SECRET_EXTERNAL
 
