@@ -73,8 +73,9 @@ REQUIRED = {"foreign": "KRONIK_FOREIGN_TESTS", "s3": "KRONIK_TEST_S3"}
 
 def requires(text, variable):
     """Whether a job's text sets `variable` to `require`, as a step's `env:`
-    entry or in a command."""
-    return re.search(rf"\b{variable}(?:=|:[ \t]*)[\"']?require\b", text) is not None
+    entry or in a command. A comment that names it does not count."""
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    return re.search(rf"\b{variable}(?:=|:[ \t]*)[\"']?require\b", code) is not None
 
 
 def check(script, workflow):

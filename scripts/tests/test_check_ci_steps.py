@@ -54,6 +54,9 @@ class CheckCiSteps(unittest.TestCase):
                                       "KRONIK_FOREIGN_TESTS=require scripts/ci.sh foreign"),
             "foreign without require": ("          KRONIK_TEST_S3: require\n",
                                         "scripts/ci.sh foreign"),
+            "foreign's require only in a comment": (
+                "          KRONIK_TEST_S3: require\n",
+                "scripts/ci.sh foreign\n      # KRONIK_FOREIGN_TESTS=require fails a skip."),
         }.items():
             with self.assertRaises(ValueError, msg=case):
                 CHECK["check"](script, text(s3_env, foreign_cmd))
