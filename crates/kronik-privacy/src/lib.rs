@@ -59,12 +59,8 @@ pub enum PrivacyError {
     InvalidSecretRow,
     #[error("the original encrypted secret row is unavailable for complete scrub custody")]
     SecretRowIncomplete,
-    #[error("encrypted secret row conflicts with retained custody")]
-    SecretRowConflict,
     #[error("secret version is covered by a retained deletion floor")]
     SecretDeleted,
-    #[error("encrypted secret row requires snapshot transport")]
-    SecretRowTooLarge,
     #[error("secret store is not backed by a database file")]
     FileStoreRequired,
     #[error("the original secret-store writer is busy")]
@@ -466,35 +462,6 @@ pub struct SecretDeletionFloor {
     pub applied_wall_ms: u64,
 }
 
-/// A successful commit is not necessarily operational authorization.
-#[must_use = "ScrubOnly must never authorize an operational secret or READY value"]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SecretImportDisposition {
-    /// Stored live; the caller still owns current operational authorization.
-    Operational,
-    /// Host scrub custody only, never a READY or operational secret.
-    ScrubOnly,
-}
-
-/// Original SQLite row facts; no plaintext and deliberately no Serde format.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EncryptedSecretRow {
-    /// Physical FILE reference used by SQLite, AEAD and the physical keyed hash;
-    /// a canonical identity's logical name may differ.
-    pub name: String,
-    pub physical_version: u64,
-    pub nonce: Vec<u8>,
-    pub ciphertext: Vec<u8>,
-    pub version_hash: Vec<u8>,
-    pub created_wall_ms: u64,
-    pub token_id: String,
-    pub reason: String,
-    /// Source-local application diagnostic; absent is unknown, never permission.
-    pub deletion_applied_wall_ms: Option<u64>,
-    /// Diagnostic only: absence means unknown, not "never deleted".
-    pub known_floor: Option<SecretDeletionFloor>,
-}
-
 /// An owned private encrypted backup, never a replacement for a live store.
 pub struct EncryptedSecretSnapshot {
     _directory: tempfile::TempDir,
@@ -504,39 +471,6 @@ pub struct EncryptedSecretSnapshot {
 impl EncryptedSecretSnapshot {
     pub fn database_path(&self) -> &Path {
         &self.database
-    }
-
-    /// Only this staged, immutable database is opened; no schema/key check writes.
-    pub fn export_encrypted_row(
-        &self,
-        name: &str,
-        physical_version: u64,
-    ) -> Result<Option<EncryptedSecretRow>, PrivacyError> {
-        let max_bytes = std::fs::metadata(&self.database)
-            .map_err(|source| PrivacyError::CustodyIo {
-                path: self.database.display().to_string(),
-                source,
-            })?
-            .len();
-        let max_bytes = usize::try_from(max_bytes).map_err(|_| PrivacyError::SecretRowTooLarge)?;
-        SecretStore::export_encrypted_snapshot_row(
-            &self.database,
-            name,
-            physical_version,
-            max_bytes,
-        )
-    }
-
-    /// Retains this completed SQLite backup through the read-only reader's lifetime.
-    pub fn open_readonly(self, master: &MasterKey) -> Result<SecretStore, PrivacyError> {
-        require_no_snapshot_sidecars(&self.database)?;
-        let conn = Connection::open_with_flags(
-            &self.database,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        let mut store = SecretStore::open_readonly(conn, master)?;
-        store._snapshot = Some(self);
-        Ok(store)
     }
 }
 
@@ -629,60 +563,6 @@ fn stored_wall(wall: i64) -> Result<u64, PrivacyError> {
     u64::try_from(wall).map_err(|_| PrivacyError::InvalidTimestamp)
 }
 
-fn file_source_version(
-    expected: &kronik_proto::log::v1::SecretVersion,
-    intended: SecretImportDisposition,
-) -> Result<u64, PrivacyError> {
-    use kronik_proto::log::v1::secret_version::Phase;
-    kronik_proto::validate_secret_version(expected).map_err(|_| PrivacyError::InvalidSecretRow)?;
-    if !valid_name(&expected.name)
-        || !valid_name(&expected.r#ref)
-        || expected.backend != "file"
-        || expected.version_hash.len() != 16
-        || !matches!(expected.phase, p if p == Phase::Reserved as i32 || p == Phase::Active as i32)
-        || (expected.deleted
-            && (intended != SecretImportDisposition::ScrubOnly
-                || expected.phase != Phase::Active as i32))
-    {
-        return Err(PrivacyError::InvalidSecretRow);
-    }
-    let source = expected
-        .source_version
-        .parse::<u64>()
-        .map_err(|_| PrivacyError::InvalidSecretRow)?;
-    sql_version(source)?;
-    let audit = expected
-        .audit
-        .as_ref()
-        .ok_or(PrivacyError::InvalidSecretRow)?;
-    i64::try_from(audit.wall_time_ms).map_err(|_| PrivacyError::InvalidTimestamp)?;
-    Ok(source)
-}
-
-fn row_disposition(
-    physical: u64,
-    deleted: bool,
-    local: Option<SecretDeletionFloor>,
-    committed: Option<SecretDeletionFloor>,
-    intended: SecretImportDisposition,
-) -> Result<SecretImportDisposition, PrivacyError> {
-    if intended == SecretImportDisposition::ScrubOnly
-        && committed.is_some_and(|floor| physical <= floor.through_version)
-    {
-        Ok(SecretImportDisposition::ScrubOnly)
-    } else if intended == SecretImportDisposition::Operational
-        && !deleted
-        && ![local, committed]
-            .into_iter()
-            .flatten()
-            .any(|floor| physical <= floor.through_version)
-    {
-        Ok(SecretImportDisposition::Operational)
-    } else {
-        Err(PrivacyError::SecretDeleted)
-    }
-}
-
 fn deletion_floor(
     conn: &Connection,
     name: &str,
@@ -701,68 +581,6 @@ fn deletion_floor(
         })
     })
     .transpose()
-}
-
-fn encrypted_row(
-    conn: &Connection,
-    name: &str,
-    version: u64,
-    max_bytes: Option<usize>,
-    read_floor: bool,
-) -> Result<Option<EncryptedSecretRow>, PrivacyError> {
-    if let Some(max_bytes) = max_bytes {
-        let lengths: Option<[i64; 6]> = conn
-            .query_row(
-                "SELECT length(CAST(name AS BLOB)), length(nonce), length(ciphertext), \
-             length(version_hash), length(CAST(token_id AS BLOB)), length(CAST(reason AS BLOB)) \
-             FROM secrets WHERE name = ?1 AND version = ?2",
-                params![name, sql_version(version)?],
-                |row| {
-                    Ok([
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ])
-                },
-            )
-            .optional()?;
-        let Some(lengths) = lengths else {
-            return Ok(None);
-        };
-        // Include space for every scalar fact, even absent deletion diagnostics.
-        let mut total = 5 * std::mem::size_of::<u64>();
-        for length in lengths {
-            let length = usize::try_from(length).map_err(|_| PrivacyError::InvalidSecretRow)?;
-            total = total
-                .checked_add(length)
-                .ok_or(PrivacyError::SecretRowTooLarge)?;
-        }
-        if total > max_bytes {
-            return Err(PrivacyError::SecretRowTooLarge);
-        }
-    }
-    let mut row = conn.query_row(
-        "SELECT nonce, ciphertext, version_hash, created_wall_ms, token_id, reason, deleted_wall_ms \
-         FROM secrets WHERE name = ?1 AND version = ?2",
-        params![name, sql_version(version)?],
-        |row| Ok((EncryptedSecretRow {
-            name: name.to_owned(), physical_version: version,
-            nonce: row.get(0)?, ciphertext: row.get(1)?, version_hash: row.get(2)?,
-            created_wall_ms: 0, token_id: row.get(4)?, reason: row.get(5)?,
-            deletion_applied_wall_ms: None, known_floor: None,
-        }, row.get::<_, i64>(3)?, row.get::<_, Option<i64>>(6)?)),
-    ).optional()?;
-    if let Some((row, created, deleted)) = row.as_mut() {
-        row.created_wall_ms = stored_wall(*created)?;
-        row.deletion_applied_wall_ms = deleted.map(stored_wall).transpose()?;
-        if read_floor {
-            row.known_floor = deletion_floor(conn, name)?;
-        }
-    }
-    Ok(row.map(|(row, _, _)| row))
 }
 
 fn apply_deletion(
@@ -877,8 +695,6 @@ pub struct SecretStore {
     has_floor_table: bool,
     // ... and the table of external scrub copies (ADR 0142).
     has_copy_table: bool,
-    // Declared after the connection so SQLite closes before private staging is removed.
-    _snapshot: Option<EncryptedSecretSnapshot>,
     custody: SecretStoreCustody,
 }
 
@@ -975,7 +791,6 @@ impl SecretStore {
             fresh_at_open: false,
             has_floor_table: self.has_floor_table,
             has_copy_table: self.has_copy_table,
-            _snapshot: None,
             custody: SecretStoreCustody::Owned(owned.clone()),
         }))
     }
@@ -1087,93 +902,6 @@ impl SecretStore {
         Ok(high)
     }
 
-    /// Reads original row and diagnostic floor from one SQLite snapshot; never decrypts.
-    pub fn export_encrypted_row(
-        &self,
-        name: &str,
-        physical_version: u64,
-    ) -> Result<Option<EncryptedSecretRow>, PrivacyError> {
-        if !valid_name(name) {
-            return Err(PrivacyError::InvalidName(name.to_owned()));
-        }
-        sql_version(physical_version)?;
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let row = encrypted_row(&tx, name, physical_version, None, self.has_floor_table)?;
-        tx.commit()?;
-        Ok(row)
-    }
-
-    /// Caps row payload plus scalar facts before allocating any SQLite BLOB/text.
-    /// The caller supplies its actual peer budget and still preflights exact wire size.
-    pub fn export_encrypted_row_bounded(
-        &self,
-        name: &str,
-        physical_version: u64,
-        max_bytes: usize,
-    ) -> Result<Option<EncryptedSecretRow>, PrivacyError> {
-        if !valid_name(name) {
-            return Err(PrivacyError::InvalidName(name.to_owned()));
-        }
-        sql_version(physical_version)?;
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let row = encrypted_row(
-            &tx,
-            name,
-            physical_version,
-            Some(max_bytes),
-            self.has_floor_table,
-        )?;
-        tx.commit()?;
-        Ok(row)
-    }
-
-    /// Reads one row from a privately staged, completed and verified encrypted snapshot.
-    /// The caller owns snapshot authorization/completion; never pass a live database.
-    /// No WAL/journal sidecars, schema writes, or live-store replacement are permitted.
-    pub fn export_encrypted_snapshot_row(
-        snapshot: &Path,
-        name: &str,
-        physical_version: u64,
-        max_row_bytes: usize,
-    ) -> Result<Option<EncryptedSecretRow>, PrivacyError> {
-        if !valid_name(name) {
-            return Err(PrivacyError::InvalidName(name.to_owned()));
-        }
-        sql_version(physical_version)?;
-        let snapshot = snapshot
-            .canonicalize()
-            .map_err(|source| PrivacyError::CustodyIo {
-                path: snapshot.display().to_string(),
-                source,
-            })?;
-        require_no_snapshot_sidecars(&snapshot)?;
-        let mut uri =
-            url::Url::from_file_path(&snapshot).map_err(|_| PrivacyError::InvalidSecretRow)?;
-        uri.query_pairs_mut()
-            .append_pair("mode", "ro")
-            .append_pair("immutable", "1");
-        let mut conn = Connection::open_with_flags(
-            uri.as_str(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )?;
-        let tx = conn.transaction()?;
-        let has_floor_table: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'secret_deletion_floors')",
-            [], |row| row.get(0),
-        )?;
-        let row = encrypted_row(
-            &tx,
-            name,
-            physical_version,
-            Some(max_row_bytes),
-            has_floor_table,
-        )?;
-        tx.commit()?;
-        Ok(row)
-    }
-
     /// Performs the actual directory fsync; an in-memory SQLite database cannot pass.
     /// This does not replace SQLite's FULL transaction acknowledgement.
     pub fn sync_parent_directory(&self) -> Result<(), PrivacyError> {
@@ -1240,261 +968,6 @@ impl SecretStore {
         })
     }
 
-    /// Validates both physical and logical identities, then commits the exact envelope.
-    /// `committed_floor` binds an actual physical-name global cut to its local application clock;
-    /// a logical alias deletion is never authority to revoke its shared physical reference.
-    /// Callers prove current role and canonical identity/source before immutable handoff.
-    /// Retained/legacy repair additionally requires the actual original Meta13 descriptor
-    /// and old Meta28 binding; a fresh local SET uses its accepted original producer.
-    /// Explicit ScrubOnly can install genuine original LIVE bytes without inventing source
-    /// deletion history; legacy canonical deleted-value identities stay unchanged.
-    /// Body diagnostics never grant authority. Success acknowledges SQLite's FULL commit,
-    /// not a separate receipt or operational authorization.
-    pub fn import_encrypted_row(
-        &self,
-        expected: &kronik_proto::log::v1::SecretVersion,
-        row: &EncryptedSecretRow,
-        committed_floor: Option<(&str, SecretDeletionFloor)>,
-        intended: SecretImportDisposition,
-    ) -> Result<SecretImportDisposition, PrivacyError> {
-        if !valid_name(&row.name) {
-            return Err(PrivacyError::InvalidName(row.name.clone()));
-        }
-        sql_version(row.physical_version)?;
-        let mutation = self.begin_mutation(&row.name, row.physical_version)?;
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let byte_limit = usize::try_from(tx.limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH)?)
-            .map_err(|_| PrivacyError::InvalidSecretRow)?;
-        if [
-            row.name.len(),
-            row.nonce.len(),
-            row.ciphertext.len(),
-            row.version_hash.len(),
-            row.token_id.len(),
-            row.reason.len(),
-        ]
-        .into_iter()
-        .any(|length| length > byte_limit)
-        {
-            return Err(PrivacyError::InvalidSecretRow);
-        }
-        let committed_floor = committed_floor
-            .map(|(name, floor)| {
-                if name != row.name {
-                    return Err(PrivacyError::InvalidSecretRow);
-                }
-                Ok(floor)
-            })
-            .transpose()?;
-        let source = file_source_version(expected, intended)?;
-        let created =
-            i64::try_from(row.created_wall_ms).map_err(|_| PrivacyError::InvalidTimestamp)?;
-        if expected.r#ref != row.name
-            || source != row.physical_version
-            || row.version_hash.len() != 16
-        {
-            return Err(PrivacyError::InvalidSecretRow);
-        }
-        if let Some(wall) = row.deletion_applied_wall_ms {
-            i64::try_from(wall).map_err(|_| PrivacyError::InvalidTimestamp)?;
-        }
-        for floor in [committed_floor, row.known_floor].into_iter().flatten() {
-            sql_version(floor.through_version)?;
-            i64::try_from(floor.applied_wall_ms).map_err(|_| PrivacyError::InvalidTimestamp)?;
-        }
-        if row.nonce.is_empty() && row.ciphertext.is_empty() {
-            return Err(PrivacyError::SecretRowIncomplete);
-        }
-        if row.nonce.len() != 24 || row.ciphertext.len() < 16 {
-            return Err(PrivacyError::InvalidSecretRow);
-        }
-        // Diagnostics never choose purpose or grant authority. Operational cannot upgrade
-        // to ScrubOnly; only the explicit intent plus independent canonical floor permits it.
-        let local_floor = deletion_floor(&tx, &row.name)?;
-        let disposition = row_disposition(
-            row.physical_version,
-            row.deletion_applied_wall_ms.is_some(),
-            local_floor,
-            committed_floor,
-            intended,
-        )?;
-        self.check_encrypted_identity(
-            expected,
-            row.physical_version,
-            &row.nonce,
-            &row.ciphertext,
-            &row.version_hash,
-        )?;
-        // Compare borrowed SQLite fields without copying a second large ciphertext.
-        let existing: Option<(bool, bool, bool, Option<i64>)> = tx.query_row(
-            "SELECT nonce, ciphertext, version_hash, created_wall_ms, token_id, reason, deleted_wall_ms \
-             FROM secrets WHERE name = ?1 AND version = ?2",
-            params![row.name, sql_version(row.physical_version)?],
-            |existing| {
-                use rusqlite::types::ValueRef::{Blob, Text};
-                let nonce = existing.get_ref(0)?;
-                let ciphertext = existing.get_ref(1)?;
-                let facts_match = existing.get_ref(2)? == Blob(&row.version_hash)
-                    && existing.get::<_, i64>(3)? == created
-                    && existing.get_ref(4)? == Text(row.token_id.as_bytes())
-                    && existing.get_ref(5)? == Text(row.reason.as_bytes());
-                Ok((facts_match, nonce == Blob(&[]) && ciphertext == Blob(&[]),
-                    nonce == Blob(&row.nonce) && ciphertext == Blob(&row.ciphertext), existing.get(6)?))
-            },
-        ).optional()?;
-        if let Some((facts_match, legacy_empty, envelope_matches, deleted)) = existing {
-            let deleted = deleted.map(stored_wall).transpose()?;
-            if deleted.is_some() && disposition == SecretImportDisposition::Operational {
-                return Err(PrivacyError::SecretDeleted);
-            }
-            if !facts_match {
-                return Err(PrivacyError::SecretRowConflict);
-            }
-            if legacy_empty
-                && deleted.is_some()
-                && disposition == SecretImportDisposition::ScrubOnly
-            {
-                // Only genuine caller-authenticated original ciphertext may repair
-                // a legacy erased row; its retained audit and deletion facts stay put.
-                tx.execute(
-                    "UPDATE secrets SET nonce = ?3, ciphertext = ?4 WHERE name = ?1 AND version = ?2",
-                    params![row.name, sql_version(row.physical_version)?, row.nonce, row.ciphertext],
-                )?;
-            } else if !envelope_matches {
-                return Err(PrivacyError::SecretRowConflict);
-            }
-        } else {
-            tx.execute(
-                "INSERT INTO secrets (name, version, nonce, ciphertext, version_hash, created_wall_ms, \
-                 token_id, reason, deleted_wall_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
-                params![row.name, sql_version(row.physical_version)?, row.nonce, row.ciphertext,
-                    row.version_hash, created, row.token_id, row.reason],
-            )?;
-        }
-        if let Some(floor) = committed_floor {
-            apply_deletion(&tx, &row.name, floor)?;
-        }
-        tx.commit()?;
-        drop(conn);
-        if let Some(mutation) = mutation {
-            mutation.committed()?;
-        }
-        Ok(disposition)
-    }
-
-    /// Read-only validation of an already committed local copy, without cloning its ciphertext.
-    /// The caller still proves source/role and performs actual parent-directory sync before ACK.
-    /// The expected raw ciphertext digest is identity data, never authority or a receipt.
-    /// A supplied deletion floor must already be committed locally; this never installs it.
-    pub fn verify_encrypted_row(
-        &self,
-        expected: &kronik_proto::log::v1::SecretVersion,
-        ciphertext_hash: &[u8; 32],
-        committed_floor: Option<(&str, SecretDeletionFloor)>,
-        intended: SecretImportDisposition,
-    ) -> Result<Option<SecretImportDisposition>, PrivacyError> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let physical = file_source_version(expected, intended)?;
-        let committed_floor = committed_floor
-            .map(|(name, floor)| {
-                if name != expected.r#ref {
-                    return Err(PrivacyError::InvalidSecretRow);
-                }
-                sql_version(floor.through_version)?;
-                i64::try_from(floor.applied_wall_ms).map_err(|_| PrivacyError::InvalidTimestamp)?;
-                Ok(floor)
-            })
-            .transpose()?;
-        let local_floor = deletion_floor(&tx, &expected.r#ref)?;
-        let byte_limit = usize::try_from(tx.limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH)?)
-            .map_err(|_| PrivacyError::InvalidSecretRow)?;
-        let disposition = {
-            let mut statement = tx.prepare(
-                "SELECT nonce, ciphertext, version_hash, created_wall_ms, token_id, reason, deleted_wall_ms \
-                 FROM secrets WHERE name = ?1 AND version = ?2",
-            )?;
-            let mut rows = statement.query(params![expected.r#ref, sql_version(physical)?])?;
-            if let Some(stored) = rows.next()? {
-                let nonce = stored
-                    .get_ref(0)?
-                    .as_blob()
-                    .map_err(|_| PrivacyError::InvalidSecretRow)?;
-                let ciphertext = stored
-                    .get_ref(1)?
-                    .as_blob()
-                    .map_err(|_| PrivacyError::InvalidSecretRow)?;
-                let physical_hash = stored
-                    .get_ref(2)?
-                    .as_blob()
-                    .map_err(|_| PrivacyError::InvalidSecretRow)?;
-                stored_wall(stored.get(3)?)?;
-                let token = stored
-                    .get_ref(4)?
-                    .as_str()
-                    .map_err(|_| PrivacyError::InvalidSecretRow)?;
-                let reason = stored
-                    .get_ref(5)?
-                    .as_str()
-                    .map_err(|_| PrivacyError::InvalidSecretRow)?;
-                let deleted = stored
-                    .get::<_, Option<i64>>(6)?
-                    .map(stored_wall)
-                    .transpose()?;
-                if nonce.is_empty() && ciphertext.is_empty() {
-                    return Err(PrivacyError::SecretRowIncomplete);
-                }
-                if nonce.len() != 24
-                    || ciphertext.len() < 16
-                    || physical_hash.len() != 16
-                    || [
-                        expected.r#ref.len(),
-                        nonce.len(),
-                        ciphertext.len(),
-                        physical_hash.len(),
-                        token.len(),
-                        reason.len(),
-                    ]
-                    .into_iter()
-                    .any(|length| length > byte_limit)
-                {
-                    return Err(PrivacyError::InvalidSecretRow);
-                }
-                if committed_floor.is_some_and(|floor| {
-                    local_floor.is_none_or(|local| local.through_version < floor.through_version)
-                }) {
-                    return Err(PrivacyError::SecretRowIncomplete);
-                }
-                if intended == SecretImportDisposition::ScrubOnly && deleted.is_none() {
-                    return Err(PrivacyError::SecretRowIncomplete);
-                }
-                let disposition = row_disposition(
-                    physical,
-                    deleted.is_some(),
-                    local_floor,
-                    committed_floor,
-                    intended,
-                )?;
-                if blake3::hash(ciphertext).as_bytes() != ciphertext_hash {
-                    return Err(PrivacyError::InvalidSecretRow);
-                }
-                self.check_encrypted_identity(
-                    expected,
-                    physical,
-                    nonce,
-                    ciphertext,
-                    physical_hash,
-                )?;
-                Some(disposition)
-            } else {
-                None
-            }
-        };
-        tx.commit()?;
-        Ok(disposition)
-    }
-
     // Only the private create-new encrypted stage selects a backup destination.
     fn backup_to(&self, path: &std::path::Path) -> Result<(), PrivacyError> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner()).backup(
@@ -1550,7 +1023,6 @@ impl SecretStore {
             fresh_at_open: false,
             has_floor_table,
             has_copy_table,
-            _snapshot: None,
             custody: SecretStoreCustody::ReadOnly,
         })
     }
@@ -1585,7 +1057,6 @@ impl SecretStore {
             fresh_at_open,
             has_floor_table: true,
             has_copy_table: true,
-            _snapshot: None,
             custody,
         };
         {
@@ -1727,41 +1198,7 @@ impl SecretStore {
             .map_err(|_| PrivacyError::Decrypt(name.to_owned()))
     }
 
-    /// Prepares exact custody bytes for reservation preflight without accessing SQLite.
-    /// This is not persistence or authorization; import still checks the committed floor.
-    /// `nonce` must be fresh randomness for this physical version and value.
-    // The row layout is the on-disk format: name, version, value, nonce,
-    // wall clock, token and reason mirror the physical columns.
-    #[allow(clippy::too_many_arguments)]
-    pub fn prepare_encrypted_row(
-        &self,
-        name: &str,
-        physical_version: u64,
-        value: &[u8],
-        nonce: [u8; 24],
-        wall_ms: u64,
-        token_id: &str,
-        reason: &str,
-    ) -> Result<EncryptedSecretRow, PrivacyError> {
-        i64::try_from(wall_ms).map_err(|_| PrivacyError::InvalidTimestamp)?;
-        let version_hash = self.version_hash(name, physical_version, value)?;
-        let ciphertext = self.encrypt(name, physical_version, value, nonce)?;
-        Ok(EncryptedSecretRow {
-            name: name.to_owned(),
-            physical_version,
-            nonce: nonce.to_vec(),
-            ciphertext,
-            version_hash,
-            created_wall_ms: wall_ms,
-            token_id: token_id.to_owned(),
-            reason: reason.to_owned(),
-            deletion_applied_wall_ms: None,
-            known_floor: None,
-        })
-    }
-
     /// Stores an explicitly reserved immutable version. `nonce` must be fresh randomness.
-    // As prepare_encrypted_row: the physical row's field order.
     #[allow(clippy::too_many_arguments)]
     pub fn set_at(
         &self,
@@ -1821,30 +1258,6 @@ impl SecretStore {
                 },
             )
             .map_err(|_| PrivacyError::Decrypt(name.to_owned()))
-    }
-
-    fn check_encrypted_identity(
-        &self,
-        expected: &kronik_proto::log::v1::SecretVersion,
-        physical: u64,
-        nonce: &[u8],
-        ciphertext: &[u8],
-        stored_hash: &[u8],
-    ) -> Result<(), PrivacyError> {
-        let value = Zeroizing::new(self.decrypt(&expected.r#ref, physical, nonce, ciphertext)?);
-        let physical_hash = self.version_hash(&expected.r#ref, physical, &value)?;
-        if physical_hash.as_slice() != stored_hash {
-            return Err(PrivacyError::InvalidSecretRow);
-        }
-        let logical_hash = if expected.name == expected.r#ref && expected.version == physical {
-            physical_hash
-        } else {
-            self.version_hash(&expected.name, expected.version, &value)?
-        };
-        if logical_hash != expected.version_hash {
-            return Err(PrivacyError::InvalidSecretRow);
-        }
-        Ok(())
     }
 
     fn read(
