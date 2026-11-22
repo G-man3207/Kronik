@@ -1883,6 +1883,31 @@ mod tests {
         );
     }
 
+    /// The root unit's bytes are v0.4.1's, so it cannot gain a comment for a
+    /// setting the nonroot unit has and it lacks: ADR 0027 names each one
+    /// and says why (#277).
+    #[test]
+    fn adr_0027_says_why_the_root_unit_lacks_each_nonroot_setting() {
+        let adr = include_str!("../../../docs/adr/0027-systemd-unit-hardening.md");
+        let section = adr
+            .split_once("\n## The root unit next to the nonroot unit\n")
+            .and_then(|(_, rest)| rest.split("\n## ").next())
+            .expect("ADR 0027 has the section");
+        let keys = |unit: &'static str| {
+            unit.lines()
+                .filter(|line| !line.starts_with('#'))
+                .filter_map(|line| line.split_once('=').map(|(key, _)| key))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let root = keys(super::ROOT_UNIT);
+        let unnamed: Vec<_> = keys(super::UNIT)
+            .difference(&root)
+            .copied()
+            .filter(|key| !section.contains(&format!("`{key}=")))
+            .collect();
+        assert!(unnamed.is_empty(), "{unnamed:?}");
+    }
+
     #[test]
     fn the_operations_guide_shows_the_microvm_drop_in_verbatim() {
         let guide = include_str!("../../../docs/guides/operations.md");
