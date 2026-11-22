@@ -824,56 +824,6 @@ impl TokenStore {
         }
     }
 
-    /// A trusted OIDC binding names an ordinary token; names are never reused.
-    pub fn authority_for_name(
-        self: &Arc<Self>,
-        name: &str,
-        required: Scope,
-    ) -> Result<kronik_core::authority::AuthLease, ApiError> {
-        self.authority(TokenIdentity::Name(name.to_owned()), required)
-    }
-
-    pub fn authority_for_token(
-        self: &Arc<Self>,
-        token: &str,
-        required: Scope,
-    ) -> Result<kronik_core::authority::AuthLease, ApiError> {
-        self.authority(TokenIdentity::Hash(hash(token)), required)
-    }
-
-    fn authority(
-        self: &Arc<Self>,
-        identity: TokenIdentity,
-        required: Scope,
-    ) -> Result<kronik_core::authority::AuthLease, ApiError> {
-        let _publication = self.publication();
-        let execution = self.capture_execution()?;
-        let expected = match &*self.metadata() {
-            MetadataState::Native => None,
-            MetadataState::Ready(source) => {
-                let live = self.live();
-                let name = match &identity {
-                    TokenIdentity::Hash(hash) => live.get(hash).map(|row| row.0.as_str()),
-                    TokenIdentity::Name(name) => Some(name.as_str()),
-                    TokenIdentity::Local => None,
-                };
-                let row = name.and_then(|name| source.tokens.get(name));
-                Some(source.expected(row))
-            }
-            _ => return Err(metadata::unavailable()),
-        };
-        let lease = TokenAuthority {
-            store: self.clone(),
-            execution,
-            identity,
-            required,
-            expected,
-            peer: None,
-        };
-        lease.current()?;
-        Ok(Arc::new(lease))
-    }
-
     /// Register a notification before inspecting sticky live authentication state.
     pub fn changes(&self) -> Arc<tokio::sync::Notify> {
         self.changed.clone()
@@ -888,7 +838,6 @@ impl TokenStore {
 #[derive(Clone)]
 enum TokenIdentity {
     Hash([u8; 32]),
-    Name(String),
     Local,
 }
 
@@ -912,7 +861,6 @@ impl TokenAuthority {
         let live = self.store.live();
         let token = match &self.identity {
             TokenIdentity::Hash(hash) => live.get(hash),
-            TokenIdentity::Name(name) => live.values().find(|(live, _)| live == name),
             TokenIdentity::Local => None,
         };
         match (&*metadata, self.expected) {

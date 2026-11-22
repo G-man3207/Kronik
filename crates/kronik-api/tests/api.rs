@@ -1093,7 +1093,13 @@ async fn public_audit_positions_do_not_become_free_secret_text() {
         .read(1, node.applied_lsn(), |committed| {
             expected.extend(
                 mapper
-                    .expected(committed.lsn, &committed.record)
+                    .expected_at(
+                        kronik_core::ids::SourcePos::Actor {
+                            shard: None,
+                            lsn: committed.lsn,
+                        },
+                        &committed.record,
+                    )
                     .expect("the audit mapper maps a committed record"),
             );
             Ok(())

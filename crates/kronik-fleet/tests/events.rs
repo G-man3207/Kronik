@@ -25,6 +25,24 @@ use kronik_sched::{
 };
 use serde_json::json;
 
+/// The receiver's keyed check of a delivery, recomputed here as the tests
+/// sign: the crate itself signs through the key resolver.
+fn signature(key: &[u8], timestamp_ms: u64, event_id: &str, body: &[u8]) -> Result<String, String> {
+    use hmac::{KeyInit as _, Mac as _};
+    if key.is_empty() {
+        return Err("webhook_signature".into());
+    }
+    let input = kronik_fleet::webhook::signing_input(timestamp_ms, event_id, body)?;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key)
+        .map_err(|_| "webhook_signature".to_owned())?;
+    mac.update(&input);
+    Ok(format!(
+        "{}={}",
+        kronik_fleet::webhook::SIGNATURE_VERSION,
+        kronik_core::ids::hex(&mac.finalize().into_bytes())
+    ))
+}
+
 struct RevokedAuthority;
 impl kronik_core::authority::Authority for RevokedAuthority {
     fn check(&self) -> Result<(), kronik_core::error::ApiError> {
@@ -720,30 +738,30 @@ fn effect_subindices_are_distinct_and_sse_resumes_after_each_event() {
 #[test]
 fn hmac_authenticates_version_timestamp_identity_and_exact_body() {
     let id = "ke1.69.6d.actor.native.9.0.0000000000000000000000000000000000000000000000000000000000000000";
-    let signed = webhook::signature(b"dummy-key", 123, id, b"{\"a\":1}").unwrap();
+    let signed = signature(b"dummy-key", 123, id, b"{\"a\":1}").unwrap();
     assert_eq!(
         signed,
-        webhook::signature(b"dummy-key", 123, id, b"{\"a\":1}").unwrap()
+        signature(b"dummy-key", 123, id, b"{\"a\":1}").unwrap()
     );
     assert_ne!(
         signed,
-        webhook::signature(b"dummy-key", 124, id, b"{\"a\":1}").unwrap()
+        signature(b"dummy-key", 124, id, b"{\"a\":1}").unwrap()
     );
     let different = "ke1.69.6d.actor.native.10.0.0000000000000000000000000000000000000000000000000000000000000000";
     assert_ne!(
         signed,
-        webhook::signature(b"dummy-key", 123, different, b"{\"a\":1}").unwrap()
+        signature(b"dummy-key", 123, different, b"{\"a\":1}").unwrap()
     );
     assert_ne!(
         signed,
-        webhook::signature(b"dummy-key", 123, id, b"{\"a\":2}").unwrap()
+        signature(b"dummy-key", 123, id, b"{\"a\":2}").unwrap()
     );
     assert_ne!(
         signed,
-        webhook::signature(b"wrong-key", 123, id, b"{\"a\":1}").unwrap()
+        signature(b"wrong-key", 123, id, b"{\"a\":1}").unwrap()
     );
-    assert!(webhook::signature(b"dummy-key", 123, "ke1.bad\nheader", b"{}").is_err());
-    assert!(webhook::signature(b"", 123, id, b"{}").is_err());
+    assert!(signature(b"dummy-key", 123, "ke1.bad\nheader", b"{}").is_err());
+    assert!(signature(b"", 123, id, b"{}").is_err());
     assert_eq!(
         webhook::signing_input(123, id, b"{}").unwrap(),
         format!("kronik.webhook/v1\n123\n{id}\n{{}}").into_bytes()
@@ -1040,7 +1058,7 @@ async fn committed_pages_restart_rewind_and_prepared_webhook_survive_durable_rel
         };
         assert_eq!(
             header("kronik-signature"),
-            webhook::signature(
+            signature(
                 b"dummy-next-key",
                 header("kronik-timestamp-ms").parse().unwrap(),
                 &event.id,
@@ -3255,7 +3273,7 @@ async fn metadata_worker_restart_rotates_next_pin_but_retries_pending_pin_and_re
         let key = if index < 2 { KEY } else { NEXT_KEY };
         assert_eq!(
             header("kronik-signature"),
-            webhook::signature(key, timestamp, &event.id, &request.body).unwrap()
+            signature(key, timestamp, &event.id, &request.body).unwrap()
         );
     }
 }

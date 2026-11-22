@@ -276,6 +276,8 @@ fn the_two_phases_restore_what_one_call_restores() {
             &env,
             &Keys::default(),
             KeystoreMode::Require,
+            false,
+            &|_| Ok(()),
         ))
         .unwrap();
     let split = shipped.destination();
@@ -596,6 +598,8 @@ fn both_flows(
         &env,
         &Keys::default(),
         mode,
+        false,
+        &|_| Ok(()),
     ));
     let split = shipped.destination();
     let before = listing(split.path());

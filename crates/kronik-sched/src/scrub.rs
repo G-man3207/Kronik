@@ -135,7 +135,8 @@ fn sealable_budget(
 }
 
 /// Raw guest bytes, before sealing.
-pub fn sealable<N: AsRef<str>, V: AsRef<[u8]>>(
+#[cfg(test)]
+fn sealable<N: AsRef<str>, V: AsRef<[u8]>>(
     s: &mut Option<pb::Sealable>,
     secrets: &[(N, V)],
 ) -> Result<(), ScrubError> {
@@ -163,15 +164,6 @@ fn message_budget(
         message_fields(m, matcher, remaining)?;
     }
     Ok(())
-}
-
-pub fn message<N: AsRef<str>, V: AsRef<[u8]>>(
-    m: &mut Option<pb::Message>,
-    secrets: &[(N, V)],
-) -> Result<(), ScrubError> {
-    let matcher = CompiledScrubber::new(secrets, MAX_SECRET_PATTERN_BYTES)?;
-    let mut remaining = MAX_JSON_OUTPUT_BYTES;
-    message_budget(m, &matcher, &mut remaining)
 }
 
 fn text_budget(
@@ -427,19 +419,10 @@ pub fn prepared_fields_safe<'a>(
 /// must already be opened by their real key/source path. This does not
 /// authorize operational use, fetch a provider, or invent an empty proof.
 /// Historical version-0 identities remain inventory, not prepared-byte proof.
-pub fn effect_secret_references(
-    kind: &str,
-    status: i32,
-    bytes: &[u8],
-) -> Result<Vec<pb::SecretRef>, ScrubError> {
-    decode_secret_references(kind, status, bytes, false)
-}
-
 fn decode_secret_references(
     kind: &str,
     status: i32,
     bytes: &[u8],
-    prepared_http: bool,
 ) -> Result<Vec<pb::SecretRef>, ScrubError> {
     let mut references: Vec<pb::SecretRef> = match kind {
         "http.fetch" | "foreign.http" => {
@@ -448,10 +431,7 @@ fn decode_secret_references(
                 request
                     .merge(bytes)
                     .map_err(|_| ScrubError::SourceScopeUnavailable)?;
-                if !matches!(request.fingerprint_version, 0 | 2 | 3)
-                    || (prepared_http
-                        && !kronik_effects::http::prepared_version(request.fingerprint_version))
-                {
+                if !kronik_effects::http::prepared_version(request.fingerprint_version) {
                     return Err(ScrubError::SourceScopeUnavailable);
                 }
                 let mut references = Vec::new();
@@ -578,7 +558,7 @@ pub fn original_secret_prefix(
         };
         // Policy qualification and identity extraction share ONE decode; a
         // separate HTTP pre-decode would copy the whole inline body twice.
-        let found = decode_secret_references(&effect.kind, effect.status, bytes, true).ok()?;
+        let found = decode_secret_references(&effect.kind, effect.status, bytes).ok()?;
         references.try_reserve(found.len()).ok()?;
         references.extend(found);
     }
@@ -648,7 +628,8 @@ pub fn call_request(
     Ok(())
 }
 
-pub fn call_response(
+#[cfg(test)]
+fn call_response(
     r: &mut pb::CallEffectResponse,
     matcher: &CompiledScrubber<'_>,
     output_bytes: usize,

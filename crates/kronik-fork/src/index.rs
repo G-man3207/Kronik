@@ -198,17 +198,8 @@ pub struct ProductionIndex {
 
 impl ProductionIndex {
     /// Reads main's log up to `to_lsn` and indexes the window
-    /// `(fork_lsn, to_lsn]`.
-    pub async fn load(
-        reader: &LogReader,
-        fork_lsn: Lsn,
-        to_lsn: Lsn,
-    ) -> Result<ProductionIndex, LogError> {
-        ProductionIndex::load_from(reader, None, fork_lsn, to_lsn).await
-    }
-
-    /// Like `load`, continuing the snapshot `base` (its LSN at most
-    /// `fork_lsn`): only records after it are read.
+    /// `(fork_lsn, to_lsn]`, continuing the snapshot `base` (its LSN at
+    /// most `fork_lsn`): only records after it are read.
     pub async fn load_from(
         reader: &LogReader,
         base: Option<Base>,

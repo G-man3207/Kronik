@@ -1475,7 +1475,7 @@ pub fn pack(out: &Path, layers: &[LayerSource], spec: &ImageSpec) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fetch::import_layout;
+    use crate::fetch::{ImportLimits, import_layout_limited};
 
     fn temp_dir() -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -2417,7 +2417,14 @@ mod tests {
         assert!(pack(&tmp.path().join("a"), &layers, &spec).is_err());
 
         let store = new_store(&tmp);
-        let resolved = import_layout(&store, &tmp.path().join("a"), None).unwrap();
+        let resolved = import_layout_limited(
+            &store,
+            &tmp.path().join("a"),
+            None,
+            None,
+            &ImportLimits::default(),
+        )
+        .unwrap();
         assert_eq!(resolved.manifest_digest, a);
         let image = Image::open(&store, &a).unwrap();
         let rootfs = tmp.path().join("rootfs");

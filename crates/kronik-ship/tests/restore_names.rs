@@ -345,6 +345,8 @@ fn restore_in(
             &env,
             &Default::default(),
             KeystoreMode::Require,
+            false,
+            &|_| Ok(()),
         )),
         Flow::Split => rt.block_on(async {
             let ownership = lock_data(data)?;

@@ -8,9 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use kronik_otel::audit::{
-    Class, Ctx, Expected, Line, REASON_MAX, class, expected, lines, record_hash, verify,
-};
+use kronik_otel::audit::{Ctx, Expected, Line, REASON_MAX, expected, lines, record_hash, verify};
 use kronik_otel::spans::ActorKeys;
 use kronik_privacy::sealer::Sealer;
 use kronik_proto::Record;
@@ -755,6 +753,51 @@ fn privacy_reseal_request_projects_the_request_action_not_a_completion() {
         reseal_requested: true,
     });
     assert!(request.validate().is_err());
+}
+
+/// What the export does with a record (§4.1). A test-local mirror of the
+/// projection's record handling: no wildcard arm, so a new record kind must
+/// be classified here to compile (review M4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Class {
+    /// One line per record.
+    Record,
+    /// A line for an operator send or resend, and one per `secret.reveal`
+    /// effect.
+    Turn,
+    /// Carries an `Audit`, but is not exported: a `TurnBegin` copies its
+    /// `TurnRecord`'s, and only fork logs have `BranchCreated`.
+    Copy,
+    /// Carries no audit and holds no reveal.
+    None,
+}
+
+fn class(record: &Record) -> Class {
+    match record {
+        Record::Deployment(_)
+        | Record::Grant(_)
+        | Record::Limits(_)
+        | Record::Policy(_)
+        | Record::Approval(_)
+        | Record::PrivacyMode(_)
+        | Record::ForeignActor(_)
+        | Record::Erasure(_)
+        | Record::EngineUpgrade(_)
+        | Record::SimulatorConfig(_)
+        | Record::GuardTriggered(_)
+        | Record::AuditEvent(_)
+        | Record::SecretVersion(_)
+        | Record::SecretLink(_) => Class::Record,
+        // A rebase's switch is the mutation (`rollback --by-replay`); its
+        // rebased turns are what the fork recorded, not operator actions.
+        Record::StateRebase(r) => match &r.part {
+            Some(pb::state_rebase::Part::Switch(_)) => Class::Record,
+            _ => Class::Copy,
+        },
+        Record::TurnRecord(_) => Class::Turn,
+        Record::TurnBegin(_) | Record::BranchCreated(_) => Class::Copy,
+        Record::EffectResult(_) | Record::SnapshotMarker(_) => Class::None,
+    }
 }
 
 /// Review M4: every record message that carries an `Audit` (directly or

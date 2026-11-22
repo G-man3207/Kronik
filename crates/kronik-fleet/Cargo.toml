@@ -9,7 +9,6 @@ publish.workspace = true
 [dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
-hmac = { workspace = true }
 http = { workspace = true }
 kronik-core = { workspace = true, features = ["host-identity", "schemars"] }
 kronik-log = { workspace = true }
@@ -29,6 +28,7 @@ url = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+hmac = { workspace = true }
 kronik-core = { workspace = true, features = ["real"] }
 kronik-privacy = { workspace = true }
 kronik-store = { workspace = true }

@@ -112,14 +112,16 @@ fn erasure_replaces_older_snapshots_and_a_rebuild_drops_the_subject() {
         .node
         .store()
         .db()
-        .kv_get_sealable("counter", "a", "s")
-        .unwrap();
+        .kv_get_written("counter", "a", "s")
+        .unwrap()
+        .map(|(s, _)| s);
     let t = p
         .node
         .store()
         .db()
-        .kv_get_sealable("counter", "a", "t")
-        .unwrap();
+        .kv_get_written("counter", "a", "t")
+        .unwrap()
+        .map(|(t, _)| t);
     assert!(s.is_none(), "user:1's value came back: {s:?}");
     let t = t.expect("user:2's value from the same turn");
     assert_eq!(t.subject.as_deref(), Some("user:2"));

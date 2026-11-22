@@ -992,7 +992,8 @@ impl<'a> StreamScrubber<'a> {
 }
 
 /// Redacts free text without silently expanding invalid UTF-8 beyond its byte budget.
-pub fn scrub_str<N: AsRef<str>, V: AsRef<[u8]>>(
+#[cfg(test)]
+fn scrub_str<N: AsRef<str>, V: AsRef<[u8]>>(
     text: &str,
     secrets: &[(N, V)],
     limits: ScrubLimits,

@@ -147,6 +147,8 @@ fn a_keystore_change_is_shipped_pruned_and_restored() {
             &Env::real(runtime.handle().clone()),
             &Default::default(),
             KeystoreMode::Require,
+            false,
+            &|_| Ok(()),
         ))
         .unwrap();
     assert_eq!(report.keystore_backup_ms, Some(wall));

@@ -49,8 +49,7 @@ async fn head(reader: &LogReader, log_dir: &Path) -> Result<Lsn, String> {
 /// Replays `(fork point, head]` of `data`'s main, where the fork point is
 /// `window` of logical time before the newest root input (or the oldest
 /// point retention keeps), in both modes with the same code. `sealer` opens
-/// the sealed values in the window, as the daemon's does
-/// ([`kronik_sched::offline_sealer`]).
+/// the window, as the daemon's does (`kronik_sched::offline_sealer_with`).
 pub async fn check(
     env: &Env,
     data: &Path,

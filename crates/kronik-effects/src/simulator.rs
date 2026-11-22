@@ -98,8 +98,10 @@ impl EffectSimulator for RecordedMatch {
 }
 
 /// Never answers: an effect without a recording is denied (forks, I7).
-pub struct FailClosed;
+#[cfg(test)]
+struct FailClosed;
 
+#[cfg(test)]
 impl EffectSimulator for FailClosed {
     fn respond(&self, _req: &EffectRequest, _ctx: &ReplayContext<'_>) -> Option<EffectResponse> {
         None
