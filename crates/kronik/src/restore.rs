@@ -235,11 +235,16 @@ fn execute(args: RestoreArgs) -> Result<(String, RestoreOutput), ApiError> {
                 return Ok(None);
             }
             let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
-            let options = kronik_ship::RestoreOptions {
-                allow_missing_blobs: args.allow_missing_blobs,
-            };
-            let report = kronik_ship::restore_with_options(
-                &remote, &data, &branch, force, &env, &keys, mode, options,
+            let report = kronik_ship::restore(
+                &remote,
+                &data,
+                &branch,
+                force,
+                &env,
+                &keys,
+                mode,
+                args.allow_missing_blobs,
+                &|_| Ok(()),
             )
             .await
             .map_err(ship_error)?;

@@ -1154,18 +1154,6 @@ pub enum KeystoreMode {
     Without,
 }
 
-pub async fn restore(
-    remote: &Remote,
-    data: &Path,
-    branch: &str,
-    force: bool,
-    env: &Env,
-    keys: &Keys,
-    mode: KeystoreMode,
-) -> Result<RestoreReport, ShipError> {
-    restore_with_fault(remote, data, branch, force, env, keys, mode, &|_| Ok(())).await
-}
-
 /// The directory that `held` locks must still be the one `data` names.
 fn directory_identity(
     data: &Path,
@@ -1188,13 +1176,14 @@ fn directory_identity(
 /// has already seen).
 pub const RESTORE_MARKER: &str = "restored.json";
 
-/// [`restore`] that calls `fault` before each step of moving the staged
-/// restore into place, and once after (`committed`), so tests can
-/// interrupt it there.
+/// Restores a branch from `remote` into `data`. `allow_missing_blobs` is
+/// `--allow-missing-blobs` ([`RootPhase::allow_missing_blobs`]). `fault`
+/// runs before each step of moving the staged restore into place, and once
+/// after (`committed`), so tests can interrupt it there; production passes
+/// a no-op.
 // The normal restore parameters plus one deterministic fault-injection seam.
 #[allow(clippy::too_many_arguments)]
-#[doc(hidden)]
-pub async fn restore_with_fault(
+pub async fn restore(
     remote: &Remote,
     data: &Path,
     branch: &str,
@@ -1202,6 +1191,7 @@ pub async fn restore_with_fault(
     env: &Env,
     keys: &Keys,
     mode: KeystoreMode,
+    allow_missing_blobs: bool,
     fault: &dyn Fn(&str) -> std::io::Result<()>,
 ) -> Result<RestoreReport, ShipError> {
     restore_inner(
@@ -1212,41 +1202,8 @@ pub async fn restore_with_fault(
         env,
         keys,
         mode,
-        RestoreOptions::default(),
+        allow_missing_blobs,
         fault,
-    )
-    .await
-}
-
-/// What a restore may accept besides its keystore mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RestoreOptions {
-    /// `--allow-missing-blobs` ([`RootPhase::allow_missing_blobs`]).
-    pub allow_missing_blobs: bool,
-}
-
-/// [`restore`] with `options`.
-#[allow(clippy::too_many_arguments)]
-pub async fn restore_with_options(
-    remote: &Remote,
-    data: &Path,
-    branch: &str,
-    force: bool,
-    env: &Env,
-    keys: &Keys,
-    mode: KeystoreMode,
-    options: RestoreOptions,
-) -> Result<RestoreReport, ShipError> {
-    restore_inner(
-        remote,
-        data,
-        branch,
-        force,
-        env,
-        keys,
-        mode,
-        options,
-        &|_| Ok(()),
     )
     .await
 }
@@ -1260,7 +1217,7 @@ async fn restore_inner(
     env: &Env,
     keys: &Keys,
     mode: KeystoreMode,
-    options: RestoreOptions,
+    allow_missing_blobs: bool,
     fault: &dyn Fn(&str) -> std::io::Result<()>,
 ) -> Result<RestoreReport, ShipError> {
     // The directories this restore may create, innermost first: a refusal
@@ -1278,7 +1235,7 @@ async fn restore_inner(
     // One process, one authority: the root phase and the owner's phase run
     // here in the order they would run across a privilege drop.
     let phase = match root_phase(remote, data, env, keys, mode).await {
-        Ok(phase) => phase.allow_missing_blobs(options.allow_missing_blobs),
+        Ok(phase) => phase.allow_missing_blobs(allow_missing_blobs),
         Err(e) => {
             // Empty only: never anything else that appeared meanwhile.
             for d in &created {

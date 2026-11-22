@@ -195,6 +195,8 @@ fn ship_and_restore(remote: &Remote) {
             &Env::real(rt.handle().clone()),
             &Default::default(),
             KeystoreMode::Require,
+            false,
+            &|_| Ok(()),
         ))
         .unwrap();
     assert_eq!(r.snapshot_lsn, m.lsn);
@@ -210,6 +212,8 @@ fn ship_and_restore(remote: &Remote) {
             &Env::real(rt.handle().clone()),
             &Default::default(),
             KeystoreMode::Require,
+            false,
+            &|_| Ok(()),
         ))
         .unwrap_err();
     assert!(err.to_string().contains("--force"), "{err}");
@@ -332,6 +336,8 @@ fn restore_keeps_the_snapshot_the_bucket_log_reaches() {
             &Env::real(rt.handle().clone()),
             &Default::default(),
             KeystoreMode::Require,
+            false,
+            &|_| Ok(()),
         ))
         .unwrap();
     assert_eq!(report.snapshot_lsn, old.lsn, "{report:?}");
@@ -407,6 +413,8 @@ fn restore_fails_when_a_listed_manifest_cannot_be_read() {
             &Env::real(rt.handle().clone()),
             &Default::default(),
             KeystoreMode::Require,
+            false,
+            &|_| Ok(()),
         ))
         .unwrap_err();
     assert!(
@@ -474,6 +482,8 @@ fn restore_proceeds_when_the_newest_manifest_is_gone() {
             &Env::real(rt.handle().clone()),
             &Default::default(),
             KeystoreMode::Require,
+            false,
+            &|_| Ok(()),
         ))
         .unwrap();
     assert_eq!(report.snapshot_lsn, old.lsn, "{report:?}");
@@ -537,6 +547,8 @@ fn restore_refuses_a_bucket_whose_log_reaches_no_snapshot() {
             &Env::real(rt.handle().clone()),
             &Default::default(),
             KeystoreMode::Require,
+            false,
+            &|_| Ok(()),
         ))
         .unwrap_err();
     let text = err.to_string();
@@ -582,7 +594,7 @@ fn an_interrupted_restore_leaves_a_consistent_directory() {
     std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
     let rt = rt();
     let run = |force: bool, at: Option<&'static str>| {
-        rt.block_on(kronik_ship::restore_with_fault(
+        rt.block_on(kronik_ship::restore(
             &remote,
             dst.path(),
             "main",
@@ -590,6 +602,7 @@ fn an_interrupted_restore_leaves_a_consistent_directory() {
             &Env::real(rt.handle().clone()),
             &Default::default(),
             KeystoreMode::Require,
+            false,
             &|step| match at {
                 Some(s) if s == step => Err(std::io::Error::other(format!("injected at {step}"))),
                 _ => Ok(()),
@@ -844,6 +857,8 @@ fn restore_compacted_log_with_an_idle_sql_actor(ship_early: bool) {
             &Env::real(rt.handle().clone()),
             &Default::default(),
             KeystoreMode::Require,
+            false,
+            &|_| Ok(()),
         ))
         .unwrap();
     drop(rt);

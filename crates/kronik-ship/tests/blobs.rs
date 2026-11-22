@@ -22,8 +22,7 @@ use kronik_proto::log::v1 as pb;
 use kronik_sched::snapshots::StorageConfig;
 use kronik_sched::{BlobsConfig, Ingress, Node, NodeConfig, start_local};
 use kronik_ship::{
-    KeystoreMode, Remote, RestoreOptions, ShipError, ShipState, restore_with_options, ship_once,
-    ship_once_with_fault,
+    KeystoreMode, Remote, ShipError, ShipState, restore, ship_once, ship_once_with_fault,
 };
 use tokio::runtime::Runtime;
 
@@ -379,7 +378,7 @@ fn ship_and_restore_blobs(remote: &Remote) {
         std::fs::create_dir_all(dst.path().join("keys")).unwrap();
         std::fs::write(dst.path().join("keys/master.key"), &key).unwrap();
         let rt = rt();
-        let r = rt.block_on(restore_with_options(
+        let r = rt.block_on(restore(
             remote,
             dst.path(),
             "main",
@@ -387,9 +386,8 @@ fn ship_and_restore_blobs(remote: &Remote) {
             &Env::real(rt.handle().clone()),
             &Default::default(),
             KeystoreMode::Require,
-            RestoreOptions {
-                allow_missing_blobs: allow,
-            },
+            allow,
+            &|_| Ok(()),
         ));
         (dst, r)
     };
@@ -519,7 +517,7 @@ fn restore_keeps_a_timer_only_blob(remote: &Remote) {
     std::fs::write(dst.path().join("keys/master.key"), &key).unwrap();
     let r = {
         let rt = rt();
-        rt.block_on(restore_with_options(
+        rt.block_on(restore(
             remote,
             dst.path(),
             "main",
@@ -527,9 +525,8 @@ fn restore_keeps_a_timer_only_blob(remote: &Remote) {
             &Env::real(rt.handle().clone()),
             &Default::default(),
             KeystoreMode::Require,
-            RestoreOptions {
-                allow_missing_blobs: false,
-            },
+            false,
+            &|_| Ok(()),
         ))
         .unwrap()
     };
@@ -699,7 +696,7 @@ fn restored(remote: &Remote, key: &[u8]) -> (tempfile::TempDir, Proc) {
     std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
     {
         let rt = rt();
-        rt.block_on(restore_with_options(
+        rt.block_on(restore(
             remote,
             dst.path(),
             "main",
@@ -707,7 +704,8 @@ fn restored(remote: &Remote, key: &[u8]) -> (tempfile::TempDir, Proc) {
             &Env::real(rt.handle().clone()),
             &Default::default(),
             KeystoreMode::Require,
-            RestoreOptions::default(),
+            false,
+            &|_| Ok(()),
         ))
         .unwrap();
     }

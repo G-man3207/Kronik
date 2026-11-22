@@ -18,7 +18,7 @@ use kronik_proto::log::v1 as pb;
 use kronik_sched::snapshots::StorageConfig;
 use kronik_sched::{BlobsConfig, Ingress, Node, NodeConfig, start_local};
 use kronik_ship::{
-    KeystoreMode, Remote, RestoreOptions, ShipError, ShipState, restore_with_options,
+    KeystoreMode, Remote, ShipError, ShipState, restore,
     ship_keystore, ship_once,
 };
 use tokio::runtime::Runtime;
@@ -152,7 +152,7 @@ fn a_restored_blob_reference_needs_its_subjects_key() {
         std::fs::create_dir_all(dst.path().join("keys")).unwrap();
         std::fs::write(dst.path().join("keys/master.key"), &key).unwrap();
         let restorer = crate::rt();
-        let r = restorer.block_on(restore_with_options(
+        let r = restorer.block_on(restore(
             &remote,
             dst.path(),
             "main",
@@ -160,7 +160,8 @@ fn a_restored_blob_reference_needs_its_subjects_key() {
             &Env::real(restorer.handle().clone()),
             &Default::default(),
             mode,
-            RestoreOptions::default(),
+            false,
+            &|_| Ok(()),
         ));
         (dst, r)
     };
