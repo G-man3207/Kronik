@@ -8,9 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use kronik_otel::audit::{
-    Ctx, Expected, Line, REASON_MAX, expected, lines, record_hash, verify,
-};
+use kronik_otel::audit::{Ctx, Expected, Line, REASON_MAX, expected, lines, record_hash, verify};
 use kronik_otel::spans::ActorKeys;
 use kronik_privacy::sealer::Sealer;
 use kronik_proto::Record;

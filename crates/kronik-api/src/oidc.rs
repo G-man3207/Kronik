@@ -4358,7 +4358,10 @@ mod tests {
         let exchange = ProviderAuthority::new(
             &auth,
             &auth.state(),
-            auth.tokens.capture_name("reader", Scope::Read).unwrap().authority,
+            auth.tokens
+                .capture_name("reader", Scope::Read)
+                .unwrap()
+                .authority,
             expires,
         );
         let original = auth

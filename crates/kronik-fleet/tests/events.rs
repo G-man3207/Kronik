@@ -27,12 +27,7 @@ use serde_json::json;
 
 /// The receiver's keyed check of a delivery, recomputed here as the tests
 /// sign: the crate itself signs through the key resolver.
-fn signature(
-    key: &[u8],
-    timestamp_ms: u64,
-    event_id: &str,
-    body: &[u8],
-) -> Result<String, String> {
+fn signature(key: &[u8], timestamp_ms: u64, event_id: &str, body: &[u8]) -> Result<String, String> {
     use hmac::{KeyInit as _, Mac as _};
     if key.is_empty() {
         return Err("webhook_signature".into());

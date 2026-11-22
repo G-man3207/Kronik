@@ -488,7 +488,8 @@ impl PreparedEnrollment {
         self.draft.command_hash
     }
     pub async fn dispatch(self) -> Result<HttpResponse, FleetError> {
-        self.dispatch_with_admission(|| std::future::ready(Ok(()))).await
+        self.dispatch_with_admission(|| std::future::ready(Ok(())))
+            .await
     }
 
     /// The complete original command is owned by its bounded job before this

@@ -392,9 +392,14 @@ fn upgrade_replays_grant_and_revoke_but_fork_overrides_stay_fixed() {
         assert_eq!(checked.diff.summary.live, 0);
 
         let index = Arc::new(
-            kronik_fork::ProductionIndex::load_from(node.reader(), None, fork_lsn, node.applied_lsn())
-                .await
-                .unwrap(),
+            kronik_fork::ProductionIndex::load_from(
+                node.reader(),
+                None,
+                fork_lsn,
+                node.applied_lsn(),
+            )
+            .await
+            .unwrap(),
         );
         let code = kronik_fork::fork_kinds(
             &index,

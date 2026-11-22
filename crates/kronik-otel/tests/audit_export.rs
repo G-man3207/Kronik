@@ -842,8 +842,14 @@ fn an_initially_unavailable_file_sink_retries_without_blocking_the_node() {
     let m = mapper(&node);
     rt.block_on(node.reader().read(1, node.applied_lsn(), |c| {
         expected.extend(
-            m.expected_at(kronik_core::ids::SourcePos::Actor { shard: None, lsn: c.lsn }, &c.record)
-                .map_err(|error| kronik_log::LogError::Corrupt(error.message))?,
+            m.expected_at(
+                kronik_core::ids::SourcePos::Actor {
+                    shard: None,
+                    lsn: c.lsn,
+                },
+                &c.record,
+            )
+            .map_err(|error| kronik_log::LogError::Corrupt(error.message))?,
         );
         Ok(())
     }))
@@ -947,8 +953,14 @@ fn restore_reusing_lsns(sink: &Sink, got: &Mutex<Vec<String>>) {
     let m = mapper(&node);
     rt.block_on(node.reader().read(1, node.applied_lsn(), |c| {
         expected.extend(
-            m.expected_at(kronik_core::ids::SourcePos::Actor { shard: None, lsn: c.lsn }, &c.record)
-                .map_err(|error| kronik_log::LogError::Corrupt(error.message))?,
+            m.expected_at(
+                kronik_core::ids::SourcePos::Actor {
+                    shard: None,
+                    lsn: c.lsn,
+                },
+                &c.record,
+            )
+            .map_err(|error| kronik_log::LogError::Corrupt(error.message))?,
         );
         Ok(())
     }))

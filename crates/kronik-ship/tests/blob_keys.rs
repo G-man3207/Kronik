@@ -17,10 +17,7 @@ use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::snapshots::StorageConfig;
 use kronik_sched::{BlobsConfig, Ingress, Node, NodeConfig, start_local};
-use kronik_ship::{
-    KeystoreMode, Remote, ShipError, ShipState, restore,
-    ship_keystore, ship_once,
-};
+use kronik_ship::{KeystoreMode, Remote, ShipError, ShipState, restore, ship_keystore, ship_once};
 use tokio::runtime::Runtime;
 
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");

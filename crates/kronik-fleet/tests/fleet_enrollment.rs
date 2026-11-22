@@ -833,9 +833,7 @@ async fn real_net_queued_before_start_is_denied_but_started_http_outlives_its_wa
             task_authority.clone(),
             task_network.http_capacity.clone(),
             move |prepared| {
-                Box::pin(prepared.dispatch_with_admission(move || {
-                    std::future::ready(Ok(hold))
-                }))
+                Box::pin(prepared.dispatch_with_admission(move || std::future::ready(Ok(hold))))
             },
             guarded_persistence(&task_network, task_authority),
         )
@@ -1782,9 +1780,7 @@ async fn inflight_http_keeps_capacity_after_waiter_revocation_and_cannot_admit_a
             task_authority,
             task_network.http_capacity.clone(),
             move |prepared| {
-                Box::pin(prepared.dispatch_with_admission(move || {
-                    std::future::ready(Ok(hold))
-                }))
+                Box::pin(prepared.dispatch_with_admission(move || std::future::ready(Ok(hold))))
             },
             persistence(&task_network),
         )

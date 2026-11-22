@@ -719,7 +719,8 @@ mod tests {
         let tmp = temp_dir();
         let (layout, digest) = packed(&tmp, "one", "1");
         let store = BlobStore::new(tmp.path().join("blobs"));
-        let resolved = import_layout_limited(&store, &layout, None, None, &ImportLimits::default()).unwrap();
+        let resolved =
+            import_layout_limited(&store, &layout, None, None, &ImportLimits::default()).unwrap();
         assert_eq!(resolved.manifest_digest, digest);
         assert_eq!(
             resolved.pinned,
@@ -756,24 +757,29 @@ mod tests {
         let (b, db) = packed(&tmp, "b", "B");
         merge_layouts(&a, &b);
         let store = BlobStore::new(tmp.path().join("blobs"));
-        let err = import_layout_limited(&store, &a, None, None, &ImportLimits::default()).unwrap_err();
+        let err =
+            import_layout_limited(&store, &a, None, None, &ImportLimits::default()).unwrap_err();
         assert!(err.to_string().contains("holds 2 images"), "{err}");
-        let resolved = import_layout_limited(&store, &a, Some(&db), None, &ImportLimits::default()).unwrap();
+        let resolved =
+            import_layout_limited(&store, &a, Some(&db), None, &ImportLimits::default()).unwrap();
         assert_eq!(resolved.manifest_digest, db);
         assert_eq!(Image::open(&store, &db).unwrap().manifest_digest, db);
         assert!(Image::open(&store, &da).is_err());
         let missing = sha256_digest(b"missing");
-        let err = import_layout_limited(&store, &a, Some(&missing), None, &ImportLimits::default()).unwrap_err();
+        let err = import_layout_limited(&store, &a, Some(&missing), None, &ImportLimits::default())
+            .unwrap_err();
         assert!(err.to_string().contains("does not list"), "{err}");
         // oci-layout:<dir>:<ref name> picks by the ref name annotation.
-        let resolved = import_layout_limited(&store, &a, None, Some("a"), &ImportLimits::default()).unwrap();
+        let resolved =
+            import_layout_limited(&store, &a, None, Some("a"), &ImportLimits::default()).unwrap();
         assert_eq!(resolved.manifest_digest, da);
         assert!(
             resolved.pinned.ends_with(&format!("@{da}")),
             "{}",
             resolved.pinned
         );
-        let err = import_layout_limited(&store, &a, None, Some("c"), &ImportLimits::default()).unwrap_err();
+        let err = import_layout_limited(&store, &a, None, Some("c"), &ImportLimits::default())
+            .unwrap_err();
         assert!(err.to_string().contains("no image named"), "{err}");
     }
 
@@ -793,7 +799,8 @@ mod tests {
         let mut bytes = fs::read(&path).unwrap();
         bytes.push(0);
         fs::write(&path, bytes).unwrap();
-        let err = import_layout_limited(&store, &layout, None, None, &ImportLimits::default()).unwrap_err();
+        let err = import_layout_limited(&store, &layout, None, None, &ImportLimits::default())
+            .unwrap_err();
         assert!(matches!(err, ImageError::Invalid(_)), "{err}");
         assert!(!store.has(&Descriptor {
             media_type: String::new(),
@@ -860,7 +867,8 @@ mod tests {
         bytes.push(b'\n');
         fs::write(&path, bytes).unwrap();
         let store = BlobStore::new(tmp.path().join("blobs"));
-        let err = import_layout_limited(&store, &layout, None, None, &ImportLimits::default()).unwrap_err();
+        let err = import_layout_limited(&store, &layout, None, None, &ImportLimits::default())
+            .unwrap_err();
         assert!(err.to_string().contains("descriptor says"), "{err}");
     }
 
