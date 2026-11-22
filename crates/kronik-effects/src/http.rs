@@ -193,6 +193,17 @@ pub fn parse_url(url: &str) -> Result<Target, String> {
     Ok(parsed_url(url)?.1)
 }
 
+/// A loopback target: cleartext to it never leaves the host, so it is the
+/// exception to the scheme and port rules of #269. `host` is a
+/// [`Target::host`], brackets included for an IPv6 literal.
+pub fn is_loopback(host: &str) -> bool {
+    let inner = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    matches!(inner, "localhost" | "127.0.0.1" | "::1")
+}
+
 /// Parse the live URL once and retain its original host bytes for exact redaction.
 pub fn parse_request_url(url: &str) -> Result<(Target, &str), String> {
     let (uri, target) = parsed_url(url)?;
@@ -1466,6 +1477,22 @@ mod tests {
         assert!(parse_url("https://user:pw@x.com/").is_err());
         assert_eq!(parse_url("http://h:8080").unwrap().port, Some(8080));
         assert_eq!(parse_url("http://h:80/a").unwrap().port, None);
+    }
+
+    #[test]
+    fn loopback_names_the_host_the_scheme_and_port_rules_except() {
+        for host in ["localhost", "127.0.0.1", "::1", "[::1]"] {
+            assert!(is_loopback(host), "{host}");
+        }
+        for host in [
+            "example.com",
+            "127.0.0.2",
+            "::2",
+            "[::2]",
+            "localhost.example.com",
+        ] {
+            assert!(!is_loopback(host), "{host}");
+        }
     }
 
     #[test]

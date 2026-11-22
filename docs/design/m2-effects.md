@@ -46,7 +46,12 @@ turn's gate:
    specific `*.suffix` wildcard; a wildcard never matches the apex). An
    IPv6 literal is matched without URI brackets, so `http:[::1]` and a
    fetch to `http://[::1]/` are the capability `http:::1`. A port in the
-   capability is refused: ports are not part of it. A secret header or
+   capability is refused: ports are not part of it, and a fetch URL beyond
+   loopback may not name one either (`HTTP_PORT_REFUSED`); a granted host's
+   cleartext `http` form carries no secret header, so the value never
+   transits unencrypted (`SECRET_CLEARTEXT_REFUSED`). Loopback
+   (`localhost`, `127.0.0.1`, `::1`) keeps both: its bytes never leave the
+   host (#269). A secret header or
    `crypto.*` needs `secret:<name>`; `secrets.reveal`
    needs `secret-reveal:<name>`. Without it the guest gets
    `denied("CAPABILITY_NOT_GRANTED")` and an `EffectRecord`

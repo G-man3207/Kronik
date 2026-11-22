@@ -736,7 +736,9 @@ fork matching and simulators.
 - A header value with one `{{secret:NAME}}` is a secret header: the host
   inserts the secret, with the rest of the value as its template (`Bearer
   {{secret:api-key}}` is the template `Bearer {}`). It needs `secret:NAME`;
-  the guest never holds the value, and responses are scrubbed of it. Two
+  the guest never holds the value, and responses are scrubbed of it. A
+  cleartext `http` URL beyond loopback is refused (`SECRET_CLEARTEXT_REFUSED`).
+  Two
   placeholders in one value, or a literal `{}` beside one, are not sent.
 - The request body counts against `message_bytes`, like `http-client`'s;
   responses are read whole within the effect limits. Trailers are not

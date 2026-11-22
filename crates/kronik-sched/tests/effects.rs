@@ -471,6 +471,72 @@ fn an_ipv6_literal_grant_authorizes_the_bracketed_fetch() {
     assert_eq!(server.seen("/ok").len(), 1);
 }
 
+/// #269: the `http:` capability names only a host. Beyond loopback an
+/// explicit port is a target no grant can cover, and a secret header never
+/// transits cleartext http. Loopback keeps both (the local servers of these
+/// tests and of the identity examples).
+#[test]
+fn beyond_loopback_an_explicit_port_is_refused_even_when_the_host_is_granted() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy();
+    p.grant("http:example.com", None, None);
+    let r = p.send(
+        "counter/a",
+        msg("fetch-ok", "GET https://example.com:8443/x"),
+    );
+    assert!(
+        reply(&r).contains("HTTP_PORT_REFUSED: example.com:8443"),
+        "{}",
+        reply(&r)
+    );
+    // A denial needs neither a TurnBegin nor an EffectResult.
+    let records = p.records();
+    assert!(!records.iter().any(|r| matches!(r, Record::TurnBegin(_))));
+    assert!(!records.iter().any(|r| matches!(r, Record::EffectResult(_))));
+    let turns = turn_records(&records);
+    let denied = &turns.last().unwrap().effects[0];
+    assert_eq!(denied.status, pb::EffectStatus::Denied as i32);
+    assert_eq!(denied.target, "http:example.com");
+    assert_eq!(denied.error, "HTTP_PORT_REFUSED: example.com:8443");
+}
+
+#[test]
+fn beyond_loopback_a_secret_header_over_cleartext_http_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy();
+    p.rt.block_on(p.node.secret_set(
+        "api-key",
+        b"secret-value-269".to_vec(),
+        &audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+    p.grant("http:example.com", None, None);
+    p.grant("secret:api-key", None, None);
+    // The host is granted and the secret exists; the cleartext target is
+    // what the gate refuses.
+    let spec = "GET http://example.com/x\nS x-api-key api-key {}";
+    let r = p.send("counter/a", msg("fetch-ok", spec));
+    assert!(
+        reply(&r).contains("SECRET_CLEARTEXT_REFUSED: example.com"),
+        "{}",
+        reply(&r)
+    );
+    let turns = turn_records(&p.records());
+    let denied = &turns.last().unwrap().effects[0];
+    assert_eq!(denied.status, pb::EffectStatus::Denied as i32);
+    assert_eq!(denied.error, "SECRET_CLEARTEXT_REFUSED: example.com");
+    // The secret was never resolved: no TurnBegin was written for its use.
+    assert!(
+        !p.records()
+            .iter()
+            .any(|r| matches!(r, Record::TurnBegin(_)))
+    );
+}
+
 #[test]
 fn turn_begin_is_durable_before_the_effect_and_replay_safe_reruns() {
     let dir = tempfile::tempdir().unwrap();
