@@ -85,7 +85,8 @@ pub fn allocate(text: &str, max_id_in_use: u32) -> Option<Range> {
 }
 
 /// The line to append for `user`.
-pub fn line(user: &str, r: Range) -> String {
+#[cfg(test)]
+fn line(user: &str, r: Range) -> String {
     format!("{user}:{}:{}\n", r.start, r.count)
 }
 

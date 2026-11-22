@@ -217,7 +217,8 @@ pub fn refs(record: &Record) -> Vec<&pb::BlobRef> {
 }
 
 /// Calls `f` for every reference of `record` outside sealed payloads.
-pub fn for_each(record: &Record, f: &mut dyn FnMut(&pb::BlobRef)) {
+#[cfg(test)]
+fn for_each(record: &Record, f: &mut dyn FnMut(&pb::BlobRef)) {
     refs(record).into_iter().for_each(f);
 }
 

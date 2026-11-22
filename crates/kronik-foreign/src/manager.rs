@@ -16,7 +16,7 @@ use kronik_proto::log::v1 as pb;
 use crate::blobs::BlobStore;
 use crate::fetch::{FetchOptions, Resolved};
 use crate::image::{ImageError, ImageRef};
-use crate::runtime::{Engine, Runtime, container_id, find_runc, is_executable, run_quick};
+use crate::runtime::{Engine, Runtime, find_runc, is_executable, run_quick};
 use crate::supervisor::{Actor, Ctx, Paths, State, Status, Timings, secret_binding, supervise};
 
 /// The tested gVisor release (ADR 0003).
@@ -1224,11 +1224,6 @@ impl Foreign {
             }
         }
         drop(cleaned);
-    }
-
-    /// The container id of `name` (tests and diagnostics).
-    pub fn container_id(name: &str) -> String {
-        container_id(name)
     }
 
     /// The cgroup of `name` under the cgroup v2 root (tests and doctor).

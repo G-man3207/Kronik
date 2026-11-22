@@ -169,31 +169,13 @@ fn check_blob_dir(dir: &Path) -> Result<(), ImageError> {
 }
 
 /// Imports an image from the OCI image layout in `dir` into the store
-/// (blocking). `digest` selects an image listed in `index.json`; without it
-/// the layout must list exactly one. Indexes resolve to their entry for
-/// `linux` and the host architecture; index, manifest, config and layers are
-/// verified and copied, so the image no longer depends on the directory.
-pub fn import_layout(
-    store: &BlobStore,
-    dir: &Path,
-    digest: Option<&str>,
-) -> Result<Resolved, ImageError> {
-    import_layout_named(store, dir, digest, None)
-}
-
-/// [`import_layout`], choosing the image by its
+/// (blocking): `digest` selects an image listed in `index.json`, or the
 /// `org.opencontainers.image.ref.name` annotation when `reference` is given
-/// (`oci-layout:<dir>:<ref name>`).
-pub fn import_layout_named(
-    store: &BlobStore,
-    dir: &Path,
-    digest: Option<&str>,
-    reference: Option<&str>,
-) -> Result<Resolved, ImageError> {
-    import_layout_limited(store, dir, digest, reference, &ImportLimits::default())
-}
-
-/// [`import_layout_named`] with an add's space budget and a cancel flag.
+/// (`oci-layout:<dir>:<ref name>`); without either the layout must list
+/// exactly one. Indexes resolve to their entry for `linux` and the host
+/// architecture; index, manifest, config and layers are verified and copied,
+/// so the image no longer depends on the directory. `limits` carries an
+/// add's space budget and a cancel flag.
 pub fn import_layout_limited(
     store: &BlobStore,
     dir: &Path,
@@ -737,7 +719,7 @@ mod tests {
         let tmp = temp_dir();
         let (layout, digest) = packed(&tmp, "one", "1");
         let store = BlobStore::new(tmp.path().join("blobs"));
-        let resolved = import_layout(&store, &layout, None).unwrap();
+        let resolved = import_layout_limited(&store, &layout, None, None, &ImportLimits::default()).unwrap();
         assert_eq!(resolved.manifest_digest, digest);
         assert_eq!(
             resolved.pinned,
@@ -774,24 +756,24 @@ mod tests {
         let (b, db) = packed(&tmp, "b", "B");
         merge_layouts(&a, &b);
         let store = BlobStore::new(tmp.path().join("blobs"));
-        let err = import_layout(&store, &a, None).unwrap_err();
+        let err = import_layout_limited(&store, &a, None, None, &ImportLimits::default()).unwrap_err();
         assert!(err.to_string().contains("holds 2 images"), "{err}");
-        let resolved = import_layout(&store, &a, Some(&db)).unwrap();
+        let resolved = import_layout_limited(&store, &a, Some(&db), None, &ImportLimits::default()).unwrap();
         assert_eq!(resolved.manifest_digest, db);
         assert_eq!(Image::open(&store, &db).unwrap().manifest_digest, db);
         assert!(Image::open(&store, &da).is_err());
         let missing = sha256_digest(b"missing");
-        let err = import_layout(&store, &a, Some(&missing)).unwrap_err();
+        let err = import_layout_limited(&store, &a, Some(&missing), None, &ImportLimits::default()).unwrap_err();
         assert!(err.to_string().contains("does not list"), "{err}");
         // oci-layout:<dir>:<ref name> picks by the ref name annotation.
-        let resolved = import_layout_named(&store, &a, None, Some("a")).unwrap();
+        let resolved = import_layout_limited(&store, &a, None, Some("a"), &ImportLimits::default()).unwrap();
         assert_eq!(resolved.manifest_digest, da);
         assert!(
             resolved.pinned.ends_with(&format!("@{da}")),
             "{}",
             resolved.pinned
         );
-        let err = import_layout_named(&store, &a, None, Some("c")).unwrap_err();
+        let err = import_layout_limited(&store, &a, None, Some("c"), &ImportLimits::default()).unwrap_err();
         assert!(err.to_string().contains("no image named"), "{err}");
     }
 
@@ -811,7 +793,7 @@ mod tests {
         let mut bytes = fs::read(&path).unwrap();
         bytes.push(0);
         fs::write(&path, bytes).unwrap();
-        let err = import_layout(&store, &layout, None).unwrap_err();
+        let err = import_layout_limited(&store, &layout, None, None, &ImportLimits::default()).unwrap_err();
         assert!(matches!(err, ImageError::Invalid(_)), "{err}");
         assert!(!store.has(&Descriptor {
             media_type: String::new(),
@@ -878,7 +860,7 @@ mod tests {
         bytes.push(b'\n');
         fs::write(&path, bytes).unwrap();
         let store = BlobStore::new(tmp.path().join("blobs"));
-        let err = import_layout(&store, &layout, None).unwrap_err();
+        let err = import_layout_limited(&store, &layout, None, None, &ImportLimits::default()).unwrap_err();
         assert!(err.to_string().contains("descriptor says"), "{err}");
     }
 

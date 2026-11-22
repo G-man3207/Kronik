@@ -426,7 +426,7 @@ fn foreign_actors_end_to_end() {
     );
     assert_eq!(
         containers(RUNSC, &runsc_root, "-quiet"),
-        [kronik_foreign::Foreign::container_id("echo")]
+        [kronik_foreign::container_id("echo")]
     );
 
     // Default deny (I6): no grant, no call.
@@ -531,14 +531,14 @@ fn foreign_actors_end_to_end() {
     d.kill9();
     assert_eq!(
         containers(RUNSC, &runsc_root, "-quiet"),
-        [kronik_foreign::Foreign::container_id("echo")]
+        [kronik_foreign::container_id("echo")]
     );
     d = Daemon::start(&dir);
     assert_eq!(d.foreign("echo")["status"]["state"], "running");
     assert_eq!(d.foreign("echo")["status"]["starts"], 1);
     assert_eq!(
         containers(RUNSC, &runsc_root, "-quiet"),
-        [kronik_foreign::Foreign::container_id("echo")]
+        [kronik_foreign::container_id("echo")]
     );
     let (r, last_call) = d.fetch_lsn("GET foreign://echo/healthz");
     assert_eq!(r, "200 ok");
@@ -902,7 +902,7 @@ fn actor_names_that_prefix_each_other_keep_their_own_sandboxes() {
     let ids = |names: &[&str]| {
         let mut v: Vec<String> = names
             .iter()
-            .map(|n| kronik_foreign::Foreign::container_id(n))
+            .map(|n| kronik_foreign::container_id(n))
             .collect();
         v.sort();
         v
@@ -1261,7 +1261,7 @@ fn postgres_fork_answers_from_a_copy() {
     assert!(!netns.iter().any(|n| n.starts_with("copy-")), "{netns:?}");
     assert_eq!(
         containers(RUNSC, &runsc_root, "-quiet"),
-        [kronik_foreign::Foreign::container_id("pg")]
+        [kronik_foreign::container_id("pg")]
     );
 }
 
@@ -1293,7 +1293,7 @@ fn sandbox_status(dir: &Path, name: &str) -> String {
     let out = Command::new(RUNSC)
         .arg("--root")
         .arg(dir.join("run/runsc"))
-        .args(["state", &kronik_foreign::Foreign::container_id(name)])
+        .args(["state", &kronik_foreign::container_id(name)])
         .output()
         .unwrap();
     serde_json::from_slice::<Value>(&out.stdout)

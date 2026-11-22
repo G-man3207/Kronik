@@ -63,7 +63,8 @@ pub fn fleet_token_name(epoch: u64, request: &[u8]) -> Result<String, DecodeErro
 }
 
 /// Validate a public managed name without allocating or treating it as provenance.
-pub fn fleet_token_name_matches(name: &str, epoch: u64, request: &[u8]) -> bool {
+#[cfg(test)]
+fn fleet_token_name_matches(name: &str, epoch: u64, request: &[u8]) -> bool {
     if epoch == 0 || request.len() != 32 || name.len() > 59 {
         return false;
     }
