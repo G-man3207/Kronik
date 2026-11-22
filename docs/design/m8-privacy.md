@@ -51,27 +51,6 @@ one subject.
   revision-bound cache. `Some(0)` is actual erasure history; `None` only observes
   no local row and is not a complete-history or OriginalSourcePos proof. Missing
   storage or a revision/read failure returns an error, never fabricated absence.
-- Internal shard bootstrap can export one original wrapped subject-key version
-  and its observed erasure floor from one SQLite read snapshot. It exports
-  neither a master nor a plaintext data key and never creates a fallback key.
-  The receiver asserts the separately committed expected subject/version,
-  verifies the existing wrap/AAD under the already shared protected master,
-  and preserves an existing equivalent raw key's original envelope and times.
-  Only a separately proved, subject-bound global floor can advance local state;
-  physical shared-key deletion requires the actual GLOBAL epoch/all-required-
-  replica barrier and LOCAL hosted-shard cuts, not one shard's erasure/intent.
-  The method's floor tuple is an expectation/projection, not that proof. A
-  floor that has not been proved cannot authorize deletion, and absence is not
-  floor zero.
-  The already-admitted receiving host supplies its actual clock only to stamp
-  a newly applied local floor; unchanged/lower floors preserve their old time,
-  and the capsule's erasure time is diagnostic, not authority. Floor advancement
-  and noncovered envelope insertion share one transaction/revision; conflicts
-  and failures leave both unchanged.
-  The cluster caller owns authoritative SourcePos/epoch/barrier, current member
-  and registered install assignment, and final term/principal admission after
-  all waits/body/capacity. These primitives do not bootstrap the shared master,
-  prove a complete source cut, or grant production access while recovering.
 - `seal(subject, key, nonce, plaintext)` / `unseal(..)` handle one value:
   XChaCha20-Poly1305, associated data `"kronik sealed v1" \0 subject \0
   version`, so a sealed value can't be replayed under another subject or
