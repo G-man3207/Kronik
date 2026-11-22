@@ -1,8 +1,9 @@
 //! Names that a restore takes from a bucket. The manifest of a snapshot
 //! lists the files to download; a restore refuses one whose paths are not
 //! plain relative paths below the snapshot directory, writes nothing, and
-//! leaves the destination as it was. The tests edit a `file://` bucket to
-//! break each part of that rule.
+//! leaves the destination as it was. It refuses the same way a file whose
+//! content is not what the manifest says. The tests edit a `file://` bucket
+//! to break each part of these rules.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
@@ -462,6 +463,40 @@ fn a_refused_restore_leaves_existing_state_as_it_was(flow: Flow) {
     assert_eq!(tree(area.path()), before);
 }
 
+/// A snapshot file whose content is not what the manifest says (a bit-rotted
+/// or hostile bucket) is refused, whichever file it is, and the forced
+/// restore leaves the node already in the data directory as it was.
+fn a_snapshot_file_that_does_not_match_the_manifest_is_refused(flow: Flow) {
+    let shipped = shipped(flow);
+    let (area, data) = shipped.destination();
+    shipped.restore(&shipped.copy(), &data, false).unwrap();
+    let before = tree(area.path());
+    assert!(shipped.manifest.files.len() > 1, "{:?}", shipped.manifest);
+    for file in &shipped.manifest.files {
+        let bucket = shipped.copy();
+        let object = format!("{}/{}.zst", shipped.base, file.path);
+        let packed = shipped.rt.block_on(bucket.remote.get(&object)).unwrap();
+        let mut content = zstd::stream::decode_all(packed.as_slice()).unwrap();
+        // One bit, then compressed again: the object still decompresses, so
+        // only the comparison with the manifest can refuse it.
+        let middle = content.len() / 2;
+        content[middle] ^= 1;
+        let packed = zstd::stream::encode_all(content.as_slice(), 3).unwrap();
+        shipped
+            .rt
+            .block_on(bucket.remote.put(&object, packed))
+            .unwrap();
+
+        let error = refusal(shipped.restore(&bucket, &data, true), &file.path);
+        assert!(
+            error.contains(&format!("{} does not match the manifest", file.path)),
+            "{}: {error}",
+            file.path
+        );
+        assert_eq!(tree(area.path()), before, "{}: the area changed", file.path);
+    }
+}
+
 fn the_files_a_node_writes_are_restored(flow: Flow) {
     let shipped = shipped(flow);
     let (_area, data) = shipped.destination();
@@ -830,6 +865,7 @@ macro_rules! in_both_flows {
 in_both_flows!(
     a_manifest_with_unsound_paths_is_refused_and_nothing_is_written,
     a_refused_restore_leaves_existing_state_as_it_was,
+    a_snapshot_file_that_does_not_match_the_manifest_is_refused,
     the_files_a_node_writes_are_restored,
     a_code_object_that_is_not_a_component_named_by_its_hash_is_refused,
     a_restore_installs_the_components_and_no_precompiled_artifact,
