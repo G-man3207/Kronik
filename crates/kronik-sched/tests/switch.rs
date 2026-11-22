@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
-use kronik_core::ids::{ActorRef, Lsn};
+use kronik_core::ids::{ActorRef, CodeHash, Lsn};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Born, CodeSwitch, Node, NodeConfig, SwitchHold, start_local};
@@ -793,4 +793,20 @@ fn a_crash_between_the_switch_record_and_state_db_repeats_the_switch() {
     );
     assert_eq!(node.epoch(), switched.0);
     assert_eq!(node.store().state_hash().unwrap(), hash);
+}
+
+/// A switch sweeps the node's code cache (issue #274): the code it
+/// replaced is no longer resident, and the hash a rerun of an old turn
+/// asks for reloads from the code directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_switch_sweeps_the_code_cache_and_old_code_reloads_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, hold) = node(dir.path()).await;
+    let old = CodeHash::from_slice(&deployed_hash(&node)).unwrap();
+    promote_now(&node, &hold, "counter-step2").await;
+
+    assert_ne!(CodeHash::from_slice(&deployed_hash(&node)).unwrap(), old);
+    // `get` is what a rerun of an old turn does; the old code now comes
+    // from disk instead of the cache.
+    node.code().get(&old).unwrap();
 }

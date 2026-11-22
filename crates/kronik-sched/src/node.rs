@@ -2051,6 +2051,7 @@ impl Node {
         installs: Vec<(pb::KindVersion, Arc<Program>, CodeHash)>,
         epoch: u64,
     ) {
+        let live: Vec<CodeHash>;
         {
             let mut kinds = lock(&self.kinds);
             for (version, program, hash) in installs {
@@ -2064,7 +2065,11 @@ impl Node {
                     }),
                 );
             }
+            live = kinds.values().map(|k| k.hash).collect();
         }
+        // The code this switch replaced stays on disk; dropping its cache
+        // entries bounds the code cache to the live kinds (issue #274).
+        self.code.sweep(&live);
         self.publish_secret_config_epoch(|| self.epoch.store(epoch, Ordering::Release));
     }
 
