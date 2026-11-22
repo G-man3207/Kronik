@@ -13,7 +13,7 @@ import tempfile
 import time
 import unittest
 
-SCRIPT = Path(__file__).with_name("build-microvm-tools.sh").resolve()
+SCRIPT = Path(__file__).resolve().parent.parent / "build-microvm-tools.sh"
 REPO = SCRIPT.parent.parent
 
 # Debugger instrumentation enters the real CLI's original run(), before its

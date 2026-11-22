@@ -117,6 +117,10 @@ tests in `scripts/tests`. These are semantic checks of parsers, provenance,
 tampering and regression enforcement, not real benchmark results or
 between-release performance acceptance. The gate-watcher tests use canned
 upstream inputs and make no request.
+It also runs the regressions of the microVM tool builder
+(`scripts/tests/test_build_microvm_tools.py`), which run
+`scripts/build-microvm-tools.sh` for its argument checks and for its
+cancellation of the processes it owns, without fetching or building anything.
 The `examples` step tests the dependency-free standalone `tools/loadgen`.
 The `ts` step reuses its already-built binary for the CLI/API/WIT/error
 documentation-surface gate and the frozen published log and genuine tagged
