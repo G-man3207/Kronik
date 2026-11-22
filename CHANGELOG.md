@@ -5,6 +5,12 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- The node's in-memory code cache no longer grows with every deploy:
+  when a switch installs new code, it drops the cached programs and
+  bytes of every code hash that is no longer live, and a rerun or a
+  fork replay that needs switched-away code reloads it from the code
+  directory. Dry-run code — a proposal that was only checked, never
+  deployed — exists only in memory and stays cached, as before (#274).
 - An `http:` capability names only a host, and the fetch gate now refuses
   what a host-only grant cannot cover beyond loopback: a URL with an
   explicit port is denied `HTTP_PORT_REFUSED`, and a secret header on a

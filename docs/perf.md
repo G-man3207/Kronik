@@ -222,6 +222,17 @@ little stays resident. The TypeScript counter's turns are slower (458 and
 more. The worst case fits a 4 GB VPS; `docs/guides/operations.md` has it
 for operators.
 
+The code store's in-memory caches are a smaller term of the same kind:
+until v0.6.0 every deploy kept the component bytes and the compiled
+program resident for the process's lifetime, so a deploy-heavy node
+with multi-MB TypeScript components lost headroom until restart. A
+switch that installs new code now drops the cache entries of every hash
+that is not live, bounding the caches to the live kinds; a rerun or a
+fork replay that needs switched-away code reloads it from the code
+directory (`crates/kronik-runtime/src/engine.rs`, #274). Dry-run code —
+a proposal that was only checked, never deployed — exists only in
+memory and stays cached.
+
 
 
 ## Startup after a crash (M6)

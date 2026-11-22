@@ -248,6 +248,20 @@ impl CodeStore {
         Ok(bytes)
     }
 
+    /// Drops the cached program and bytes of every hash that is not in
+    /// `live` and is durably in the code directory: such a hash reloads
+    /// from disk on the next `get`, so dropping it only costs a re-read.
+    /// Dry-run code (`check`) exists only in memory and stays cached, as
+    /// does everything in a store without a directory. A switch calls
+    /// this once its code is installed, so the caches stay bounded by
+    /// the live kinds instead of the deploy history (issue #274).
+    pub fn sweep(&self, live: &[CodeHash]) {
+        let droppable =
+            |h: &CodeHash| !live.contains(h) && self.wasm_path(h).is_some_and(|p| p.exists());
+        lock(&self.programs).retain(|h, _| !droppable(h));
+        lock(&self.bytes).retain(|h, _| !droppable(h));
+    }
+
     fn load_bytes(&self, hash: CodeHash, bytes: &[u8]) -> Result<Arc<Program>, CodeError> {
         if let Some(p) = lock(&self.programs).get(&hash) {
             return Ok(p.clone());
@@ -319,6 +333,81 @@ mod tests {
             Some(dir.to_path_buf()),
         )
         .unwrap()
+    }
+
+    /// `base` plus a custom section holding `i`: a distinct valid component.
+    fn variant(base: &[u8], i: u32) -> Vec<u8> {
+        let name = b"kronik-test";
+        let payload = i.to_le_bytes();
+        let mut out = base.to_vec();
+        out.push(0x00); // custom section: id, size, name, payload
+        out.push((name.len() + 1 + payload.len()) as u8);
+        out.push(name.len() as u8);
+        out.extend_from_slice(name);
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    #[test]
+    fn sweep_drops_persisted_code_and_reloads_it_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = store(dir.path());
+        let (hash, _) = code.add(COUNTER).unwrap();
+
+        code.sweep(&[]);
+        assert!(
+            !lock(&code.programs).contains_key(&hash) && !lock(&code.bytes).contains_key(&hash),
+            "switched-away code leaves the cache"
+        );
+
+        // It is still on disk: a rerun of an old turn reloads it.
+        code.get(&hash).unwrap();
+        assert!(lock(&code.programs).contains_key(&hash));
+    }
+
+    #[test]
+    fn sweep_keeps_live_and_dry_run_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = store(dir.path());
+        let (deployed, _) = code.add(COUNTER).unwrap();
+        // A dry run's code exists only in memory; the sweep must keep it.
+        let (dry, _) = code.check(&variant(COUNTER, 7)).unwrap();
+
+        code.sweep(&[deployed]);
+        assert!(lock(&code.programs).contains_key(&deployed));
+        assert!(
+            lock(&code.programs).contains_key(&dry) && lock(&code.bytes).contains_key(&dry),
+            "dry-run code is not on disk, so it stays cached"
+        );
+    }
+
+    #[test]
+    fn sweep_keeps_everything_without_a_directory() {
+        let code =
+            CodeStore::new(build_engine(PoolSize { concurrency: 1 }).unwrap(), None).unwrap();
+        let (hash, _) = code.add(COUNTER).unwrap();
+        code.sweep(&[]);
+        assert!(
+            lock(&code.programs).contains_key(&hash) && lock(&code.bytes).contains_key(&hash),
+            "an in-memory store has no disk to reload from"
+        );
+    }
+
+    /// The acceptance soak of issue #274, sized for CI: after any number of
+    /// deploys, the cache holds the live code, not the deploy history.
+    #[test]
+    fn the_cache_stays_bounded_across_deploys() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = store(dir.path());
+        let mut hash = None;
+        for i in 0..8u32 {
+            hash = Some(code.add(&variant(COUNTER, i)).unwrap().0);
+            // Each deploy switches the kind away from the previous code.
+            code.sweep(&[hash.unwrap()]);
+        }
+        assert_eq!(lock(&code.programs).len(), 1);
+        assert_eq!(lock(&code.bytes).len(), 1);
+        assert!(lock(&code.programs).contains_key(&hash.unwrap()));
     }
 
     fn names(dir: &std::path::Path) -> Vec<String> {
