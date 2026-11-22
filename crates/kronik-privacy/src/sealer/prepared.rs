@@ -20,8 +20,24 @@ impl Sealer {
         let ks = self.keystore.as_ref().ok_or_else(|| {
             PrivacyError::Decrypt("source key preparation needs a keystore".into())
         })?;
-        let key =
-            self.load_sealing_key(ks, subject, fill, wall_ms, Some(expected_erasure_floor))?;
+        let mut fresh = Zeroizing::new([0u8; 32]);
+        let mut nonce = [0u8; 24];
+        fill(&mut fresh[..]);
+        fill(&mut nonce);
+        let (revision, key) = match ks.plain_source_key_at_revision(
+            subject,
+            expected_erasure_floor,
+            *fresh,
+            nonce,
+            wall_ms,
+        ) {
+            Ok(found) => found,
+            Err(error) => {
+                lock(&self.cache).clear();
+                return Err(error);
+            }
+        };
+        self.cache_put(subject, &key, revision, true);
         PreparedSubjectKey::new(ks, subject, key, expected_erasure_floor)
     }
 

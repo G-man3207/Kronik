@@ -199,13 +199,13 @@ fn fixed_keystore_metadata(path: &Path) -> [(u64, SystemTime); 2] {
     })
 }
 
-fn sealed_at(sealer: &Sealer, version: u32, bytes: &[u8], nonce: u8) -> pb::Sealable {
+fn sealed_newest(sealer: &Sealer, bytes: &[u8], nonce: u8, wall: u64) -> pb::Sealable {
     let mut value = pb::Sealable {
         subject: Some("user:revision".into()),
         value: Some(pb::sealable::Value::Plain(bytes.to_vec())),
     };
     sealer
-        .seal_value_at(&mut value, version, &|bytes| bytes.fill(nonce))
+        .seal_value(&mut value, &|out| out.fill(nonce), wall)
         .unwrap();
     value
 }
@@ -235,7 +235,8 @@ fn semantic_revisions_ship_rotate_erase_and_import_with_identical_file_and_wal_m
     store
         .key_for_sealing("user:revision", [11; 32], [12; 24], 1)
         .unwrap();
-    let original = sealed_at(node.sealer(), 1, b"original-subject-value", 13);
+    node.sealer().set_on(true);
+    let original = sealed_newest(node.sealer(), b"original-subject-value", 13, 2);
     let metadata = settled_keystore_metadata(&store, &master);
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     let wall = 1_700_000_000_000;
@@ -282,7 +283,7 @@ fn semantic_revisions_ship_rotate_erase_and_import_with_identical_file_and_wal_m
     writer
         .rotate("user:revision", [16; 32], [17; 24], 2)
         .unwrap();
-    let current = sealed_at(node.sealer(), 2, b"current-subject-value", 18);
+    let current = sealed_newest(node.sealer(), b"current-subject-value", 18, 3);
     assert_eq!(settled_keystore_metadata(&store, &master), metadata);
     assert_eq!(ship(&mut state, wall + 60_000, 19).unwrap().objects, 1);
     writer.erase_through("user:revision", 1, 3).unwrap();

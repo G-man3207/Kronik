@@ -13,9 +13,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[path = "revision_tests/erasure_floor.rs"]
 mod erasure_floor_tests;
 
-#[path = "revision_tests/plain_source_floor.rs"]
-mod plain_source_floor_tests;
-
 #[path = "revision_tests/wrapped_floor_clock.rs"]
 mod wrapped_floor_clock_tests;
 
@@ -441,49 +438,6 @@ fn even_an_empty_backup_install_advances_the_persistent_revision_and_checkpoints
 }
 
 #[test]
-fn fixed_version_snapshot_sealing_never_promotes_v1_to_v2_or_resurrects_an_erased_key() {
-    let pair = Pair::new();
-    warm(&pair);
-    pair.second.rotate("user:1", [81; 32], [82; 24], 2).unwrap();
-    pair.a.set_on(false);
-    let mut v1 = plain(b"original v1 snapshot row");
-    pair.a
-        .seal_value_at(&mut v1, 1, &|bytes| pair.fill(bytes))
-        .unwrap();
-    assert_eq!(version(&v1), 1);
-    assert_eq!(
-        pair.b.open(&v1).bytes(),
-        Some(b"original v1 snapshot row".as_slice())
-    );
-    let mut v2 = plain(b"original v2 snapshot row");
-    pair.a
-        .seal_value_at(&mut v2, 2, &|bytes| pair.fill(bytes))
-        .unwrap();
-    assert_eq!(version(&v2), 2);
-    pair.second.erase_through("user:1", 1, 3).unwrap();
-    assert!(matches!(pair.a.open(&v1), Opened::Erased { .. }));
-    assert!(matches!(pair.b.open(&v1), Opened::Erased { .. }));
-    assert_eq!(
-        pair.b.open(&v2).bytes(),
-        Some(b"original v2 snapshot row".as_slice())
-    );
-    let before = pair.first.stats().unwrap();
-    for missing in [0, 1, 99] {
-        let mut value = plain(b"must not be promoted");
-        let original = value.clone();
-        assert!(
-            pair.a
-                .seal_value_at(&mut value, missing, &|_| panic!(
-                    "missing key must not request randomness"
-                ))
-                .is_err()
-        );
-        assert_eq!(value, original);
-    }
-    assert_eq!(pair.first.stats().unwrap(), before);
-}
-
-#[test]
 fn maximum_subject_key_is_usable_but_rotation_never_wraps_or_creates_a_key() {
     let pair = Pair::new();
     {
@@ -522,7 +476,7 @@ fn maximum_subject_key_is_usable_but_rotation_never_wraps_or_creates_a_key() {
 }
 
 #[test]
-fn maximum_erased_floor_refuses_plain_source_creation_and_rotation_without_mutating_rows() {
+fn maximum_erased_floor_refuses_key_creation_and_rotation_without_mutating_rows() {
     let pair = Pair::new();
     pair.second.erase_through("user:1", u32::MAX, 1).unwrap();
     let before = pair.first.stats().unwrap();
@@ -545,13 +499,6 @@ fn maximum_erased_floor_refuses_plain_source_creation_and_rotation_without_mutat
             .is_err()
     );
     assert_eq!(value, original);
-    assert!(
-        pair.a
-            .seal_plain_source(&mut value, Some(u32::MAX), &|bytes| pair.fill(bytes), 4)
-            .is_err()
-    );
-    assert_eq!(value, original);
-    assert!(pair.a.require_key_version("user:1", u32::MAX).is_err());
     assert_eq!(pair.first.stats().unwrap(), before);
     assert_eq!(pair.first.revision().unwrap(), revision);
     assert_eq!(pair.first.stats().unwrap().keys, 0);
@@ -581,155 +528,6 @@ fn invalid_stored_subject_key_versions_fail_closed_before_creating_or_deleting_r
         assert!(pair.first.export_backup([117; 24]).is_err());
         assert_eq!(pair.first.stats().unwrap(), before);
         assert_eq!(pair.first.revision().unwrap(), revision);
-    }
-}
-
-#[test]
-fn original_key_admission_is_noncreating_and_does_not_select_a_historical_key_as_newest() {
-    let pair = Pair::new();
-    let before = pair.first.stats().unwrap();
-    let revision = pair.first.revision().unwrap();
-    for missing in [0, 1, u32::MAX] {
-        assert!(pair.a.require_key_version("user:1", missing).is_err());
-    }
-    assert_eq!(pair.first.stats().unwrap(), before);
-    assert_eq!(pair.first.revision().unwrap(), revision);
-    warm(&pair);
-    pair.second
-        .rotate("user:1", [121; 32], [122; 24], 2)
-        .unwrap();
-    let before = pair.first.stats().unwrap();
-    let revision = pair.first.revision().unwrap();
-    pair.a.require_key_version("user:1", 1).unwrap();
-    assert!(pair.a.require_key_version("user:1", 99).is_err());
-    assert_eq!(pair.first.stats().unwrap(), before);
-    assert_eq!(pair.first.revision().unwrap(), revision);
-    assert_eq!(version(&pair.seal(&pair.a, b"must use v2")), 2);
-    pair.a.require_key_version("user:1", 1).unwrap();
-    assert_eq!(version(&pair.seal(&pair.a, b"still uses v2")), 2);
-    pair.second.erase_through("user:1", 1, 3).unwrap();
-    assert!(pair.a.require_key_version("user:1", 1).is_err());
-    pair.a.require_key_version("user:1", 2).unwrap();
-}
-
-#[test]
-fn never_erased_plain_source_receipt_rejects_history_even_with_a_newer_active_key() {
-    let pair = Pair::new();
-    pair.a.set_on(false);
-    let mut initial = plain(b"proved initial source");
-    pair.a
-        .seal_plain_source(&mut initial, None, &|bytes| pair.fill(bytes), 1)
-        .unwrap();
-    assert_eq!(version(&initial), 1);
-    assert_eq!(
-        pair.b.open(&initial).bytes(),
-        Some(b"proved initial source".as_slice())
-    );
-    assert!(
-        pair.a
-            .seal_plain_source(
-                &mut initial,
-                None,
-                &|_| panic!("sealed input must not request randomness"),
-                1
-            )
-            .is_err()
-    );
-    pair.second
-        .rotate("user:1", [131; 32], [132; 24], 2)
-        .unwrap();
-    let mut current = plain(b"proved source before any erasure");
-    pair.a
-        .seal_plain_source(&mut current, None, &|bytes| pair.fill(bytes), 2)
-        .unwrap();
-    assert_eq!(version(&current), 2);
-    let mut stale = plain(b"must not promote stale plaintext to v2");
-    pair.second.erase_through("user:1", 1, 3).unwrap();
-    let before = pair.first.stats().unwrap();
-    let revision = pair.first.revision().unwrap();
-    let original = stale.clone();
-    assert!(
-        pair.a
-            .seal_plain_source(&mut stale, None, &|bytes| pair.fill(bytes), 4)
-            .is_err()
-    );
-    assert_eq!(stale, original);
-    assert_eq!(pair.first.stats().unwrap(), before);
-    assert_eq!(pair.first.revision().unwrap(), revision);
-    pair.a.set_on(true);
-    assert_eq!(
-        version(&pair.seal(&pair.a, b"legitimate live use of v2")),
-        2
-    );
-    let mut empty = plain(b"erasing an unknown subject still fences old plaintext");
-    empty.subject = Some("user:empty".into());
-    assert_eq!(pair.second.erase("user:empty", 5).unwrap(), 0);
-    let before = pair.first.stats().unwrap();
-    let revision = pair.first.revision().unwrap();
-    let original = empty.clone();
-    assert!(
-        pair.a
-            .seal_plain_source(&mut empty, None, &|bytes| pair.fill(bytes), 6)
-            .is_err()
-    );
-    assert_eq!(empty, original);
-    assert_eq!(pair.first.stats().unwrap(), before);
-    assert_eq!(pair.first.revision().unwrap(), revision);
-}
-
-#[test]
-fn concurrent_erasure_after_plain_source_selection_never_mints_a_post_erasure_key() {
-    for existing in [false, true] {
-        let pair = Pair::new();
-        if existing {
-            warm(&pair);
-        }
-        let before = pair.first.revision().unwrap();
-        let erased = Arc::new(AtomicBool::new(false));
-        let observed = erased.clone();
-        let writer = pair.second.clone();
-        pair.first
-            .conn()
-            .authorizer(Some(move |context: AuthContext<'_>| {
-                if matches!(
-                    context.action,
-                    AuthAction::Read {
-                        table_name: "subject_keys",
-                        ..
-                    }
-                ) && !observed.swap(true, Ordering::SeqCst)
-                {
-                    writer
-                        .erase_through("user:1", if existing { 1 } else { 0 }, 2)
-                        .unwrap();
-                }
-                Authorization::Allow
-            }))
-            .unwrap();
-        let mut value = plain(b"source selected before concurrent erase");
-        let original = value.clone();
-        let result = pair
-            .a
-            .seal_plain_source(&mut value, None, &|bytes| pair.fill(bytes), 3);
-        pair.first
-            .conn()
-            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
-            .unwrap();
-        assert!(erased.load(Ordering::SeqCst));
-        if existing {
-            result.unwrap();
-            assert_eq!(version(&value), 1);
-            assert!(matches!(pair.b.open(&value), Opened::Erased { .. }));
-        } else {
-            assert!(result.is_err());
-            assert_eq!(value, original);
-        }
-        assert_eq!(pair.first.stats().unwrap().keys, 0);
-        assert_eq!(pair.first.stats().unwrap().erased, 1);
-        assert_eq!(
-            pair.first.revision().unwrap(),
-            before + if existing { 2 } else { 1 }
-        );
     }
 }
 

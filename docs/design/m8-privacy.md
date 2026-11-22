@@ -47,38 +47,10 @@ one subject.
   requires reopening it; arbitrary raw in-place writes outside SQLite are not a
   supported concurrent update path. These revisions are housekeeping metadata:
   `KRKSTOR1` backups and master-keyed audit identity remain unchanged.
-- `Sealer::seal_value_at(value, version, fill)` protects a tagged plaintext
-  snapshot value under its required positive original subject-key version,
-  independently of the current mode. It refuses missing or erased versions and
-  never creates a key or promotes a value to a newer version; callers must first
-  validate the original row's source and erasure provenance.
-  `require_key_version(subject, version)` is the noncreating read-only admission
-  check: snapshot callers must check every original positive reference across
-  all actors before minting any first-protection key.
-- `Sealer::key_availability(subject, version)` reports `Found`, `Missing`, or
-  `Erased` for an exact positive original reference through the same opening
-  cache and revision/floor checks. It exposes no key material, creates no key,
-  and never selects the newest version. Database and wrapped-key MAC failures
-  remain errors. `Found` still requires payload/source/schema authentication;
-  a missing outer key leaves nested references unknown, not proved complete.
 - `Sealer::erasure_floor(subject)` is a noncreating point read through the same
   revision-bound cache. `Some(0)` is actual erasure history; `None` only observes
   no local row and is not a complete-history or OriginalSourcePos proof. Missing
   storage or a revision/read failure returns an error, never fabricated absence.
-  Generic historical plaintext after any erasure needs the caller's actual
-  source-position/floor proof or remains incomplete; a current A2 key is not
-  that proof. `seal_plain_source` compares the proved floor expectation
-  atomically with key selection at protection.
-- `Sealer::seal_plain_source(value, expected_erasure_floor, fill, wall)`
-  protects plaintext only after its caller verifies the current ready proof:
-  matching erasure receipt and namespace, source/materialized coverage, and no
-  old plaintext across cells, schema and sequence data. The required argument
-  is an expectation, not that proof: `None` means proved never-erased;
-  `Some(0)` is a real receipt. A mismatch fails before any key creation or
-  plaintext replacement. It bypasses newest-cache selection, and original
-  sealed versions still use `seal_value_at(original_version)`, never promotion.
-  Ordinary privacy-off handling does not mint a key. Missing source proof
-  leaves the operation incomplete while preserving keys and data.
 - Internal shard bootstrap can export one original wrapped subject-key version
   and its observed erasure floor from one SQLite read snapshot. It exports
   neither a master nor a plaintext data key and never creates a fallback key.
