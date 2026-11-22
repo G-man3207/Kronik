@@ -274,11 +274,6 @@ impl Disk {
             .is_some_and(|i| !i.pending.is_empty())
     }
 
-    /// Whether `path` is a name the disk has, durable or not.
-    pub fn is_named(&self, path: &Path) -> bool {
-        self.names.contains_key(path)
-    }
-
     /// The bytes of `path`'s file that are synced, whether its name is
     /// durable or not; 0 when there is no such name.
     pub fn synced_len(&self, path: &Path) -> usize {
@@ -854,11 +849,6 @@ impl File for SimFile {
 }
 
 impl Disk {
-    /// Lock helper for code outside the simulator's tasks (invariant checks).
-    pub fn snapshot_durable(disk: &Mutex<Disk>, path: &Path) -> Option<Vec<u8>> {
-        lock(disk).durable_contents(path)
-    }
-
     pub fn durable_suffix_of(
         disk: &Mutex<Disk>,
         path: &Path,

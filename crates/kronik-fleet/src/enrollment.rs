@@ -487,19 +487,8 @@ impl PreparedEnrollment {
     pub fn command_hash(&self) -> [u8; 32] {
         self.draft.command_hash
     }
-
     pub async fn dispatch(self) -> Result<HttpResponse, FleetError> {
-        self.dispatch_with_hold(()).await
-    }
-
-    /// `hold` retains a transport resource, never supplies or replaces authority.
-    /// The bounded control response is collected through actual network EOF.
-    pub async fn dispatch_with_hold<H: Send + 'static>(
-        self,
-        hold: H,
-    ) -> Result<HttpResponse, FleetError> {
-        self.dispatch_with_admission(move || std::future::ready(Ok(hold)))
-            .await
+        self.dispatch_with_admission(|| std::future::ready(Ok(()))).await
     }
 
     /// The complete original command is owned by its bounded job before this

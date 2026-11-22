@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use hmac::{KeyInit as _, Mac as _};
 use kronik_core::authority::AuthLease;
 use kronik_core::env::{BoxFuture, Env};
 use kronik_core::error::{ApiError, ErrorCode};
@@ -440,25 +439,6 @@ pub fn signing_input(timestamp_ms: u64, event_id: &str, body: &[u8]) -> Result<V
     let mut input = format!("kronik.webhook/v1\n{timestamp_ms}\n{event_id}\n").into_bytes();
     input.extend_from_slice(body);
     Ok(input)
-}
-
-pub fn signature(
-    key: &[u8],
-    timestamp_ms: u64,
-    event_id: &str,
-    body: &[u8],
-) -> Result<String, String> {
-    if key.is_empty() {
-        return Err("webhook_signature".into());
-    }
-    let input = signing_input(timestamp_ms, event_id, body)?;
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key)
-        .map_err(|_| "webhook_signature".to_owned())?;
-    mac.update(&input);
-    Ok(format!(
-        "{SIGNATURE_VERSION}={}",
-        hex(&mac.finalize().into_bytes())
-    ))
 }
 
 async fn advance_cursor(

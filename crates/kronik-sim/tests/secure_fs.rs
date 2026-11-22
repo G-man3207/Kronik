@@ -42,7 +42,7 @@ fn secure_files_are_private_bounded_durable_and_exclusive_across_crashes() {
                     fs.write_secure_new(path.clone(), Bytes::from_static(b"first"))
                         .await
                         .unwrap();
-                    assert_eq!(Disk::snapshot_durable(&disk, &path).unwrap(), b"first");
+                    assert_eq!(disk.lock().unwrap().durable_contents(&path).unwrap(), b"first");
                     assert_eq!(fs.read_secure(path.clone(), 5).await.unwrap(), b"first");
                     assert_eq!(
                         fs.read_secure(path.clone(), 4).await.unwrap_err().kind(),
@@ -71,8 +71,8 @@ fn secure_files_are_private_bounded_durable_and_exclusive_across_crashes() {
                     fs.write_secure(path.clone(), b"second".to_vec())
                         .await
                         .unwrap();
-                    assert_eq!(Disk::snapshot_durable(&disk, &path).unwrap(), b"second");
-                    assert_eq!(Disk::snapshot_durable(&disk, &stale).unwrap(), b"leftover");
+                    assert_eq!(disk.lock().unwrap().durable_contents(&path).unwrap(), b"second");
+                    assert_eq!(disk.lock().unwrap().durable_contents(&stale).unwrap(), b"leftover");
                     disk.lock()
                         .unwrap()
                         .crash(model, &SimRng::new(seed, b"secure-crash"));
@@ -176,7 +176,7 @@ fn secure_files_are_private_bounded_durable_and_exclusive_across_crashes() {
                         restarted.read_secure(race.clone(), 3).await.unwrap(),
                         expected
                     );
-                    assert_eq!(Disk::snapshot_durable(&disk, &race).unwrap(), expected);
+                    assert_eq!(disk.lock().unwrap().durable_contents(&race).unwrap(), expected);
                     done.store(true, Ordering::SeqCst);
                 }),
             );
@@ -238,7 +238,7 @@ fn secure_write_fsync_failure_preserves_the_previous_durable_credential() {
                         io::ErrorKind::Other
                     );
                     assert_eq!(fs.read_secure(path.clone(), 3).await.unwrap(), b"old");
-                    assert_eq!(Disk::snapshot_durable(&disk, &path).unwrap(), b"old");
+                    assert_eq!(disk.lock().unwrap().durable_contents(&path).unwrap(), b"old");
                     disk.lock()
                         .unwrap()
                         .crash(model, &SimRng::new(seed, b"secure-eio-crash"));
@@ -267,7 +267,7 @@ fn secure_write_fsync_failure_preserves_the_previous_durable_credential() {
                         .write_secure(path.clone(), b"next".to_vec())
                         .await
                         .unwrap();
-                    assert_eq!(Disk::snapshot_durable(&disk, &path).unwrap(), b"next");
+                    assert_eq!(disk.lock().unwrap().durable_contents(&path).unwrap(), b"next");
                     done.store(true, Ordering::SeqCst);
                 }),
             );

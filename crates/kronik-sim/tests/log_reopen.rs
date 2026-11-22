@@ -172,7 +172,7 @@ impl Sim {
         let first = segment(1);
         let end = self.exec.run(50_000_000, || {
             let d = disk.lock().unwrap();
-            d.is_named(&first)
+            d.exists(&first)
                 && d.synced_len(&first) > 0
                 && !d.has_unsynced(&first)
                 && !d.is_durably_named(&first)
