@@ -41,6 +41,32 @@ fn sqlite_busy(error: rusqlite::Error) {
         if matches!(error.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)));
 }
 
+// A second store under the fixture's master wraps a key the fixture store can
+// unwrap; the envelope itself is only reachable by reading the row, as a shard
+// bootstrap would.
+fn foreign_wrapped(fresh: [u8; 32], nonce: [u8; 24]) -> (SubjectKey, WrappedSubjectKey) {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = crate::key_source::lock_data(dir.path()).unwrap();
+    let master = MasterKey::from_bytes([41; 32]).unwrap();
+    let foreign = Keystore::open_owned(&owner, &master).unwrap();
+    let key = foreign.key_for_sealing(SUBJECT, fresh, nonce, 30).unwrap();
+    let envelope = Connection::open(dir.path().join("keys/keystore.db"))
+        .unwrap()
+        .query_row(
+            "SELECT nonce, wrapped, created_wall_ms FROM subject_keys WHERE subject = ?1 AND version = 1",
+            [SUBJECT],
+            |row| {
+                Ok(WrappedSubjectKey {
+                    nonce: row.get(0)?,
+                    wrapped: row.get(1)?,
+                    created_wall_ms: row_wall_ms(row, 2)?,
+                })
+            },
+        )
+        .unwrap();
+    (key, envelope)
+}
+
 #[test]
 fn fixed_holder_seals_the_prepared_key_off_and_on_after_rotation() {
     for on in [false, true] {
@@ -120,16 +146,7 @@ fn valid_same_version_replacement_cannot_retarget_the_actual_prepared_key() {
     let (ks, sealer) = fixture(dir.path());
     let prepared = prepare(&sealer, None);
     let actual = prepared.envelope.clone();
-    let master = MasterKey::from_bytes([41; 32]).unwrap();
-    let foreign = Keystore::open_memory(&master).unwrap();
-    let replacement_key = foreign
-        .key_for_sealing(SUBJECT, [19; 32], [19; 24], 30)
-        .unwrap();
-    let replacement = foreign
-        .export_wrapped_version(SUBJECT, 1)
-        .unwrap()
-        .key
-        .unwrap();
+    let (replacement_key, replacement) = foreign_wrapped([19; 32], [19; 24]);
     let other = Connection::open(&path).unwrap();
     replace(&other, &replacement);
     let installed = found(ks.key(SUBJECT, 1).unwrap());
@@ -173,16 +190,7 @@ fn even_a_valid_same_key_rewrap_changes_the_prepared_envelope() {
     let path = dir.path().join("keys/keystore.db");
     let (ks, sealer) = fixture(dir.path());
     let prepared = prepare(&sealer, None);
-    let master = MasterKey::from_bytes([41; 32]).unwrap();
-    let foreign = Keystore::open_memory(&master).unwrap();
-    foreign
-        .key_for_sealing(SUBJECT, *prepared.key.key, [29; 24], 30)
-        .unwrap();
-    let rewrapped = foreign
-        .export_wrapped_version(SUBJECT, 1)
-        .unwrap()
-        .key
-        .unwrap();
+    let rewrapped = foreign_wrapped(*prepared.key.key, [29; 24]).1;
     assert_ne!(rewrapped, prepared.envelope);
     replace(&Connection::open(&path).unwrap(), &rewrapped);
     assert_eq!(*found(ks.key(SUBJECT, 1).unwrap()).key, *prepared.key.key);
@@ -243,8 +251,8 @@ fn another_arc_of_the_same_physical_store_cannot_substitute_for_the_original() {
     let other = ks.reopen_owned().unwrap();
     let other_sealer = Sealer::new(other.clone());
     assert_eq!(
-        other.export_wrapped_version(SUBJECT, 1).unwrap(),
-        ks.export_wrapped_version(SUBJECT, 1).unwrap()
+        *found(other.key(SUBJECT, 1).unwrap()).key,
+        *found(ks.key(SUBJECT, 1).unwrap()).key
     );
     assert!(other.with_current_prepared(&prepared, || ()).is_err());
     assert!(
