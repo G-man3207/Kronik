@@ -4,6 +4,8 @@ Postgres behind a small HTTP/1.1 shim: the foreign actor of Kronik's M14
 fork tests (`fork_mode = "sandbox"`, docs/design/m14-foreign-forks.md). The
 shim is a standalone Cargo project (std only, no dependencies), not part of
 the `examples/` workspace.
+Its HTTP server is `foreign-echo`'s `src/http.rs`, included with `#[path]`:
+the shim has no copy of its own and needs `examples/foreign-echo` next to it.
 
 ```text
 foreign-pg [--listen ADDR]     default: 0.0.0.0:8080

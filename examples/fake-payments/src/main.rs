@@ -15,8 +15,12 @@
 //! With `PAYMENTS_API_KEY` set, every `/v1/*` request needs
 //! `Authorization: Bearer <key>`.
 
+// foreign-echo's server and hash, of which the service uses a part.
+#[allow(dead_code)]
+#[path = "../../foreign-echo/src/http.rs"]
 mod http;
 mod json;
+#[path = "../../foreign-echo/src/sha256.rs"]
 mod sha256;
 
 use std::collections::BTreeMap;

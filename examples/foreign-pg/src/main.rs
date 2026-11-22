@@ -13,8 +13,9 @@
 //!
 //! One thread per connection, keep-alive with `Content-Length` bodies.
 
-// Shared with foreign-echo, which uses all of it.
+// foreign-echo's server, of which the shim uses a part.
 #[allow(dead_code)]
+#[path = "../../foreign-echo/src/http.rs"]
 mod http;
 
 use std::io::{BufReader, Read, Write};

@@ -5,6 +5,10 @@
 //! Every limit is checked before memory is allocated for it, so a hostile
 //! client cannot make the server allocate more than [`MAX_HEAD`] plus the
 //! caller's body limit per connection.
+//!
+//! The foreign-actor examples share this file: `foreign-pg`, `fake-payments`
+//! and `foreign-probe` include it with `#[path]`, so a change here reaches
+//! all of them.
 
 use std::io::{self, BufRead, Read, Write};
 
@@ -33,6 +37,13 @@ impl Request {
         self.target
             .split_once('?')
             .map_or(self.target.as_str(), |(path, _)| path)
+    }
+
+    /// The first value of the header `name` (lowercase).
+    // Only fake-payments reads one header; it includes this file.
+    #[allow(dead_code)]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        header(&self.headers, name)
     }
 
     /// The raw query string (after `?`), empty if there is none.
@@ -369,6 +380,8 @@ mod tests {
         assert_eq!(r.query("b").as_deref(), Some("x y"));
         assert_eq!(r.query("c"), None);
         assert_eq!(header(&r.headers, "x-thing"), Some("v"));
+        assert_eq!(r.header("x-thing"), Some("v"));
+        assert_eq!(r.header("missing"), None);
         assert_eq!(r.body, b"hello");
         assert!(r.keep_alive);
     }

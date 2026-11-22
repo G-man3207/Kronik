@@ -4,6 +4,10 @@ A small HTTP/1.1 server that plays a foreign actor in Kronik's tests. It
 reports what the gVisor sandbox looks like from the inside. It is a
 standalone Cargo project (std only, no dependencies), not part of the
 `examples/` workspace.
+Its `src/http.rs` is the one HTTP server of the foreign-actor examples:
+`foreign-pg`, `fake-payments` and `foreign-probe` include it with `#[path]`
+(`fake-payments` also includes `src/sha256.rs`), so a change here reaches all
+of them.
 
 ```text
 foreign-echo [--listen ADDR] [--data-dir DIR]     defaults: 0.0.0.0:8080, /data
