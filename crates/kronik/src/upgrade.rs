@@ -296,7 +296,7 @@ fn offline_sealer(
     match key {
         Key::None => Ok(None),
         Key::Source(source) => {
-            kronik_sched::offline_sealer_loaded(data, &source).map_err(|e| e.api_error())
+            kronik_sched::offline_sealer_with(data, source.master()).map_err(|e| e.api_error())
         }
         Key::Master(master) => {
             if !data.join("keys/keystore.db").exists() {

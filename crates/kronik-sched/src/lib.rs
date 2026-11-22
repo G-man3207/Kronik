@@ -504,34 +504,7 @@ pub async fn start_local_locked(
     .await
 }
 
-/// The data directory's privacy keystore for an offline reader. It shares
-/// the daemon's source configuration and never creates key material.
-pub async fn offline_sealer(
-    env: Env,
-    data: &Path,
-    config: kronik_privacy::key_source::Keys,
-) -> Result<Option<Arc<kronik_privacy::sealer::Sealer>>, kronik_privacy::key_source::KeySourceError>
-{
-    let file = data.join("keys/keystore.db");
-    if !file.exists() {
-        return Ok(None);
-    }
-    let source = kronik_privacy::key_source::KeySource::load(env, config, data, false).await?;
-    offline_sealer_loaded(data, &source)
-}
-
-/// Opens the offline keystore read-only from a key source that is already
-/// loaded, so a caller that has dropped to the destination owner does not
-/// load its source twice.
-pub fn offline_sealer_loaded(
-    data: &Path,
-    source: &kronik_privacy::key_source::KeySource,
-) -> Result<Option<Arc<kronik_privacy::sealer::Sealer>>, kronik_privacy::key_source::KeySourceError>
-{
-    offline_sealer_with(data, source.master())
-}
-
-/// [`offline_sealer_loaded`] from a master key alone, for a caller that has
+/// The offline keystore from a master key alone, for a caller that has
 /// read the key as root and opens the keystore, as the directory's owner,
 /// after it has given up root.
 pub fn offline_sealer_with(

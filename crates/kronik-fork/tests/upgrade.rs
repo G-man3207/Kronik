@@ -213,11 +213,7 @@ fn the_check_opens_sealed_values_with_the_directorys_keystore() {
     let err = check(None).err().unwrap();
     assert!(err.contains("KEYSTORE_INCOMPLETE"), "{err}");
     let sealer = rt
-        .block_on(kronik_sched::offline_sealer(
-            Env::real(rt.handle().clone()),
-            dir.path(),
-            Default::default(),
-        ))
+        .block_on(offline_sealer(Env::real(rt.handle().clone()), dir.path()))
         .unwrap();
     assert!(sealer.is_some());
     let checked = check(sealer).unwrap();
@@ -602,14 +598,29 @@ fn keep(dir: &tempfile::TempDir, name: &str) {
 fn check_dir(rt: &Runtime, dir: &Path, window: Duration) -> kronik_fork::upgrade::Checked {
     rt.block_on(async {
         let env = Env::real(tokio::runtime::Handle::current());
-        let sealer = kronik_sched::offline_sealer(env.clone(), dir, Default::default())
-            .await
-            .unwrap();
+        let sealer = offline_sealer(env.clone(), dir).await.unwrap();
         assert!(sealer.is_some(), "privacy mode left no keystore");
         kronik_fork::upgrade::check(&env, dir, window, 2, sealer)
             .await
             .unwrap()
     })
+}
+
+/// The daemon's offline sealer path, as `kronik upgrade` walks it: load the
+/// key source as the directory's owner, then open the keystore read-only.
+async fn offline_sealer(
+    env: Env,
+    dir: &Path,
+) -> Result<
+    Option<std::sync::Arc<kronik_privacy::sealer::Sealer>>,
+    kronik_privacy::key_source::KeySourceError,
+> {
+    if !dir.join("keys/keystore.db").exists() {
+        return Ok(None);
+    }
+    let source =
+        kronik_privacy::key_source::KeySource::load(env, Default::default(), dir, false).await?;
+    kronik_sched::offline_sealer_with(dir, source.master())
 }
 
 /// S-16 (1): a sealed request whose subject was erased is replayed from its
