@@ -5,6 +5,12 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- Recording a metric allocates nothing once its label set is in the
+  registry, and each metric's series have a lock of their own instead of
+  one mutex for them all: every turn, connection frame, log write and
+  request records, and each built a key to look up under that lock. The
+  turn timer borrows its label instead of copying it, and a test counts
+  the heap allocations of every recorder (#273).
 - The node's in-memory code cache no longer grows with every deploy:
   when a switch installs new code, it drops the cached programs and
   bytes of every code hash that is no longer live, and a rerun or a

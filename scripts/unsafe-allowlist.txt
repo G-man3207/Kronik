@@ -16,3 +16,4 @@ sdk/rust/src/lib.rs                   the `bindings` module that wit-bindgen gen
 crates/kronik-guest-init/src/sys.rs   Linux guest PID1 mount/device/capability/fork/exec/signal/reboot and bounded AF_VSOCK operations on live buffers and owned descriptors
 crates/kronik-foreign/src/microvm_sys.rs KVM device/version/create ioctls, checked disk reservation/reflink/noreplace and confined OCI timestamp restoration
 examples/foreign-probe/src/sys.rs   hostile actor's SysV shared-memory positive/negative controls; IPC_EXCL allocation and only its own IPC_RMID cleanup
+crates/kronik-metrics/tests/allocations.rs the test's counting global allocator, which forwards every call to the system allocator to prove that recording a known label set allocates nothing (issue #273); it is linked into that test binary only
