@@ -292,6 +292,26 @@ pub fn client_key(ip: IpAddr) -> IpAddr {
 /// transport (none: finish at once), the code and the reason.
 type HostClose = (String, Option<Arc<dyn Transport>>, u16, &'static str);
 
+/// Counts by the kind of a connection's owner and the connection's protocol.
+type ByKind<T> = Vec<((String, &'static str), T)>;
+
+/// The count of `(kind, protocol)` in `counts`, added at zero when the key
+/// is new: a delivery clones a kind once, not once per target frame.
+fn counted<'a, T: Default>(
+    counts: &'a mut ByKind<T>,
+    kind: &str,
+    protocol: &'static str,
+) -> &'a mut T {
+    let at = counts
+        .iter()
+        .position(|((k, p), _)| k == kind && *p == protocol)
+        .unwrap_or_else(|| {
+            counts.push(((kind.to_owned(), protocol), T::default()));
+            counts.len() - 1
+        });
+    &mut counts[at].1
+}
+
 /// The live connections of a node.
 pub struct Hub {
     /// For the tasks the hub starts (the attach watchdog).
@@ -656,8 +676,8 @@ impl Hub {
         let mut wake: Vec<Arc<dyn Transport>> = Vec::new();
         let mut close: Vec<HostClose> = Vec::new();
         // Counted under the lock, reported after it (review M8).
-        let mut out: HashMap<(String, &'static str), (u64, u64)> = HashMap::new();
-        let mut dropped_live: HashMap<(String, &'static str), u64> = HashMap::new();
+        let mut out: ByKind<(u64, u64)> = Vec::new();
+        let mut dropped_live: ByKind<u64> = Vec::new();
         let gauges = {
             let mut inner = lock(&self.inner);
             for op in ops {
@@ -670,15 +690,12 @@ impl Hub {
                             let Some(live) = inner.live.get_mut(id) else {
                                 continue;
                             };
-                            let key = (
-                                live.owner.kind.clone(),
-                                conn::protocol_name(live.protocol as i32),
-                            );
+                            let protocol = conn::protocol_name(live.protocol as i32);
                             if live.state == State::Closing {
-                                *dropped_live.entry(key).or_default() += 1;
+                                *counted(&mut dropped_live, &live.owner.kind, protocol) += 1;
                                 continue;
                             }
-                            let counts = out.entry(key).or_default();
+                            let counts = counted(&mut out, &live.owner.kind, protocol);
                             counts.0 += 1;
                             counts.1 += bytes as u64;
                             live.queue.push_back(Outgoing::Frame {

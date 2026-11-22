@@ -9,8 +9,11 @@ until the v1.0 compatibility promise takes effect.
   registry, and each metric's series have a lock of their own instead of
   one mutex for them all: every turn, connection frame, log write and
   request records, and each built a key to look up under that lock. The
-  turn timer borrows its label instead of copying it, and a test counts
-  the heap allocations of every recorder (#273).
+  gateway takes its status label from a table instead of formatting a
+  string per request, the turn timer borrows its label instead of copying
+  it, and a delivery to many connections copies the owner's kind once, not
+  once per target frame. A test counts the heap allocations of every
+  recorder (#273).
 - The node's in-memory code cache no longer grows with every deploy:
   when a switch installs new code, it drops the cached programs and
   bytes of every code hash that is no longer live, and a rerun or a
