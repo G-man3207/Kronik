@@ -301,7 +301,16 @@ jobs:
       # tests the examples the identity step replays.
       - name: sdks
         run: scripts/ci.sh sdks
+      # todo-ts's replay restarts its daemon under libfaketime, a day later
+      # by its wall clock. KRONIK_TEST_FAKETIME=require makes its skip a
+      # failure.
+      - name: Install libfaketime
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y faketime
       - name: identity
+        env:
+          KRONIK_TEST_FAKETIME: require
         run: scripts/ci.sh identity
 
   action:

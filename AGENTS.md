@@ -126,7 +126,7 @@ and `cargo-deny`. Some steps need more:
   tests against moto's S3 server (`scripts/s3.sh`). It needs Docker and is
   skipped with a message without it, unless `KRONIK_TEST_S3=require`.
 - `identity` needs libfaketime for `todo-ts`, which it skips with a message
-  otherwise.
+  otherwise, unless `KRONIK_TEST_FAKETIME=require`.
 
 `ts` uses the local port 47831, and `ts`, `sdks` and `identity` work in fixed
 directories under `/var/tmp`, so two runs of them on one machine collide.

@@ -63,7 +63,8 @@ conformance harness and the escape probe. The two explicit drivers,
 (`cargo test -p kronik --no-run --test isolation_fixture`; ADR 0064 gives
 their arguments) and are never run by `cargo test`. The `foreign` step
 needs root and `runsc` and is skipped with a message otherwise; without
-libfaketime, `identity` skips `todo-ts` the same way. The `ui` step
+libfaketime, `identity` skips `todo-ts` the same way, unless
+`KRONIK_TEST_FAKETIME=require`, as CI sets it. The `ui` step
 syntax-checks `ui/app.js` and runs the admin UI's Node+Chrome test scripts
 (`scripts/test-ui-session-retry.cjs` and
 `scripts/test-ui-paging-focus.cjs`), which drive a real Chrome over CDP; it
