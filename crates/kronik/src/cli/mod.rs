@@ -2099,6 +2099,10 @@ pub(crate) use units::parse_duration_ms;
 mod tests {
     use super::*;
 
+    use std::collections::BTreeSet;
+
+    use clap::CommandFactory as _;
+
     /// L2: with --json, stdout is the error JSON even when a proxy answered.
     #[test]
     fn a_non_api_error_answer_becomes_unavailable_json() {
@@ -2214,5 +2218,217 @@ mod tests {
         ] {
             assert!(crate::Cli::try_parse_from(args).is_err());
         }
+    }
+
+    /// A file at the repository root, such as docs/reference/cli.md.
+    fn repo_doc(relative: &str) -> String {
+        let path = format!("{}/../../{relative}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+    }
+
+    /// The text of one `##` section, without the heading.
+    fn section<'a>(text: &'a str, heading: &str) -> &'a str {
+        let heading_line = format!("\n## {heading}\n");
+        let start = text
+            .find(&heading_line)
+            .unwrap_or_else(|| panic!("missing section {heading}"))
+            + heading_line.len();
+        let rest = &text[start..];
+        rest.find("\n## ").map_or(rest, |end| &rest[..end])
+    }
+
+    /// The text with every whitespace run collapsed to one space.
+    fn flat(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Every `name` in backticks, in order.
+    fn backticked(text: &str) -> Vec<String> {
+        text.split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The leaf commands that take `--reason` and `--dry-run`, as
+    /// `actors list`. `replay` carries its own `--reason` without a dry run
+    /// and `restore`, `upgrade check` and `serve` take only `--dry-run`, so
+    /// both flags together mean the command takes Mutation (I12).
+    fn mutation_leaves(cmd: &clap::Command, prefix: &str, out: &mut BTreeSet<String>) {
+        for sub in cmd.get_subcommands() {
+            if sub.is_hide_set() || sub.get_name() == "help" {
+                continue;
+            }
+            let name = if prefix.is_empty() {
+                sub.get_name().to_owned()
+            } else {
+                format!("{prefix} {}", sub.get_name())
+            };
+            if sub.has_subcommands() {
+                mutation_leaves(sub, &name, out);
+            } else {
+                let takes = |flag: &str| sub.get_arguments().any(|a| a.get_long() == Some(flag));
+                if takes("reason") && takes("dry-run") {
+                    out.insert(name);
+                }
+            }
+        }
+    }
+
+    fn mutations() -> BTreeSet<String> {
+        let mut commands = BTreeSet::new();
+        mutation_leaves(&crate::Cli::command(), "", &mut commands);
+        commands
+    }
+
+    /// #296: the overview names every command that takes Mutation, and no
+    /// others, straight from the clap tree instead of a source parser.
+    #[test]
+    fn overview_names_every_mutation_command_and_no_others() {
+        let text = repo_doc("docs/reference/cli.md");
+        let list = text
+            .find("Every mutation (")
+            .and_then(|start| {
+                text[start..]
+                    .find(") requires `--reason`")
+                    .map(|end| &text[start + "Every mutation (".len()..start + end])
+            })
+            .unwrap_or_else(|| panic!("missing exhaustive mutation overview sentence"));
+        let named = backticked(list);
+        assert!(
+            !named.is_empty() && named.len() == named.iter().collect::<BTreeSet<_>>().len(),
+            "overview mutation list is empty or repeated: {named:?}"
+        );
+        let documented: BTreeSet<String> = named.into_iter().collect();
+        let commands = mutations();
+        assert_eq!(
+            documented,
+            commands,
+            "overview mutation list differs from commands that take Mutation:\n\
+             missing {}\nextra {}",
+            commands
+                .difference(&documented)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            documented
+                .difference(&commands)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        // The sentence still states its caveats.
+        let window = &text[text.find("Every mutation (").unwrap()..];
+        let window = &window[..window.len().min(1800)];
+        let window = flat(window);
+        for required in [
+            "supports `--dry-run`",
+            "`replay` writes only in its",
+            "`send --fork` only in the fork",
+            "have no dry run",
+            "`restore` and `upgrade check` are offline",
+            "so they take no `--reason`",
+        ] {
+            assert!(
+                window.contains(required),
+                "overview no longer states {required:?}"
+            );
+        }
+    }
+
+    /// #296: the operations guide's REASON_REQUIRED row agrees with the
+    /// commands that take Mutation.
+    #[test]
+    fn reason_required_row_does_not_contradict_the_overview() {
+        let row = repo_doc("docs/guides/operations.md")
+            .lines()
+            .find(|l| l.starts_with("| `REASON_REQUIRED`"))
+            .unwrap_or_else(|| panic!("missing the REASON_REQUIRED row"))
+            .to_owned();
+        assert!(row.contains("`restore` and `upgrade check`"), "{row}");
+        assert!(row.contains("take no `--reason`"), "{row}");
+        let commands = mutations();
+        let inventory: BTreeSet<String> = backticked(&row)
+            .into_iter()
+            .filter(|name| {
+                !name.starts_with("--")
+                    && !["REASON_REQUIRED", "restore", "upgrade check"].contains(&name.as_str())
+            })
+            .collect();
+        if !inventory.is_empty() {
+            assert_eq!(inventory, commands, "REASON_REQUIRED row names: {row}");
+        }
+        for sentence in row.split('.') {
+            assert!(
+                !(sentence.contains("replay") && sentence.contains("take no `--reason`")),
+                "replay takes a reason: {row}"
+            );
+            assert!(
+                !(sentence.contains("send --fork") && sentence.contains("take no `--reason`")),
+                "send --fork takes a reason: {row}"
+            );
+        }
+    }
+
+    /// `kronik secret link` commits unless the run is a dry run.
+    #[test]
+    fn secret_link_commits_unless_the_run_is_a_dry_run() {
+        let text = repo_doc("docs/reference/cli.md");
+        let body = section(&text, "kronik secret link");
+        let (prose, example) = body.split_once("```").unwrap_or((body, ""));
+        let prose = flat(prose);
+        for required in [
+            "does not set the remote provider's value",
+            "SecretLink",
+            "without `--dry-run`",
+            "commits",
+            "`--dry-run` only previews",
+        ] {
+            assert!(
+                prose.contains(required),
+                "secret link no longer states {required:?}"
+            );
+        }
+        assert!(!flat(body).contains("does not establish a committed link"));
+        assert!(example.contains("--dry-run"));
+    }
+
+    /// `keys wrap` and `keys enroll` name the same sources the parser
+    /// accepts.
+    #[test]
+    fn keys_wrap_synopsis_and_enroll_name_the_same_sources() {
+        let text = repo_doc("docs/reference/cli.md");
+        let wrap = section(&text, "kronik keys wrap");
+        let enroll = section(&text, "kronik keys enroll");
+        let synopsis = wrap.trim().lines().next().unwrap();
+        assert!(
+            synopsis.contains("`kronik keys wrap --source <openbao|aws|gcp|azure|pkcs11>"),
+            "{synopsis}"
+        );
+        let sources = "openbao|aws|gcp|azure|pkcs11";
+        assert!(
+            flat(enroll).contains(sources),
+            "keys enroll names other sources"
+        );
+        assert!(flat(enroll).contains("`kronik keys wrap --source pkcs11`"));
+        assert!(flat(wrap).contains("not a cloud KMS"));
+        assert!(flat(enroll).contains("not a cloud KMS"));
+        assert!(!flat(wrap).contains("pkcs11 is a cloud KMS"));
+        let cli = crate::Cli::command();
+        let wrap_cmd = cli
+            .find_subcommand("keys")
+            .and_then(|keys| keys.find_subcommand("wrap"))
+            .expect("the keys wrap command");
+        let source = wrap_cmd
+            .get_arguments()
+            .find(|a| a.get_long() == Some("source"))
+            .expect("keys wrap --source");
+        let accepted: Vec<String> = source
+            .get_possible_values()
+            .iter()
+            .map(|value| value.get_name().to_owned())
+            .collect();
+        assert_eq!(accepted, ["openbao", "aws", "gcp", "azure", "pkcs11"]);
     }
 }
