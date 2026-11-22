@@ -11,7 +11,8 @@
 # /usr/bin/runc, and under require that absence fails the foreign test),
 # s3 (needs docker; skipped with a message otherwise, a failure with
 # KRONIK_TEST_S3=require),
-# identity (without libfaketime, todo-ts is skipped with a message too),
+# identity (without libfaketime, todo-ts is skipped with a message too, a
+# failure with KRONIK_TEST_FAKETIME=require),
 # ui (the admin UI's Node+Chrome scripts; Chrome comes with the runner
 # image, and KRONIK_CHROME names another binary),
 # action.
@@ -561,7 +562,8 @@ step_s3() {
 # debug build takes minutes per example, and the release dependencies are
 # shared with the dst step. todo-ts restarts its daemon under libfaketime
 # for its day-later sweep; without the library the run covers the other
-# examples and says why (as the foreign step does).
+# examples and says why (as the foreign step does), or fails with
+# KRONIK_TEST_FAKETIME=require.
 step_identity() {
     local faketime_lib="${FAKETIME_LIB:-}"
     if [ -z "$faketime_lib" ]; then
@@ -578,7 +580,12 @@ step_identity() {
     fi
     local only=()
     if [ -z "$faketime_lib" ]; then
-        echo "skipped: todo-ts needs libfaketime for its sweep (Debian and Ubuntu: apt-get install faketime)"
+        local why="todo-ts needs libfaketime for its sweep (Debian and Ubuntu: apt-get install faketime)"
+        if [ "${KRONIK_TEST_FAKETIME:-}" = require ]; then
+            echo "error: KRONIK_TEST_FAKETIME=require, but $why" >&2
+            return 1
+        fi
+        echo "skipped: $why"
         # Every example in scripts/identity-examples.py's EXAMPLES but todo-ts.
         only=(--only counter-rs,counter-ts,counter-py,counter-go,notes-rs,notes-ts,notes-py,notes-go,webhook-relay-rs,webhook-relay-ts,webhook-relay-py,webhook-relay-go,uptime-ts,billing-ts,chat-ts,media-ts,media-ts-private)
     fi

@@ -4,9 +4,10 @@
 The steps may be spread over parallel jobs. Each job runs its steps in the
 order ci.sh lists them, since a later step of a job can use what an earlier
 one built. A step that skips with a message where its environment is missing
-(foreign without root and runsc, s3 without docker) must run with its
-variable set to `require` in the job that runs it, so that CI never passes
-by skipping. The workflow is read as text, so the check needs no YAML library.
+(foreign without root and runsc, s3 without docker, identity's todo-ts
+without libfaketime) must run with its variable set to `require` in the job
+that runs it, so that CI never passes by skipping. The workflow is read as
+text, so the check needs no YAML library.
 """
 
 import pathlib
@@ -68,7 +69,8 @@ def calls(text, steps):
 
 # The steps that skip without their environment, and the variable that makes
 # a skip a failure.
-REQUIRED = {"foreign": "KRONIK_FOREIGN_TESTS", "s3": "KRONIK_TEST_S3"}
+REQUIRED = {"foreign": "KRONIK_FOREIGN_TESTS", "s3": "KRONIK_TEST_S3",
+            "identity": "KRONIK_TEST_FAKETIME"}
 
 
 def requires(text, variable):

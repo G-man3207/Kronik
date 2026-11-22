@@ -61,6 +61,18 @@ class CheckCiSteps(unittest.TestCase):
             with self.assertRaises(ValueError, msg=case):
                 CHECK["check"](script, text(s3_env, foreign_cmd))
 
+    def test_identity_needs_libfaketime_required(self):
+        # Without libfaketime the identity step skips todo-ts's replay.
+        script = 'if [ "$#" -eq 0 ]; then\n    set -- test identity\nfi\n'
+        def text(identity):
+            return ("name: CI\njobs:\n"
+                    "  test:\n    steps:\n      - run: scripts/ci.sh test\n"
+                    f"  identity:\n    steps:\n{identity}")
+        CHECK["check"](script, text("      - env:\n          KRONIK_TEST_FAKETIME: require\n"
+                                    "        run: scripts/ci.sh identity\n"))
+        with self.assertRaisesRegex(ValueError, "identity without KRONIK_TEST_FAKETIME=require"):
+            CHECK["check"](script, text("      - run: scripts/ci.sh identity\n"))
+
     def test_the_repository_runs_every_step_and_musl_in_a_job_of_its_own(self):
         script = (ROOT / "scripts/ci.sh").read_text()
         text = (ROOT / ".github/workflows/ci.yml").read_text()
