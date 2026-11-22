@@ -180,7 +180,8 @@ the gateway certificate. Plain HTTP serves only `/metrics` and `/healthz`. A
 bind failure is fatal when OIDC is configured; otherwise the daemon warns and
 continues without this listener. `GET /healthz` answers 200 with
 `{"applied_lsn","status":"ok"}` while the node runs (plus `"low_disk":true`
-below `[log] disk_reserve`), and 503 after a storage failure. `GET /metrics`
+below `[log] disk_reserve`, and `"blobs_low_disk":true` below
+`[blobs] disk_reserve`), and 503 after a storage failure. `GET /metrics`
 gives the Prometheus text format.
 
 ```text
