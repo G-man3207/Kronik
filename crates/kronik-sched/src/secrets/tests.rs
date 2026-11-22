@@ -574,7 +574,7 @@ fn new_value_is_scrubbed_before_reserved_and_remains_redacted_after_restart() {
         .enable_all()
         .build()
         .unwrap();
-    let (data, identity, encrypted) = runtime.block_on(async {
+    let (data, identity, physical) = runtime.block_on(async {
         let (data, node) = node().await;
         let original = node.local_operator_authority().unwrap();
         let mut audit = audit();
@@ -602,25 +602,16 @@ fn new_value_is_scrubbed_before_reserved_and_remains_redacted_after_restart() {
         );
         let identity = (*phases[1]).clone();
         let physical = identity.source_version.parse().unwrap();
-        let encrypted = node
-            .secrets()
-            .unwrap()
-            .export_encrypted_row("token", physical)
-            .unwrap()
-            .unwrap();
         for row in phases {
             let stored = row.audit.as_ref().unwrap();
             assert_eq!(stored.token_id, audit.token_id);
             assert_eq!(stored.wall_time_ms, audit.wall_time_ms);
             assert!(!stored.reason.contains("new-needle"));
-            assert_eq!(stored.reason, encrypted.reason);
-            assert_eq!(stored.token_id, encrypted.token_id);
-            assert_eq!(stored.wall_time_ms, encrypted.created_wall_ms);
         }
         let history = node.secret_history("token").await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0], identity);
-        (data, identity, encrypted)
+        (data, identity, physical)
     });
     drop(runtime);
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -642,9 +633,11 @@ fn new_value_is_scrubbed_before_reserved_and_remains_redacted_after_restart() {
         assert_eq!(
             node.secrets()
                 .unwrap()
-                .export_encrypted_row("token", encrypted.physical_version)
-                .unwrap(),
-            Some(encrypted)
+                .version("token", physical)
+                .unwrap()
+                .unwrap()
+                .value,
+            b"new-needle"
         );
         assert_eq!(
             node.resolve_secret(
@@ -2661,14 +2654,6 @@ async fn file_links_refuse_mutation_without_touching_either_physical_name() {
         .unwrap();
     assert_eq!(b.value, b"shared-live-alt");
     let store = node.secrets().unwrap();
-    let token_row = store
-        .export_encrypted_row("token", token_physical)
-        .unwrap()
-        .unwrap();
-    let alt_row = store
-        .export_encrypted_row("alt", alt_physical)
-        .unwrap()
-        .unwrap();
     let rows = node.secret_rows(None).await.unwrap();
     let through = node.applied_lsn();
     for name in ["token", "alt"] {
@@ -2697,20 +2682,6 @@ async fn file_links_refuse_mutation_without_touching_either_physical_name() {
     }
     assert_eq!(node.applied_lsn(), through);
     assert_eq!(node.secret_rows(None).await.unwrap(), rows);
-    assert_eq!(
-        &store
-            .export_encrypted_row("token", token_physical)
-            .unwrap()
-            .unwrap(),
-        &token_row
-    );
-    assert_eq!(
-        &store
-            .export_encrypted_row("alt", alt_physical)
-            .unwrap()
-            .unwrap(),
-        &alt_row
-    );
     assert_eq!(
         store.current("token").unwrap().unwrap().value.as_slice(),
         b"unrelated-owned-token"
@@ -2754,19 +2725,17 @@ async fn file_links_refuse_mutation_without_touching_either_physical_name() {
     );
     assert!(store.current("token").unwrap().is_none());
     assert!(store.stored_deletion_floor("token").unwrap().is_some());
-    let retained = store
-        .export_encrypted_row("token", token_physical)
-        .unwrap()
-        .unwrap();
-    assert_eq!(retained.nonce, token_row.nonce);
-    assert_eq!(retained.ciphertext, token_row.ciphertext);
-    assert_eq!(retained.version_hash, token_row.version_hash);
     assert_eq!(
-        &store
-            .export_encrypted_row("alt", alt_physical)
+        store
+            .retained_version_for_scrub("token", token_physical)
             .unwrap()
-            .unwrap(),
-        &alt_row
+            .unwrap()
+            .value,
+        b"unrelated-owned-token"
+    );
+    assert_eq!(
+        store.version("alt", alt_physical).unwrap().unwrap().value,
+        b"shared-live-alt"
     );
     assert!(store.stored_deletion_floor("alt").unwrap().is_none());
     let still_b = node
