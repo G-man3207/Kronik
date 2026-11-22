@@ -357,6 +357,7 @@ async function run() {
       const ax = await pressed.json();
       assert(ax.name && ax.name.includes('production will change') && ax.name.includes('p-1'), 'accessible name');
       await sleep(400);
+      assert(document.activeElement === button, 'enter did not move focus to the promote button');
       assert(document.getElementById('error').hidden, 'enter showed an error');
       assert(!document.getElementById('promote-result').textContent, 'enter wrote a result');
     } else {

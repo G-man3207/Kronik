@@ -5,6 +5,10 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- Enter in an admin UI mutation reason field (approve, promote, resend)
+  moves focus to the form's button instead of doing nothing. It still does
+  not submit; the button's name says what will change, so a second Enter is
+  an informed confirmation (#279).
 - The gateway asks the node for the deployed routes only when the
   configuration epoch changes. Before, every HTTP request copied every
   route of every kind under the kinds lock. Requests also match against a

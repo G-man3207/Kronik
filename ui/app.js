@@ -269,8 +269,11 @@
     nameButton();
     dry.addEventListener("change", nameButton);
     // Enter in the reason field must not submit: the button is the change.
+    // It moves focus to that button, whose name says what will change.
     reason.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && !event.isComposing) event.preventDefault();
+      if (event.key !== "Enter" || event.isComposing) return;
+      event.preventDefault();
+      submit.focus();
     });
     form.append(element("label", "Reason", { for: reason.id }), reason, check, submit);
     area.append(explanation, form);
