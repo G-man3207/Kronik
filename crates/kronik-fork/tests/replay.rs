@@ -1914,9 +1914,9 @@ fn fork_replay_keeps_a_compensation_turns_caller_subject() {
         p.node
             .store()
             .db()
-            .kv_get_sealable("counter", key, "n")
+            .kv_get_written("counter", key, "n")
             .unwrap()
-            .and_then(|s| s.subject)
+            .and_then(|(s, _)| s.subject)
     };
     assert_eq!(kv_subject("kv").as_deref(), Some("user:kv"));
     assert_eq!(kv_subject("none").as_deref(), None);
@@ -2029,9 +2029,9 @@ fn fork_replay_keeps_a_compensation_turns_caller_subject() {
     let fork_kv = |key: &str| {
         cont.store
             .db()
-            .kv_get_sealable("counter", key, "n")
+            .kv_get_written("counter", key, "n")
             .unwrap()
-            .and_then(|s| s.subject)
+            .and_then(|(s, _)| s.subject)
     };
     assert_eq!(fork_kv("kv").as_deref(), Some("user:kv"));
     assert_eq!(fork_kv("none").as_deref(), None);

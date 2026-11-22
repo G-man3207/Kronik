@@ -1446,28 +1446,8 @@ impl StateDb {
             .transpose()
     }
 
-    /// One state value as the log recorded it (sealed or plain, with its
-    /// subject).
-    pub fn kv_get_sealable(
-        &self,
-        kind: &str,
-        key: &str,
-        k: &str,
-    ) -> Result<Option<pb::Sealable>, StoreError> {
-        let row: Option<(Vec<u8>, Option<String>, bool)> = self
-            .conn
-            .prepare_cached(
-                "SELECT value, subject, sealed FROM kv WHERE kind = ?1 AND key = ?2 AND k = ?3",
-            )?
-            .query_row([kind, key, k], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .optional()?;
-        row.map(|(v, s, sealed)| sealable_of(v, s, sealed))
-            .transpose()
-    }
-
-    /// [`StateDb::kv_get_sealable`] with the LSN of the record that wrote
-    /// the value (a fork tells a value its base snapshot holds from one its
-    /// replay wrote).
+    /// One state value with the LSN of the record that wrote it (a fork
+    /// tells a value its base snapshot holds from one its replay wrote).
     pub fn kv_get_written(
         &self,
         kind: &str,

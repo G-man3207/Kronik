@@ -840,28 +840,24 @@ impl BrowserAuth {
         self.origin.as_deref()
     }
 
-    /// The owner validates the control transition and supplies its durable source.
-    pub fn prepare_projection(
+    /// [`Self::publish_current`]'s projection, minus provider I/O, for the
+    /// tests that drive `publish_prepared` directly.
+    #[cfg(test)]
+    fn prepare_projection(
         &self,
         operation: &kronik_proto::log::v1::audit_event::Operation,
         revision: SourcePos,
-    ) -> Result<PreparedProjection, ApiError> {
-        operation
-            .validate()
-            .map_err(|error| crate::bad(error.to_string()))?;
+    ) -> PreparedProjection {
         let kronik_proto::log::v1::audit_event::Operation::AuthConfig(config) = operation else {
-            return Err(bad("expected typed authentication configuration"));
+            unreachable!("the fixture commits an authentication configuration")
         };
-        if !Self::valid_revision(revision) {
-            return Err(bad("authentication configuration lacks a durable source"));
-        }
-        Ok(PreparedProjection {
+        PreparedProjection {
             revision,
             profile: Arc::new(config.clone()),
             provider: None,
             reason: None,
             generation: None,
-        })
+        }
     }
 
     /// Called under TokenStore's single fence after durable local or metadata apply.
@@ -2245,8 +2241,9 @@ mod tests {
             },
         });
         let token = tokens
-            .authority_for_name("reader", *scopes.iter().next().unwrap())
-            .unwrap();
+            .capture_name("reader", *scopes.iter().next().unwrap())
+            .unwrap()
+            .authority;
         let auth = Arc::new(BrowserAuth {
             env: env.clone(),
             tokens: tokens.clone(),
@@ -2334,7 +2331,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut projection = Some(auth.prepare_projection(&disabled, source).unwrap());
+            let mut projection = Some(auth.prepare_projection(&disabled, source));
             auth.tokens
                 .publish_auth_change(&mut || auth.publish_prepared(projection.take().unwrap()))
                 .unwrap();
@@ -2354,8 +2351,9 @@ mod tests {
             assert_eq!(node.applied_lsn(), before);
             let unrelated = auth
                 .tokens
-                .authority_for_token(&bearer, Scope::Operate)
-                .unwrap();
+                .capture_token(&bearer, Scope::Operate)
+                .unwrap()
+                .authority;
             let accepted = node
                 .record_audit_event_authorized(
                     "test.provider",
@@ -2394,10 +2392,8 @@ mod tests {
         let SourcePos::Actor { shard: None, lsn } = original_source else {
             panic!("expected actual native fixture source")
         };
-        let mut foreign = Some(
-            auth.prepare_projection(&disabled, SourcePos::Metadata { index: lsn })
-                .unwrap(),
-        );
+        let mut foreign =
+            Some(auth.prepare_projection(&disabled, SourcePos::Metadata { index: lsn }));
         assert!(
             auth.tokens
                 .publish_auth_change(&mut || auth.publish_prepared(foreign.take().unwrap()))
@@ -2418,7 +2414,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let mut next = Some(auth.prepare_projection(&disabled, committed).unwrap());
+        let mut next = Some(auth.prepare_projection(&disabled, committed));
         auth.tokens
             .publish_auth_change(&mut || auth.publish_prepared(next.take().unwrap()))
             .unwrap();
@@ -2426,7 +2422,7 @@ mod tests {
         assert!(auth.state().pending.is_empty());
         assert!(auth.state().sessions.is_empty());
         assert!(auth.login().is_err());
-        let mut stale = Some(auth.prepare_projection(&disabled, original_source).unwrap());
+        let mut stale = Some(auth.prepare_projection(&disabled, original_source));
         assert!(
             auth.tokens
                 .publish_auth_change(&mut || auth.publish_prepared(stale.take().unwrap()))
@@ -2788,7 +2784,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let mut projection = Some(auth.prepare_projection(&operation, source).unwrap());
+        let mut projection = Some(auth.prepare_projection(&operation, source));
         let ticket = auth.next_configuration_generation().unwrap();
         auth.tokens
             .publish_auth_change(&mut || {
@@ -2961,7 +2957,7 @@ mod tests {
             .unwrap();
         let guarded = kronik_core::authority::guard_session(
             session.clone(),
-            guards.authority_for_name("guard", Scope::Read).unwrap(),
+            guards.capture_name("guard", Scope::Read).unwrap().authority,
         );
         guards.revoke("guard", &change, false).unwrap();
         let audit = pb::Audit {
@@ -4362,9 +4358,7 @@ mod tests {
         let exchange = ProviderAuthority::new(
             &auth,
             &auth.state(),
-            auth.tokens
-                .authority_for_name("reader", Scope::Read)
-                .unwrap(),
+            auth.tokens.capture_name("reader", Scope::Read).unwrap().authority,
             expires,
         );
         let original = auth
