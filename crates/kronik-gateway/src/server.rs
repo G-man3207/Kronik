@@ -398,11 +398,12 @@ where
                     Err(resp) => to_hyper(resp),
                 },
             };
-            let status = resp.status().as_u16().to_string();
-            kronik_metrics::inc("kronik_gateway_requests_total", &[("status", &status)]);
+            let code = resp.status();
+            let status = code.as_str();
+            kronik_metrics::inc("kronik_gateway_requests_total", &[("status", status)]);
             kronik_metrics::observe(
                 "kronik_gateway_request_duration_seconds",
-                &[("status", &status)],
+                &[("status", status)],
                 started.elapsed(),
             );
             Ok::<_, Infallible>(resp)

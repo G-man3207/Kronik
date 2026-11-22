@@ -1041,6 +1041,84 @@ for each allowed compile-time value
 prints the 64-actor `perf-m1` row. Record numbers in this file before changing
 the default.
 
+## The metrics registry (issue #273)
+
+Every turn, connection frame, log write and HTTP request records a metric,
+about 5 000 recordings a second at M24's load. Until 2026-11-22 each one
+built an owned key (a vector and a string per label), locked the registry's
+one mutex and looked the key up in a map ordered by strings. Each catalog
+entry's series now sit behind a lock of their own, on a cache line of their
+own, sorted by a hash of the label set that does not depend on the order
+of the labels: a recording probes with the caller's labels as they are and
+allocates only on the first use of a label set.
+`crates/kronik-metrics/tests/allocations.rs` counts the heap allocations
+of every recorder with a global allocator of its own: none after the first
+use.
+
+### Method
+
+- Time per recording, in a release build of `kronik-metrics` alone: a
+  three-label counter and one without labels in a tight loop on one
+  thread, then two and eight threads recording eight different metrics at
+  once, with the time each thread took per recording.
+- M24 criterion 1 as in [Long-lived connections
+  (M24)](#long-lived-connections-m24), from glibc release builds of `main`
+  at `2652e47e` and of the same commit with the change, a run of each
+  build in turn. On the development machine, with other workloads running,
+  the daemon and the load generator ran in one systemd scope confined to
+  four of its eight CPUs (so the daemon's default concurrency was 32) with
+  CPU weight over the rest. Three pairs wrote the log to the disk as
+  usual, with a 4 KiB `O_DSYNC` write sampled every two seconds next to
+  the run; two pairs wrote it to tmpfs, so that no turn waits on that disk.
+
+### Results (2026-11-22)
+
+| Recording | Before | After |
+| --- | ---: | ---: |
+| Heap allocations after the first use of a label set with three labels | 4 | 0 |
+| One thread, three labels | 102 to 136 ns | 113 to 150 ns |
+| One thread, no label | 33 to 40 ns | 15 to 22 ns |
+| Two threads on different metrics | 478 to 496 ns | 110 to 147 ns |
+| Eight threads on different metrics | 2.8 to 3.0 µs | 163 to 251 ns |
+
+On one thread a recording with labels takes the same time: hashing the
+label set costs what the four allocations cost. The mutex is the convoy:
+with the one lock, two threads recording different metrics each took four
+times longer per recording than one, and eight took twenty-five times
+longer.
+
+M24 criterion 1, a run of each build in turn. Every run delivered every
+message, kept the 1 000 connections open and left no dead letter. Neither
+build meets the p99 or the growth condition on this machine: during the
+first table's runs its disk answered the 4 KiB `O_DSYNC` write in 15 to
+21 ms on average (1.08 ms in [Machines](#machines)), and other workloads
+kept the load average between 3 and 13.
+
+| Build | p50 / p90 / p99 / max | `VmHWM` | Heap growth (`RssAnon`) | Daemon CPU | 4 KiB `O_DSYNC` write |
+| --- | --- | ---: | ---: | ---: | --- |
+| Before | 21.0 / 67 / 4 027 / 8 046 ms | 772 MiB | +152 MiB | 1.17 cores | 7 ms, after the run |
+| After | 28.3 / 90 / 2 282 / 4 463 ms | 713 MiB | +91 MiB | 1.14 cores | 21 ms, max 406 ms |
+| Before | 22.0 / 61 / 2 349 / 5 622 ms | 698 MiB | +98 MiB | 1.14 cores | 15 ms, max 196 ms |
+| After | 22.0 / 66 / 2 617 / 6 047 ms | 711 MiB | +135 MiB | 1.08 cores | 17 ms, max 346 ms |
+| Before | 21.5 / 52 / 1 309 / 4 728 ms | 688 MiB | +64 MiB | 1.02 cores | 16 ms, max 495 ms |
+| After | 20.4 / 61 / 4 429 / 8 924 ms | 757 MiB | +141 MiB | 1.12 cores | 19 ms, max 675 ms |
+
+| Build | p50 / p90 / p99 / max | `VmHWM` | Heap growth (`RssAnon`) | Daemon CPU |
+| --- | --- | ---: | ---: | ---: |
+| Before | 14.9 / 28 / 1 040 / 2 783 ms | 748 MiB | +121 MiB | 1.05 cores |
+| After | 15.5 / 30 / 1 074 / 3 578 ms | 707 MiB | +88 MiB | 1.13 cores |
+| Before | 15.5 / 53 / 1 510 / 4 293 ms | 680 MiB | +156 MiB | 1.16 cores |
+| After | 14.9 / 28 / 755 / 3 087 ms | 703 MiB | +83 MiB | 1.10 cores |
+
+The second table is the tmpfs pairs. p99 and the heap growth move as much
+between two runs of one build as between the builds, on the disk and on
+tmpfs: at this load the registry is a few microseconds of a turn, and the
+run cannot tell the change from the machine's noise. The runs of the change
+are not worse: on the disk they overlap the unchanged build's (p99 1.3 to
+4.0 s before and 2.3 to 4.4 s after; the slowest run of the change is the
+one with the slowest disk write, 675 ms), and on tmpfs both had the lower
+p99 and the smaller heap growth.
+
 ## M32 benchmark and regression contract
 
 The M32 targets are unchanged:
