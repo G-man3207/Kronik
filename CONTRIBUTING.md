@@ -85,7 +85,10 @@ client's refusal of an API socket that another user swapped, the key
 source's work in a tree that another user owns and `kronik restore` as root
 into the nonroot service's directory (`--test restore_drop`, which really
 gives up root), so that a host that cannot run them fails the step instead
-of leaving them out. The trusted actor needs runc at `/usr/bin/runc` (CI
+of leaving them out. It also runs the conformance harness's own regressions
+(`scripts/isolation-conformance-test.py`): one audits the owner of a separate
+actor root, which needs root, so the suite fails without it and lives
+outside `scripts/tests`. The trusted actor needs runc at `/usr/bin/runc` (CI
 installs it); under require a missing binary fails the foreign test instead
 of skipping. It also builds the hostile `foreign-probe` image and runs
 M21's malicious actor, bounded for CI: root in its gVisor sandbox under the

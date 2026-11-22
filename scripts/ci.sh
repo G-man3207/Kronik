@@ -444,6 +444,12 @@ step_foreign() {
         echo "skipped: $why"
         return 0
     fi
+    # The isolation harness's own regressions: the oracles of
+    # scripts/isolation-conformance.py against fake /proc and log input, and
+    # against real listeners, inotify watches and files. The suite stays out
+    # of scripts/tests because the owner audit of a separate actor root needs
+    # root and fails without it instead of skipping (#295).
+    python3 -B scripts/isolation-conformance-test.py
     scripts/build-foreign-examples.sh
     # The hostile actor (M21's malicious foreign actor, bounded for CI): the
     # foreign tests run it, root in a gVisor sandbox, against the host's

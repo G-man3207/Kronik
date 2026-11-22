@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Small runtime regressions for the proof's oracles; no mocked syscalls/reports.
-Run explicitly: python3 scripts/isolation-conformance-test.py
+CI's `foreign` step runs them, because one needs root. To run them yourself:
+python3 scripts/isolation-conformance-test.py
 """
 import errno
 import importlib.util
