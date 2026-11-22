@@ -3,9 +3,11 @@
 - **Status:** Accepted (confirmed 2026-10-29). Amended 2026-10-28 for
   v0.1: `RestrictSUIDSGID` stayed while nothing ran `runsc restore`.
   Amended for v0.3: M14's sandbox copies run `runsc restore`, so the unit
-  drops it (see "Without `RestrictSUIDSGID` (M14)").
-- **Date:** 2026-10-27, amended 2026-10-28 (v0.1 and v0.3); v0.3's evidence
-  under the installed unit 2026-10-29
+  drops it (see "Without `RestrictSUIDSGID` (M14)"). Amended 2026-11-22
+  with why the root unit lacks each setting the nonroot unit has (see "The
+  root unit next to the nonroot unit").
+- **Date:** 2026-10-27, amended 2026-10-28 (v0.1 and v0.3) and 2026-11-22;
+  v0.3's evidence under the installed unit 2026-10-29
 
 ## Context
 
@@ -99,7 +101,9 @@ filter, so Kronik cannot work around it.
 - Every other setting stays as it was, with the same reasons for what is
   left out: `MemoryDenyWriteExecute`, `ProtectHostname`,
   `ProtectKernelTunables`, `ProtectControlGroups` and a
-  `CapabilityBoundingSet`.
+  `CapabilityBoundingSet`. The settings the nonroot unit added later, and
+  what was measured about `ProtectKernelTunables`, are in "The root unit
+  next to the nonroot unit".
 - A unit test (`init.rs`) fails if the unit gains a `User=` or
   `RestrictSUIDSGID=` line, or loses `NoNewPrivileges=true`.
 
@@ -127,6 +131,55 @@ the residual risk, which is wider than a compromised process:
   file a guest made never reaches a checkpoint or a fork's copy. The
   actor's own `/data` keeps it; the operations guide tells operators not
   to copy that tree with modes kept.
+
+## The root unit next to the nonroot unit
+
+Amended 2026-11-22 (#277). The nonroot unit (`deploy/systemd/kronik.service`,
+ADR 0062) has settings that the root unit
+(`deploy/systemd/kronik-root.service`) does not. The root unit is the unit of
+v0.4.1 byte for byte (ADR 0062, ADR 0150): running `serve --init` again on a
+host that v0.4.1 set up must leave its unit unchanged, and a test pins the
+digest of the default rendering. So the root unit took none of the nonroot
+unit's additions, and it cannot gain a comment about them either; this
+section says why it lacks each one. Adding any of them changes the unit of
+every root installation and gives up that promise. That is a maintainers'
+decision, and this amendment does not make it.
+
+| Nonroot unit | Why the root unit lacks it |
+| --- | --- |
+| `User=kronik` | The `CAP_SETUID` trap above: an explicit `User=` with any seccomp-based setting keeps runsc from starting a sandbox. |
+| `AmbientCapabilities=CAP_NET_BIND_SERVICE`, `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` | runsc runs as host root and creates the sandboxes' namespaces and cgroups with the full capability set. A root process needs no ambient capability. |
+| `Delegate=yes`, `ProtectControlGroups=private` | runsc as host root puts each sandbox's cgroup under `/kronik/<hash>`, outside the unit's cgroup. A delegation would move them, so a root installation that wants microVMs adds it itself with the operations guide's drop-in (ADR 0061). `ProtectControlGroups=yes` makes `/sys/fs/cgroup` read-only, and runsc could not create them (measured below). |
+| `ReadWritePaths=/var/lib/kronik` | `StateDirectory=kronik` makes the data directory writable in the root unit. |
+| `PrivateDevices=yes` | It gives the service a `/dev` with only pseudo devices. A root installation uses the host's `/dev/kvm` for `[foreign] platform = "kvm"` and for microVM actors, and `serve --init` writes the drop-in that brings `/dev/kvm` back (`DeviceAllow=`, `BindPaths=`) only for the nonroot unit. |
+| `ProtectHostname=yes`, `ProtectKernelTunables=yes` | Left out since v0.1, with runsc's namespaces and cgroups as the reason. On systemd 257 `ProtectKernelTunables=yes` leaves `/sys/fs/cgroup` writable (measured below), so cgroups are not what it would break. Neither setting has run with runsc as host root. |
+| `PrivateIPC=yes`, `RemoveIPC=yes`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK`, `SystemCallErrorNumber=EPERM`, `SystemCallFilter=~@clock @cpu-emulation @module @obsolete @raw-io @reboot @swap` | Added with the nonroot unit, whose runsc runs as root of a user namespace. No conflict with the root daemon is known: it only reads `/proc/sys`, and a sandbox's network namespace holds only `lo`. None of them has run with runsc as host root. |
+
+Measured on 2026-11-22 on a Debian 13 host (kernel 6.12.117+deb13-amd64,
+systemd 257.13-1~deb13u1) without runsc or `/dev/kvm`:
+
+- `systemd-analyze security --offline=true` of both templates, rendered as
+  `serve --init` renders them by default (binary `/usr/local/bin/kronik`,
+  configuration `/etc/kronik/kronik.toml`, no key credential): the root unit
+  7.4 MEDIUM, the nonroot unit 3.2 OK. Every check that the root unit fails
+  and the nonroot unit passes belongs to a row of the table: `User=`, the
+  capability bounding set, `PrivateDevices=`, `DeviceAllow=`,
+  `ProtectControlGroups=`, `ProtectHostname=`, `ProtectKernelTunables=`,
+  `RestrictAddressFamilies=` and the seven groups of `SystemCallFilter=`.
+- In transient units run as root (`systemd-run --wait --pipe`), `mkdir` of a
+  new cgroup directly under `/sys/fs/cgroup` succeeds with no extra setting
+  and with `ProtectKernelTunables=yes`, and fails with "Read-only file system"
+  with `ProtectControlGroups=yes`.
+- With `PrivateDevices=yes` such a unit sees 7 device nodes in `/dev`
+  instead of the host's 132: `/dev/mem` and `/dev/net/tun` are gone, and
+  `/dev/null` and `/dev/urandom` stay.
+
+To revisit: if the maintainers give up the byte-for-byte promise for the
+root unit, each setting of the last three rows has to pass the toggle test
+under Evidence with runsc as host root first. A foreign actor with a sandbox
+copy (`--fork-mode sandbox`) also has to run under the installed unit, as
+v0.3's evidence did. `PrivateDevices=` also needs the `/dev/kvm` drop-in for
+root installations.
 
 ## Evidence
 

@@ -939,10 +939,13 @@ and says where the root unit differs:
   fail, which `runsc restore` needs for sandbox copies in forks and which the
   daemon needs to connect to a microVM's sockets
   ([ADR 0027](../adr/0027-systemd-unit-hardening.md)); a drop-in that adds it
-  makes a microVM refuse to start with a message that names the setting. The root unit leaves
-  out `ProtectHostname`, `ProtectKernelTunables`, `ProtectControlGroups` and a
-  `CapabilityBoundingSet` as well, because `runsc` creates namespaces and
-  cgroups there with host root.
+  makes a microVM refuse to start with a message that names the setting. The root unit,
+  which is the unit of v0.4.1 byte for byte, also leaves out `PrivateDevices`,
+  `PrivateIPC`, `RemoveIPC`, `ProtectHostname`, `ProtectKernelTunables`,
+  `ProtectControlGroups`, `RestrictAddressFamilies`, the `SystemCallFilter`
+  and a `CapabilityBoundingSet`. [ADR 0027](../adr/0027-systemd-unit-hardening.md#the-root-unit-next-to-the-nonroot-unit)
+  says why for each; `systemd-analyze security` rates the root unit 7.4 and
+  the nonroot unit 3.2.
 
 `ProtectSystem=strict` makes the whole file system read-only for the daemon
 except its runtime and state directories. If `server.data_dir` is somewhere
