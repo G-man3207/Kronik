@@ -1152,7 +1152,8 @@ operator access). With TLS, scrape HTTPS using the certificate hostname;
 with OIDC, Host must match the configured admin origin:
 
 - `GET /healthz` answers `200 {"status": "ok", "applied_lsn": N}` while the
-  node runs (with `"low_disk": true` below `[log] disk_reserve`), and `503`
+  node runs (with `"low_disk": true` below `[log] disk_reserve`, and
+  `"blobs_low_disk": true` below `[blobs] disk_reserve`), and `503`
   with the error JSON after a storage failure, when the daemon must be
   restarted (systemd does this).
 - `GET /metrics` answers in Prometheus' text format:
@@ -2143,8 +2144,8 @@ Below the reserve:
   above the reserve and still met it. Nothing of it is recorded: a message
   stays queued, and an open turn runs again at the next start.
 
-`kronik_blob_store_below_reserve` is 1 meanwhile, and `/v1/health` says
-`blobs_low_disk`. Turns without blobs are not affected.
+`kronik_blob_store_below_reserve` is 1 meanwhile, and `/v1/health` and
+`/healthz` say `"blobs_low_disk": true`. Turns without blobs are not affected.
 
 Memory does not grow with a blob's size. In the M25 acceptance a 300 MB
 upload, a 40 MB fetch and a 1 GB response each raised the release build's
