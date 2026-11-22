@@ -4,6 +4,9 @@ A small payments service run as a foreign actor; the billing examples
 charge invoices with it and refund them as compensation. No money moves. It
 is a standalone Cargo project (std only, no dependencies), not part of the
 `examples/` workspace.
+Its HTTP server and SHA-256 are `foreign-echo`'s `src/http.rs` and
+`src/sha256.rs`, included with `#[path]`: it has no copies of its own and
+needs `examples/foreign-echo` next to it.
 
 ```text
 fake-payments [--listen ADDR] [--data-dir DIR]    defaults: 0.0.0.0:8080, /data
