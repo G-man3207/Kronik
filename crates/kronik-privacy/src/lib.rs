@@ -15,7 +15,6 @@ mod publication;
 mod scrub_copies;
 pub mod sealer;
 pub mod secret_backend;
-pub mod secret_selection;
 pub use publication::PublicationError;
 pub use scrub_copies::ScrubCopy;
 

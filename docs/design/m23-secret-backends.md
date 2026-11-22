@@ -826,14 +826,6 @@ authority, a feature gate or an unused replacement courier. Native operational
 Foreign hot-rebind acceptance, as well as Member historical closure, is not
 established. The private startup guard and ordinary storage DATA work are separate.
 
-The shared `CurrentSecretSelection` primitive retains the actual active logical
-row, zeroizing value, original expiry and original publisher notification. A
-retired selection never revives. Its final DATA callback checks all selections
-under one actual publisher with a denial prepared before original admission;
-it is not an authority or historical inventory certificate. Retiring one
-logical alias must not retire another binding to the same still-live physical
-row or extend its expiry. The global scrub-corpus certificate stays global.
-
 FILE row verification uses the canonical physical reference and physical
 `source_version` for SQLite, AEAD and the original physical keyed hash. The
 logical name/version has its own independently checked M23 keyed identity,
