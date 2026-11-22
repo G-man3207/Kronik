@@ -28,52 +28,6 @@ pub const OPERATIONAL_SCHEMA: &str = "kronik.operation/v1";
 /// The cap on a line's `reason`, in bytes (§4.3).
 pub const REASON_MAX: usize = 4096;
 
-/// What the export does with a record (§4.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Class {
-    /// One line per record.
-    Record,
-    /// A line for an operator send or resend, and one per `secret.reveal`
-    /// effect.
-    Turn,
-    /// Carries an `Audit`, but is not exported: a `TurnBegin` copies its
-    /// `TurnRecord`'s, and only fork logs have `BranchCreated`.
-    Copy,
-    /// Carries no audit and holds no reveal.
-    None,
-}
-
-/// The classifier. No wildcard arm: a new record kind must be classified
-/// here to compile, and `tests/audit.rs` checks every message with an
-/// `Audit` field against it (review M4).
-pub fn class(record: &Record) -> Class {
-    match record {
-        Record::Deployment(_)
-        | Record::Grant(_)
-        | Record::Limits(_)
-        | Record::Policy(_)
-        | Record::Approval(_)
-        | Record::PrivacyMode(_)
-        | Record::ForeignActor(_)
-        | Record::Erasure(_)
-        | Record::EngineUpgrade(_)
-        | Record::SimulatorConfig(_)
-        | Record::GuardTriggered(_)
-        | Record::AuditEvent(_)
-        | Record::SecretVersion(_)
-        | Record::SecretLink(_) => Class::Record,
-        // A rebase's switch is the mutation (`rollback --by-replay`); its
-        // rebased turns are what the fork recorded, not operator actions.
-        Record::StateRebase(r) => match &r.part {
-            Some(pb::state_rebase::Part::Switch(_)) => Class::Record,
-            _ => Class::Copy,
-        },
-        Record::TurnRecord(_) => Class::Turn,
-        Record::TurnBegin(_) | Record::BranchCreated(_) => Class::Copy,
-        Record::EffectResult(_) | Record::SnapshotMarker(_) => Class::None,
-    }
-}
-
 /// One exported line, keys in §4.3's order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Line {
@@ -370,34 +324,12 @@ impl Mapper {
     }
 
     /// Record-derived verification identities; legacy hashes never leave this type.
-    pub fn expected(&self, lsn: u64, record: &Record) -> Result<Vec<Expected>, ApiError> {
-        self.expected_at(SourcePos::Actor { shard: None, lsn }, record)
-    }
-
     pub fn expected_at(
         &self,
         source: SourcePos,
         record: &Record,
     ) -> Result<Vec<Expected>, ApiError> {
         self.expected_in(source, &self.branch, record)
-    }
-
-    pub fn expected_actor_at(
-        &self,
-        source: &pb::ActorSource,
-        record: &Record,
-    ) -> Result<Vec<Expected>, ApiError> {
-        source
-            .validate()
-            .map_err(|_| corruption(LogError::Corrupt("invalid actor source".into())))?;
-        self.expected_in(
-            SourcePos::Actor {
-                shard: source.shard,
-                lsn: source.lsn,
-            },
-            &source.branch,
-            record,
-        )
     }
 
     pub fn expected_metadata(
@@ -1701,40 +1633,6 @@ pub fn verify(expected: &[Expected], sink: &[Line], from: u64, to: u64) -> Repor
     verify_range(expected, sink, from, to, None)
 }
 
-/// Verifies an explicit actor-shard or metadata-index range without aliasing domains.
-pub fn verify_at(
-    expected: &[Expected],
-    sink: &[Line],
-    from: SourcePos,
-    to: SourcePos,
-) -> Result<Report, ApiError> {
-    let positions = match (from, to) {
-        (
-            SourcePos::Actor {
-                shard: a,
-                lsn: from,
-            },
-            SourcePos::Actor { shard: b, lsn: to },
-        ) if a == b && a.is_none_or(|shard| shard < 4096) && from <= to => (from, to),
-        (SourcePos::Metadata { index: from }, SourcePos::Metadata { index: to }) if from <= to => {
-            (from, to)
-        }
-        _ => {
-            return Err(ApiError::new(
-                ErrorCode::BadRequest,
-                "audit range requires one source namespace",
-            ));
-        }
-    };
-    Ok(verify_range(
-        expected,
-        sink,
-        positions.0,
-        positions.1,
-        Some((from, to)),
-    ))
-}
-
 fn verify_range(
     expected: &[Expected],
     sink: &[Line],
@@ -1862,3 +1760,6 @@ fn verify_range(
         report.missing.is_empty() && report.extra.is_empty() && report.conflicting.is_empty();
     report
 }
+
+#[cfg(test)]
+mod tests;
