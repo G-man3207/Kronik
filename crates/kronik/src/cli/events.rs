@@ -821,12 +821,19 @@ mod tests {
                             break;
                         }
                         let line = String::from_utf8(line).unwrap();
-                        if let Some(value) = line.strip_prefix("Last-Event-ID: ") {
+                        // hyper writes lower-case field names; fields are
+                        // case-insensitive (RFC 9110 §5.1).
+                        let (name, value) = line
+                            .strip_suffix("\r\n")
+                            .and_then(|line| line.split_once(':'))
+                            .unwrap();
+                        let value = value.trim();
+                        if name.eq_ignore_ascii_case("last-event-id") {
                             assert!(cursor.is_none());
-                            cursor = Some(value.strip_suffix("\r\n").unwrap().to_owned());
+                            cursor = Some(value.to_owned());
                         }
-                        if let Some(value) = line.strip_prefix("Authorization: ") {
-                            bearer = Some(value.strip_suffix("\r\n").unwrap().to_owned());
+                        if name.eq_ignore_ascii_case("authorization") {
+                            bearer = Some(value.to_owned());
                         }
                     }
                     let socket = input.get_mut();
@@ -1552,7 +1559,13 @@ mod tests {
                     break;
                 }
                 let line = std::str::from_utf8(&line).unwrap();
-                if let Some(value) = line.strip_prefix("Content-Length: ") {
+                // hyper writes lower-case field names; fields are
+                // case-insensitive (RFC 9110 §5.1).
+                if let Some((name, value)) = line
+                    .strip_suffix("\r\n")
+                    .and_then(|line| line.split_once(':'))
+                    && name.eq_ignore_ascii_case("content-length")
+                {
                     length = Some(value.trim().parse::<usize>().unwrap());
                 }
             }

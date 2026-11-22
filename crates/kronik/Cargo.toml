@@ -13,7 +13,10 @@ blake3 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 http-body-util = { workspace = true }
-hyper = { workspace = true }
+# The CLI's HTTP/1.1 client to the API (local socket, or TLS to a remote
+# API, ADR 0021): one hyper connection per request, as the daemon's other
+# clients in this workspace.
+hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true }
 kronik-api = { workspace = true, features = ["server"] }
 kronik-core = { workspace = true, features = ["real"] }
