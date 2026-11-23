@@ -4574,7 +4574,7 @@ impl Node {
                 ));
             }
         }
-        self.check_routes(&kind, &manifest)?;
+        self.check_routes_of(&[(&kind, &manifest)])?;
         let epoch = epoch + 1;
         if dry_run {
             return Ok(DeployResult {
@@ -4664,11 +4664,6 @@ impl Node {
             Ok((hash, program, manifest))
         })
         .await
-    }
-
-    /// ROUTE_CONFLICT when another kind serves one of the manifest's routes.
-    fn check_routes(&self, kind: &str, manifest: &pb::Manifest) -> Result<(), ApiError> {
-        self.check_routes_of(&[(kind, manifest)])
     }
 
     /// ROUTE_CONFLICT when, after `set` replaced its kinds' code, two kinds
