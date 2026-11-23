@@ -42,7 +42,7 @@ use kronik_core::ids::{ActorRef, Lsn};
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{BlobsConfig, Ingress, Node, TurnResult};
 
-use super::World;
+use super::{World, audit};
 use crate::SimRng;
 use crate::fs::{CrashOp, CrashPoint};
 use crate::service::{ServiceFaults, content};
@@ -515,11 +515,6 @@ impl World {
     ) -> Result<(), String> {
         let Some(workload) = self.blobs() else {
             return Ok(());
-        };
-        let audit = || pb::Audit {
-            token_id: "sim".into(),
-            reason: "dst".into(),
-            wall_time_ms: 0,
         };
         if !node.kind_exists(KIND) {
             node.deploy(MEDIA, audit(), false, authority.clone())
