@@ -225,13 +225,6 @@ impl Simulators {
         self.targets.values().map(|t| t.option.clone()).collect()
     }
 
-    /// Production's recorded effects of `target` in the window, newest
-    /// first. Neighbor hits use [`Self::neighbor`], which also keeps each
-    /// effect's source secret-use prefix.
-    pub fn recorded(index: &ProductionIndex, target: &str) -> Vec<(Lsn, pb::EffectRecord)> {
-        Self::recorded_where(index, target, |_| true)
-    }
-
     /// The recorded effects the model may learn from: only those of turns
     /// that show no personal data anywhere (no subject or sealed value in
     /// the input, effects, writes, messages, timers, reply or SQL, and no
@@ -244,31 +237,6 @@ impl Simulators {
         target: &str,
     ) -> Vec<(Lsn, &'a pb::EffectRecord, Option<Arc<[pb::SecretRef]>>)> {
         Self::recorded_sources(index, target, |turn| !turn_tainted(turn))
-    }
-
-    fn recorded_where(
-        index: &ProductionIndex,
-        target: &str,
-        keep: impl Fn(&pb::TurnRecord) -> bool,
-    ) -> Vec<(Lsn, pb::EffectRecord)> {
-        let mut out: Vec<(Lsn, pb::EffectRecord)> = index
-            .records
-            .iter()
-            .filter_map(|c| match &c.record {
-                Record::TurnRecord(t) if t.effects.iter().any(|e| e.target == target) => {
-                    keep(t).then_some((c.lsn, t))
-                }
-                _ => None,
-            })
-            .flat_map(|(lsn, t)| {
-                t.effects
-                    .iter()
-                    .filter(|e| e.target == target)
-                    .map(move |e| (lsn, e.clone()))
-            })
-            .collect();
-        out.reverse();
-        out
     }
 
     // The recorded-effect view a simulator replays: LSN, effect, secrets.

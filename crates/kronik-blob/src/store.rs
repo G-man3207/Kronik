@@ -778,11 +778,6 @@ impl BlobWriter {
         }
     }
 
-    /// Plaintext bytes accepted so far.
-    pub fn written(&self) -> u64 {
-        self.written
-    }
-
     /// The space the blob is written to.
     pub fn space(&self) -> &Space {
         &self.space
@@ -1085,11 +1080,6 @@ impl BlobReader {
     /// Whether the file is sealed.
     pub fn is_sealed(&self) -> bool {
         self.header.sealed
-    }
-
-    /// The body digest from the header (shipping compares it).
-    pub fn body_digest(&self) -> [u8; 32] {
-        self.header.body_digest
     }
 
     fn corrupt(&self, why: String) -> BlobError {

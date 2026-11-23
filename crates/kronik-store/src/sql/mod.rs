@@ -292,15 +292,6 @@ impl SqlPool {
             .map(|(name, _)| name)
             .collect()
     }
-
-    /// Drops every open connection (simulated crash, shutdown).
-    pub fn close_all(&self) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .open
-            .clear();
-    }
 }
 
 fn evict(g: &mut PoolInner) {

@@ -467,7 +467,7 @@ as built: `{"roots": [{"kind": "log", "lsn": …, "floor": …}, {"kind": "held"
   two files leaves a fork without it, whose base the floor and the snapshot
   indexes keep while the fork is in retention; a proposal or preview, whose
   base is rebuilt from main's snapshots and log for each run, has none, and
-  its runs take a floor lease (`Node::blob_floor_lease`).
+  its runs take a floor lease (`store.leases().floor("replay", fork_lsn)`).
 
 ## 8. Shipping and restore
 

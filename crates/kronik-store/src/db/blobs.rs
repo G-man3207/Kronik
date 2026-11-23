@@ -897,31 +897,6 @@ impl StateDb {
         Ok(out)
     }
 
-    /// The rows of shard `shard`, for the collector's dry run.
-    pub fn blobs_in_shard(&self, shard: &str) -> Result<Vec<BlobRow>, StoreError> {
-        let mut out = Vec::new();
-        let mut statement = self.conn.prepare_cached(
-            "SELECT hash, size, subject, key_version, first_lsn, last_ref_lsn, erased \
-             FROM blobs WHERE hash >= ?1 AND hash < ?2 ORDER BY hash",
-        )?;
-        for (low, high) in shard_ranges(shard) {
-            for r in statement.query_map(params![low, high], row)? {
-                out.push(r?);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Whether the state keeps `hash`: a pin or a hold.
-    pub fn blob_kept_by_state(&self, hash: &str) -> Result<bool, StoreError> {
-        Ok(self
-            .conn
-            .prepare_cached(&format!(
-                "SELECT EXISTS(SELECT 1 FROM blobs WHERE hash = ?1 AND {KEPT_BY_STATE})"
-            ))?
-            .query_row([hash], |r| r.get(0))?)
-    }
-
     /// The identities this state roots, for a snapshot's `blobs.idx` and a
     /// fork's `blobs.roots` (M26 §7): pinned (M26: or held), not erased,
     /// sorted.

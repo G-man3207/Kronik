@@ -1225,18 +1225,6 @@ impl Foreign {
         }
         drop(cleaned);
     }
-
-    /// The cgroup of `name` under the cgroup v2 root (tests and doctor).
-    pub fn cgroup_path(&self, name: &str) -> String {
-        lock(&self.actors)
-            .get(name)
-            .map_or_else(|| self.ctx.cgroup_path(name), |actor| actor.cgroup.clone())
-    }
-
-    /// The network namespace file of `name` (tests).
-    pub fn netns_path(&self, name: &str) -> PathBuf {
-        self.ctx.paths.netns(name)
-    }
 }
 
 /// The node's view: reconcile and the bridge.

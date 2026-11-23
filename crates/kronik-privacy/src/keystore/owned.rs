@@ -46,13 +46,6 @@ impl Custody {
         }
     }
 
-    pub(super) fn live_identity(&self) -> Option<(u64, u64)> {
-        match self {
-            Self::Owned(store) if store.live => Some((store.identity.device, store.identity.inode)),
-            _ => None,
-        }
-    }
-
     pub(super) fn stage(&self) -> Option<u64> {
         if let Self::Owned(store) = self {
             store.stage
@@ -191,31 +184,6 @@ impl Keystore {
             return Err(PublicationError::Unowned.into());
         }
         Self::open_connection(Mutex::new(conn), master, Custody::ReadOnly)
-    }
-
-    pub fn erasure_revision(&self) -> Result<u64, PrivacyError> {
-        self.custody
-            .publisher()?
-            .revision_for(self.custody.live_identity(), self.custody.stage())
-            .map_err(Into::into)
-    }
-
-    /// Final publication is a bounded move under the same original caller's
-    /// admission. No SQL, filesystem work, await or retirement belongs here.
-    pub fn with_erasure_revision<T>(
-        &self,
-        expected: u64,
-        publish: impl FnOnce() -> T,
-    ) -> Result<Option<T>, PrivacyError> {
-        self.custody
-            .publisher()?
-            .publish_for(
-                expected,
-                self.custody.live_identity(),
-                self.custody.stage(),
-                publish,
-            )
-            .map_err(Into::into)
     }
 
     pub(super) fn begin_erasure(&self) -> Result<KeystoreMutation, PrivacyError> {

@@ -537,17 +537,6 @@ impl Node {
         .map_err(store_error)
     }
 
-    /// A floor lease at `lsn` (ADR 0120 §4): while it lives (its holder
-    /// renews it at least every 30 s), main's collector keeps every blob a
-    /// record at or after `lsn` references. For a replay, proposal,
-    /// catch-up, rebase or preview run, at its fork point. `None` when blobs
-    /// are off.
-    pub fn blob_floor_lease(&self, holder: &'static str, lsn: Lsn) -> Option<kronik_blob::Lease> {
-        self.blobs
-            .as_ref()
-            .map(|store| store.leases().floor(holder, lsn))
-    }
-
     /// `kronik blobs gc --dry-run --verify` (M26 §6.6): the differences
     /// between the index's pins and the rows they mirror, which should
     /// always be empty. An open turn's references come from its

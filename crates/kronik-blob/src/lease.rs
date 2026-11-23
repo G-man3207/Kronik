@@ -63,7 +63,6 @@ impl Leases {
         Lease(Arc::new(Handle {
             leases: self.clone(),
             id,
-            holder,
         }))
     }
 
@@ -112,7 +111,6 @@ impl Leases {
 struct Handle {
     leases: Arc<Leases>,
     id: u64,
-    holder: &'static str,
 }
 
 impl Drop for Handle {
@@ -171,10 +169,6 @@ impl Lease {
             .entries
             .get(&self.0.id)
             .is_some_and(|e| e.expires > now)
-    }
-
-    pub fn holder(&self) -> &'static str {
-        self.0.holder
     }
 }
 
