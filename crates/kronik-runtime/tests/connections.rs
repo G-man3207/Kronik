@@ -1,7 +1,7 @@
 //! M24 (ADR 0113): the host binds `kronik:actor@0.1.1`. Components built
-//! for 0.1.0 (the committed guests and every released corpus component)
-//! link and run unchanged, and a component's optional `connection-handler`
-//! export is found when it has one.
+//! for 0.1.0 (the committed guests and the corpus counters and notes)
+//! link and run unchanged, and a component's optional
+//! `connection-handler` export is found when it has one.
 
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -384,37 +384,60 @@ async fn connection_inputs_call_the_connection_handler() {
     }
 }
 
-/// Every released component of the compatibility corpus (built for 0.1.0)
-/// passes the import check, links without the connection export, describes
-/// and runs a turn under the 0.1.1 bindings.
+/// Every released component of the compatibility corpus passes the import
+/// check, links and describes under the current bindings. The counters and
+/// notes were built for 0.1.0 and link without the connection export: the
+/// counters run a key-value turn here, and the notes components need an SQL
+/// host, so their SQL turns run in the scheduler's tests. v0.5.0's media
+/// (world `actor`, with the `blobs` import) links without the export too;
+/// v0.5.0's room (world `actor-connections`) is found with it and runs an
+/// `open` turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn released_components_link_and_run_under_the_new_bindings() {
     let code = store();
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/compatibility/components");
-    let mut seen = 0;
+    // What the corpus holds: kind -> components.
+    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().path())
         .collect();
     entries.sort();
     for path in entries {
+        let file = path.display();
         let bytes = std::fs::read(&path).unwrap();
-        let (_, program) = code
-            .add(&bytes)
-            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        assert!(!program.handles_connections(), "{}", path.display());
+        let (_, program) = code.add(&bytes).unwrap_or_else(|e| panic!("{file}: {e}"));
         let manifest = program.describe(TurnLimits::default()).await.unwrap();
-        // The counters run a key-value turn here; the notes components need
-        // an SQL host, and their SQL turns run in the scheduler's tests.
-        if manifest.kind == "counter" {
-            let outcome = run(&program, "counter/released", message("increment", b"")).await;
-            assert_eq!(reply(&outcome), "1", "{}", path.display());
-        } else {
-            assert_eq!(manifest.kind, "notes", "{}", path.display());
+        *kinds.entry(manifest.kind.clone()).or_default() += 1;
+        match manifest.kind.as_str() {
+            "counter" => {
+                assert!(!program.handles_connections(), "{file}");
+                let outcome = run(&program, "counter/released", message("increment", b"")).await;
+                assert_eq!(reply(&outcome), "1", "{file}");
+            }
+            "notes" | "media" => assert!(!program.handles_connections(), "{file}"),
+            // The open turn accepts: the subject from the query, the offered
+            // `room.v1`, and the welcome frame at seq 0.
+            "room" => {
+                assert!(program.handles_connections(), "{file}");
+                let out = run_full(&program, "room/a", open("user=ada", &["x", "room.v1"])).await;
+                let Some(pb::outcome::Output::Accept(accept)) = &out.outcome.output else {
+                    panic!("{file}: {:?}", out.outcome)
+                };
+                assert_eq!(accept.subprotocol_index, Some(1), "{file}");
+                assert_eq!(accept.subject.as_deref(), Some("user:ada"), "{file}");
+                assert_eq!(out.connection_ops.len(), 1, "{file}");
+                assert_eq!(out.connection_ops[0].connections, [CONN], "{file}");
+                assert_eq!(out.connection_ops[0].seqs, [0], "{file}");
+            }
+            other => panic!("{file}: a released component of kind {other} has no claim here"),
         }
-        seen += 1;
     }
-    assert!(seen >= 5, "the corpus has {seen} components");
+    assert_eq!(
+        kinds.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["counter", "media", "notes", "room"],
+        "the corpus components by kind: {kinds:?}"
+    );
     // The committed notes guest (0.1.0, SQL) also links.
     let (_, notes) = code.add(NOTES).unwrap();
     assert!(!notes.handles_connections());
