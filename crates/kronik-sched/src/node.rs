@@ -1358,12 +1358,6 @@ impl Node {
         }
     }
 
-    /// Stops the node as a failed log fsync does: a storage step whose
-    /// durability is unknown, which the next start recovers.
-    pub(crate) fn stop_fatal(&self, message: String) {
-        self.fatal.set(message);
-    }
-
     pub fn kind_exists(&self, kind: &str) -> bool {
         lock(&self.kinds).contains_key(kind)
     }

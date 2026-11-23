@@ -336,7 +336,7 @@ impl Node {
     /// directory and fixes state.db from the journal ([`journal_fix`]).
     pub(crate) fn reseal_rewrite_error(&self, start: Lsn, e: kronik_log::LogError) -> ApiError {
         if matches!(e, kronik_log::LogError::RenameNotDurable(_)) {
-            self.stop_fatal(format!("reseal of segment {start}: {e}"));
+            self.stop(format!("reseal of segment {start}: {e}"));
         }
         ApiError::new(ErrorCode::Internal, format!("reseal: {e}"))
     }
