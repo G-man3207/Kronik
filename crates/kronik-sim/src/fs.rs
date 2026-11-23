@@ -129,7 +129,6 @@ fn parent(p: &Path) -> PathBuf {
     p.parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
-
 impl Disk {
     /// Fails the given `sync_data` calls, counted from 1 over the whole disk
     /// in the order they run, in addition to the random failures of

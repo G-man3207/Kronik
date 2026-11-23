@@ -39,7 +39,6 @@ fn not_found(path: &Path) -> io::Error {
     )
 }
 
-
 fn note_dirs(dirs: &mut BTreeMap<PathBuf, bool>, path: &Path) {
     for dir in path.ancestors() {
         dirs.entry(dir.to_path_buf()).or_insert(false);
