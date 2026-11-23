@@ -225,10 +225,8 @@ impl OwnedOidc {
             .take(1_048_577)
             .read_line(&mut line)
             .unwrap();
-        assert!(
-            bytes > 0 && bytes <= 1_048_576,
-            "bounded owned OIDC response; prepare pinned cryptography/PyJWT from CONTRIBUTING.md"
-        );
+        assert!(bytes > 0, "owned OIDC fixture exited before it answered");
+        assert!(bytes <= 1_048_576, "bounded owned OIDC response");
         let value: Value = serde_json::from_str(&line).expect("owned OIDC fixture response JSON");
         assert!(
             value.get("fixture_error").is_none(),
