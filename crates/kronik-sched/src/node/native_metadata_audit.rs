@@ -50,9 +50,7 @@ impl Node {
         kronik_proto::control::validate_metadata_gap_event(&event)
             .map_err(|error| ApiError::new(ErrorCode::BadRequest, error.to_string()))?;
         let held = self.lock_deploy_authorized(&authority).await?;
-        let node = self
-            .arc()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self.arc()?;
         let (done, result) = oneshot::channel();
         self.env.spawn("metadata-gap-audit", async move {
             let _held = held;

@@ -329,9 +329,7 @@ impl Node {
         if let Some(fatal) = self.fatal() {
             return Err(ApiError::new(ErrorCode::Unavailable, fatal));
         }
-        let node = self
-            .me()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self.arc()?;
         let started = self.env.clock.monotonic();
         let floor = self.blob_floor()?;
         // The erasures this pass is for (M26 §9.3): it deletes their

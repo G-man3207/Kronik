@@ -163,9 +163,7 @@ impl Node {
                 pending_blob_objects: 0,
             });
         }
-        let node = self
-            .arc()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self.arc()?;
         // A collector pass waits for this erasure's own deletion of its
         // blobs' files, which counts them (M26 §9.3).
         let erasing = self.blob_gc.erasing.lock().await;

@@ -591,9 +591,7 @@ impl Node {
             audit: Some(audit),
             reseal_requested: true,
         });
-        let node = self
-            .arc()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self.arc()?;
         self.authorized_effect(authority, move || async move {
             // The exact request and segment set were admitted together.
             node.commit_config_locked(&held, epoch, request, OperationOrigin::Internal, None)

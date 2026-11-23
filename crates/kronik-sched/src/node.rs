@@ -1983,9 +1983,7 @@ impl Node {
         hold: bool,
         origin: OperationOrigin,
     ) -> Result<Lsn, ApiError> {
-        let node = self
-            .me()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self.arc()?;
         let rebase = matches!(record, Record::StateRebase(_));
         // The rebased kinds, whose connections a rebase switch closes.
         let kinds: std::collections::BTreeSet<String> =
@@ -2468,12 +2466,7 @@ impl Node {
             ("kind", &actor.kind),
             move || clock.monotonic(),
         );
-        let Some(me) = self.me() else {
-            return Err(ApiError::new(
-                ErrorCode::Unavailable,
-                "the node is stopping",
-            ));
-        };
+        let me = self.arc()?;
         let (execution_id, seed, time, epoch, program, code_hash, recorded, recovery_begin) =
             match rerun {
                 Some(r) => {
@@ -3563,9 +3556,7 @@ impl Node {
         if !tagged {
             return Ok(record);
         }
-        let node = self
-            .me()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "The node is stopping"))?;
+        let node = self.arc()?;
         self.authorized_effect(authority, move || async move {
             node.seal(&mut record)?;
             Ok(record)
@@ -3753,8 +3744,10 @@ impl Node {
         rx
     }
 
-    pub(crate) fn arc(&self) -> Option<Arc<Node>> {
+    /// The node itself, or `Unavailable` while it is stopping.
+    pub(crate) fn arc(&self) -> Result<Arc<Node>, ApiError> {
         self.me()
+            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))
     }
 
     /// Checks a sealed record as a reader of the log will (Record::validate)
@@ -5279,9 +5272,7 @@ impl Node {
         // has retired the certificate is waited out first, with no lock held.
         self.wait_out_rebuild_window().await;
         let held = self.lock_deploy_authorized(&authority).await?;
-        let node = self
-            .arc()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self.arc()?;
         let (done, result) = oneshot::channel();
         self.env().spawn("control-operation", async move {
             let _held = held;
@@ -5558,9 +5549,7 @@ impl Node {
         origin: OperationOrigin,
         fence: Option<ErasureFence>,
     ) -> Result<Lsn, ApiError> {
-        let node = self
-            .me()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self.arc()?;
         let task = self.env.spawn("config", async move {
             node.commit_config_locked(&guard, epoch, record, origin, fence)
                 .await

@@ -632,9 +632,7 @@ impl Node {
             () = authority.cancelled() => return Err(ApiError::new(ErrorCode::Unauthenticated, "request revoked while waiting for snapshot lock")),
             held = self.snapshot_lock.clone().lock_owned() => held,
         };
-        let node = self
-            .arc()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self.arc()?;
         let reason = reason.to_owned();
         self.authorized_effect(authority, move || async move {
             let _held = held;
