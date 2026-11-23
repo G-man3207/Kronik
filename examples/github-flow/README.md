@@ -14,8 +14,8 @@ merge to main the change is promoted once a reviewer approves.
 > local success is not evidence of a GitHub PR, check/comment or human gate approval.
 
 The files are kept in step with Kronik itself:
-- `kronik.yml` is `docs/examples/kronik-ci.yml`, byte for byte. A test in
-  `action/tests` checks this.
+- `kronik.yml` is `docs/examples/kronik-ci.yml` itself, as a symlink, so the
+  two cannot drift apart. A test in `action/tests` checks this.
 - The actor is `kronik init`'s Rust template for the name `counter`. A test
   in `crates/kronik/src/project/init.rs` checks this.
 - `vendor/kronik-sdk` (the SDK and the WIT) is not here. `kronik init`

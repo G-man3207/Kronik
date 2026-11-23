@@ -48,6 +48,14 @@ class GithubFixtureTest(unittest.TestCase):
         self.assertIn("head.repo.full_name == github.repository", flow["jobs"]["propose"]["if"])
         self.assertEqual(flow["jobs"]["promote"]["environment"]["name"], "kronik-production")
 
+    def test_the_example_repositorys_workflow_is_the_reference_workflow(self):
+        # README: examples/github-flow's kronik.yml is docs/examples/kronik-ci.yml
+        # itself. The symlink keeps the two from drifting apart; this holds the
+        # link in place if it is ever replaced by an edited copy.
+        example = ROOT / "examples/github-flow/.github/workflows/kronik.yml"
+        self.assertTrue(example.is_symlink())
+        self.assertEqual(example.resolve(), ROOT / "docs/examples/kronik-ci.yml")
+
     def test_the_isolation_proofs_keep_their_evidence_and_pin_every_action(self):
         # ADR 0133: the M21 job twice (R1 active and lifted), the microVM tool
         # bundle, then M20; every job keeps its evidence whatever happened and
