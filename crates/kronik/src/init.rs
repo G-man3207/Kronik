@@ -1108,42 +1108,26 @@ pub fn run(
     match InitHost::production(selected_key)
         .and_then(|host| execute_on(args, config_path.unwrap_or(Path::new(DEFAULT_PATH)), &host))
     {
-        Ok(out) => {
-            if json {
-                match serde_json::to_string(&out) {
-                    Ok(body) => println!("{body}"),
-                    Err(error) => {
-                        return crate::cli::report_error(
-                            true,
-                            &ApiError::new(
-                                ErrorCode::Internal,
-                                format!("encoding init result failed: {error}"),
-                            ),
-                        );
-                    }
-                }
-            } else {
-                if out.dry_run {
-                    println!("kronik serve --init would do this (dry run, nothing changed):");
-                }
-                for step in out.steps {
-                    println!("  {:<7} {}", step.action, step.what);
-                }
-                if !out.dry_run {
+        Ok(out) => crate::project::emit(out, json, |out| {
+            if out.dry_run {
+                println!("kronik serve --init would do this (dry run, nothing changed):");
+            }
+            for step in &out.steps {
+                println!("  {:<7} {}", step.action, step.what);
+            }
+            if !out.dry_run {
+                println!(
+                    "Kronik runs as kronik.service. Next:\n  kronik doctor\n  journalctl -u kronik -f"
+                );
+                print_warnings(&out.warnings);
+                if !args.domain.is_empty() {
                     println!(
-                        "Kronik runs as kronik.service. Next:\n  kronik doctor\n  journalctl -u kronik -f"
+                        "  point {} at this host: the gateway gets its certificate when it starts",
+                        args.domain.join(", ")
                     );
-                    print_warnings(&out.warnings);
-                    if !args.domain.is_empty() {
-                        println!(
-                            "  point {} at this host: the gateway gets its certificate when it starts",
-                            args.domain.join(", ")
-                        );
-                    }
                 }
             }
-            std::process::ExitCode::SUCCESS
-        }
+        }),
         Err(error) => {
             let api = error.downcast::<ApiError>().unwrap_or_else(|error| {
                 match error.downcast::<kronik_privacy::key_source::KeySourceError>() {

@@ -98,34 +98,19 @@ struct Done {
 }
 
 pub fn check(args: CheckArgs, json: bool) -> ExitCode {
-    match execute(args) {
-        Ok(done) => {
-            if let Some(note) = &done.note {
-                eprintln!("{note}");
-            }
-            if json {
-                match serde_json::to_string(&done.value) {
-                    Ok(body) => println!("{body}"),
-                    Err(e) => {
-                        return cli::report_error(
-                            true,
-                            &ApiError::new(
-                                ErrorCode::Internal,
-                                format!("encoding JSON failed: {e}"),
-                            ),
-                        );
-                    }
-                }
-            } else {
-                print!("{}", done.text);
-            }
-            match done.error {
-                Some(e) if !json => cli::report_error(false, &e),
-                Some(_) => ExitCode::FAILURE,
-                None => ExitCode::SUCCESS,
-            }
-        }
-        Err(e) => cli::report_error(json, &e),
+    let done = match execute(args) {
+        Ok(done) => done,
+        Err(e) => return cli::report_error(json, &e),
+    };
+    if let Some(note) = &done.note {
+        eprintln!("{note}");
+    }
+    // The report is printed whatever came of the check; the JSON carries its code.
+    let code = crate::project::emit(done.value, json, |_| print!("{}", done.text));
+    match done.error {
+        Some(e) if !json => cli::report_error(false, &e),
+        Some(_) => ExitCode::FAILURE,
+        None => code,
     }
 }
 

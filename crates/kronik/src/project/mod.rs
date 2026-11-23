@@ -129,6 +129,27 @@ impl From<std::io::Error> for Failure {
     }
 }
 
+/// Prints a value: `human` for a person, or with `json` one JSON object on
+/// stdout. A value that does not encode is reported as an error, and the
+/// command fails. `restore`, `upgrade check` and `serve --init` print
+/// through it too.
+pub(crate) fn emit<T: Serialize>(out: T, json: bool, human: impl FnOnce(&T)) -> ExitCode {
+    if json {
+        match serde_json::to_string(&out) {
+            Ok(body) => println!("{body}"),
+            Err(e) => {
+                return crate::cli::report_error(
+                    true,
+                    &ApiError::new(ErrorCode::Internal, format!("encoding JSON failed: {e}")),
+                );
+            }
+        }
+    } else {
+        human(&out);
+    }
+    ExitCode::SUCCESS
+}
+
 /// Prints a result: `human` for a person, or with `json` one JSON object on
 /// stdout, the error JSON on failure.
 fn report<T: Serialize>(
@@ -137,14 +158,10 @@ fn report<T: Serialize>(
     human: impl FnOnce(&T),
 ) -> ExitCode {
     match result {
-        Ok(out) => {
-            if json {
-                println!("{}", serde_json::to_string(&out).unwrap_or_default());
-            } else {
-                human(&out);
-            }
-            ExitCode::SUCCESS
-        }
+        Ok(out) => emit(out, json, human),
+        // shortcut: to_json sorts the keys and the CLI's report_error keeps
+        // the declared order, so the JSON error is printed here; report can
+        // take an ApiError once the two agree (#326).
         Err(f) if json => {
             println!("{}", f.api_error().to_json());
             ExitCode::FAILURE
@@ -250,5 +267,13 @@ mod tests {
             !human.contains("IMPORT_NOT_ALLOWED: IMPORT_NOT_ALLOWED"),
             "{human}"
         );
+    }
+
+    /// `--json` scripts read the exit code: a value that does not encode
+    /// fails the command instead of passing for a success.
+    #[test]
+    fn an_unencodable_value_fails_the_command() {
+        let tuple_key = std::collections::HashMap::from([((1u8, 2u8), 3u8)]);
+        assert_eq!(emit(tuple_key, true, |_| {}), ExitCode::FAILURE);
     }
 }
