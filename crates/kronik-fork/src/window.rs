@@ -28,8 +28,6 @@ pub struct WindowFound {
     pub roots: Vec<FoundRoot>,
     /// Newest engine version in the tail, if the tail named one.
     pub engine: Option<String>,
-    /// First LSN the forward read covered. Older segments were not read.
-    pub read_from: Lsn,
 }
 
 /// Applied segment marks from a branch `state.db`, oldest first.
@@ -69,7 +67,6 @@ pub async fn discover_window(
         return Ok(WindowFound {
             roots: Vec::new(),
             engine: None,
-            read_from: 0,
         });
     }
     let starts = reader.starts().await?;
@@ -78,17 +75,12 @@ pub async fn discover_window(
         return Ok(WindowFound {
             roots: Vec::new(),
             engine,
-            read_from: starts.first().copied().unwrap_or(1),
         });
     };
     let start_time = newest_time.saturating_sub(window_ms);
     let jump = jump_lsn(segments, start_time, newest_segment, &starts);
     let roots = roots_from(reader, jump, head, start_time, floor_lsn).await?;
-    Ok(WindowFound {
-        roots,
-        engine,
-        read_from: jump,
-    })
+    Ok(WindowFound { roots, engine })
 }
 
 /// The last LSN whose turn ran at or before `ms`. Segments older than the
