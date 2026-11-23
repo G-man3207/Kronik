@@ -1,13 +1,12 @@
 use super::*;
 use crate::secret_backend::{BackendError, Fetched, SecretBackend, VersionPage};
 use kronik_core::env::BoxFuture;
-use std::sync::Mutex;
 
 pub(crate) struct Secrets {
     env: Env,
     config: Gcp,
     base: String,
-    token: Mutex<Option<(Zeroizing<String>, Duration)>>,
+    bearer: BearerCache,
 }
 
 fn resource(path: &str) -> Result<(), BackendError> {
@@ -37,6 +36,10 @@ fn source_version<'a>(path: &str, name: &'a str) -> Result<&'a str, BackendError
         .filter(|s| config::positive_version(s))
         .ok_or(BackendError::Invalid)?;
     Ok(id)
+}
+
+fn expires_in(response: &Value) -> Option<u64> {
+    response.get("expires_in").and_then(Value::as_u64)
 }
 
 fn page_token(value: &str) -> Result<(), BackendError> {
@@ -138,77 +141,31 @@ impl Secrets {
             env,
             config,
             base,
-            token: Mutex::new(None),
+            bearer: BearerCache::new(),
         })
     }
 
-    async fn token(
-        &self,
-        net: &Env,
-        original: &AuthLease,
-    ) -> Result<Zeroizing<String>, BackendError> {
-        original.check().map_err(|_| BackendError::Unauthorized)?;
-        let now = self.env.clock.monotonic();
-        {
-            let cache = self.token.lock().map_err(|_| BackendError::Invalid)?;
-            if let Some((token, expires)) = &*cache
-                && now < *expires
-            {
-                return Ok(Zeroizing::new(token.to_string()));
-            }
-        }
-        let response = auth_response(
-            net,
-            &self.config,
-            "https://www.googleapis.com/auth/cloud-platform",
-            Dispatch::Authorized(original),
-        )
-        .await?;
-        let token = field(&response, "access_token").map_err(|_| BackendError::Invalid)?;
-        header_secret(token).map_err(|_| BackendError::Invalid)?;
-        let seconds = response
-            .get("expires_in")
-            .and_then(Value::as_u64)
-            .filter(|seconds| *seconds > 0)
-            .ok_or(BackendError::Invalid)?;
-        let expires = now
-            .checked_add(Duration::from_secs(seconds.saturating_sub(30)))
-            .ok_or(BackendError::Invalid)?;
-        let mut cache = self.token.lock().map_err(|_| BackendError::Invalid)?;
-        original
-            .admit(&mut || {
-                *cache = Some((Zeroizing::new(token.to_owned()), expires));
-                Ok(())
-            })
-            .map_err(|_| BackendError::Unauthorized)?;
-        Ok(Zeroizing::new(token.to_owned()))
-    }
-
     async fn get(&self, url: String, original: &AuthLease) -> Result<SecretJson, BackendError> {
-        let dispatch = Dispatch::Authorized(original);
-        let net = dispatch
-            .wait(tls_env(
+        self.bearer
+            .get(
                 &self.env,
                 self.config.ca_file.as_deref(),
-                None,
-                dispatch,
-            ))
-            .await?
-            .map_err(|_| BackendError::Invalid)?;
-        let token = self.token(&net, original).await?;
-        let result = secret_request(
-            &net,
-            "GET",
-            url,
-            bearer(&token).map_err(|_| BackendError::Invalid)?,
-            vec![],
-            dispatch,
-        )
-        .await;
-        if matches!(result, Err(BackendError::Denied)) {
-            *self.token.lock().map_err(|_| BackendError::Invalid)? = None;
-        }
-        result
+                url,
+                original,
+                |net| {
+                    Box::pin(async move {
+                        auth_response(
+                            &net,
+                            &self.config,
+                            "https://www.googleapis.com/auth/cloud-platform",
+                            Dispatch::Authorized(original),
+                        )
+                        .await
+                    })
+                },
+                expires_in,
+            )
+            .await
     }
 
     async fn access(

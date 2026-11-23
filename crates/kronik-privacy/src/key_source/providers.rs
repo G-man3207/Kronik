@@ -3,6 +3,7 @@
 //! token refresh and bounded collection; only fixed B1 startup uses unleased HTTP.
 use std::ops::Deref;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use base64::{
@@ -11,7 +12,7 @@ use base64::{
 };
 use bytes::Bytes;
 use kronik_core::authority::AuthLease;
-use kronik_core::env::{Env, HttpRequest, OpenMode, TlsConfig};
+use kronik_core::env::{BoxFuture, Env, HttpRequest, OpenMode, TlsConfig};
 use serde_json::{Value, json};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -162,13 +163,13 @@ async fn request_raw(
         .await?
 }
 
-async fn request_bytes(
+async fn request(
     env: &Env,
     method: &str,
     url: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
-) -> Result<Zeroizing<Vec<u8>>, String> {
+) -> Result<SecretJson, String> {
     let (status, data) = request_raw(
         env,
         method,
@@ -183,9 +184,22 @@ async fn request_bytes(
     if !(200..300).contains(&status) {
         return Err(format!("provider returned HTTP {status}"));
     }
-    Ok(data)
+    serde_json::from_slice(&data)
+        .map(SecretJson)
+        .map_err(|_| "invalid provider JSON response".into())
 }
 
+fn http_status(status: u16) -> Result<(), crate::secret_backend::BackendError> {
+    use crate::secret_backend::BackendError;
+    match status {
+        200..=299 => Ok(()),
+        401 | 403 => Err(BackendError::Denied),
+        404 => Err(BackendError::NotFound),
+        410 => Err(BackendError::VersionGone),
+        408 | 425 | 429 | 500..=599 => Err(BackendError::Unavailable),
+        _ => Err(BackendError::Invalid),
+    }
+}
 // Secret services expose larger payloads/catalogues than a 32-byte KMS operation.
 // Exceeding this bound is incomplete coverage, never a successful truncated page.
 const SECRET_RESPONSE_CAP: usize = 32 * 1024 * 1024;
@@ -209,28 +223,10 @@ async fn secret_request(
         dispatch,
     )
     .await?;
-    match status {
-        200..=299 => serde_json::from_slice(&data)
-            .map(SecretJson)
-            .map_err(|_| BackendError::Invalid),
-        401 | 403 => Err(BackendError::Denied),
-        404 => Err(BackendError::NotFound),
-        410 => Err(BackendError::VersionGone),
-        408 | 425 | 429 | 500..=599 => Err(BackendError::Unavailable),
-        _ => Err(BackendError::Invalid),
-    }
-}
-async fn request(
-    env: &Env,
-    method: &str,
-    url: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-) -> Result<SecretJson, String> {
-    let data = request_bytes(env, method, url, headers, body).await?;
+    http_status(status)?;
     serde_json::from_slice(&data)
         .map(SecretJson)
-        .map_err(|_| "invalid provider JSON response".into())
+        .map_err(|_| BackendError::Invalid)
 }
 async fn json_request(
     env: &Env,
@@ -472,6 +468,87 @@ fn bearer(token: &str) -> Result<Vec<(String, String)>, String> {
     Ok(vec![("authorization".into(), format!("Bearer {token}"))])
 }
 
+/// One bearer-token cache per provider: TLS scoping, expiry, admission and
+/// denial invalidation are shared; only the auth request and the `expires_in`
+/// spelling differ between the Azure and GCP backends.
+struct BearerCache(Mutex<Option<(Zeroizing<String>, Duration)>>);
+
+impl BearerCache {
+    fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    // A refused admission means the caller's authority ended mid-authentication,
+    // not that the secret was denied, so every provider answers Unauthorized.
+    async fn token<'a>(
+        &self,
+        net: &Env,
+        original: &'a AuthLease,
+        auth: impl FnOnce(Env) -> BoxFuture<'a, Result<SecretJson, crate::secret_backend::BackendError>>,
+        expires_in: fn(&Value) -> Option<u64>,
+    ) -> Result<Zeroizing<String>, crate::secret_backend::BackendError> {
+        use crate::secret_backend::BackendError;
+        original.check().map_err(|_| BackendError::Unauthorized)?;
+        let now = net.clock.monotonic();
+        {
+            let cache = self.0.lock().map_err(|_| BackendError::Invalid)?;
+            if let Some((token, expires)) = &*cache
+                && now < *expires
+            {
+                return Ok(Zeroizing::new(token.to_string()));
+            }
+        }
+        let response = auth(net.clone()).await?;
+        let token = field(&response, "access_token").map_err(|_| BackendError::Invalid)?;
+        header_secret(token).map_err(|_| BackendError::Invalid)?;
+        let seconds = expires_in(&response)
+            .filter(|seconds| *seconds > 0)
+            .ok_or(BackendError::Invalid)?;
+        let expires = now
+            .checked_add(Duration::from_secs(seconds.saturating_sub(30)))
+            .ok_or(BackendError::Invalid)?;
+        let mut cache = self.0.lock().map_err(|_| BackendError::Invalid)?;
+        original
+            .admit(&mut || {
+                *cache = Some((Zeroizing::new(token.to_owned()), expires));
+                Ok(())
+            })
+            .map_err(|_| BackendError::Unauthorized)?;
+        Ok(Zeroizing::new(token.to_owned()))
+    }
+
+    async fn get<'a>(
+        &self,
+        env: &'a Env,
+        ca: Option<&'a Path>,
+        url: String,
+        original: &'a AuthLease,
+        auth: impl FnOnce(Env) -> BoxFuture<'a, Result<SecretJson, crate::secret_backend::BackendError>>,
+        expires_in: fn(&Value) -> Option<u64>,
+    ) -> Result<SecretJson, crate::secret_backend::BackendError> {
+        use crate::secret_backend::BackendError;
+        let dispatch = Dispatch::Authorized(original);
+        let net = dispatch
+            .wait(tls_env(env, ca, None, dispatch))
+            .await?
+            .map_err(|_| BackendError::Invalid)?;
+        let token = self.token(&net, original, auth, expires_in).await?;
+        let result = secret_request(
+            &net,
+            "GET",
+            url,
+            bearer(&token).map_err(|_| BackendError::Invalid)?,
+            vec![],
+            dispatch,
+        )
+        .await;
+        if matches!(result, Err(BackendError::Denied)) {
+            *self.0.lock().map_err(|_| BackendError::Invalid)? = None;
+        }
+        result
+    }
+}
+
 /// Invalid local credential configuration is not a transient KMS outage.
 pub(crate) async fn preflight(env: &Env, cfg: &Keys) -> Result<(), String> {
     if cfg.source == Source::Pkcs11 {
@@ -480,21 +557,10 @@ pub(crate) async fn preflight(env: &Env, cfg: &Keys) -> Result<(), String> {
         }
         super::pkcs11::check(cfg.pkcs11.as_ref().ok_or("PKCS11_CONFIG")?, true)?;
     }
-    if cfg.source == Source::Aws {
-        for name in [
-            "AWS_PROFILE",
-            "AWS_DEFAULT_PROFILE",
-            "AWS_WEB_IDENTITY_TOKEN_FILE",
-            "AWS_ROLE_ARN",
-            "AWS_CONFIG_FILE",
-            "AWS_SHARED_CREDENTIALS_FILE",
-            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-        ] {
-            if std::env::var_os(name).is_some() {
-                return Err(format!("unsupported AWS credential source {name}"));
-            }
-        }
+    if cfg.source == Source::Aws
+        && let Some(name) = aws::unsupported_source()
+    {
+        return Err(format!("unsupported AWS credential source {name}"));
     }
     if let Some(file) = cfg
         .gcp
@@ -527,6 +593,8 @@ pub(crate) async fn preflight(env: &Env, cfg: &Keys) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::NoNetwork;
 
 #[cfg(test)]
 mod authorized_tests;

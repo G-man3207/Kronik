@@ -352,25 +352,6 @@ impl SecretBackend for Secrets {
 mod tests {
     use super::*;
 
-    struct NoNetwork;
-    impl kronik_core::env::Net for NoNetwork {
-        fn http_authorized(
-            &self,
-            _: HttpRequest,
-            _: kronik_core::authority::AuthLease,
-        ) -> BoxFuture<'static, Result<kronik_core::env::HttpResponse, kronik_core::env::NetError>>
-        {
-            panic!("malformed local identity must not initiate authorized provider I/O")
-        }
-        fn http(
-            &self,
-            _: HttpRequest,
-        ) -> BoxFuture<'static, Result<kronik_core::env::HttpResponse, kronik_core::env::NetError>>
-        {
-            panic!("malformed local identity must not initiate provider I/O");
-        }
-    }
-
     #[tokio::test]
     async fn malformed_inputs_fail_before_authentication_or_network() {
         let mut env = Env::real(tokio::runtime::Handle::current());
