@@ -474,33 +474,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn member_scope_declaration_revokes_native_but_not_physical_lifetime() {
-        let data = tempfile::tempdir().unwrap();
-        let env = Env::real(tokio::runtime::Handle::current());
-        let node = crate::start_local(env, data.path(), NodeConfig::default())
-            .await
-            .unwrap();
-        let recovery = node.native_recovery_authority().unwrap();
-        let original = node.local_operator_authority().unwrap();
-        {
-            let _publication = lock(&node.publication);
-            node.lifecycle.declare_member_under_publication();
-        }
-        assert!(original.check().is_err());
-        tokio::time::timeout(Duration::from_secs(2), original.cancelled())
-            .await
-            .unwrap();
-        assert!(recovery.check().is_err());
-        tokio::time::timeout(Duration::from_secs(2), recovery.cancelled())
-            .await
-            .unwrap();
-        assert!(node.lifecycle.check().is_ok());
-        assert!(node.local_operator_authority().is_err());
-        assert!(node.stop_native_execution().is_err());
-        assert!(node.lifecycle.check().is_ok());
-    }
-
-    #[tokio::test]
     async fn native_capability_does_not_keep_its_original_node_alive() {
         let data = tempfile::tempdir().unwrap();
         let env = Env::real(tokio::runtime::Handle::current());

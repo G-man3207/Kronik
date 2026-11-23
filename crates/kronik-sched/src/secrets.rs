@@ -602,16 +602,6 @@ impl SecretCache {
         drop(state);
         drop(retired);
     }
-    // Unused since the certified-snapshot rework; kept for the M23 track.
-    #[allow(dead_code)]
-    fn invalidate(&self) {
-        let mut state = lock(&self.state);
-        state.revision = state.revision.wrapping_add(1);
-        let retired = Self::retire_certificate(&mut state);
-        self.revision_changed.notify_one();
-        drop(state);
-        drop(retired);
-    }
     fn invalidate_file_operational(&self, name: &str, through: u64) {
         let retired;
         let mut state = lock(&self.state);
@@ -1122,10 +1112,6 @@ pub struct SecretRuntime {
     copies: Mutex<BTreeSet<(String, u64)>>,
     initialized: AtomicBool,
     background: AtomicBool,
-    // The ADR-0004-compliant replacement ripples through the wait/notify
-    // design of every reader and the background cycle; tracked under the
-    // M23 track with the other secret-catalogue defects.
-    #[allow(clippy::disallowed_types)]
     // The ADR-0004-compliant replacement ripples through the wait/notify
     // design of every reader and the background cycle; tracked under the
     // M23 track with the other secret-catalogue defects.

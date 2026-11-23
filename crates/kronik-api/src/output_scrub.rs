@@ -7,7 +7,6 @@
 use std::ops::{Deref, DerefMut};
 
 use kronik_effects::http::{CompiledScrubber, ScrubError};
-use kronik_proto::log::v1 as pb;
 use kronik_sched::scrub::{MAX_JSON_OUTPUT_BYTES, MAX_SECRET_PATTERN_BYTES};
 use serde::Serialize;
 use serde_json::Value;
@@ -99,74 +98,6 @@ impl<'a> Context<'a> {
             Some(error) => Err(scrub_error(error)),
             None => Ok(()),
         }
-    }
-
-    /// Validate only this original outcome's scalar phase, without replacing
-    /// prepared markers. Opaque bodies and effects need their own source guards.
-    /// The endpoint that calls it has not landed yet.
-    #[allow(dead_code)]
-    pub(super) fn prepared_outcome(
-        &mut self,
-        value: &pb::Outcome,
-        current: Option<&[pb::SecretRef]>,
-        original: Option<&[pb::SecretRef]>,
-    ) -> Result<()> {
-        fn plaintext(value: Option<&pb::Sealable>) -> Option<&[u8]> {
-            match value.and_then(|value| value.value.as_ref()) {
-                Some(pb::sealable::Value::Plain(bytes)) => Some(bytes),
-                _ => None,
-            }
-        }
-        let Some(matcher) = self.matcher.as_ref() else {
-            return Err(scrub_error(
-                self.error.take().unwrap_or(ScrubError::MatcherUnavailable),
-            ));
-        };
-        let host_code = value.kind == pb::OutcomeKind::Trap as i32
-            && ErrorCode::parse(&value.error_code).is_some();
-        let free = [
-            (!host_code).then_some(value.error_code.as_bytes()),
-            Some(value.message.as_bytes()),
-        ]
-        .into_iter()
-        .flatten();
-        match value.output.as_ref() {
-            Some(pb::outcome::Output::Reply(message)) => kronik_sched::scrub::prepared_fields_safe(
-                current,
-                original,
-                matcher,
-                free.chain([message.name.as_bytes(), message.content_type.as_bytes()])
-                    .chain(plaintext(message.body.as_ref())),
-            ),
-            Some(pb::outcome::Output::Http(http)) => {
-                let headers = http.headers.iter().flat_map(|header| {
-                    std::iter::once(header.name.as_bytes()).chain(plaintext(header.value.as_ref()))
-                });
-                let body = match http.body.as_ref().and_then(|body| body.value.as_ref()) {
-                    Some(pb::body::Value::Inline(value)) => plaintext(Some(value)),
-                    _ => None,
-                };
-                kronik_sched::scrub::prepared_fields_safe(
-                    current,
-                    original,
-                    matcher,
-                    free.chain(headers).chain(body),
-                )
-            }
-            Some(pb::outcome::Output::Accept(accept)) => {
-                let headers = accept.headers.iter().flat_map(|header| {
-                    std::iter::once(header.name.as_bytes()).chain(plaintext(header.value.as_ref()))
-                });
-                kronik_sched::scrub::prepared_fields_safe(
-                    current,
-                    original,
-                    matcher,
-                    free.chain(headers),
-                )
-            }
-            None => kronik_sched::scrub::prepared_fields_safe(current, original, matcher, free),
-        }
-        .map_err(scrub_error)
     }
 }
 

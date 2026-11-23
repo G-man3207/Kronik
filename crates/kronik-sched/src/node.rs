@@ -3762,33 +3762,6 @@ impl Node {
         rx
     }
 
-    /// Appends records in order (sealed) and resolves once the last is
-    /// applied; its LSN, 0 for none.
-    // Unused since the single-record commit path settled; kept for the M23
-    // track's batched writes.
-    #[allow(dead_code)]
-    pub(crate) async fn commit_all(&self, records: Vec<Record>) -> Result<Lsn, ApiError> {
-        let mut sealed = Vec::with_capacity(records.len());
-        for mut r in records {
-            self.seal(&mut r)?;
-            self.decodable(&r)?;
-            sealed.push(r);
-        }
-        let last = match self.log.append_all(sealed).await {
-            Ok(last) => last.unwrap_or(0),
-            Err(e) if e.is_refusal() => return Err(refused(&e)),
-            Err(e) => {
-                self.fatal.set(e.to_string());
-                return Err(ApiError::new(ErrorCode::Unavailable, e.to_string()));
-            }
-        };
-        tokio::select! {
-            biased;
-            () = self.store.applied.wait(last) => Ok(last),
-            msg = self.fatal.wait() => Err(ApiError::new(ErrorCode::Unavailable, msg)),
-        }
-    }
-
     pub(crate) fn arc(&self) -> Option<Arc<Node>> {
         self.me()
     }

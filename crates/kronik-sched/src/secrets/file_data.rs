@@ -218,14 +218,7 @@ impl SecretCache {
         let live = previous
             .as_ref()
             .and_then(std::sync::Weak::upgrade)
-            .is_some_and(|previous| {
-                previous.data_is_alive_under_publication()
-                    && if previous.data_is_native_under_publication() {
-                        native_live
-                    } else {
-                        previous_runtime.strong_count() != 0
-                    }
-            });
+            .is_some_and(|previous| previous.data_is_alive_under_publication() && native_live);
         let next = Arc::downgrade(physical);
         let mut state = lock(&self.state);
         let unchanged = match (&state.physical, &previous) {
