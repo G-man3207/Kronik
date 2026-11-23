@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use zeroize::{Zeroize, Zeroizing};
 
+use kronik_core::sync::lock;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 
@@ -30,10 +31,6 @@ mod prepared;
 
 /// Unwrapped keys kept in memory at most.
 const CACHE_KEYS: usize = 4096;
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// What reading a `Sealable` gives.
 #[derive(Debug, Clone, PartialEq, Eq)]

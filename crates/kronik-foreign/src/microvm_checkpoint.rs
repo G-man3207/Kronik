@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use kronik_core::sync::lock;
 use kronik_effects::foreign::{Checkpoint, CopySpec};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -15,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 use crate::bridge::{Dialer, Pool};
 use crate::checkpoint::{Copy, CopyInner, Meta, copy_key, prune, write_private};
 use crate::layout::private_dir;
-use crate::manager::{Foreign, lock};
+use crate::manager::Foreign;
 use crate::microvm::{DATA_BYTES, RemoveDirOnDrop, Resources, Start, Vm};
 use crate::microvm_assets::{Assets, Identity};
 use crate::runtime::{Engine, Runtime};

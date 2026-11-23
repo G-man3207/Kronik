@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use kronik_blob::{BlobError, BlobId, BlobMeta, BlobReader, BlobStore, BlobWriter, Lease, Space};
 use kronik_core::env::{BodySource, BoxFuture, Env};
+use kronik_core::sync::lock;
 use kronik_effects::http::{CompiledScrubber, ScrubError, StreamScrubber};
 use kronik_privacy::sealer::Sealer;
 use kronik_proto::log::v1 as pb;
@@ -36,10 +37,6 @@ const RENEW_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 pub type SecretValues = Vec<(String, Arc<zeroize::Zeroizing<Vec<u8>>>)>;
 /// Where a turn's blob host reads them, at each write.
 pub type SecretSource = Arc<dyn Fn() -> SecretValues + Send + Sync>;
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// How a blob host treats keys and subjects' blobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

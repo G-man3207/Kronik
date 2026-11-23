@@ -17,6 +17,7 @@ use kronik_core::authority::{AuthLease, Authority};
 use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::Lsn;
+use kronik_core::sync::lock;
 use kronik_effects::contract::Contract;
 use kronik_effects::http::ScrubError;
 use kronik_effects::http::{
@@ -32,10 +33,6 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::index::ProductionIndex;
 use crate::stubs::StubRule;
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// One target's simulators.
 pub struct TargetSimulators {

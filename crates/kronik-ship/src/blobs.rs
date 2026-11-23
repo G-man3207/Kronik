@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use kronik_blob::format::{self, FrameKey, HEADER_LEN, Header};
 use kronik_blob::{BlobId, BlobMeta, KeyAccess, KeyAnswer};
 use kronik_core::ids::Lsn;
+use kronik_core::sync::lock;
 use kronik_proto::log::v1 as pb;
 use object_store::{ObjectStoreExt as _, PutPayload};
 use rusqlite::{OptionalExtension, params};
@@ -51,12 +52,6 @@ pub(crate) struct Shipped {
     conn: std::sync::Mutex<rusqlite::Connection>,
 }
 
-fn locked(
-    m: &std::sync::Mutex<rusqlite::Connection>,
-) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 impl Shipped {
     pub(crate) fn path(data: &Path) -> PathBuf {
         kronik_store::ship_blobs::path(data)
@@ -79,7 +74,7 @@ impl Shipped {
     }
 
     fn digest(&self, name: &str) -> Result<Option<Vec<u8>>, ShipError> {
-        locked(&self.conn)
+        lock(&self.conn)
             .query_row(
                 "SELECT body_digest FROM shipped WHERE name = ?1",
                 [name],
@@ -90,7 +85,7 @@ impl Shipped {
     }
 
     fn put(&self, name: &str, digest: &[u8]) -> Result<(), ShipError> {
-        locked(&self.conn)
+        lock(&self.conn)
             .execute(
                 "INSERT OR REPLACE INTO shipped (name, body_digest) VALUES (?1, ?2)",
                 params![name, digest],
@@ -103,7 +98,7 @@ impl Shipped {
     /// no file, so a blob referenced again before the deletion's end is
     /// uploaded again, and the row stays until the object is gone.
     fn mark_deleting(&self, name: &str) -> Result<(), ShipError> {
-        locked(&self.conn)
+        lock(&self.conn)
             .execute(
                 "UPDATE shipped SET body_digest = x'' WHERE name = ?1",
                 [name],
@@ -115,28 +110,28 @@ impl Shipped {
     /// Records a referenced blob whose file is missing; `true` the first
     /// time.
     fn note_missing(&self, name: &str) -> Result<bool, ShipError> {
-        Ok(locked(&self.conn)
+        Ok(lock(&self.conn)
             .execute("INSERT OR IGNORE INTO missing (name) VALUES (?1)", [name])
             .map_err(sqlite)?
             > 0)
     }
 
     fn found(&self, name: &str) -> Result<(), ShipError> {
-        locked(&self.conn)
+        lock(&self.conn)
             .execute("DELETE FROM missing WHERE name = ?1", [name])
             .map_err(sqlite)?;
         Ok(())
     }
 
     fn remove(&self, name: &str) -> Result<(), ShipError> {
-        locked(&self.conn)
+        lock(&self.conn)
             .execute("DELETE FROM shipped WHERE name = ?1", [name])
             .map_err(sqlite)?;
         Ok(())
     }
 
     fn names(&self) -> Result<Vec<String>, ShipError> {
-        let conn = locked(&self.conn);
+        let conn = lock(&self.conn);
         let mut st = conn
             .prepare("SELECT name FROM shipped ORDER BY name")
             .map_err(sqlite)?;
@@ -197,7 +192,7 @@ impl Index {
         let Some(conn) = &self.conn else {
             return Ok(Indexed::Absent);
         };
-        let erased: Option<bool> = locked(conn)
+        let erased: Option<bool> = lock(conn)
             .query_row("SELECT erased FROM blobs WHERE hash = ?1", [hash], |r| {
                 r.get(0)
             })
@@ -217,7 +212,7 @@ impl Index {
             return Ok(0);
         };
         let done: BTreeSet<String> = shipped.names()?.into_iter().collect();
-        let conn = locked(conn);
+        let conn = lock(conn);
         let mut st = conn
             .prepare("SELECT hash FROM blobs WHERE erased = 0")
             .map_err(sqlite)?;
@@ -331,7 +326,7 @@ pub fn missing_blob_names(data: &Path) -> Result<BTreeSet<String>, ShipError> {
         return Ok(BTreeSet::new());
     }
     let shipped = Shipped::open(data)?;
-    let conn = locked(&shipped.conn);
+    let conn = lock(&shipped.conn);
     let mut st = conn
         .prepare("SELECT name FROM missing ORDER BY name")
         .map_err(sqlite)?;

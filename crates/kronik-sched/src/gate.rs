@@ -25,15 +25,12 @@ use std::time::Duration;
 
 use kronik_core::authority::AuthLease;
 use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::sync::lock;
 
 use tokio::sync::{Notify, OwnedMutexGuard, OwnedRwLockWriteGuard, RwLock, RwLockReadGuard};
 
 use crate::node::Node;
 use crate::rebase::stale;
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 #[derive(Default)]
 pub(crate) struct DrainState {

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kronik_core::env::{Env, Process};
+use kronik_core::sync::lock;
 use kronik_effects::foreign::{ForeignSecrets, SecretSource};
 use kronik_proto::log::v1 as pb;
 use tokio::sync::Notify;
@@ -26,10 +27,6 @@ const BUNDLE_FORMAT: u32 = 1;
 pub(crate) const PIDS_LIMIT: i64 = 1024;
 /// Short runtime commands (kill, delete, list).
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// Timings of supervision; the defaults are the design's.
 #[derive(Debug, Clone)]

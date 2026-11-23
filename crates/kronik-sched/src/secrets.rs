@@ -12,13 +12,14 @@ use file_data::{ReadStamp, StampedFetched};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kronik_core::authority::AuthLease;
 use kronik_core::env::Env;
 
 use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::sync::lock;
 use kronik_effects::Config;
 use kronik_privacy::secret_backend::config::{Backends, Settings};
 use kronik_privacy::secret_backend::{BackendError, Fetched, SecretBackend, file::FileBackend};
@@ -38,9 +39,6 @@ const MAX_CATALOGUE_PAGES: usize = 1024;
 const MAX_INVENTORY_VALUES: usize = 65_536;
 pub(crate) const MAX_INVENTORY_BYTES: usize = 64 * 1024 * 1024;
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|error| error.into_inner())
-}
 fn unavailable() -> ApiError {
     ApiError::new(
         ErrorCode::SecretUnavailable,

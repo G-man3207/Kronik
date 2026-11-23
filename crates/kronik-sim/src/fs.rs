@@ -19,6 +19,7 @@ use zeroize::Zeroizing;
 use super::SimRng;
 use kronik_core::env::Clock;
 use kronik_core::env::{BoxFuture, File, Fs, OpenMode, insecure_file, secure_path};
+use kronik_core::sync::lock;
 
 const SECTOR: u64 = 512;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -573,10 +574,6 @@ impl SimFs {
             result
         })
     }
-}
-
-fn lock(d: &Mutex<Disk>) -> std::sync::MutexGuard<'_, Disk> {
-    d.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Fs for SimFs {

@@ -11,6 +11,7 @@ use kronik_core::causal;
 use kronik_core::env::{BoxFuture, HttpRequest, NetError};
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, TurnId};
+use kronik_core::sync::lock;
 use kronik_effects::http::{
     CompiledScrubber, ScrubError, fingerprint as legacy_http_fingerprint, fingerprint_v2,
     is_loopback, parse_request_url, prepared_version,
@@ -27,10 +28,6 @@ use prost::Message as _;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::node::{Node, OperationOrigin};
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// A recorded value of `subject` (the guest's default subject at the
 /// effect); sealed when the record is appended in privacy mode.

@@ -24,21 +24,18 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::ActorRef;
+use kronik_core::sync::lock;
 use kronik_proto::connection as conn;
 use kronik_proto::log::v1 as pb;
 use tokio::sync::{Notify, Semaphore};
 
 use crate::node::Node;
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// The queue slots a drained connection keeps.
 const QUEUE_KEPT: usize = 16;

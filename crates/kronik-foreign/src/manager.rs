@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use kronik_core::env::{BoxFuture, Env, HttpRequest, HttpResponse, NetError};
 use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::sync::lock;
 use kronik_effects::foreign::{ForeignHost, SecretSource, unavailable, valid_name};
 use kronik_proto::log::v1 as pb;
 
@@ -25,10 +26,6 @@ pub const TESTED_RUNSC: &str = "release-20261019.0";
 const RECONCILE_WAIT: Duration = Duration::from_secs(30);
 /// How long a call waits for a starting or restarting actor.
 const CALL_WAIT: Duration = Duration::from_secs(10);
-
-pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// `[foreign] platform`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

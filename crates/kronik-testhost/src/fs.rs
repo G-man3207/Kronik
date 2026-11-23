@@ -3,10 +3,11 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use kronik_core::env::{BoxFuture, File, Fs, OpenMode, insecure_file, secure_path};
+use kronik_core::sync::lock;
 use zeroize::Zeroizing;
 
 /// Files by path. Ordinary directories exist implicitly; their privacy is
@@ -22,10 +23,6 @@ struct MemFile {
     data: Mutex<Vec<u8>>,
     // Files are owned, singly linked and regular; ordinary creation is not private.
     private: bool,
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn ready<T: Send + 'static>(v: T) -> BoxFuture<'static, T> {

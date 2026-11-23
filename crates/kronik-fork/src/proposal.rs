@@ -20,6 +20,7 @@ use base64::Engine as _;
 use kronik_core::authority::AuthLease;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{CodeHash, Lsn, random_id};
+use kronik_core::sync::lock;
 use kronik_policy::RuleSet;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
@@ -382,10 +383,6 @@ fn replay_error(e: replay::ReplayError) -> ApiError {
         }
         e => internal(e),
     }
-}
-
-fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn not_found(id: &str) -> ApiError {

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use chacha20::ChaCha20Rng;
 use chacha20::rand_core::{Rng, SeedableRng};
+use kronik_core::sync::lock;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::limits::Limit;
@@ -503,10 +504,6 @@ pub struct SqlActor {
     /// Full-scan steps of the last `scrub`. A seen secret must not scan.
     #[cfg(test)]
     pub last_scrub_fullscan_steps: u64,
-}
-
-fn lock(m: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn sql_err(e: rusqlite::Error, shared: &Mutex<Shared>) -> SqlError {
