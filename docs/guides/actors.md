@@ -555,8 +555,8 @@ of the Rust ones, with the same routes and JSON.
 | `webhook-relay-rs` | `webhook-relay-ts` | `webhook-relay-py` | `webhook-relay-go` | Signed webhook forwarding with retries by timer |
 | | `billing-ts` | | | Invoices with VAT, a `call` to a ledger with a compensation, charges through `payments.internal`; `src/eu-vat.ts` is the change to propose |
 
-`scripts/build-examples.sh`, `build-examples-ts.sh`, `build-examples-py.sh`
-and `build-examples-go.sh` build them into `examples/dist`; `npm test
+`scripts/build-examples.sh`, `build-examples-ts.sh` and
+`build-examples-py-go.sh` build them into `examples/dist`; `npm test
 --workspaces` in `examples/` runs the TypeScript ones' tests, `python3 -m
 unittest discover -s tests` and `go test ./...` (in `test/`) the Python and
 Go ones'.

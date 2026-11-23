@@ -713,11 +713,18 @@ def main():
     missing = [c for n in names for c in EXAMPLES[n][0] if not os.path.exists(os.path.join(args.dist, c))]
     if missing:
         sys.exit(f"error: {', '.join(missing)} not in {args.dist}; build the examples with scripts/build-examples.sh, "
-                 "scripts/build-examples-ts.sh, -py.sh and -go.sh")
+                 "scripts/build-examples-ts.sh and build-examples-py-go.sh")
     if "billing-ts" in names and not args.fake_payments:
         sys.exit("error: billing-ts needs --fake-payments")
     if "todo-ts" in names and not args.faketime_lib:
-        sys.exit("error: todo-ts needs libfaketime (Debian and Ubuntu: apt-get install faketime) for its sweep")
+        why = "todo-ts needs libfaketime (Debian and Ubuntu: apt-get install faketime) for its sweep"
+        if os.environ.get("KRONIK_TEST_FAKETIME") == "require":
+            sys.exit(f"error: KRONIK_TEST_FAKETIME=require, but {why}")
+        if names == ["todo-ts"]:
+            sys.exit(f"error: {why}")
+        # Skip todo-ts with a message, as the foreign and s3 steps do.
+        names.remove("todo-ts")
+        print(f"skipped: {why}", flush=True)
     shutil.rmtree(args.dir, ignore_errors=True)
     os.makedirs(args.dir)
     results = {}

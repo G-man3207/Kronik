@@ -333,8 +333,8 @@ step_sdks() {
     KRONIK_BIN="$kronik" python3 -m unittest discover -s sdk/python/host_tests
     (cd sdk/go && KRONIK_BIN="$kronik" PATH="$tools/bin:$PATH" GOTOOLCHAIN=local go test -tags kronikhost -run 'TestATestPlaysTheClient|TestBlobsInAnActor|TestBlobHoldsAndMessages' .)
     KRONIK_BIN="$kronik" cargo test --manifest-path examples/Cargo.toml --locked -p kronik-sdk --test testkit_connections -- --ignored
-    KRONIK_BIN="$kronik" scripts/build-examples-py.sh
-    KRONIK_BIN="$kronik" scripts/build-examples-go.sh
+    KRONIK_BIN="$kronik" scripts/build-examples-py-go.sh py
+    KRONIK_BIN="$kronik" scripts/build-examples-py-go.sh go
     cargo run --quiet --locked -p kronik-runtime --example check_imports -- examples/dist/*-py*.wasm examples/dist/*-go*.wasm
     local example
     for example in counter-py notes-py webhook-relay-py; do
@@ -571,35 +571,11 @@ step_s3() {
 # examples and says why (as the foreign step does), or fails with
 # KRONIK_TEST_FAKETIME=require.
 step_identity() {
-    local faketime_lib="${FAKETIME_LIB:-}"
-    if [ -z "$faketime_lib" ]; then
-        # The same search scripts/identity-examples.sh does.
-        local lib
-        for lib in /usr/lib/*/faketime/libfaketimeMT.so.1 \
-                /usr/lib/faketime/libfaketimeMT.so.1 \
-                /usr/local/lib/faketime/libfaketimeMT.so.1; do
-            if [ -f "$lib" ]; then
-                faketime_lib="$lib"
-                break
-            fi
-        done
-    fi
-    local only=()
-    if [ -z "$faketime_lib" ]; then
-        local why="todo-ts needs libfaketime for its sweep (Debian and Ubuntu: apt-get install faketime)"
-        if [ "${KRONIK_TEST_FAKETIME:-}" = require ]; then
-            echo "error: KRONIK_TEST_FAKETIME=require, but $why" >&2
-            return 1
-        fi
-        echo "skipped: $why"
-        # Every example in scripts/identity-examples.py's EXAMPLES but todo-ts.
-        only=(--only counter-rs,counter-ts,counter-py,counter-go,notes-rs,notes-ts,notes-py,notes-go,webhook-relay-rs,webhook-relay-ts,webhook-relay-py,webhook-relay-go,uptime-ts,billing-ts,chat-ts,media-ts,media-ts-private)
-    fi
     cargo build --locked --release -p kronik
     # Where cargo put it, also with CARGO_TARGET_DIR set.
     local kronik
     kronik="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/release/kronik"
-    KRONIK_BIN="$kronik" scripts/identity-examples.sh "${only[@]}"
+    KRONIK_BIN="$kronik" scripts/identity-examples.sh
 }
 
 # The static release binary's target, linked as scripts/release.sh links it:

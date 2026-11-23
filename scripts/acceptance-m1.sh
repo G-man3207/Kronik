@@ -13,7 +13,7 @@
 # notes-rs from examples/dist (build them with scripts/build-examples.sh);
 # `ts` runs their TypeScript twins counter-ts and notes-ts (build them with
 # scripts/build-examples-ts.sh); `py` and `go` the Python and Go twins
-# (scripts/build-examples-py.sh, scripts/build-examples-go.sh; M15).
+# (scripts/build-examples-py-go.sh; M15).
 #
 # Usage: [M1_GUESTS=test|examples|ts|py|go] [KRONIK_BIN=path] scripts/acceptance-m1.sh [WORKDIR] [PORT] [N]
 # Defaults: /var/tmp/kronik-m1 (a real disk, not tmpfs), port 47812, N 10000,

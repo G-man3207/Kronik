@@ -9,7 +9,7 @@
 # and also checks notes-rs's routes and a failed message turn; `ts` does the
 # same with their TypeScript twins counter-ts and notes-ts (build them with
 # scripts/build-examples-ts.sh); `py` and `go` with the Python and Go twins
-# (scripts/build-examples-py.sh, scripts/build-examples-go.sh; M15).
+# (scripts/build-examples-py-go.sh; M15).
 #
 # Usage: [M1_GUESTS=test|examples|ts|py|go] [KRONIK_BIN=path] scripts/e2e-m1.sh [WORKDIR] [PORT]
 # Defaults: /var/tmp/kronik-e2e and port 47811, KRONIK_BIN

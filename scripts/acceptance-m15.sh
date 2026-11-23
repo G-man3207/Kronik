@@ -121,8 +121,8 @@ run_lang() {
 
     echo "== build ${lang} examples"
     case "$lang" in
-        py) scripts/build-examples-py.sh ;;
-        go) scripts/build-examples-go.sh ;;
+        py) scripts/build-examples-py-go.sh py ;;
+        go) scripts/build-examples-py-go.sh go ;;
     esac
     require_component "examples/dist/counter-${lang}.wasm"
     require_component "examples/dist/notes-${lang}.wasm"
