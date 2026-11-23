@@ -4,16 +4,13 @@
 //! hold blobs forever.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kronik_core::env::Clock;
+use kronik_core::sync::lock;
 
 use crate::BlobId;
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 struct Entry {
     holder: &'static str,

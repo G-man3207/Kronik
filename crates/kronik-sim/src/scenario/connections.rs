@@ -48,6 +48,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use kronik_core::env::Env;
 use kronik_core::ids::Lsn;
+use kronik_core::sync::lock;
 use kronik_gateway::{Gateway, HttpRequest, HttpResponse};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
@@ -63,10 +64,6 @@ use crate::fs::Disk;
 /// The room guest (tests/guests/room.wasm), built for the world
 /// `actor-connections`.
 pub const ROOM: &[u8] = include_bytes!("../../../../tests/guests/room.wasm");
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// The connections workload's knobs, from the seed.
 #[derive(Debug, Clone, Copy)]

@@ -587,14 +587,11 @@ impl Stream {
     }
 }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 use kronik_core::{
     authority::{AuthLease, Authority},
     env::BoxFuture,
     error::{ApiError, ErrorCode},
+    sync::lock,
 };
 use kronik_sched::secrets::{CertifiedSecretSnapshot, SecretSnapshotPublication};
 

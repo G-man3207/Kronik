@@ -2,6 +2,7 @@
 use kronik_core::authority::Authority;
 use kronik_core::env::BoxFuture;
 use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::sync::lock;
 use kronik_log::NativeWriterState;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -9,11 +10,6 @@ use tokio::sync::Notify;
 
 mod source_roots;
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 fn stopped() -> ApiError {
     ApiError::new(
         ErrorCode::Unavailable,

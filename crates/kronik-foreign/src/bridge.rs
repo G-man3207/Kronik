@@ -12,6 +12,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full, Limited};
 use hyper::client::conn::http1::SendRequest;
 use kronik_core::env::{Env, HttpRequest, HttpResponse, NetError};
+use kronik_core::sync::lock;
 use kronik_effects::foreign::unavailable;
 
 use crate::runtime::Runtime;
@@ -52,10 +53,6 @@ pub(crate) enum Dialer {
 pub(crate) struct Pool {
     idle: Mutex<Vec<Sender>>,
     seq: AtomicU64,
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Pool {

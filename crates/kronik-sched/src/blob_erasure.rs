@@ -27,12 +27,9 @@ use kronik_blob::{BlobId, Space};
 use kronik_core::env::{Fs, OpenMode};
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::Lsn;
+use kronik_core::sync::lock;
 
 use crate::Node;
-
-fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// How often the collector looks again while a writer of an erased subject
 /// is still writing: as often as a lease is renewed, at most.

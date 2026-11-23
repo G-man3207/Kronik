@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use kronik_core::ids::CodeHash;
+use kronik_core::sync::lock;
 use wasmtime::component::Component;
 use wasmtime::{Config, Engine, InstanceAllocationStrategy, OptLevel, PoolingAllocationConfig};
 
@@ -297,10 +298,6 @@ impl CodeStore {
         // SAFETY: as above; the file was just written by this process.
         unsafe { Component::deserialize_file(&self.engine, &path) }.map_err(wt)
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Write to a temporary file, fsync, rename, fsync the directory.

@@ -4,21 +4,18 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use kronik_core::env::{Env, File, OpenMode};
+use kronik_core::sync::lock;
 use zeroize::Zeroizing;
 
 use crate::SpaceBudget;
 use crate::format::{self, FRAME_SIZE, FrameKey, HEADER_LEN, Header};
 use crate::id::hex;
 use crate::{BlobError, BlobId, BlobMeta, Lease, Leases};
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// Where blobs are written and first looked for.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use kronik_core::authority::AuthLease;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{CodeHash, Lsn};
+use kronik_core::sync::lock;
 use kronik_log::{Committed, LogReader};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
@@ -27,10 +28,6 @@ use crate::node::{internal, store_err};
 pub fn rebase_turn_bytes(id: &str, record: &pb::TurnRecord) -> u64 {
     let wrapped = prost::Message::encoded_len(record) as u64 + id.len() as u64 + 32;
     wrapped + wrapped / 4 + 17 + 64
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub(crate) fn stale(msg: impl Into<String>) -> ApiError {

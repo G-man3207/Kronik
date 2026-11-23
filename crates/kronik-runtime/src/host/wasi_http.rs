@@ -30,13 +30,14 @@
 //! [`EffectGate::fetch`]: super::EffectGate::fetch
 
 use std::pin::{Pin, pin};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Full};
 use kronik_core::env::BoxFuture;
+use kronik_core::sync::lock;
 use kronik_proto::log::v1 as pb;
 use wasmtime::component::{Linker, Resource, ResourceTable};
 use wasmtime::format_err;
@@ -119,10 +120,6 @@ struct BlobFrames {
     failed: Option<HttpErr>,
 }
 
-fn frames(body: &Mutex<BlobFrames>) -> MutexGuard<'_, BlobFrames> {
-    body.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// A response body above the threshold, as `wasi:http` reads it: its frames
 /// come only from [`TurnHost::fill_bodies`], at the guest's waits.
 struct BlobBody(Arc<Mutex<BlobFrames>>);
@@ -135,7 +132,7 @@ impl Body for BlobBody {
         self: Pin<&mut Self>,
         _: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, HttpErr>>> {
-        let mut f = frames(&self.0);
+        let mut f = lock(&self.0);
         if let Some(bytes) = f.frame.take() {
             return Poll::Ready(Some(Ok(Frame::data(bytes))));
         }
@@ -151,12 +148,12 @@ impl Body for BlobBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        let f = frames(&self.0);
+        let f = lock(&self.0);
         f.frame.is_none() && f.failed.is_none() && f.next >= f.blob.size
     }
 
     fn size_hint(&self) -> SizeHint {
-        let f = frames(&self.0);
+        let f = lock(&self.0);
         let held = f.frame.as_ref().map_or(0, |frame| frame.len() as u64);
         SizeHint::with_exact(f.blob.size.saturating_sub(f.next) + held)
     }
@@ -650,7 +647,7 @@ impl TurnHost {
             };
             i += 1;
             let (blob, offset, len) = {
-                let mut f = frames(&body);
+                let mut f = lock(&body);
                 if !f.wanted || f.frame.is_some() || f.failed.is_some() || f.next >= f.blob.size {
                     continue;
                 }
@@ -662,7 +659,7 @@ impl TurnHost {
             self.charge_blob_bytes(read_charge(blob.size, offset, len))?;
             let read = host.read(&blob, offset, len).await;
             let failure = {
-                let mut f = frames(&body);
+                let mut f = lock(&body);
                 match read {
                     Ok(bytes) if !bytes.is_empty() => {
                         f.next = offset + bytes.len() as u64;

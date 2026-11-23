@@ -2,13 +2,14 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use kronik_core::authority::AuthLease;
 use kronik_core::causal;
 use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, CodeHash, Lsn, TurnId, random_id};
+use kronik_core::sync::lock;
 use kronik_core::time::LogicalClock;
 use kronik_effects::http::FingerprintRules;
 use kronik_effects::rate::RateLimiter;
@@ -39,10 +40,6 @@ mod source_gc;
 #[cfg(test)]
 mod timer_replace;
 pub use records::{ExportResume, ShardReadPoint, ShardReader, ShardRecordPage};
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 pub(crate) fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::new(ErrorCode::Internal, e.to_string())

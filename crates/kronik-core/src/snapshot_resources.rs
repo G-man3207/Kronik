@@ -4,9 +4,11 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
-    Arc, Mutex, MutexGuard,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+
+use crate::sync::lock;
 
 /// The existing physical reader-root state, shared by its original lifecycle.
 /// Empty means no active reader resources, never complete durable-source cover.
@@ -94,11 +96,6 @@ impl Drop for SnapshotRootPin {
     }
 }
 
-fn lock_root_state(registry: &Mutex<SnapshotRootRegistry>) -> MutexGuard<'_, SnapshotRootRegistry> {
-    registry
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 fn unavailable_root_state() -> String {
     "the original physical source roots are unavailable for retention".into()
 }
@@ -111,7 +108,7 @@ impl SnapshotRootRegistry {
         paths: Vec<PathBuf>,
     ) -> Result<SnapshotRootPin, String> {
         let paths = normalized_paths(paths)?;
-        let mut state = lock_root_state(registry);
+        let mut state = lock(registry);
         if let Some(existing) = state.retained_roots.get(&paths) {
             return existing.try_pin().ok_or_else(unavailable_root_state);
         }

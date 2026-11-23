@@ -14,6 +14,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use kronik_core::authority::AuthLease;
 use kronik_core::ids::Lsn;
+use kronik_core::sync::lock;
 use kronik_log::Committed;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::Node;
@@ -577,7 +578,7 @@ impl AuditExport {
         let env = self.node.env();
         match &mut self.target {
             Target::File(writer) => {
-                if follow_lock(writer).failed {
+                if lock(writer).failed {
                     return Err(("storage_sync".into(), None));
                 }
                 let (writer, body) = (writer.clone(), batch.body.clone());
@@ -589,7 +590,7 @@ impl AuditExport {
                         Ok(env
                             .blocking("audit-file", move || {
                                 let _retained = retained;
-                                follow_lock(&writer).append(&body)
+                                lock(&writer).append(&body)
                             })
                             .await)
                     })
@@ -697,10 +698,6 @@ impl AuditExport {
     }
 }
 
-fn follow_lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 impl follow::Sink for AuditExport {
     type Batch = Batch;
 
@@ -746,7 +743,7 @@ impl follow::Sink for AuditExport {
 
     async fn deliver(&mut self, batch: &Batch, original: AuthLease) -> Delivery {
         if let Target::File(writer) = &self.target
-            && follow_lock(writer).failed
+            && lock(writer).failed
         {
             return Delivery::Retry {
                 code: "storage_sync".into(),

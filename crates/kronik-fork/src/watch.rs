@@ -15,6 +15,7 @@ use std::time::Duration;
 use kronik_core::authority::AuthLease;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{Lsn, random_id};
+use kronik_core::sync::lock;
 use kronik_log::LogError;
 use kronik_policy::{GuardAction, GuardEvaluation, RuleSet};
 use kronik_proto::Record;
@@ -116,10 +117,6 @@ fn log_err(e: LogError) -> ApiError {
         LogError::Corrupt(m) => ApiError::new(ErrorCode::StorageCorrupt, m),
         other => internal(other),
     }
-}
-
-fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn not_found(id: &str) -> ApiError {

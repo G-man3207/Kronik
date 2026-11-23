@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kronik_core::env::{BoxFuture, Env, HttpRequest, HttpResponse, NetError};
+use kronik_core::sync::lock;
 use kronik_effects::foreign::{Checkpoint, CopySpec, ForeignCopy};
 use serde::{Deserialize, Serialize};
 
@@ -196,7 +197,7 @@ impl Foreign {
         hold: Box<dyn std::any::Any + Send>,
         budget: Option<u64>,
     ) -> Result<Checkpoint, String> {
-        let actor = crate::manager::lock(&self.actors).get(name).cloned();
+        let actor = lock(&self.actors).get(name).cloned();
         let a = actor.ok_or_else(|| format!("{name} is not running in this daemon"))?;
         if a.runtime.engine == Engine::Runc {
             return Err(format!("{name} runs under runc, which has no checkpoints"));
@@ -342,7 +343,7 @@ impl Foreign {
         };
         let keep = self.cfg.checkpoints_kept.max(1);
         let (root2, tmp) = (root.clone(), tmp.to_path_buf());
-        let spec = crate::manager::lock(&a.spec).clone();
+        let spec = lock(&a.spec).clone();
         if spec.is_empty() {
             return Err(format!("{name} has no runtime spec: it is not running"));
         }
@@ -457,7 +458,7 @@ impl Foreign {
             vm: None,
         });
         {
-            let mut all = crate::manager::lock(&self.copies);
+            let mut all = lock(&self.copies);
             all.retain(|c| c.strong_count() > 0);
             all.push(Arc::downgrade(&copy));
         }

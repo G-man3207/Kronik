@@ -12,6 +12,7 @@ use kronik_core::causal;
 use kronik_core::env::{BoxFuture, Env};
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
+use kronik_core::sync::lock;
 use kronik_effects::http::{
     CompiledScrubber, fingerprint, fingerprint_v2, parse_request_url, prepared_target,
     prepared_version, target_of, under_rules_of,
@@ -33,10 +34,6 @@ use prost::Message as _;
 
 use crate::index::{ProductionIndex, RootInput};
 use crate::taint::Taint;
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReplayError {

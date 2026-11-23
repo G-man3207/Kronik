@@ -28,12 +28,9 @@ use kronik_blob::{BlobError, BlobId, Roots, Space, SweepReport};
 pub use kronik_blob::{BlobReader, SweepOptions};
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::Lsn;
+use kronik_core::sync::lock;
 
 use crate::Node;
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// The file a snapshot carries its blob roots in (M26 §7).
 pub const SNAPSHOT_INDEX: &str = "blobs.idx";
