@@ -3,7 +3,7 @@ name: nightly
 # The Definition of done's long checks. They are too slow, and too expensive
 # in hosted-runner minutes, to start on a schedule or on every pull request
 # (a manual CI run uses DST with 200 seeds): the crash test for 1,000 cycles
-# (scripts/chaos.sh), the crash test under retention
+# (scripts/chaos.py), the crash test under retention
 # (scripts/chaos-retention.py), the runbook drills
 # (scripts/runbook-drills.py), DST with 10,000 seeds over every scenario, over
 # the rebuild workload and over the webhook workload with webhook-relay-ts
@@ -41,7 +41,7 @@ jobs:
         run: cargo build --locked --release -p kronik
       # A real disk, not tmpfs: the test is about fsync and recovery.
       - name: Crash test
-        run: scripts/chaos.sh 1000 "$RUNNER_TEMP/chaos"
+        run: python3 scripts/chaos.py --cycles 1000 --dir "$RUNNER_TEMP/chaos"
       # The work directory of the first violation: data dir, daemon log,
       # target log.
       - name: Keep the work directory

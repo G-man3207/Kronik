@@ -1656,7 +1656,7 @@ a key with other attributes is refused (`KEY_HELPER_FAILED`). After that a
 start on an empty data directory makes the seed in memory and writes only
 its envelope, and later starts unwrap it through the helper. A wrong PIN, a
 missing helper or a token that does not answer stops the start with
-`KEY_HELPER_FAILED` and writes nothing. `scripts/e2e-pkcs11.sh` runs this
+`KEY_HELPER_FAILED` and writes nothing. `scripts/e2e-pkcs11.py` runs this
 flow against SoftHSM2 (the design's §9 has what it showed); no physical HSM
 has been tried.
 
@@ -1747,7 +1747,7 @@ fallback. Give the process enough `LimitMEMLOCK` for its key mappings.
 
 ### Free emulator acceptance
 
-`scripts/e2e-keys.sh` exercises an already-built Linux binary against pinned
+`scripts/e2e-keys.py` exercises an already-built Linux binary against pinned
 OpenBao, Moto KMS, GCP KMS and Azure Key Vault emulator images. It builds and
 installs nothing, uses dummy credentials, and needs Linux root, Python 3.12+
 (`os.setns`), Docker, OpenSSL and the host public CA bundle at
@@ -1756,7 +1756,7 @@ counter component supplies the secret-HMAC and sealed-value workload.
 
 ```sh
 KRONIK_BIN=target/x86_64-unknown-linux-musl/release/kronik \
-  flock -w 20 /var/tmp/kronik-vps.lock scripts/e2e-keys.sh
+  flock -w 20 /var/tmp/kronik-vps.lock python3 scripts/e2e-keys.py
 ```
 
 The VPS lock is the existing convention on the shared test VPS: do not run

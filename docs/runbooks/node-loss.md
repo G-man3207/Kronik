@@ -45,7 +45,7 @@ before executing a cluster drill.
 
 For a single-node fixture, SIGKILL/restart and comparison of acknowledged
 counter/SQL state against the recovered log is a useful **crash-recovery
-control**, not cluster leader replacement. The existing `scripts/chaos.sh` and
+control**, not cluster leader replacement. The existing `scripts/chaos.py` and
 [snapshot/retention documentation](../guides/operations.md#snapshots-and-retention)
 cover that path. A 30-day physical three-node chaos history cannot be replaced
 by a short local control or fabricated elapsed time.

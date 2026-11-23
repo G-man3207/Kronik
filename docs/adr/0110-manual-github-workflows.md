@@ -13,7 +13,7 @@ allowance whether or not anyone needs the run. The nightly jobs are allowed
 hours each, and one night starts all of them.
 
 The checks themselves are unchanged. `scripts/ci.sh` is still the local run of
-the CI steps. The nightly commands (`scripts/chaos.sh`, `scripts/dst.sh`,
+the CI steps. The nightly commands (`scripts/chaos.py`, `scripts/dst.sh`,
 `scripts/release.sh`) still exist and still match the Definition of done
 volumes in [ADR 0004](0004-deterministic-simulation.md): 200 seeds in an
 ordinary CI run, 10,000 seeds and a million-step run in the long workflow, and

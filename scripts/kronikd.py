@@ -7,10 +7,13 @@ import contextlib
 import http.client
 import json
 import os
+from pathlib import Path
 import signal
 import socket
 import subprocess
 import time
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 class Violation(Exception):
@@ -58,6 +61,15 @@ def free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+def artifact(variable, *path):
+    """The binary a script runs unless the caller names one: the value of the
+    environment variable `variable` (KRONIK_BIN, KRONIK_KEYHELPER), else
+    `path` under cargo's target directory ($CARGO_TARGET_DIR, or the
+    repository's target/). A relative value is relative to the caller's
+    current directory."""
+    return Path(os.environ.get(variable) or Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target", *path))
 
 
 def docker_image(ref, pull_timeout=240):

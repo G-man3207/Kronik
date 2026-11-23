@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """Kronik's crash test (brief: Test strategy and Definition of done): kill -9
 in a loop under load on a real disk, with the invariants checked after every
-restart. Run it with scripts/chaos.sh.
+restart.
+
+Usage: [KRONIK_BIN=path] python3 scripts/chaos.py [--cycles N] [--dir DIR] [options]
+Defaults: 1000 cycles in /var/tmp/kronik-chaos (a real disk, not tmpfs);
+KRONIK_BIN, else $CARGO_TARGET_DIR/release/kronik or target/release/kronik; the
+test guests from tests/guests. Needs python3. Prints a line per cycle and a
+JSON summary; exits non-zero on the first violation, keeping the work
+directory for inspection.
 
 Every cycle starts load on the daemon, kills it with SIGKILL at a random
 moment, restarts it on the same data directory and checks:
@@ -53,6 +60,7 @@ import hashlib
 import http.client
 import json
 import os
+from pathlib import Path
 import random
 import re
 import shutil
@@ -65,7 +73,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.dont_write_bytecode = True  # no __pycache__ in scripts/
-from kronikd import Daemon, Violation  # noqa: E402
+from kronikd import Daemon, Violation, artifact  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def median(values):
@@ -401,8 +411,10 @@ def privacy_phase(daemon, data, target, cycles):
 
 def main():
     p = argparse.ArgumentParser(description="Kronik's crash test: kill -9 in a loop under load")
-    p.add_argument("--bin", required=True)
-    p.add_argument("--dir", required=True)
+    p.add_argument("--bin", type=Path, default=artifact("KRONIK_BIN", "release", "kronik"),
+                   help="an already-built kronik (default: KRONIK_BIN, else the repository's release build)")
+    p.add_argument("--dir", default="/var/tmp/kronik-chaos",
+                   help="the work directory on a real disk, removed at the start and kept after a violation")
     p.add_argument("--port", type=int,
                    help="the gateway's port (default: a free one below the ephemeral range, claimed)")
     p.add_argument("--cycles", type=int, default=1000)
@@ -419,7 +431,7 @@ def main():
     p.add_argument("--min-kill", type=float, default=0.2, help="least seconds of load before the kill")
     p.add_argument("--max-kill", type=float, default=2.0, help="most seconds of load before the kill")
     p.add_argument("--clients", type=int, default=12)
-    p.add_argument("--guests", default="tests/guests")
+    p.add_argument("--guests", default=ROOT / "tests/guests")
     p.add_argument("--skip-identity-replay", action="store_true")
     p.add_argument("--privacy-cycles", type=int, default=2,
                    help="cycles of the privacy phase after the identity replay: erase a subject whose turns "

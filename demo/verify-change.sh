@@ -56,7 +56,7 @@ if [ -n "${KRONIK_DEMO_SOCKET:-}" ]; then
     : "${KRONIK_DEMO_RUN_DIR:?external daemon needs its owned runtime directory}"
     : "${KRONIK_DEMO_OWNER_TOKEN:?external daemon needs its fixture ownership token}"
     : "${KRONIK_DEMO_FIXTURE:?external daemon needs its trusted fixture manifest}"
-    bash scripts/check-rootless.sh --fixture "$KRONIK_DEMO_FIXTURE"
+    python3 scripts/isolation-conformance.py check --fixture "$KRONIK_DEMO_FIXTURE"
     [ "$(cat "$KRONIK_DEMO_DATA_DIR/.kronik-proof-owner")" = "$KRONIK_DEMO_OWNER_TOKEN" ] ||
         { echo "wrong external fixture owner" >&2; exit 2; }
     [ ! -e "$dir" ] || { echo "evidence directory already exists: $dir" >&2; exit 2; }

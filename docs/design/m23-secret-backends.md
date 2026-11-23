@@ -11,14 +11,14 @@ the code; a plan is not a pass.
 
 | Slice | In the code | Has run | Not done |
 | --- | --- | --- | --- |
-| B1 master key in a KMS | OpenBao, AWS, GCP and Azure wrapping; `file` and `env` seeds; `keys wrap`, `rewrap`, `status` | `scripts/e2e-keys.sh` on pinned service images (the status page has the runs) | |
+| B1 master key in a KMS | OpenBao, AWS, GCP and Azure wrapping; `file` and `env` seeds; `keys wrap`, `rewrap`, `status` | `scripts/e2e-keys.py` on pinned service images (the status page has the runs) | |
 | B2 trait, links, versions | `SecretBackend`; `SecretVersion` (kind 45) and `SecretLink` (kind 46); `secret link`, `unlink`, `refresh`, `history`, `backends`; effects resolve through links; re-runs fetch by `source_version`; `secrets` in the effects of `history` | `crates/kronik/tests/secret_backends.rs` (§9, criteria 2 and 3, steps 1 to 7, against a stand-in for OpenBao's KV v2); the DST scenario `allocator` ("one allocator", step 8): `scripts/dst.sh 0..10000 6 --scenario allocator` passes (release), and seeds 0..300 give the same trace twice | |
-| B3 cache and outages | the cache and the refresher; `fetch_timeout`; `max_stale`; the failure cache of 5 s; an error result for an effect that cannot get its secret; scrubbing that fails closed; foreign actors through the cache; forks that use only a held value and never fetch; the four metrics and `kronik doctor`'s `secrets` check (§6); encrypted scrub-only copies of recorded versions (ADR 0142) | the same file (outage, refusal, restart and crash re-run cases, a fork and `foreign add` with a linked name, a version the backend destroyed scrubbed from its copy after a restart); the DST scenario `secret-outage`: `scripts/dst.sh 0..2000 6 --scenario secret-outage` passes (release), seeds 0..100 give the same trace twice, and 4 of seeds 0..16 fail without the stale fallback of this release; `scripts/e2e-secrets.sh` with each real service paused, and OpenBao also stopped | a foreign actor's start with a linked name has run only in unit tests and through `foreign add` (a start needs a sandbox) |
-| B4 providers | clients for `env`, `openbao` (KV v2, token, AppRole, certificate), `aws` (Secrets Manager), `gcp` and `azure` | unit tests for each; `scripts/e2e-secrets.sh` against the real services below, all passing on one run | OpenBao's certificate login and token renewal, and the cloud metadata/IMDS logins, against a real service; any real cloud |
-| B5 proof and docs | `secret_backends.rs`; `scripts/e2e-secrets.sh`; `scripts/e2e-cloud-secrets.sh`; the `[secrets]` table and the troubleshooting sections of the operations guide; the CLI, JSON, OpenAPI and error references | `scripts/e2e-secrets.sh`, see below | `scripts/e2e-cloud-secrets.sh` has **not been run**: the project has no AWS, GCP or Azure account for it |
-| B6 PKCS#11 | the `kronik-keyhelper` crate and its default-off release asset (ADR 0093); `[keys] source = "pkcs11"`; `keys enroll` | `scripts/e2e-pkcs11.sh` against SoftHSM2 2.6.1 with a **development build** of `kronik` and `kronik-keyhelper --features pkcs11`, see below | the release artifacts (musl daemon, glibc helper asset); a physical HSM; the rest of ADR 0093's acceptance list (staged restore, migration with `keys wrap`, helper crash/timeout/overflow drills) |
+| B3 cache and outages | the cache and the refresher; `fetch_timeout`; `max_stale`; the failure cache of 5 s; an error result for an effect that cannot get its secret; scrubbing that fails closed; foreign actors through the cache; forks that use only a held value and never fetch; the four metrics and `kronik doctor`'s `secrets` check (§6); encrypted scrub-only copies of recorded versions (ADR 0142) | the same file (outage, refusal, restart and crash re-run cases, a fork and `foreign add` with a linked name, a version the backend destroyed scrubbed from its copy after a restart); the DST scenario `secret-outage`: `scripts/dst.sh 0..2000 6 --scenario secret-outage` passes (release), seeds 0..100 give the same trace twice, and 4 of seeds 0..16 fail without the stale fallback of this release; `scripts/e2e-secrets.py` with each real service paused, and OpenBao also stopped | a foreign actor's start with a linked name has run only in unit tests and through `foreign add` (a start needs a sandbox) |
+| B4 providers | clients for `env`, `openbao` (KV v2, token, AppRole, certificate), `aws` (Secrets Manager), `gcp` and `azure` | unit tests for each; `scripts/e2e-secrets.py` against the real services below, all passing on one run | OpenBao's certificate login and token renewal, and the cloud metadata/IMDS logins, against a real service; any real cloud |
+| B5 proof and docs | `secret_backends.rs`; `scripts/e2e-secrets.py`; `scripts/e2e-secrets.py --cloud`; the `[secrets]` table and the troubleshooting sections of the operations guide; the CLI, JSON, OpenAPI and error references | `scripts/e2e-secrets.py`, see below | `scripts/e2e-secrets.py --cloud` has **not been run**: the project has no AWS, GCP or Azure account for it |
+| B6 PKCS#11 | the `kronik-keyhelper` crate and its default-off release asset (ADR 0093); `[keys] source = "pkcs11"`; `keys enroll` | `scripts/e2e-pkcs11.py` against SoftHSM2 2.6.1 with a **development build** of `kronik` and `kronik-keyhelper --features pkcs11`, see below | the release artifacts (musl daemon, glibc helper asset); a physical HSM; the rest of ADR 0093's acceptance list (staged restore, migration with `keys wrap`, helper crash/timeout/overflow drills) |
 
-**`scripts/e2e-secrets.sh`, 2026-11-13** (a development build of `kronik`,
+**`scripts/e2e-secrets.py`, 2026-11-13** (a development build of `kronik`,
 0.5.0-dev, SHA-256 `55fe5dd7…cb38514`; images by digest, ports on loopback):
 
 | Service | Image | Outcome |
@@ -53,7 +53,7 @@ fixes three defects: a re-run's older version became the current value after
 a restart, moto's empty `NextToken` was refused, and a Key Vault answer
 without `attributes.enabled` was refused.
 
-**`scripts/e2e-pkcs11.sh`, 2026-11-13** (development builds: `kronik`
+**`scripts/e2e-pkcs11.py`, 2026-11-13** (development builds: `kronik`
 `55fe5dd7…cb38514`, `kronik-keyhelper` `e7b8a3eb…3ef99781`; Debian
 `softhsm2` 2.6.1-3 and `opensc` 0.26.1-2, module SHA-256 `f2c19104…2f753fd`):
 pass. `keys enroll` refused an extractable, modifiable key; a start with
@@ -608,7 +608,7 @@ cache, scrubbing that fails closed, the error result of an effect that cannot
 get its secret, the resolver for foreign actors and forks, the four metrics,
 the doctor section and the DST scenario `secret-outage`. `secret_backends.rs`
 exercises the outage, refusal and restart cases against the stand-in,
-`scripts/e2e-secrets.sh` against the real services (§9), and unit tests the
+`scripts/e2e-secrets.py` against the real services (§9), and unit tests the
 stale-use bounds.
 
 The rule (I10): a backend that is down affects only effects that need its
@@ -692,7 +692,7 @@ secrets, and only once Kronik has no usable value.
 - **Turns that use no linked secret never touch the cache or a backend.**
   The DST scenario `secret-outage` asserts this with a backend that hangs:
   such turns commit at their normal rate. `secret_backends.rs` shows it in a
-  daemon with a hanging stand-in, and `scripts/e2e-secrets.sh` with real
+  daemon with a hanging stand-in, and `scripts/e2e-secrets.py` with real
   services stopped or paused.
 - **Retries:** the refresher backs off from 1 s up to `refresh`. A refused
   fetch (bad credentials) is logged as `secret fetch failed`, once for each 5 s
@@ -1015,10 +1015,10 @@ Milestone "M23".
 The original full-M23 plan uses the following free services. The B1 KMS
 lifecycle has run against them. The external-secret criteria run against a
 stand-in for OpenBao's KV v2 shape (`secret_backends.rs`) and, with
-`scripts/e2e-secrets.sh`, against OpenBao itself, moto's Secrets Manager and
+`scripts/e2e-secrets.py`, against OpenBao itself, moto's Secrets Manager and
 the GCP and Azure emulators (the table at the top has the images and the
 outcomes). They have not run against the real clouds. The PKCS#11 flow runs
-against SoftHSM2 with `scripts/e2e-pkcs11.sh`; no physical HSM was used.
+against SoftHSM2 with `scripts/e2e-pkcs11.py`; no physical HSM was used.
 
 | What | With | Licence |
 |---|---|---|
@@ -1039,7 +1039,7 @@ outcomes are recorded in the project status page; this table is not a proof of
 unrun work.
 
 **B1 criterion 1: "Kronik starts with the master key in a KMS without the key
-being written to disk"** (`scripts/e2e-keys.sh`; observed runs are in the project status page):
+being written to disk"** (`scripts/e2e-keys.py`; observed runs are in the project status page):
 1. Start OpenBao. Enable transit and create key `kronik`.
 2. `kronik serve --init`-style start with `[keys] source = "openbao"`.
 3. Set a secret, send a turn, stop, and start again: the secret still
@@ -1058,7 +1058,7 @@ being written to disk"** (`scripts/e2e-keys.sh`; observed runs are in the projec
    unwraps through OpenBao, and its secrets and sealed values decrypt.
 
 The same flow runs for `aws` (moto KMS) and `azure` (emulator wrapkey), on
-the **release artifacts**. For `pkcs11`, `scripts/e2e-pkcs11.sh` runs it
+the **release artifacts**. For `pkcs11`, `scripts/e2e-pkcs11.py` runs it
 against SoftHSM2: `softhsm2-util --init-token`, then an AES-256 key made
 through PKCS#11 itself (`C_GenerateKey`; `pkcs11-tool --keygen` cannot set
 `CKA_MODIFIABLE`, which the helper requires to be false), `kronik keys
@@ -1074,7 +1074,7 @@ physical HSM, is not claimed.
 hash in the log, just as with the built-in store"**
 (`crates/kronik/tests/secret_backends.rs` runs steps 1 to 4 below, and the
 steps of criterion 3, against a real `kronik serve` and a local fake that
-speaks the KV v2 shape of the OpenBao client; `scripts/e2e-secrets.sh` runs
+speaks the KV v2 shape of the OpenBao client; `scripts/e2e-secrets.py` runs
 the same steps against each real service, reading the `SecretVersion` and
 the effect's `SecretRef` from the log's segment files itself):
 1. Link `stripe` to `secret/payments#key`. A turn uses it in an HMAC.
@@ -1111,7 +1111,7 @@ in `history`, and replay of old turns is not affected":**
    `source_version`, with dense numbers.
 
 Steps 1 to 7 of criterion 3 run in `secret_backends.rs`, and steps 1 to 6
-in `scripts/e2e-secrets.sh` against each service: there the fork of step 4
+in `scripts/e2e-secrets.py` against each service: there the fork of step 4
 runs while the service is paused, so it cannot have asked it, and the
 destroyed version of step 6 is the service's own (OpenBao `kv destroy`, GCP
 `DestroySecretVersion`; Secrets Manager destroys no single version, so the
@@ -1142,7 +1142,7 @@ version.
   (also for a timer's turn and after a restart) and no second request for one
   `Idempotency-Key`. Every scenario of that file ends by checking that no
   `TurnBegin` is open once the daemon is quiet.
-- `scripts/e2e-secrets.sh` does the same with each real service paused
+- `scripts/e2e-secrets.py` does the same with each real service paused
   (`docker pause`: every request hangs), and OpenBao also stopped and started
   again (it comes back sealed, and requests are refused until it is
   unsealed): turns without a secret that arrive through the gateway commit
@@ -1152,8 +1152,8 @@ version.
   `TurnBegin`; the crash re-run of a recorded reveal waits while the service
   is down and then gets the recorded version's value.
 
-**Cloud providers for real:** `scripts/e2e-cloud-secrets.sh` runs the
-checks of `scripts/e2e-secrets.sh` against the real AWS Secrets Manager, GCP
+**Cloud providers for real:** `scripts/e2e-secrets.py --cloud` runs the
+checks of `scripts/e2e-secrets.py` against the real AWS Secrets Manager, GCP
 Secret Manager and Azure Key Vault with the operator's own credentials (the
 cloud CLIs for the test's own writes; environment variables and credential
 files for the daemon), except the outages, as a test cannot stop a real
@@ -1241,7 +1241,7 @@ the top of this page.
      non-dumpable offline commands;
    - providers openbao and aws first, then gcp and azure;
    - `keys status`, `keys wrap`, `keys rewrap`, with their audit events;
-   - `scripts/e2e-keys.sh` (criterion 1, and restore onto an empty
+   - `scripts/e2e-keys.py` (criterion 1, and restore onto an empty
      directory).
 2. **B2 trait and log:**
    - `SecretBackend`;

@@ -79,5 +79,5 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 "$helper" init "$proof" rootless >"$proof/initial-init.log" 2>&1
-bash "$(dirname "${BASH_SOURCE[0]}")/conformance-rootless.sh" --fixture "$proof" \
+python3 "$(dirname "${BASH_SOURCE[0]}")/isolation-conformance.py" conformance --fixture "$proof" \
     --isolation "$isolation" "$proof_mode" --ubuntu-required

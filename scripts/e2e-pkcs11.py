@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""M23 B6: the PKCS#11 master-key flow of ADR 0093 against SoftHSM2; see e2e-pkcs11.sh.
+"""M23 B6: the PKCS#11 master-key flow of ADR 0093 against SoftHSM2.
+
+Usage: [KRONIK_BIN=target/debug/kronik] [KRONIK_KEYHELPER=target/debug/kronik-keyhelper]
+       python3 scripts/e2e-pkcs11.py [--dir DIR]
+Needs root (the helper and the daemon run as the user that owns the token),
+Linux, Python 3.11+, and the Debian packages softhsm2 and opensc. Does not
+build or install anything: KRONIK_BIN is an already-built kronik and
+KRONIK_KEYHELPER a kronik-keyhelper built with `--features pkcs11` (a
+development or a release build; the results record which files ran).
+
+The helper runs with an empty environment, as the daemon starts it, so
+SoftHSM reads its system configuration (/etc/softhsm/softhsm2.conf): the
+run creates one token with a random label in the system token directory
+and deletes it at the end, also when the run fails. No other token is
+touched. Writes its evidence to results.json in the run directory.
 
 1. A SoftHSM token with a random label; in it an AES-256 key that is
    sensitive, not extractable and not modifiable (made through PKCS#11 itself,
@@ -38,7 +52,7 @@ import sys
 import tempfile
 
 sys.dont_write_bytecode = True  # no __pycache__ in scripts/
-from kronikd import command, stop_process, unix_api, write  # noqa: E402
+from kronikd import artifact, command, stop_process, unix_api, write  # noqa: E402
 from kronikd import wait_for as kronik_wait_for  # noqa: E402
 
 # A daemon or API that is not answering yet is a wait, not a failure.
@@ -220,8 +234,11 @@ def hits(paths, needles, skip=()):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--bin", type=Path, required=True)
-    parser.add_argument("--helper", type=Path, required=True)
+    parser.add_argument("--bin", type=Path, default=artifact("KRONIK_BIN", "debug", "kronik"),
+                        help="an already-built kronik (default: KRONIK_BIN, else the repository's debug build)")
+    parser.add_argument("--helper", type=Path, default=artifact("KRONIK_KEYHELPER", "debug", "kronik-keyhelper"),
+                        help="a kronik-keyhelper built with --features pkcs11 (default: KRONIK_KEYHELPER, else "
+                             "the repository's debug build)")
     parser.add_argument("--dir", type=Path)
     args = parser.parse_args()
     assert os.geteuid() == 0, "run as root: the token, the helper and the daemon share one user"

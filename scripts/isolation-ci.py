@@ -416,8 +416,8 @@ def explicit_fixture(positional, isolation, tools, max_runtime, log):
         result = run([helper, "init", proof, "rootless"], log=log, timeout=180, check=False)
         if result.returncode == 0:
             proof_mode = "--microvm-proof" if isolation == "microvm" else "--program-proof"
-            result = run(["bash", "scripts/conformance-rootless.sh", "--fixture", proof, "--isolation",
-                          isolation, proof_mode], log=log, timeout=int(max_runtime), check=False)
+            result = run([sys.executable, "scripts/isolation-conformance.py", "conformance", "--fixture", proof,
+                          "--isolation", isolation, proof_mode], log=log, timeout=int(max_runtime), check=False)
         return result
     finally:
         cleanup = run([helper, "cleanup", proof], log=Path(proof) / "cleanup.log", check=False)

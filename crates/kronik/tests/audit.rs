@@ -956,7 +956,7 @@ fn every_mutation_reaches_the_file_sink_and_verify_reports_it_complete() {
                 None,
             ),
             // File source rejects without audit; real KMS audit is covered
-            // by scripts/e2e-keys.sh.
+            // by scripts/e2e-keys.py.
             step(
                 "POST",
                 "/v1/keys/rewrap",

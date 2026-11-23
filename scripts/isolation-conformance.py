@@ -3,6 +3,19 @@
 
 No package installation, build, user database update, arbitrary service target,
 privileged container, or host security-policy change is performed here.
+
+The modes act on a fixture made by scripts/proof-rootless.sh (or its helper's
+`create`), which runs only on a machine whose operator wrote /etc/kronik-proof-host
+(see that script). Prebuilt artifacts only; missing prerequisites and every FAIL are
+fatal.
+
+check        the read-only service audit plus the exclusive child-only filesystem probes:
+             python3 scripts/isolation-conformance.py check --fixture /absolute/owned-proof-root
+conformance  the audit, then the hostile-actor conformance; --program-proof adds the full
+             program proof (the actual demos, Postgres, fork, ship/restore and UID audit):
+             python3 scripts/isolation-conformance.py conformance --fixture /absolute/owned-proof-root
+                 [--isolation gvisor|microvm]
+directory    the standalone mapped DIRECTORY oracle (ADR 0064).
 """
 import argparse
 import base64
@@ -1490,7 +1503,7 @@ def shipping_proof(root, cfg, daemon):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("mode",choices=["check","conformance","directory"])
     parser.add_argument("--fixture",required=True)
     parser.add_argument("--isolation",choices=["gvisor","microvm"],default="gvisor")
