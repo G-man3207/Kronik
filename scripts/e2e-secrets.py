@@ -1,5 +1,42 @@
 #!/usr/bin/env python3
-"""M23 B4/B5: the external-secret criteria against real services; see e2e-secrets.sh.
+"""M23 B4/B5: the external-secret criteria against real services.
+
+Usage: [KRONIK_BIN=target/debug/kronik]
+       python3 scripts/e2e-secrets.py [--only openbao,openbao-approle,aws,gcp,azure] [--dir DIR]
+       python3 scripts/e2e-secrets.py --cloud [--only aws,gcp,azure] [--dir DIR]
+
+Against the services in Docker, it runs the external-secret criteria of
+docs/design/m23-secret-backends.md section 9 (criteria 2 and 3) and the outages:
+OpenBao (KV v2, token and AppRole), moto (AWS Secrets Manager), the Blackwell
+Systems GCP Secret Manager emulator and the rokeller Azure Key Vault emulator,
+every image pinned by digest below. Needs Docker, Python 3.11+ and openssl. Does
+not build or install anything: KRONIK_BIN is an already-built kronik (a
+development or a release build; the results record which file ran). The services
+publish their ports on 127.0.0.1 only, in 47100-47199, as do the script's own
+fixtures; the daemons talk to them over loopback. Only containers this run
+created are removed, also when it fails. Writes its evidence to results.json in
+the run directory, which it prints.
+
+With --cloud, the same criteria against the real AWS Secrets Manager, GCP Secret
+Manager and Azure Key Vault, with the operator's own credentials, except the
+outages: a real service cannot be stopped by a test, so those run against the
+emulators. Not part of CI and never run by the project's automation: it costs money
+(each run makes and deletes one secret per cloud, plus API calls) and it needs
+accounts. Running it before a release is the maintainers' call. Needs Python 3.11+,
+openssl, and per cloud:
+  aws    the `aws` CLI logged in with rights to create, write, read and delete
+         secrets under `kronik-e2e/`; KRONIK_E2E_AWS_REGION; the daemon reads
+         AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN
+         (`auth = "env"`).
+  gcp    `gcloud` logged in with rights on Secret Manager;
+         KRONIK_E2E_GCP_PROJECT_NUMBER (the number: Secret Manager answers with
+         it, whatever the request named); KRONIK_E2E_GCP_SERVICE_ACCOUNT_FILE, a
+         service-account key that may access the project's secrets.
+  azure  `az` logged in with secret set/delete rights on the vault;
+         KRONIK_E2E_AZURE_VAULT (https://<name>.vault.azure.net),
+         KRONIK_E2E_AZURE_TENANT_ID, KRONIK_E2E_AZURE_CLIENT_ID and
+         KRONIK_E2E_AZURE_CLIENT_SECRET_FILE for the daemon's app.
+The cloud run uses loopback ports 47150-47171 for its fixtures and gateway.
 
 For each service, a real `kronik serve` links the name `stripe` to a reference
 in the service and runs criteria 2 and 3 of docs/design/m23-secret-backends.md
@@ -55,7 +92,7 @@ import urllib.parse
 import urllib.request
 
 sys.dont_write_bytecode = True  # no __pycache__ in scripts/
-from kronikd import UnixConnection, command, docker_image, stop_process, unix_api, write  # noqa: E402
+from kronikd import UnixConnection, artifact, command, docker_image, stop_process, unix_api, write  # noqa: E402
 from kronikd import wait_for as kronik_wait_for  # noqa: E402
 
 # An API or fixture that is not answering yet, a fail-closed 503 window
@@ -820,7 +857,7 @@ def cli_json(*args, data=None):
 def environment(name):
     value = os.environ.get(name, "")
     if not value:
-        raise SystemExit(f"{name} is not set; see scripts/e2e-cloud-secrets.sh")
+        raise SystemExit(f"{name} is not set; see the --cloud requirements under --help")
     return value
 
 
@@ -1411,11 +1448,12 @@ def run_service(service, binary, root, target, evidence):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--bin", type=Path, required=True)
+    parser.add_argument("--bin", type=Path, default=artifact("KRONIK_BIN", "debug", "kronik"),
+                        help="an already-built kronik (default: KRONIK_BIN, else the repository's debug build)")
     parser.add_argument("--dir", type=Path, help="a new private output directory")
     parser.add_argument("--only", default=None)
     parser.add_argument("--cloud", action="store_true",
-                        help="real AWS, GCP and Azure with the operator's credentials (e2e-cloud-secrets.sh)")
+                        help="the real AWS, GCP and Azure with the operator's credentials, not the emulators")
     args = parser.parse_args()
     known = ["aws", "gcp", "azure"] if args.cloud else PROVIDERS
     selected = (args.only or ",".join(known)).split(",")

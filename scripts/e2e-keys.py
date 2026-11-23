@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""M23 B1 acceptance; see e2e-keys.sh. Uses only dummy credentials and owned data.
+"""M23 B1 acceptance: real REST emulators, an already-built static Linux binary,
+no cloud account. Uses only dummy credentials and owned data.
+
+Usage: [KRONIK_BIN=target/x86_64-unknown-linux-musl/release/kronik]
+       python3 scripts/e2e-keys.py [options]
+Needs root, Linux Python 3.12+, Docker and openssl. Does not build or install
+anything. Containers have no external network; only this run's containers and
+data are changed. On a shared VPS:
+flock /var/tmp/kronik-vps.lock python3 scripts/e2e-keys.py [options]
 
 The provider and Kronik containers share an otherwise empty network namespace.
 The trusted driver briefly enters it; the tested binary never gets host network,
@@ -29,7 +37,7 @@ import urllib.parse
 import urllib.request
 
 sys.dont_write_bytecode = True  # no __pycache__ in scripts/
-from kronikd import command, docker_image, unix_api, wait_for, write  # noqa: E402
+from kronikd import artifact, command, docker_image, unix_api, wait_for, write  # noqa: E402
 
 IMAGES = {
     "openbao": "openbao/openbao@sha256:5046911075e137e154ce49ab051502f4ec7cf367d484ae4a4dce665d9b90561f",
@@ -761,8 +769,9 @@ def product(runtime, counter):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bin", type=Path, required=True)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--bin", type=Path, default=artifact("KRONIK_BIN", "x86_64-unknown-linux-musl", "release", "kronik"),
+                        help="an already-built static Linux kronik (default: KRONIK_BIN, else the repository's musl release build)")
     parser.add_argument("--dir", type=Path, help="new private output directory; never reuses existing data")
     parser.add_argument("--only", default="openbao,aws,gcp,azure", help="comma-separated provider subset")
     parser.add_argument("--probe-only", action="store_true", help="only emulator capability checks; no Kronik acceptance claim")
