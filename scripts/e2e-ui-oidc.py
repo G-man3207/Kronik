@@ -119,6 +119,9 @@ import traceback
 from urllib.parse import parse_qs, urlencode, urlsplit
 from types import SimpleNamespace
 
+sys.dont_write_bytecode = True  # no __pycache__ in scripts/
+from kronikd import UnixConnection  # noqa: E402
+
 try:
     import jwt
     from cryptography import x509
@@ -366,19 +369,8 @@ class Provider:
         self.effect_thread.join(timeout=2)
 
 
-class UnixHTTP(http.client.HTTPConnection):
-    def __init__(self, path):
-        super().__init__("localhost", timeout=5)
-        self.path = path
-
-    def connect(self):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect(self.path)
-
-
 def unix_reply(path, method, route, body=None):
-    connection = UnixHTTP(path)
+    connection = UnixConnection(path, 5)
     try:
         connection.request(method, route, json.dumps(body).encode() if body is not None else None, {"Content-Type": "application/json"})
         response = connection.getresponse()

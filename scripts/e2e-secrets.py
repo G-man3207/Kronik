@@ -32,6 +32,7 @@ images' digests, is written to results.json in the run directory.
 import argparse
 import base64
 import contextlib
+import functools
 import hashlib
 import hmac
 import http.client
@@ -52,6 +53,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+sys.dont_write_bytecode = True  # no __pycache__ in scripts/
+from kronikd import UnixConnection, command, docker_image, stop_process, unix_api, write  # noqa: E402
+from kronikd import wait_for as kronik_wait_for  # noqa: E402
+
+# An API or fixture that is not answering yet, a fail-closed 503 window
+# included, is a wait, not a failure.
+wait_for = functools.partial(kronik_wait_for, retry=(OSError, http.client.HTTPException, AssertionError, KeyError, ValueError))
 
 ROOT = Path(__file__).resolve().parent.parent
 GUESTS = ROOT / "tests/guests"
@@ -87,39 +96,6 @@ DAEMONS = []
 
 # ----------------------------------------------------------------- helpers
 
-def command(*args, timeout=120, check=True, data=None, env=None):
-    r = subprocess.run([str(a) for a in args], input=data, capture_output=True, timeout=timeout, env=env)
-    if check and r.returncode:
-        raise AssertionError(f"{[str(a) for a in args[:4]]} exited {r.returncode}: "
-                             f"{r.stdout[-2000:].decode(errors='replace')}{r.stderr[-2000:].decode(errors='replace')}")
-    return r
-
-
-def write(path, text, mode=0o600):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(text, bytes):
-        path.write_bytes(text)
-    else:
-        path.write_text(text)
-    path.chmod(mode)
-
-
-def wait_for(description, predicate, seconds=90, step=0.1):
-    deadline = time.monotonic() + seconds
-    last = None
-    while time.monotonic() < deadline:
-        try:
-            last = predicate()
-        except (OSError, http.client.HTTPException, AssertionError, KeyError, ValueError) as error:
-            last = None
-            failure = error
-        else:
-            failure = None
-        if last:
-            return last
-        time.sleep(step)
-    raise AssertionError(f"timed out: {description}" + (f" ({failure})" if failure else ""))
-
 
 def hmac_hex(key, data):
     return hmac.new(key.encode(), data.encode(), hashlib.sha256).hexdigest()
@@ -134,11 +110,7 @@ def listening(port):
 
 
 def image(ref):
-    info = command("docker", "image", "inspect", ref, check=False)
-    if info.returncode:
-        command("docker", "pull", ref, timeout=600)
-        info = command("docker", "image", "inspect", ref)
-    info = json.loads(info.stdout)[0]
+    info = docker_image(ref, 600)
     return {"requested": ref, "id": info["Id"], "repo_digests": info.get("RepoDigests", []),
             "created": info.get("Created")}
 
@@ -986,17 +958,6 @@ class AzureCloud(Cloud):
 
 # ------------------------------------------------------------------ daemon
 
-class UnixConnection(http.client.HTTPConnection):
-    def __init__(self, path, timeout=60):
-        super().__init__("localhost", timeout=timeout)
-        self.path = path
-
-    def connect(self):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect(str(self.path))
-
-
 def toml_value(value):
     if isinstance(value, list):
         return "[" + ", ".join(json.dumps(v) for v in value) + "]"
@@ -1042,13 +1003,7 @@ class Daemon:
         return self
 
     def stop(self):
-        if self.process and self.process.poll() is None:
-            self.process.send_signal(signal.SIGTERM)
-            try:
-                self.process.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
+        stop_process(self.process)
 
     def kill9(self):
         if self.process and self.process.poll() is None:
@@ -1056,16 +1011,7 @@ class Daemon:
             self.process.wait()
 
     def api(self, method, path, data=None, status=200, timeout=60):
-        with contextlib.closing(UnixConnection(self.socket, timeout)) as conn:
-            conn.request(method, path, body=None if data is None else json.dumps(data),
-                         headers={"Content-Type": "application/json", "Host": "localhost"})
-            response = conn.getresponse()
-            raw = response.read()
-            value = json.loads(raw) if raw.strip() else {}
-            if status is None:
-                return response.status, value
-            assert response.status == status, (method, path, response.status, value)
-            return value
+        return unix_api(self.socket, method, path, data, status=status, timeout=timeout)
 
     def get(self, path, seconds=120):
         """A read that waits out the fail-closed window of the secret coverage."""

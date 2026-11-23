@@ -28,6 +28,9 @@ from unittest import mock
 from contextlib import closing
 import urllib.parse
 
+sys.dont_write_bytecode = True  # no __pycache__ in scripts/
+from kronikd import UnixConnection, free_port, wait_for  # noqa: E402
+
 MAX = 1 << 20
 KEY = b"m30-disposable-webhook-key-only"
 NEXT_KEY = b"m30-disposable-webhook-next-key-only"
@@ -91,33 +94,6 @@ class DiagnosticTests(unittest.TestCase):
                         readable_events("/owned.sock")
 
 
-def wait_for(description, predicate, timeout=20):
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        value = predicate()
-        if value:
-            return value
-        time.sleep(0.05)
-    raise AssertionError("timeout: " + description)
-
-
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-class UnixHTTP(http.client.HTTPConnection):
-    def __init__(self, path):
-        super().__init__("localhost", timeout=5)
-        self.path = str(path)
-
-    def connect(self):
-        self.sock = socket.socket(socket.AF_UNIX)
-        self.sock.settimeout(5)
-        self.sock.connect(self.path)
-
-
 class ApiFailure(AssertionError):
     def __init__(self, status, code):
         super().__init__(status, code)
@@ -125,7 +101,7 @@ class ApiFailure(AssertionError):
 
 
 def api(path, route, body=None, method=None, expected=200):
-    with closing(UnixHTTP(path)) as connection:
+    with closing(UnixConnection(path, 5)) as connection:
         encoded = None if body is None else json.dumps(body).encode()
         connection.request(method or ("POST" if body is not None else "GET"), route, encoded,
                            {"content-type": "application/json"})
@@ -532,7 +508,8 @@ def main():
                "--mount", f"type=bind,source={system_ca},target=/etc/ssl/certs/ca-certificates.crt,readonly",
                "--mount", f"type=bind,source={binary},target=/target/kronik,readonly",
                "--mount", f"type=bind,source={Path(__file__).resolve()},target=/tools/e2e-events.py,readonly",
-               "--mount", f"type=bind,source={tools / 'events-receiver.py'},target=/tools/events-receiver.py,readonly"]
+               "--mount", f"type=bind,source={tools / 'events-receiver.py'},target=/tools/events-receiver.py,readonly",
+               "--mount", f"type=bind,source={tools / 'kronikd.py'},target=/tools/kronikd.py,readonly"]
     for library in ("/lib", "/lib64"):
         if Path(library).exists():
             command += ["--mount", f"type=bind,source={Path(library).resolve()},target={library},readonly"]
