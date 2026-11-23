@@ -3641,13 +3641,14 @@ impl Node {
                 .map_err(|_| ApiError::new(ErrorCode::Unavailable, "Side-effect worker closed"))?,
         };
         let (send, receive) = oneshot::channel::<()>();
-        let (done, result) = oneshot::channel();
         let retained = authority.clone();
-        self.env.spawn("authorized-effect", async move {
+        let task = self.env.spawn("authorized-effect", async move {
             let _slot = slot;
             let _authority = retained;
             if receive.await.is_ok() {
-                let _ = done.send(effect().await);
+                Some(effect().await)
+            } else {
+                None
             }
         });
         let mut pending = Some(send);
@@ -3661,9 +3662,9 @@ impl Node {
         if pending.is_some() {
             return Err(internal("Authority did not admit the side effect"));
         }
-        result
-            .await
-            .map_err(|_| ApiError::new(ErrorCode::Unavailable, "Side-effect worker stopped"))?
+        task.await
+            .flatten()
+            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "Side-effect worker stopped"))?
     }
 
     /// Queues a message a turn sent; `born`: where the turn's values came
@@ -5273,10 +5274,9 @@ impl Node {
         self.wait_out_rebuild_window().await;
         let held = self.lock_deploy_authorized(&authority).await?;
         let node = self.arc()?;
-        let (done, result) = oneshot::channel();
-        self.env().spawn("control-operation", async move {
+        let task = self.env().spawn("control-operation", async move {
             let _held = held;
-            let outcome = async {
+            async {
                 authority.check()?;
                 let previous = node.store.db().control_operation(&operation).map_err(store_err)?;
                 operation.validate_transition(previous.as_ref())
@@ -5285,10 +5285,10 @@ impl Node {
                 let record = node.control_audit_record(operation, audit)?;
                 let lsn = node.commit_authorized(record, authority).await?;
                 Ok(Some(kronik_core::ids::SourcePos::Actor { shard: None, lsn }))
-            }.await;
-            let _ = done.send(outcome);
+            }
+            .await
         });
-        result.await.map_err(|_| {
+        task.await.ok_or_else(|| {
             ApiError::new(ErrorCode::Unavailable, "control operation worker stopped")
         })?
     }
