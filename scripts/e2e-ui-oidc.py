@@ -120,6 +120,8 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from types import SimpleNamespace
 
 sys.dont_write_bytecode = True  # no __pycache__ in scripts/
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))  # the Rust fixture loads this file through runpy.run_path, which leaves scripts/ off sys.path
 from kronikd import UnixConnection  # noqa: E402
 
 try:
@@ -131,7 +133,6 @@ try:
 except ImportError:
     raise SystemExit("Missing Python cryptography/PyJWT; provision explicitly (no auto-install).")
 
-ROOT = Path(__file__).resolve().parent.parent
 SCOPES = ["read", "fork", "propose", "approve", "promote", "operate", "pii:read", "admin"]
 MODES = {"valid", "issuer", "audience", "nonce", "state", "keys", "signature", "expired", "short", "long", "algorithm", "azp", "nbf", "jku", "reader", "unmapped", "revoked"}
 
