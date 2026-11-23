@@ -308,22 +308,15 @@ fn list(ctx: &Ctx, a: ListArgs) -> Result<ExitCode, Error> {
     let Some((kind, key)) = a.actor.split_once('/') else {
         return Err(local(format!("--actor {:?} is not kind/key", a.actor)));
     };
-    let mut query = Vec::new();
-    if let Some(after) = &a.after {
-        query.push(format!("after={}", percent_encode(after)));
-    }
-    if let Some(limit) = a.limit {
-        query.push(format!("limit={limit}"));
-    }
-    let mut path = format!(
-        "/v1/actors/{}/{}/blobs",
+    let path = format!(
+        "/v1/actors/{}/{}/blobs{}",
         percent_encode(kind),
-        percent_encode(key)
+        percent_encode(key),
+        super::query(&[
+            ("after", a.after.clone()),
+            ("limit", a.limit.map(|l| l.to_string())),
+        ])
     );
-    if !query.is_empty() {
-        path.push('?');
-        path.push_str(&query.join("&"));
-    }
     let body = ctx.get(&path)?;
     if ctx.json {
         ctx.print_raw(&body);

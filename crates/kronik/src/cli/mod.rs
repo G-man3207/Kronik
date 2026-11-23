@@ -2221,6 +2221,23 @@ mod tests {
         }
     }
 
+    /// `audit show`, `blobs list` and `events` build their targets with
+    /// `query`: what was not given is left out, the rest keeps its order,
+    /// and the values are encoded.
+    #[test]
+    fn query_leaves_out_what_was_not_given_and_encodes_the_values() {
+        assert_eq!(query(&[]), "");
+        assert_eq!(query(&[("a", None)]), "");
+        assert_eq!(
+            query(&[
+                ("from", None),
+                ("source", Some("actor-native".to_owned())),
+                ("after", Some("a b&c=d".to_owned())),
+            ]),
+            "?source=actor-native&after=a%20b%26c%3Dd"
+        );
+    }
+
     /// A file at the repository root, such as docs/reference/cli.md.
     fn repo_doc(relative: &str) -> String {
         let path = format!("{}/../../{relative}", env!("CARGO_MANIFEST_DIR"));
