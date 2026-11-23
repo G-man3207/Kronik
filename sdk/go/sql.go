@@ -158,6 +158,13 @@ func fromSQL(v sql.SQLValue) any {
 
 // hasOrderBy reports whether statement contains the keywords ORDER BY
 // outside string literals, quoted identifiers and comments.
+//
+// It is a hand-written scanner, as in the Rust SDK. The TypeScript and
+// Python SDKs use a regular expression instead, but package
+// initialization runs in every fresh instance and compiling the two
+// patterns costs about 300,000 fuel under TinyGo, a third of a counter
+// turn. The statements in TestHasOrderBy are the same in every SDK's
+// tests, so the four keep agreeing.
 func hasOrderBy(statement string) bool {
 	var words []string
 	var word strings.Builder
