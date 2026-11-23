@@ -87,7 +87,7 @@ api() { # METHOD PATH [JSON]
         fail "API $1 $2"
 }
 field() { python3 -c 'import json,sys; v=json.loads(sys.argv[1]); print(eval(sys.argv[2]))' "$1" "$2"; }
-b64() { python3 -c 'import base64,sys; print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "$1"; }
+b64() { base64 -w0 "$1"; }
 http() { # METHOD PATH [JSON] -> "<status> <body>"
     curl -s -o "$dir/out" -w '%{http_code}' -X "$1" -H 'content-type: application/json' \
         ${3:+--data-binary "$3"} "$gw$2" >"$dir/code" || fail "$1 $2"
