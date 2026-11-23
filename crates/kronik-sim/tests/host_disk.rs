@@ -18,10 +18,11 @@ use kronik_log::LogConfig;
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::{CodeStore, PoolSize, build_engine};
 use kronik_sched::{Node, NodeConfig, NodeParts};
+use kronik_sim::bao::SimNet;
 use kronik_sim::exec::{Executor, RunEnd};
 use kronik_sim::fs::{CrashModel, Disk, DiskFaults, SimFs};
 use kronik_sim::scenario::COUNTER;
-use kronik_sim::{SimClock, SimEntropy, SimNoNet, SimProcs, SimRng, SimSpawner};
+use kronik_sim::{SimClock, SimEntropy, SimProcs, SimRng, SimSpawner};
 use kronik_store::Store;
 use kronik_store::sql::{Limits, MemOpener, SqlPool};
 
@@ -74,7 +75,10 @@ fn a_simulated_node_writes_nothing_on_the_host() {
                 fsync_error: 0.0,
             },
         )),
-        net: Arc::new(SimNoNet),
+        net: Arc::new(SimNet {
+            bao: None,
+            service: None,
+        }),
         procs: Arc::new(SimProcs {
             clock: clock.clone(),
         }),

@@ -25,9 +25,10 @@ use kronik_core::ids::Lsn;
 use kronik_log::{Log, LogConfig, LogReader};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
+use kronik_sim::bao::SimNet;
 use kronik_sim::exec::{Executor, Handle, NodeId, RunEnd};
 use kronik_sim::fs::{CrashModel, Disk, DiskFaults, SimFs};
-use kronik_sim::{SimClock, SimEntropy, SimNoNet, SimProcs, SimRng, SimSpawner};
+use kronik_sim::{SimClock, SimEntropy, SimProcs, SimRng, SimSpawner};
 use tokio::sync::{mpsc, oneshot};
 
 const SEEDS: u64 = 32;
@@ -79,7 +80,10 @@ impl Sim {
                     fsync_error: 0.0,
                 },
             )),
-            net: Arc::new(SimNoNet),
+            net: Arc::new(SimNet {
+                bao: None,
+                service: None,
+            }),
             procs: Arc::new(SimProcs { clock }),
         }
     }

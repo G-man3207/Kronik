@@ -24,8 +24,8 @@ use std::time::Duration;
 use chacha20::ChaCha8Rng;
 use chacha20::rand_core::{Rng, SeedableRng};
 use kronik_core::env::{
-    BoxFuture, Clock, EntropySource, HttpRequest, HttpResponse, Net, NetError, Process,
-    ProcessRunner, ProcessSpec, SensitiveProcessRequest, Spawner,
+    BoxFuture, Clock, EntropySource, Process, ProcessRunner, ProcessSpec, SensitiveProcessRequest,
+    Spawner,
 };
 
 use exec::{Handle, NodeId};
@@ -120,28 +120,6 @@ pub struct SimEntropy(pub SimRng);
 impl EntropySource for SimEntropy {
     fn fill(&self, buf: &mut [u8]) {
         self.0.fill(buf);
-    }
-}
-
-/// No outbound network before M2: every request fails before leaving.
-pub struct SimNoNet;
-
-impl Net for SimNoNet {
-    fn http_authorized(
-        &self,
-        req: HttpRequest,
-        original: kronik_core::authority::AuthLease,
-    ) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
-        Box::pin(async move {
-            original
-                .check()
-                .map_err(|error| NetError::Connect(error.to_string()))?;
-            Err(NetError::Connect(format!("no network: {}", req.url)))
-        })
-    }
-
-    fn http(&self, req: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
-        Box::pin(async move { Err(NetError::Connect(format!("no network: {}", req.url))) })
     }
 }
 

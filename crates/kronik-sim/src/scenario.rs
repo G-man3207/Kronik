@@ -57,7 +57,7 @@ use crate::service::{ServiceFaults, SimService};
 mod blobs;
 mod connections;
 mod secrets;
-use crate::{SimClock, SimEntropy, SimNoNet, SimProcs, SimRng, SimSpawner, Trace};
+use crate::{SimClock, SimEntropy, SimProcs, SimRng, SimSpawner, Trace};
 pub use blobs::{BlobMutation, BlobWorkload};
 pub use connections::ConnWorkload;
 use kronik_effects::{Delivery, Rate};
@@ -551,7 +551,10 @@ impl World {
                     service: service.as_ref().map(|s| s.net(node)),
                 }),
                 (Some(s), None) => s.net(node),
-                (None, None) => Arc::new(SimNoNet),
+                (None, None) => Arc::new(SimNet {
+                    bao: None,
+                    service: None,
+                }),
             },
             procs: Arc::new(SimProcs {
                 clock: self.clock.clone(),
