@@ -50,13 +50,10 @@ impl Node {
         kronik_proto::control::validate_metadata_gap_event(&event)
             .map_err(|error| ApiError::new(ErrorCode::BadRequest, error.to_string()))?;
         let held = self.lock_deploy_authorized(&authority).await?;
-        let node = self
-            .arc()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
-        let (done, result) = oneshot::channel();
-        self.env.spawn("metadata-gap-audit", async move {
+        let node = self.arc()?;
+        let task = self.env.spawn("metadata-gap-audit", async move {
             let _held = held;
-            let outcome = async {
+            async {
                 authority.check()?;
                 let mut receipt = None;
                 node.reader
@@ -105,10 +102,9 @@ impl Node {
                 };
                 Ok(kronik_core::ids::SourcePos::Actor { shard: None, lsn })
             }
-            .await;
-            let _ = done.send(outcome);
+            .await
         });
-        result.await.map_err(|_| {
+        task.await.ok_or_else(|| {
             ApiError::new(ErrorCode::Unavailable, "metadata gap audit worker stopped")
         })?
     }

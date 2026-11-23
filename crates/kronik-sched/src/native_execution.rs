@@ -8,8 +8,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::Notify;
 
-mod source_roots;
-
 fn stopped() -> ApiError {
     ApiError::new(
         ErrorCode::Unavailable,

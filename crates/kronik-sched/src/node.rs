@@ -1358,12 +1358,6 @@ impl Node {
         }
     }
 
-    /// Stops the node as a failed log fsync does: a storage step whose
-    /// durability is unknown, which the next start recovers.
-    pub(crate) fn stop_fatal(&self, message: String) {
-        self.fatal.set(message);
-    }
-
     pub fn kind_exists(&self, kind: &str) -> bool {
         lock(&self.kinds).contains_key(kind)
     }
@@ -1989,9 +1983,7 @@ impl Node {
         hold: bool,
         origin: OperationOrigin,
     ) -> Result<Lsn, ApiError> {
-        let node = self
-            .me()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self.arc()?;
         let rebase = matches!(record, Record::StateRebase(_));
         // The rebased kinds, whose connections a rebase switch closes.
         let kinds: std::collections::BTreeSet<String> =
@@ -2474,12 +2466,7 @@ impl Node {
             ("kind", &actor.kind),
             move || clock.monotonic(),
         );
-        let Some(me) = self.me() else {
-            return Err(ApiError::new(
-                ErrorCode::Unavailable,
-                "the node is stopping",
-            ));
-        };
+        let me = self.arc()?;
         let (execution_id, seed, time, epoch, program, code_hash, recorded, recovery_begin) =
             match rerun {
                 Some(r) => {
@@ -3569,9 +3556,7 @@ impl Node {
         if !tagged {
             return Ok(record);
         }
-        let node = self
-            .me()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "The node is stopping"))?;
+        let node = self.arc()?;
         self.authorized_effect(authority, move || async move {
             node.seal(&mut record)?;
             Ok(record)
@@ -3656,13 +3641,14 @@ impl Node {
                 .map_err(|_| ApiError::new(ErrorCode::Unavailable, "Side-effect worker closed"))?,
         };
         let (send, receive) = oneshot::channel::<()>();
-        let (done, result) = oneshot::channel();
         let retained = authority.clone();
-        self.env.spawn("authorized-effect", async move {
+        let task = self.env.spawn("authorized-effect", async move {
             let _slot = slot;
             let _authority = retained;
             if receive.await.is_ok() {
-                let _ = done.send(effect().await);
+                Some(effect().await)
+            } else {
+                None
             }
         });
         let mut pending = Some(send);
@@ -3676,9 +3662,9 @@ impl Node {
         if pending.is_some() {
             return Err(internal("Authority did not admit the side effect"));
         }
-        result
-            .await
-            .map_err(|_| ApiError::new(ErrorCode::Unavailable, "Side-effect worker stopped"))?
+        task.await
+            .flatten()
+            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "Side-effect worker stopped"))?
     }
 
     /// Queues a message a turn sent; `born`: where the turn's values came
@@ -3759,8 +3745,10 @@ impl Node {
         rx
     }
 
-    pub(crate) fn arc(&self) -> Option<Arc<Node>> {
+    /// The node itself, or `Unavailable` while it is stopping.
+    pub(crate) fn arc(&self) -> Result<Arc<Node>, ApiError> {
         self.me()
+            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))
     }
 
     /// Checks a sealed record as a reader of the log will (Record::validate)
@@ -4580,7 +4568,7 @@ impl Node {
                 ));
             }
         }
-        self.check_routes(&kind, &manifest)?;
+        self.check_routes_of(&[(&kind, &manifest)])?;
         let epoch = epoch + 1;
         if dry_run {
             return Ok(DeployResult {
@@ -4670,11 +4658,6 @@ impl Node {
             Ok((hash, program, manifest))
         })
         .await
-    }
-
-    /// ROUTE_CONFLICT when another kind serves one of the manifest's routes.
-    fn check_routes(&self, kind: &str, manifest: &pb::Manifest) -> Result<(), ApiError> {
-        self.check_routes_of(&[(kind, manifest)])
     }
 
     /// ROUTE_CONFLICT when, after `set` replaced its kinds' code, two kinds
@@ -5290,13 +5273,10 @@ impl Node {
         // has retired the certificate is waited out first, with no lock held.
         self.wait_out_rebuild_window().await;
         let held = self.lock_deploy_authorized(&authority).await?;
-        let node = self
-            .arc()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
-        let (done, result) = oneshot::channel();
-        self.env().spawn("control-operation", async move {
+        let node = self.arc()?;
+        let task = self.env().spawn("control-operation", async move {
             let _held = held;
-            let outcome = async {
+            async {
                 authority.check()?;
                 let previous = node.store.db().control_operation(&operation).map_err(store_err)?;
                 operation.validate_transition(previous.as_ref())
@@ -5305,10 +5285,10 @@ impl Node {
                 let record = node.control_audit_record(operation, audit)?;
                 let lsn = node.commit_authorized(record, authority).await?;
                 Ok(Some(kronik_core::ids::SourcePos::Actor { shard: None, lsn }))
-            }.await;
-            let _ = done.send(outcome);
+            }
+            .await
         });
-        result.await.map_err(|_| {
+        task.await.ok_or_else(|| {
             ApiError::new(ErrorCode::Unavailable, "control operation worker stopped")
         })?
     }
@@ -5569,9 +5549,7 @@ impl Node {
         origin: OperationOrigin,
         fence: Option<ErasureFence>,
     ) -> Result<Lsn, ApiError> {
-        let node = self
-            .me()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self.arc()?;
         let task = self.env.spawn("config", async move {
             node.commit_config_locked(&guard, epoch, record, origin, fence)
                 .await

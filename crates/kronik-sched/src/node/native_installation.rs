@@ -15,13 +15,10 @@ impl Node {
             .validate()
             .map_err(|error| ApiError::new(ErrorCode::BadRequest, error.to_string()))?;
         let held = self.lock_deploy_authorized(&authority).await?;
-        let node = self
-            .arc()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
-        let (done, result) = oneshot::channel();
-        self.env.spawn("installation-identity", async move {
+        let node = self.arc()?;
+        let task = self.env.spawn("installation-identity", async move {
             let _held = held;
-            let outcome = async {
+            async {
                 authority.check()?;
                 let previous = node
                     .store
@@ -44,10 +41,9 @@ impl Node {
                 let lsn = node.commit_authorized(record, authority).await?;
                 Ok(SourcePos::Actor { shard: None, lsn })
             }
-            .await;
-            let _ = done.send(outcome);
+            .await
         });
-        result.await.map_err(|_| {
+        task.await.ok_or_else(|| {
             ApiError::new(
                 ErrorCode::Unavailable,
                 "installation identity worker stopped",

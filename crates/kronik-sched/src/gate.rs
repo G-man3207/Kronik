@@ -164,9 +164,7 @@ impl Node {
         max: Duration,
         deploy: Option<OwnedMutexGuard<()>>,
     ) -> Result<Drain, ApiError> {
-        let node = self
-            .arc()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self.arc()?;
         let deadline = self.env().clock.monotonic() + max;
         let rebase = deploy.is_some();
         let stale = |what: String| {

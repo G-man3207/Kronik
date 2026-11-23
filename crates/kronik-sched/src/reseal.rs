@@ -245,13 +245,8 @@ fn save_progress(data: &Path, p: &ProgressFile) -> Result<(), ApiError> {
         .map_err(|e| ApiError::new(ErrorCode::Internal, format!("privacy directory: {e}")))?;
     let bytes = serde_json::to_vec_pretty(p)
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
-    let path = progress_path(data);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)
-        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("reseal progress: {e}")))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("reseal progress: {e}")))?;
-    Ok(())
+    crate::durable::write_synced(&progress_path(data), &bytes)
+        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("reseal progress: {e}")))
 }
 
 /// Progress for `GET /v1/privacy`. `data` is the node's data directory.
@@ -341,7 +336,7 @@ impl Node {
     /// directory and fixes state.db from the journal ([`journal_fix`]).
     pub(crate) fn reseal_rewrite_error(&self, start: Lsn, e: kronik_log::LogError) -> ApiError {
         if matches!(e, kronik_log::LogError::RenameNotDurable(_)) {
-            self.stop_fatal(format!("reseal of segment {start}: {e}"));
+            self.stop(format!("reseal of segment {start}: {e}"));
         }
         ApiError::new(ErrorCode::Internal, format!("reseal: {e}"))
     }
@@ -596,9 +591,7 @@ impl Node {
             audit: Some(audit),
             reseal_requested: true,
         });
-        let node = self
-            .arc()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self.arc()?;
         self.authorized_effect(authority, move || async move {
             // The exact request and segment set were admitted together.
             node.commit_config_locked(&held, epoch, request, OperationOrigin::Internal, None)

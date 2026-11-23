@@ -125,30 +125,22 @@ fn blob_error(e: BlobError) -> ApiError {
 }
 
 /// Writes `ids` (hash text, sorted) as a roots file: `header` first, then
-/// one identity per line, through a synced temporary file and a rename.
+/// one identity per line, durably ([`crate::durable::write_synced`]).
 pub(crate) fn write_roots_file(
     path: &Path,
     header: Option<&str>,
     ids: &[String],
 ) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-        if let Some(header) = header {
-            writeln!(f, "{header}")?;
-        }
-        for id in ids {
-            writeln!(f, "{id}")?;
-        }
-        f.flush()?;
-        f.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    let mut text = String::new();
+    if let Some(header) = header {
+        text.push_str(header);
+        text.push('\n');
     }
-    std::fs::rename(&tmp, path)?;
-    if let Some(dir) = path.parent() {
-        std::fs::File::open(dir)?.sync_all()?;
+    for id in ids {
+        text.push_str(id);
+        text.push('\n');
     }
-    Ok(())
+    crate::durable::write_synced(path, text.as_bytes())
 }
 
 /// The identities of a roots file. Lines that are not blob identities (a
@@ -337,9 +329,7 @@ impl Node {
         if let Some(fatal) = self.fatal() {
             return Err(ApiError::new(ErrorCode::Unavailable, fatal));
         }
-        let node = self
-            .me()
-            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "the node is stopping"))?;
+        let node = self.arc()?;
         let started = self.env.clock.monotonic();
         let floor = self.blob_floor()?;
         // The erasures this pass is for (M26 §9.3): it deletes their

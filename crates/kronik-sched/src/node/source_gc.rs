@@ -37,7 +37,7 @@ impl Node {
             .as_ref()
             .ok_or_else(|| unavailable("native source storage is not configured"))?;
         let original = self
-            .native_execution
+            .lifecycle
             .ownership()
             .ok_or_else(|| unavailable("native source has no original directory ownership"))?;
         let root = fs::canonicalize(&storage.data_dir).map_err(io)?;
@@ -54,7 +54,6 @@ impl Node {
     }
     pub(crate) fn retain_native_source_paths(&self) -> Result<SnapshotRootPin, ApiError> {
         let (root, _original) = self.native_source_directory()?;
-        SnapshotRootRegistry::retain(&self.native_execution.source_roots(), vec![root])
-            .map_err(unavailable)
+        SnapshotRootRegistry::retain(self.lifecycle.source_roots(), vec![root]).map_err(unavailable)
     }
 }

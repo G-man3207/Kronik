@@ -215,11 +215,10 @@ impl Node {
         // has retired the certificate is waited out first, with no lock held.
         self.wait_out_rebuild_window().await;
         let held = self.lock_deploy_authorized(&authority).await?;
-        let node = self.arc().ok_or_else(unavailable_identity_key)?;
-        let (done, result) = oneshot::channel();
-        self.env.spawn("oidc-login", async move {
+        let node = self.me().ok_or_else(unavailable_identity_key)?;
+        let task = self.env.spawn("oidc-login", async move {
             let _held = held;
-            let outcome = async {
+            async {
                 let prepare_node = node.clone();
                 let (record, plan, refined) = node
                     .authorized_effect(authority.clone(), move || async move {
@@ -280,11 +279,9 @@ impl Node {
                     .ok_or_else(unavailable_identity_key)??;
                 Ok((SourcePos::Actor { shard: None, lsn }, plan))
             }
-            .await;
-            let _ = done.send(outcome);
-        });
-        result
             .await
-            .map_err(|_| ApiError::new(ErrorCode::Unavailable, "login history worker stopped"))?
+        });
+        task.await
+            .ok_or_else(|| ApiError::new(ErrorCode::Unavailable, "login history worker stopped"))?
     }
 }
