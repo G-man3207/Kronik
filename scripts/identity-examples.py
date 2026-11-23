@@ -713,7 +713,7 @@ def main():
     missing = [c for n in names for c in EXAMPLES[n][0] if not os.path.exists(os.path.join(args.dist, c))]
     if missing:
         sys.exit(f"error: {', '.join(missing)} not in {args.dist}; build the examples with scripts/build-examples.sh, "
-                 "scripts/build-examples-ts.sh, -py.sh and -go.sh")
+                 "scripts/build-examples-ts.sh and build-examples-py-go.sh")
     if "billing-ts" in names and not args.fake_payments:
         sys.exit("error: billing-ts needs --fake-payments")
     if "todo-ts" in names and not args.faketime_lib:

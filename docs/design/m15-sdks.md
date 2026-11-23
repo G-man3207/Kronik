@@ -20,7 +20,7 @@ TypeScript examples.
 | `examples/counter-py`, `notes-py`, `webhook-relay-py` | Python twins of the TypeScript examples (`--entry step2` builds `counter-py-step2.wasm`). |
 | `examples/counter-go`, `notes-go`, `webhook-relay-go` | Go twins (`--entry ./step2` builds `counter-go-step2.wasm`). |
 | `scripts/install-sdk-tools.sh` | The pinned toolchains (ADR 0030). |
-| `scripts/build-examples-py.sh`, `build-examples-go.sh` | Build the examples into `examples/dist/` with `kronik build`. |
+| `scripts/build-examples-py-go.sh py|go` | Build the examples into `examples/dist/` with `kronik build`. |
 | `scripts/acceptance-m15.sh` | Runs the section 5 commands for Python and Go. `scripts/ci.sh` `sdks` calls it. Skips with a message when the pinned tools are absent; does not skip when they are installed, and does not use `M1_GUESTS=test`. |
 
 The brief names `counter` and `webhook-relay` for both languages; `notes`

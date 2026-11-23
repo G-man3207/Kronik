@@ -333,8 +333,8 @@ step_sdks() {
     KRONIK_BIN="$kronik" python3 -m unittest discover -s sdk/python/host_tests
     (cd sdk/go && KRONIK_BIN="$kronik" PATH="$tools/bin:$PATH" GOTOOLCHAIN=local go test -tags kronikhost -run 'TestATestPlaysTheClient|TestBlobsInAnActor|TestBlobHoldsAndMessages' .)
     KRONIK_BIN="$kronik" cargo test --manifest-path examples/Cargo.toml --locked -p kronik-sdk --test testkit_connections -- --ignored
-    KRONIK_BIN="$kronik" scripts/build-examples-py.sh
-    KRONIK_BIN="$kronik" scripts/build-examples-go.sh
+    KRONIK_BIN="$kronik" scripts/build-examples-py-go.sh py
+    KRONIK_BIN="$kronik" scripts/build-examples-py-go.sh go
     cargo run --quiet --locked -p kronik-runtime --example check_imports -- examples/dist/*-py*.wasm examples/dist/*-go*.wasm
     local example
     for example in counter-py notes-py webhook-relay-py; do
