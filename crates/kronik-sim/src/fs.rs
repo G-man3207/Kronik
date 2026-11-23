@@ -18,7 +18,7 @@ use zeroize::Zeroizing;
 
 use super::SimRng;
 use kronik_core::env::Clock;
-use kronik_core::env::{BoxFuture, File, Fs, OpenMode};
+use kronik_core::env::{BoxFuture, File, Fs, OpenMode, insecure_file, secure_path};
 
 const SECTOR: u64 = 512;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,25 +129,6 @@ fn parent(p: &Path) -> PathBuf {
     p.parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
-fn secure_path(path: &Path) -> io::Result<PathBuf> {
-    use std::path::Component;
-    let mut clean = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir | Component::Normal(_) => clean.push(component.as_os_str()),
-            Component::CurDir => {}
-            _ => return Err(insecure_file()),
-        }
-    }
-    if clean.file_name().is_none() {
-        return Err(insecure_file());
-    }
-    Ok(clean)
-}
-
-fn insecure_file() -> io::Error {
-    io::Error::new(io::ErrorKind::PermissionDenied, "insecure private file")
-}
 
 impl Disk {
     /// Fails the given `sync_data` calls, counted from 1 over the whole disk

@@ -17,7 +17,7 @@
 //!   production implementations live in [`real`] (feature `real`).
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,6 +71,31 @@ pub enum OpenMode {
     /// Read and write; created if missing (creation is durable only after
     /// `Fs::sync_dir` of the parent).
     ReadWriteCreate,
+}
+
+/// The error for a private-file path that [`secure_path`] refused.
+pub fn insecure_file() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "insecure private file")
+}
+
+/// Cleans `path` to a root-relative form of ordinary components: root and
+/// normal names only, `.` dropped. Anything else — a parent or prefix
+/// reference — may reach a file outside the private tree and is refused.
+/// Both in-memory [`Fs`] implementations use it for their private files.
+pub fn secure_path(path: &Path) -> io::Result<PathBuf> {
+    use std::path::Component;
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Normal(_) => clean.push(component.as_os_str()),
+            Component::CurDir => {}
+            _ => return Err(insecure_file()),
+        }
+    }
+    if clean.file_name().is_none() {
+        return Err(insecure_file());
+    }
+    Ok(clean)
 }
 
 /// File system. Writes are durable only after `File::sync_data` (contents)
