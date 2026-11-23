@@ -320,14 +320,37 @@ class SqlTest(unittest.TestCase):
         self.assertEqual(rows.first(), {"id": 1, "t": None})
         self.assertIsNone(SqlRows(SimpleNamespace(columns=[], values=[])).first())
 
+    # The statements are the same in every SDK's tests, so the four keep agreeing.
     def test_has_order_by(self):
-        self.assertTrue(has_order_by("SELECT * FROM t ORDER  BY id"))
-        self.assertTrue(has_order_by("select * from t order\nby id"))
-        self.assertFalse(has_order_by("SELECT 'ORDER BY' FROM t"))
-        self.assertFalse(has_order_by('SELECT "order" by FROM t'))
-        self.assertFalse(has_order_by("SELECT 1 -- ORDER BY id"))
-        self.assertFalse(has_order_by("SELECT 1 /* ORDER BY */"))
-        self.assertFalse(has_order_by("SELECT border BY FROM t"))
+        with_order_by = [
+            "SELECT * FROM notes ORDER BY id",
+            "select id from notes order\n  by created desc",
+            "SELECT id FROM (SELECT id FROM t) ORDER /* c */ BY id",
+            "SELECT id FROM t ORDER -- c\nBY id",
+            "SELECT 'order by', \"order by\" FROM t ORDER BY id",
+            "SELECT x FROM t /* ' */ ORDER BY id",
+            'SELECT "/*" FROM t ORDER BY id',
+            "SELECT x FROM t -- don't\nORDER BY id",
+        ]
+        without_order_by = [
+            "SELECT * FROM notes",
+            "SELECT * FROM notes WHERE title = 'order by'",
+            "SELECT 'ORDER BY' FROM t",
+            'SELECT "order", by FROM t',
+            'SELECT "order" by FROM t',
+            "SELECT [order], `by` FROM t",
+            "SELECT x FROM t -- ORDER BY x",
+            "SELECT 1 /* ORDER BY */",
+            "SELECT recorder, bypass, orderby FROM t",
+            "SELECT 'it''s' ORDER_BY FROM t",
+            "SELECT or/* c */der BY x",
+            "SELECT 'unclosed ORDER BY",
+            "SELECT x FROM t /* unclosed ORDER BY",
+        ]
+        for statement in with_order_by:
+            self.assertTrue(has_order_by(statement), statement)
+        for statement in without_order_by:
+            self.assertFalse(has_order_by(statement), statement)
 
 
 class ActorTest(unittest.TestCase):

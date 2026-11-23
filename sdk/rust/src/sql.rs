@@ -367,24 +367,38 @@ impl Row<'_> {
 mod tests {
     use super::*;
 
+    // The statements are the same in every SDK's tests, so the four keep agreeing.
     #[test]
     fn order_by_detection() {
-        assert!(has_order_by("SELECT * FROM notes ORDER BY id"));
-        assert!(has_order_by(
-            "select id from notes order\n  by created desc"
-        ));
-        assert!(has_order_by(
-            "SELECT id FROM (SELECT id FROM t) ORDER /* c */ BY id"
-        ));
-        assert!(!has_order_by("SELECT * FROM notes"));
-        assert!(!has_order_by(
-            "SELECT * FROM notes WHERE title = 'order by'"
-        ));
-        assert!(!has_order_by("SELECT \"order\", by FROM t"));
-        assert!(!has_order_by("SELECT x FROM t -- ORDER BY x"));
-        assert!(!has_order_by("SELECT x FROM t /* ORDER BY x */"));
-        assert!(!has_order_by("SELECT recorder, bypass FROM t"));
-        assert!(!has_order_by("SELECT 'it''s' ORDER_BY FROM t"));
+        for s in [
+            "SELECT * FROM notes ORDER BY id",
+            "select id from notes order\n  by created desc",
+            "SELECT id FROM (SELECT id FROM t) ORDER /* c */ BY id",
+            "SELECT id FROM t ORDER -- c\nBY id",
+            "SELECT 'order by', \"order by\" FROM t ORDER BY id",
+            "SELECT x FROM t /* ' */ ORDER BY id",
+            "SELECT \"/*\" FROM t ORDER BY id",
+            "SELECT x FROM t -- don't\nORDER BY id",
+        ] {
+            assert!(has_order_by(s), "{s}");
+        }
+        for s in [
+            "SELECT * FROM notes",
+            "SELECT * FROM notes WHERE title = 'order by'",
+            "SELECT 'ORDER BY' FROM t",
+            "SELECT \"order\", by FROM t",
+            "SELECT \"order\" by FROM t",
+            "SELECT [order], `by` FROM t",
+            "SELECT x FROM t -- ORDER BY x",
+            "SELECT 1 /* ORDER BY */",
+            "SELECT recorder, bypass, orderby FROM t",
+            "SELECT 'it''s' ORDER_BY FROM t",
+            "SELECT or/* c */der BY x",
+            "SELECT 'unclosed ORDER BY",
+            "SELECT x FROM t /* unclosed ORDER BY",
+        ] {
+            assert!(!has_order_by(s), "{s}");
+        }
     }
 
     #[test]

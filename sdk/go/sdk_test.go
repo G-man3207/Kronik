@@ -83,14 +83,37 @@ func TestSQLValues(t *testing.T) {
 	}
 }
 
+// The statements are the same in every SDK's tests, so the four keep agreeing.
 func TestHasOrderBy(t *testing.T) {
-	for _, s := range []string{"SELECT * FROM notes ORDER BY id", "select id from notes order\n by created desc", "SELECT id FROM t ORDER /* c */ BY id"} {
+	for _, s := range []string{
+		"SELECT * FROM notes ORDER BY id",
+		"select id from notes order\n  by created desc",
+		"SELECT id FROM (SELECT id FROM t) ORDER /* c */ BY id",
+		"SELECT id FROM t ORDER -- c\nBY id",
+		`SELECT 'order by', "order by" FROM t ORDER BY id`,
+		`SELECT x FROM t /* ' */ ORDER BY id`,
+		`SELECT "/*" FROM t ORDER BY id`,
+		"SELECT x FROM t -- don't\nORDER BY id",
+	} {
 		if !hasOrderBy(s) {
 			t.Errorf("no ORDER BY found in %q", s)
 		}
 	}
-	for _, s := range []string{"SELECT * FROM notes", "SELECT * FROM notes WHERE title = 'order by'", `SELECT "order", by FROM t`,
-		"SELECT x FROM t -- ORDER BY x", "SELECT x FROM t /* ORDER BY x */", "SELECT recorder, bypass FROM t", "SELECT [order] by"} {
+	for _, s := range []string{
+		"SELECT * FROM notes",
+		"SELECT * FROM notes WHERE title = 'order by'",
+		"SELECT 'ORDER BY' FROM t",
+		`SELECT "order", by FROM t`,
+		`SELECT "order" by FROM t`,
+		"SELECT [order], `by` FROM t",
+		"SELECT x FROM t -- ORDER BY x",
+		"SELECT 1 /* ORDER BY */",
+		"SELECT recorder, bypass, orderby FROM t",
+		"SELECT 'it''s' ORDER_BY FROM t",
+		"SELECT or/* c */der BY x",
+		"SELECT 'unclosed ORDER BY",
+		"SELECT x FROM t /* unclosed ORDER BY",
+	} {
 		if hasOrderBy(s) {
 			t.Errorf("ORDER BY found in %q", s)
 		}

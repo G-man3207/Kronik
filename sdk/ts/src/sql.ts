@@ -97,38 +97,15 @@ export function fromSql(value: SqlValue): SqlResult {
 }
 
 /**
+ * A string literal, a quoted identifier or a comment, also one that is never
+ * closed. Each is replaced by a space, so that `or''der` stays two words.
+ */
+const LITERAL_OR_COMMENT = /'[^']*'?|"[^"]*"?|`[^`]*`?|\[[^\]]*\]?|--[^\n]*|\/\*[\s\S]*?(?:\*\/|$)/g;
+
+/**
  * Whether `statement` contains the keywords ORDER BY outside string
  * literals, quoted identifiers and comments.
  */
 export function hasOrderBy(statement: string): boolean {
-  const words: string[] = [];
-  let word = '';
-  const endWord = () => {
-    if (word) words.push(word.toUpperCase());
-    word = '';
-  };
-  for (let i = 0; i < statement.length; i++) {
-    const c = statement[i];
-    if (c === "'" || c === '"' || c === '`' || c === '[') {
-      endWord();
-      const close = c === '[' ? ']' : c;
-      const end = statement.indexOf(close, i + 1);
-      i = end < 0 ? statement.length : end;
-      words.push('');
-    } else if (c === '-' && statement[i + 1] === '-') {
-      endWord();
-      const end = statement.indexOf('\n', i);
-      i = end < 0 ? statement.length : end;
-    } else if (c === '/' && statement[i + 1] === '*') {
-      endWord();
-      const end = statement.indexOf('*/', i + 2);
-      i = end < 0 ? statement.length : end + 1;
-    } else if (/[\p{L}\p{N}_]/u.test(c)) {
-      word += c;
-    } else {
-      endWord();
-    }
-  }
-  endWord();
-  return words.some((w, i) => w === 'ORDER' && words[i + 1] === 'BY');
+  return /\bORDER\s+BY\b/i.test(statement.replace(LITERAL_OR_COMMENT, ' '));
 }

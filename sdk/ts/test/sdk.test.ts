@@ -59,16 +59,35 @@ test('SQL parameters and results convert', () => {
   assert.deepEqual(rows.first(), { id: 1, title: 'milk', done: null });
 });
 
+// The statements are the same in every SDK's tests, so the four keep agreeing.
 test('ORDER BY detection skips literals, identifiers and comments', () => {
-  assert.ok(hasOrderBy('SELECT * FROM notes ORDER BY id'));
-  assert.ok(hasOrderBy('select id from notes order\n by created desc'));
-  assert.ok(hasOrderBy('SELECT id FROM t ORDER /* c */ BY id'));
-  assert.ok(!hasOrderBy('SELECT * FROM notes'));
-  assert.ok(!hasOrderBy("SELECT * FROM notes WHERE title = 'order by'"));
-  assert.ok(!hasOrderBy('SELECT "order", by FROM t'));
-  assert.ok(!hasOrderBy('SELECT x FROM t -- ORDER BY x'));
-  assert.ok(!hasOrderBy('SELECT x FROM t /* ORDER BY x */'));
-  assert.ok(!hasOrderBy('SELECT recorder, bypass FROM t'));
+  const withOrderBy = [
+    'SELECT * FROM notes ORDER BY id',
+    'select id from notes order\n  by created desc',
+    'SELECT id FROM (SELECT id FROM t) ORDER /* c */ BY id',
+    'SELECT id FROM t ORDER -- c\nBY id',
+    `SELECT 'order by', "order by" FROM t ORDER BY id`,
+    `SELECT x FROM t /* ' */ ORDER BY id`,
+    'SELECT "/*" FROM t ORDER BY id',
+    "SELECT x FROM t -- don't\nORDER BY id",
+  ];
+  const withoutOrderBy = [
+    'SELECT * FROM notes',
+    "SELECT * FROM notes WHERE title = 'order by'",
+    "SELECT 'ORDER BY' FROM t",
+    'SELECT "order", by FROM t',
+    'SELECT "order" by FROM t',
+    'SELECT [order], `by` FROM t',
+    'SELECT x FROM t -- ORDER BY x',
+    'SELECT 1 /* ORDER BY */',
+    'SELECT recorder, bypass, orderby FROM t',
+    "SELECT 'it''s' ORDER_BY FROM t",
+    'SELECT or/* c */der BY x',
+    "SELECT 'unclosed ORDER BY",
+    'SELECT x FROM t /* unclosed ORDER BY',
+  ];
+  for (const s of withOrderBy) assert.ok(hasOrderBy(s), s);
+  for (const s of withoutOrderBy) assert.ok(!hasOrderBy(s), s);
 });
 
 test('bodies, JSON and requests', () => {

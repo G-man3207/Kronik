@@ -1,7 +1,14 @@
 # Values and rows for ctx.sql. No host calls here, so the conversions can be
 # tested without a host.
 
+import re
+
 from .errors import KronikError
+
+# A string literal, a quoted identifier or a comment, also one that is never
+# closed. Each is replaced by a space, so that `or''der` stays two words.
+_LITERAL_OR_COMMENT = re.compile(r"'[^']*'?|\"[^\"]*\"?|`[^`]*`?|\[[^\]]*\]?|--[^\n]*|/\*[\s\S]*?(?:\*/|\Z)")
+_ORDER_BY = re.compile(r"\bORDER\s+BY\b", re.I)
 
 
 def from_sql(value):
@@ -52,36 +59,4 @@ def to_sql(param, sql):
 def has_order_by(statement):
     """Whether `statement` contains the keywords ORDER BY outside string
     literals, quoted identifiers and comments."""
-    words = []
-    word = []
-    i, n = 0, len(statement)
-    while i < n:
-        c = statement[i]
-        if c in "'\"`[":
-            if word:
-                words.append("".join(word).upper())
-                word = []
-            end = statement.find("]" if c == "[" else c, i + 1)
-            i = n if end < 0 else end
-            words.append("")
-        elif c == "-" and statement.startswith("-", i + 1):
-            if word:
-                words.append("".join(word).upper())
-                word = []
-            end = statement.find("\n", i)
-            i = n if end < 0 else end
-        elif c == "/" and statement.startswith("*", i + 1):
-            if word:
-                words.append("".join(word).upper())
-                word = []
-            end = statement.find("*/", i + 2)
-            i = n if end < 0 else end + 1
-        elif c.isalnum() or c == "_":
-            word.append(c)
-        elif word:
-            words.append("".join(word).upper())
-            word = []
-        i += 1
-    if word:
-        words.append("".join(word).upper())
-    return any(w == "ORDER" and words[k + 1 : k + 2] == ["BY"] for k, w in enumerate(words))
+    return _ORDER_BY.search(_LITERAL_OR_COMMENT.sub(" ", statement)) is not None

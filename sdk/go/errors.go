@@ -49,7 +49,8 @@ func IsRejected(err error) bool {
 }
 
 // explainTopic is the error code that starts a host message such as
-// `CAPABILITY_NOT_GRANTED: ...`, else fallback.
+// `CAPABILITY_NOT_GRANTED: ...`, else fallback. Checked by hand rather
+// than with a regexp, for the reason hasOrderBy gives.
 func explainTopic(message, fallback string) string {
 	code, _, found := strings.Cut(message, ":")
 	if !found || len(code) < 2 || code[0] < 'A' || code[0] > 'Z' {
