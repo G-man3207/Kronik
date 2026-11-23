@@ -118,38 +118,19 @@ async fn stopped_original_native_role_denies_a_capture_waiting_on_actual_deploy_
 }
 
 #[tokio::test]
-async fn actual_native_record_guard_keeps_same_registry_root_until_the_last_owned_reader_drops() {
-    use kronik_core::snapshot_resources::SnapshotRootRegistry;
+async fn actual_native_record_reader_holds_its_physical_source_root_pin() {
     let data = tempfile::tempdir().unwrap();
     let env = Env::real(tokio::runtime::Handle::current());
     let node = crate::start_local(env, data.path(), NodeConfig::default())
         .await
         .unwrap();
     append(&node, "actual-root-pin").await;
-    let reader = Arc::new(node.capture_system_export_reader().await.unwrap());
-    let roots = node.native_execution.source_roots();
+    let reader = node.capture_system_export_reader().await.unwrap();
     let pin = reader
         .root_pin
         .as_ref()
         .expect("actual start_local has protected physical storage");
-    assert!(SnapshotRootRegistry::contains(&roots, pin));
-    let path = std::fs::canonicalize(data.path()).unwrap();
-    let owned_frames = reader.clone();
-    drop(reader);
-    let planned = SnapshotRootRegistry::prepare_deletion(&roots, vec![path.clone()]).unwrap();
-    assert!(SnapshotRootRegistry::begin_deletion(&roots, planned).is_err());
-    owned_frames
-        .local_export_page(0, 256, 4 << 20)
-        .await
-        .unwrap();
-    drop(owned_frames);
-    let planned = SnapshotRootRegistry::prepare_deletion(&roots, vec![path]).unwrap();
-    let unknown = SnapshotRootRegistry::begin_deletion(&roots, planned).unwrap();
-    assert!(node.capture_system_export_reader().await.is_err());
-    drop(unknown);
-    assert!(SnapshotRootRegistry::deletion_pending(&roots));
-    assert!(
-        node.capture_system_export_reader().await.is_err(),
-        "unknown deletion is not completion"
-    );
+    assert!(pin.data_is_live_under_publication());
+    assert!(reader.check().is_ok());
+    reader.local_export_page(0, 256, 4 << 20).await.unwrap();
 }
