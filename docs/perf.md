@@ -573,7 +573,7 @@ the commands below. It does not run on a schedule.
 
 ### Method
 
-- **Crash test:** the `chaos` job runs `scripts/chaos.sh [CYCLES] [WORKDIR]`.
+- **Crash test:** the `chaos` job runs `python3 scripts/chaos.py [--cycles N] [--dir DIR]`.
   The defaults are 1 000 cycles in `/var/tmp/kronik-chaos`, on a real disk.
   - Each cycle, 12 clients send 40 to 200 HTTP requests with an
     `Idempotency-Key`, and retry them until acknowledged. The requests go to

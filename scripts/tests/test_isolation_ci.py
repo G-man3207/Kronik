@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -91,7 +92,7 @@ class ExplicitFixture(unittest.TestCase):
         self.assertEqual(create, ["/h", "create", "/parent", "/p", "/probe", "/pg", "/pay", "61000", "61000",
                                   "2000000000", "61001", "--max-runtime", "3600"])
         self.assertEqual(calls[0], ["/h", "init", "/parent/kronik-proof-x", "rootless"])
-        self.assertEqual(calls[1][:2], ["bash", "scripts/conformance-rootless.sh"])
+        self.assertEqual(calls[1][:3], [sys.executable, "scripts/isolation-conformance.py", "conformance"])
         self.assertIn("--program-proof", calls[1])
         self.assertEqual(calls[-1], ["/h", "cleanup", "/parent/kronik-proof-x"])
         create, calls = self.sequence("microvm")

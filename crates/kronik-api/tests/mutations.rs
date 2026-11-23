@@ -985,7 +985,7 @@ async fn audited_since(node: &kronik_sched::Node, after: u64) -> Vec<String> {
 /// are still called, and a failed call must write nothing.
 // shortcut: foreign add/remove are only checked to write nothing on failure here, extend once a test harness for foreign actors exists in kronik-api.
 // This file-source fixture also proves unsupported rewrap writes nothing.
-// Provider-backed rewrap and its audit use real KMS in scripts/e2e-keys.sh.
+// Provider-backed rewrap and its audit use real KMS in scripts/e2e-keys.py.
 // The external secret link needs a configured provider backend; the fleet
 // routes need an enrolled controller; the event replay needs a published
 // event feed. Each is refused before it writes.

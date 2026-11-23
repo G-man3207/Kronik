@@ -120,7 +120,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 timeout --signal=TERM --kill-after=20s 180s \
   "$helper" init "$proof" rootless >"$proof/initial-init.log" 2>&1
-bash scripts/conformance-rootless.sh --fixture "$proof" \
+python3 scripts/isolation-conformance.py conformance --fixture "$proof" \
   --isolation gvisor --program-proof
 SH
 ```
