@@ -10,9 +10,10 @@ use kronik_api::types::{
     TokenCreateRequest, TokenCreateResponse, TokenRevokeRequest, TokenRevokeResponse, TokenView,
     TokensResponse,
 };
+use kronik_core::http::percent_encode;
 
 use super::render::{field, next, shell_quote, table};
-use super::{Ctx, Error, Mutation, http, reason, units};
+use super::{Ctx, Error, Mutation, reason, units};
 
 #[derive(Debug, Subcommand)]
 pub enum TokenCommand {
@@ -101,7 +102,7 @@ fn list(ctx: &Ctx) -> Result<ExitCode, Error> {
 fn revoke(ctx: &Ctx, name: &str, mutation: &Mutation) -> Result<ExitCode, Error> {
     let reason = reason(mutation)?;
     let body = ctx.post(
-        &format!("/v1/tokens/{}/revoke", http::encode(name)),
+        &format!("/v1/tokens/{}/revoke", percent_encode(name)),
         &TokenRevokeRequest {
             reason: reason.to_owned(),
             dry_run: mutation.dry_run,

@@ -165,7 +165,8 @@ fn invalid(what: &'static str) -> DecodeError {
     }
 }
 
-fn identifier(value: &str) -> bool {
+/// A fleet identifier: 1 to 256 bytes of ASCII letters, digits and `-_.:`.
+pub fn identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
         && value
@@ -252,7 +253,10 @@ fn matches_hex(value: &str, bytes: &[u8]) -> bool {
             })
 }
 
-fn exact_name<'a, E>(
+/// Whether an iterator of subject names holds exactly `expected` and
+/// nothing else. The enrollment identity checks of the controller and of
+/// the installation share it.
+pub fn exact_name<'a, E>(
     mut names: impl Iterator<Item = Result<&'a str, E>>,
     expected: Option<&str>,
 ) -> bool {

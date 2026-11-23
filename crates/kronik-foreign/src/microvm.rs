@@ -267,12 +267,26 @@ fn peer_is_in(proc_cgroup: &str, cgroup: &str) -> bool {
             .is_some_and(|theirs| theirs.trim_end_matches('/') == ours)
 }
 
-/// How a process that was waited for ended, for a message.
-fn describe_exit(status: io::Result<Option<i32>>) -> String {
-    match status {
-        Ok(Some(code)) => format!("exit status {code}"),
-        Ok(None) => "killed by a signal".into(),
-        Err(e) => format!("wait failed: {e}"),
+/// A directory that is removed, with everything in it, when the guard
+/// drops: an unfinished stage or copy must not leave a half-written tree
+/// behind. An empty path means the directory was taken over, and nothing
+/// is removed.
+pub(crate) struct RemoveDirOnDrop(pub(crate) PathBuf);
+
+impl RemoveDirOnDrop {
+    /// Creates `path` as a new mode-0700 directory; fails if it exists.
+    pub(crate) fn create(path: PathBuf) -> io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        if !self.0.as_os_str().is_empty() {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -296,26 +310,18 @@ pub fn validate_tools(directory: &Path) -> Result<(), String> {
     assets.require_exec_mount()
 }
 
+/// The launcher's directories: created through the shared private custody,
+/// and then refused if they are not real directories — a symlink would
+/// point the VMM's custody elsewhere.
 fn private_dir(path: &Path) -> io::Result<()> {
-    fs::create_dir_all(path)?;
+    crate::layout::private_dir(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(io::Error::other(
             "microVM directory is not a real directory",
         ));
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-}
-
-fn private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
+    Ok(())
 }
 
 /// Opens the snapshot file `name` of the VMM's `output` directory for the
@@ -528,7 +534,7 @@ impl Vm {
         let mut unspawned = Unspawned(parent.to_path_buf());
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
-        private_file(
+        crate::checkpoint::write_private(
             &parent.join(".state.tmp"),
             &serde_json::to_vec(&State {
                 cgroup: start.cgroup.into(),
@@ -553,7 +559,8 @@ impl Vm {
         private_dir(&start.root.join("out")).map_err(|e| e.to_string())?;
         private_dir(start.output).map_err(|e| e.to_string())?;
         for name in [SNAPSHOT_MEMORY, SNAPSHOT_STATE] {
-            private_file(&start.output.join(name), &[]).map_err(|e| e.to_string())?;
+            crate::checkpoint::write_private(&start.output.join(name), &[])
+                .map_err(|e| e.to_string())?;
         }
         for name in [
             "firecracker",
@@ -563,7 +570,8 @@ impl Vm {
             "data.ext4",
             "dev/kvm",
         ] {
-            private_file(&start.root.join(name), &[]).map_err(|e| e.to_string())?;
+            crate::checkpoint::write_private(&start.root.join(name), &[])
+                .map_err(|e| e.to_string())?;
         }
         let initrd = parent.join("initrd.cpio");
         let manifest = parent.join("launch.json");
@@ -583,7 +591,7 @@ impl Vm {
             parent_pid: std::process::id(),
         };
         let bytes = serde_json::to_vec(&launch).map_err(|e| e.to_string())?;
-        private_file(&manifest, &bytes).map_err(|e| e.to_string())?;
+        crate::checkpoint::write_private(&manifest, &bytes).map_err(|e| e.to_string())?;
         let output = Stdio::Log {
             path: start.log.to_path_buf(),
             max_bytes: crate::logs::ROTATE_BYTES,
@@ -637,7 +645,7 @@ impl Vm {
                         status = self.child.wait() => {
                             return Err(format!(
                                 "the microVM launcher exited before the VMM's API was ready ({})",
-                                describe_exit(status)
+                                crate::supervisor::describe_exit(status)
                             ));
                         }
                         connected = connect_vmm_socket(env, &vm.api, &vm.cgroup) => {
@@ -1569,7 +1577,8 @@ mod tests {
             .path()
             .join(format!("kronik-foreign-{}", "a".repeat(32)));
         fs::create_dir(&root).unwrap();
-        private_file(&root.join("state.json"), b"{\"cgroup\":\"/daemon\"}").unwrap();
+        crate::checkpoint::write_private(&root.join("state.json"), b"{\"cgroup\":\"/daemon\"}")
+            .unwrap();
         let env = Env::real(tokio::runtime::Handle::current());
         let error = cleanup_stale(&env, directory.path(), "").await.unwrap_err();
         assert!(error.contains("another sandbox"));

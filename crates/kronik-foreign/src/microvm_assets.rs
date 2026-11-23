@@ -10,7 +10,7 @@ use kronik_core::env::{Env, ProcessSpec, Stdio};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::microvm::DATA_BYTES;
+use crate::microvm::{DATA_BYTES, RemoveDirOnDrop};
 const MAX_BYTES: u64 = 8 << 30;
 const MAX_ENTRIES: u64 = 1_000_000;
 
@@ -260,13 +260,7 @@ impl Assets {
     }
 }
 
-struct Stage(PathBuf);
-impl Drop for Stage {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-fn stage(env: &Env, out: &Path) -> Result<Stage, String> {
+fn stage(env: &Env, out: &Path) -> Result<RemoveDirOnDrop, String> {
     let parent = out
         .parent()
         .ok_or_else(|| error("disk has no parent directory"))?;
@@ -274,7 +268,7 @@ fn stage(env: &Env, out: &Path) -> Result<Stage, String> {
     let path = parent.join(format!(".microvm-{:032x}", u128::from_le_bytes(token)));
     fs::create_dir(&path).map_err(error)?;
     fs::set_permissions(&path, Permissions::from_mode(0o700)).map_err(error)?;
-    Ok(Stage(path))
+    Ok(RemoveDirOnDrop(path))
 }
 
 #[derive(Default)]

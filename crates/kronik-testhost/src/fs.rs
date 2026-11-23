@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
-use kronik_core::env::{BoxFuture, File, Fs, OpenMode};
+use kronik_core::env::{BoxFuture, File, Fs, OpenMode, insecure_file, secure_path};
 use zeroize::Zeroizing;
 
 /// Files by path. Ordinary directories exist implicitly; their privacy is
@@ -37,26 +37,6 @@ fn not_found(path: &Path) -> io::Error {
         io::ErrorKind::NotFound,
         format!("{}: no such file", path.display()),
     )
-}
-
-fn insecure_file() -> io::Error {
-    io::Error::new(io::ErrorKind::PermissionDenied, "insecure private file")
-}
-
-fn secure_path(path: &Path) -> io::Result<PathBuf> {
-    use std::path::Component;
-    let mut clean = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir | Component::Normal(_) => clean.push(component.as_os_str()),
-            Component::CurDir => {}
-            _ => return Err(insecure_file()),
-        }
-    }
-    if clean.file_name().is_none() {
-        return Err(insecure_file());
-    }
-    Ok(clean)
 }
 
 fn note_dirs(dirs: &mut BTreeMap<PathBuf, bool>, path: &Path) {

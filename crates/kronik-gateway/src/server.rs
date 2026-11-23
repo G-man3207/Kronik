@@ -422,16 +422,6 @@ where
     }
 }
 
-/// After a failed `accept()` (EMFILE when the descriptors run out, say): a
-/// warning and a pause that doubles from 10 ms to about a second, instead
-/// of ending the server. `failures` counts the failures in a row.
-async fn pause_after_accept_error(failures: &mut u32, error: &std::io::Error) {
-    tracing::warn!(%error, listener = "gateway", "accept failed; retrying");
-    let pause = Duration::from_millis(10 << (*failures).min(7));
-    *failures += 1;
-    tokio::time::sleep(pause).await;
-}
-
 /// How many connections over their client's share are answered 503 at
 /// once, and how long each answer may take; more are closed unanswered.
 const REFUSALS: usize = 64;
@@ -534,7 +524,9 @@ async fn accept(listener: &TcpListener, slots: &Arc<Slots>, trusted: &[IpNet]) -
                     }
                 }
             }
-            Err(e) => pause_after_accept_error(&mut failures, &e).await,
+            Err(e) => {
+                kronik_core::http::pause_after_accept_error(&mut failures, &e, "gateway").await
+            }
         }
     }
 }

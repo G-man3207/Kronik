@@ -112,30 +112,22 @@ pub fn canonical_controller_url(value: &str) -> Result<String, FleetError> {
     Ok(u.as_str().trim_end_matches('/').to_owned())
 }
 
-fn identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 256
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
-}
-
 impl EnrollmentPlan {
     pub fn validate(&self) -> Result<(), FleetError> {
         if canonical_controller_url(&self.controller_url)? != self.controller_url {
             return Err(FleetError::Invalid("controller URL must be canonical"));
         }
-        if !identifier(&self.identity.installation)
+        if !kronik_proto::control::identifier(&self.identity.installation)
             || self
                 .identity
                 .node
                 .as_deref()
-                .is_some_and(|v| !identifier(v))
+                .is_some_and(|v| !kronik_proto::control::identifier(v))
             || self
                 .identity
                 .cluster
                 .as_deref()
-                .is_some_and(|v| !identifier(v))
+                .is_some_and(|v| !kronik_proto::control::identifier(v))
         {
             return Err(FleetError::Invalid("installation/node/cluster identity"));
         }
@@ -295,17 +287,17 @@ impl ControllerClient {
         {
             return Err(FleetError::Protocol);
         }
-        if !exact_name(
+        if !kronik_proto::control::exact_name(
             cert.subject()
                 .iter_common_name()
                 .map(|value| value.as_str()),
             Some(record.plan.identity.installation.as_str()),
-        ) || !exact_name(
+        ) || !kronik_proto::control::exact_name(
             cert.subject()
                 .iter_organization()
                 .map(|value| value.as_str()),
             record.plan.identity.cluster.as_deref(),
-        ) || !exact_name(
+        ) || !kronik_proto::control::exact_name(
             cert.subject()
                 .iter_organizational_unit()
                 .map(|value| value.as_str()),
@@ -350,17 +342,6 @@ impl ControllerClient {
 
     pub(crate) fn endpoint(&self, path: &str) -> String {
         format!("{}{path}", self.url)
-    }
-}
-
-fn exact_name<'a, E>(
-    mut names: impl Iterator<Item = Result<&'a str, E>>,
-    expected: Option<&str>,
-) -> bool {
-    match (names.next(), expected) {
-        (None, None) => true,
-        (Some(Ok(value)), Some(expected)) if value == expected => names.next().is_none(),
-        _ => false,
     }
 }
 

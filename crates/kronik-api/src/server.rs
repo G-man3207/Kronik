@@ -156,16 +156,6 @@ pub fn bearer(headers: &hyper::HeaderMap) -> Result<Option<String>, ApiError> {
     }
 }
 
-/// After a failed `accept()` (EMFILE when the descriptors run out, say): a
-/// warning and a pause that doubles from 10 ms to about a second, instead
-/// of ending the server. `failures` counts the failures in a row.
-pub async fn pause_after_accept_error(failures: &mut u32, error: &std::io::Error, listener: &str) {
-    tracing::warn!(%error, listener, "accept failed; retrying");
-    let pause = Duration::from_millis(10 << (*failures).min(7));
-    *failures += 1;
-    tokio::time::sleep(pause).await;
-}
-
 /// Serves until the task is dropped. Each connection is a task.
 pub async fn serve(listener: UnixListener, api: Arc<Api>) -> std::io::Result<()> {
     serve_with(listener, api, None).await
@@ -183,7 +173,7 @@ pub async fn serve_with(
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
             Err(e) => {
-                pause_after_accept_error(&mut failures, &e, "API socket").await;
+                kronik_core::http::pause_after_accept_error(&mut failures, &e, "API socket").await;
                 continue;
             }
         };
@@ -259,7 +249,8 @@ pub async fn serve_tcp(
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(e) => {
-                pause_after_accept_error(&mut failures, &e, "API over TCP").await;
+                kronik_core::http::pause_after_accept_error(&mut failures, &e, "API over TCP")
+                    .await;
                 continue;
             }
         };

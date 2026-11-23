@@ -6,15 +6,15 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use super::render::{field, next, shell_quote, table};
+use super::{Ctx, Error, Mutation, reason, units};
 use clap::{Subcommand, ValueEnum};
 use kronik_api::m7::{
     ForeignAddRequest, ForeignAddResponse, ForeignListResponse, ForeignLogsResponse,
     ForeignRemoveRequest, ForeignRemoveResponse, ForeignView,
 };
 use kronik_core::error::{ApiError, ErrorCode};
-
-use super::render::{field, next, shell_quote, table};
-use super::{Ctx, Error, Mutation, http, reason, units};
+use kronik_core::http::percent_encode;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Isolation {
@@ -577,7 +577,7 @@ fn render_list(r: &ForeignListResponse) -> String {
 }
 
 fn logs(ctx: &Ctx, name: &str, tail: Option<u32>) -> Result<ExitCode, Error> {
-    let mut target = format!("/v1/foreign/{}/logs", http::encode(name));
+    let mut target = format!("/v1/foreign/{}/logs", percent_encode(name));
     if let Some(t) = tail {
         let _ = write!(target, "?tail={t}");
     }
@@ -606,7 +606,7 @@ fn remove(ctx: &Ctx, name: &str, mutation: &Mutation) -> Result<ExitCode, Error>
     let reason = reason(mutation)?;
     let body = ctx.send_json(
         "DELETE",
-        &format!("/v1/foreign/{}", http::encode(name)),
+        &format!("/v1/foreign/{}", percent_encode(name)),
         &ForeignRemoveRequest {
             reason: reason.to_owned(),
             dry_run: mutation.dry_run,

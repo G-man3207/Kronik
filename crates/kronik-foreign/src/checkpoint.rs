@@ -19,6 +19,7 @@ use kronik_effects::foreign::{Checkpoint, CopySpec, ForeignCopy};
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{Dialer, Pool};
+use crate::layout::private_dir;
 use crate::manager::Foreign;
 use crate::runtime::{Engine, Runtime, container_id, run_quick};
 use crate::supervisor::State;
@@ -117,21 +118,24 @@ pub(crate) fn copy_tree(from: &Path, to: &Path) -> io::Result<u64> {
     Ok(bytes)
 }
 
-pub(crate) fn private_dir(path: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-}
-
+/// Writes a file only the daemon's user can read (`config.json` holds
+/// secret values): replaces a leftover, refuses to follow a link, and
+/// removes a partial write so no half a secret stays on disk.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     let _ = std::fs::remove_file(path);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()
+    let written = f.write_all(bytes).and_then(|()| f.sync_all());
+    if written.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    written
 }
 
 fn err(what: &str, e: impl std::fmt::Display) -> String {

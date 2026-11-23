@@ -9,7 +9,7 @@ publish.workspace = true
 [features]
 # The hyper server on the Unix socket and, with a bearer token, on TCP
 # (optionally TLS); the service function and the types need only the node.
-server = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:tracing", "dep:futures-util", "dep:tokio-tungstenite", "tokio/net", "tokio/rt", "tokio/time"]
+server = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:tracing", "dep:futures-util", "dep:tokio-tungstenite", "tokio/net", "tokio/rt", "tokio/time", "kronik-core/real"]
 
 [dependencies]
 base64 = { workspace = true }

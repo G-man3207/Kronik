@@ -46,6 +46,7 @@ hyper-util = { workspace = true, optional = true, features = ["client-legacy", "
 tower-service = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true }
+tracing = { workspace = true }
 rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 ring = { workspace = true, optional = true }

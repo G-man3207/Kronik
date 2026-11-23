@@ -45,6 +45,7 @@ use kronik_api::types::{
 };
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::explain;
+use kronik_core::http::percent_encode;
 use kronik_core::ids::ActorRef;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1192,7 +1193,7 @@ fn query(pairs: &[(&str, Option<String>)]) -> String {
             out.push(if out.is_empty() { '?' } else { '&' });
             out.push_str(k);
             out.push('=');
-            out.push_str(&http::encode(v));
+            out.push_str(&percent_encode(v));
         }
     }
     out
@@ -1201,8 +1202,8 @@ fn query(pairs: &[(&str, Option<String>)]) -> String {
 fn actor_path(a: &ActorRef) -> String {
     format!(
         "/v1/actors/{}/{}",
-        http::encode(&a.kind),
-        http::encode(&a.key)
+        percent_encode(&a.kind),
+        percent_encode(&a.key)
     )
 }
 
@@ -1331,9 +1332,9 @@ fn send(ctx: &Ctx, a: SendArgs) -> Result<ExitCode, Error> {
         let raw = ctx.post(
             &format!(
                 "/v1/forks/{}/actors/{}/{}/messages",
-                http::encode(fork),
-                http::encode(&actor.kind),
-                http::encode(&actor.key)
+                percent_encode(fork),
+                percent_encode(&actor.kind),
+                percent_encode(&actor.key)
             ),
             &request,
         )?;
@@ -1379,7 +1380,7 @@ fn send(ctx: &Ctx, a: SendArgs) -> Result<ExitCode, Error> {
 }
 
 fn trace(ctx: &Ctx, turn_id: &str) -> Result<ExitCode, Error> {
-    let body = ctx.get(&format!("/v1/turns/{}/trace", http::encode(turn_id)))?;
+    let body = ctx.get(&format!("/v1/turns/{}/trace", percent_encode(turn_id)))?;
     if ctx.json {
         ctx.print_raw(&body);
         return Ok(ExitCode::SUCCESS);
@@ -1496,7 +1497,7 @@ fn connections_list(
 }
 
 fn connection_inspect(ctx: &Ctx, id: &str) -> Result<ExitCode, Error> {
-    let body = ctx.get(&format!("/v1/connections/{}", http::encode(id)))?;
+    let body = ctx.get(&format!("/v1/connections/{}", percent_encode(id)))?;
     if ctx.json {
         ctx.print_raw(&body);
         return Ok(ExitCode::SUCCESS);
@@ -1515,7 +1516,7 @@ fn connection_close(
 ) -> Result<ExitCode, Error> {
     let reason = reason(&mutation)?;
     let raw = ctx.post(
-        &format!("/v1/connections/{}/close", http::encode(id)),
+        &format!("/v1/connections/{}/close", percent_encode(id)),
         &ConnectionCloseRequest {
             code,
             message: message.unwrap_or_default(),
@@ -1577,7 +1578,7 @@ fn dead_letters(ctx: &Ctx, after: Option<String>, limit: Option<u32>) -> Result<
 fn resend(ctx: &Ctx, id: &str, mutation: Mutation) -> Result<ExitCode, Error> {
     let reason = reason(&mutation)?;
     let raw = ctx.post(
-        &format!("/v1/dead-letters/{}/resend", http::encode(id)),
+        &format!("/v1/dead-letters/{}/resend", percent_encode(id)),
         &ResendRequest {
             reason: reason.to_owned(),
             dry_run: mutation.dry_run,
@@ -1773,7 +1774,7 @@ fn limits_show(ctx: &Ctx, kind: Option<String>) -> Result<ExitCode, Error> {
 }
 
 fn secret_path(name: &str) -> String {
-    format!("/v1/secrets/{}", http::encode(name))
+    format!("/v1/secrets/{}", percent_encode(name))
 }
 
 fn secret_set(ctx: &Ctx, name: &str, mutation: Mutation) -> Result<ExitCode, Error> {

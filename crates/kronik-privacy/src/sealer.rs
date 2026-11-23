@@ -160,7 +160,10 @@ fn tombstone(version: u32) -> pb::Sealed {
     }
 }
 
-fn is_tombstone(s: &pb::Sealable, version: u32) -> bool {
+/// Whether a sealed value is the tombstone `version` seals after erasure:
+/// empty ciphertext and an all-zero nonce under that key version. The
+/// reseal scan shares it, so a tombstone the sealer wrote is one it skips.
+pub fn is_tombstone(s: &pb::Sealable, version: u32) -> bool {
     matches!(
         &s.value,
         Some(pb::sealable::Value::Sealed(x))

@@ -12,6 +12,7 @@ use rmcp::service::RequestContext;
 use serde_json::{Map, Value, json};
 
 use crate::{KronikMcp, bad_request};
+use kronik_core::http::percent_encode;
 
 /// A tool, with the scope it needs.
 struct Spec {
@@ -740,7 +741,7 @@ impl Args {
         for key in keys {
             match self.0.get(*key) {
                 None | Some(Value::Null) => {}
-                Some(Value::String(s)) => pairs.push(format!("{key}={}", encode(s))),
+                Some(Value::String(s)) => pairs.push(format!("{key}={}", percent_encode(s))),
                 Some(Value::Number(n)) => pairs.push(format!("{key}={n}")),
                 Some(Value::Bool(b)) => pairs.push(format!("{key}={b}")),
                 Some(_) => {
@@ -757,7 +758,7 @@ impl Args {
     /// A required string argument, encoded as a path segment.
     fn segment(&self, key: &str) -> Result<String, Value> {
         match self.0.get(key) {
-            Some(Value::String(s)) if !s.is_empty() => Ok(encode(s)),
+            Some(Value::String(s)) if !s.is_empty() => Ok(percent_encode(s)),
             _ => Err(bad_request(
                 format!("`{key}` is required and must be a non-empty string"),
                 "See the tool's input schema.",
@@ -774,7 +775,7 @@ impl Args {
             .unwrap_or_default();
         match actor.split_once('/') {
             Some((kind, key)) if !kind.is_empty() && !key.is_empty() => {
-                Ok((encode(kind), encode(key)))
+                Ok((percent_encode(kind), percent_encode(key)))
             }
             _ => Err(bad_request(
                 format!("`actor` must be `kind/key`, got {actor:?}"),
@@ -847,20 +848,6 @@ impl Args {
             "format=json".into(),
         ))
     }
-}
-
-/// Percent-encodes everything but unreserved characters, for a path segment
-/// or a query value.
-fn encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(char::from(b));
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
 }
 
 /// A proposal with `next`: the exact commands that follow its policy outcome.

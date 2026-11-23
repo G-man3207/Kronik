@@ -234,8 +234,8 @@ async fn port_forward(
         }
         Ok(Err(status)) => {
             return Err(format!(
-                "runsc port-forward exited with {} before connecting",
-                describe(status)
+                "runsc port-forward exited before connecting ({})",
+                crate::supervisor::describe_exit(status)
             ));
         }
         Err(_) => {
@@ -250,22 +250,14 @@ async fn port_forward(
     match env.timeout(DIAL_TIMEOUT, helper.wait()).await {
         Ok(Ok(Some(0))) => Ok(stream),
         Ok(status) => Err(format!(
-            "nothing accepted the connection on port {port} (runsc port-forward exited with {})",
-            describe(status)
+            "nothing accepted the connection on port {port} (runsc port-forward ended: {})",
+            crate::supervisor::describe_exit(status)
         )),
         Err(_) => {
             let _ = helper.kill().await;
             let _ = helper.wait().await;
             Err("runsc port-forward did not finish handing over the connection".into())
         }
-    }
-}
-
-fn describe(status: std::io::Result<Option<i32>>) -> String {
-    match status {
-        Ok(Some(c)) => format!("status {c}"),
-        Ok(None) => "a signal".into(),
-        Err(e) => format!("an error ({e})"),
     }
 }
 

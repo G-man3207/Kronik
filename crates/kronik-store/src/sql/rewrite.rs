@@ -9,10 +9,10 @@
 
 use std::collections::BTreeSet;
 
+use super::actor::quote_ident;
+use super::ffi::{self, Change, Op, Val};
 use rusqlite::types::Value;
 use rusqlite::{Connection, params_from_iter};
-
-use super::ffi::{self, Change, Op, Val};
 
 /// Replaces text and blob cell values in `cs` and returns a changeset that
 /// applies to the same schema. `skip` is `(table, column index)` of
@@ -64,11 +64,11 @@ fn create_tables(conn: &Connection, changes: &[Change]) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = if pk.is_empty() {
-            format!("CREATE TABLE {} ({cols})", quote(&change.table))
+            format!("CREATE TABLE {} ({cols})", quote_ident(&change.table))
         } else {
             format!(
                 "CREATE TABLE {} ({cols}, PRIMARY KEY ({pk}))",
-                quote(&change.table)
+                quote_ident(&change.table)
             )
         };
         conn.execute_batch(&sql).map_err(|e| e.to_string())?;
@@ -154,7 +154,7 @@ fn insert_image(
     conn.execute(
         &format!(
             "INSERT INTO {} ({cols}) VALUES ({placeholders})",
-            quote(&change.table)
+            quote_ident(&change.table)
         ),
         params_from_iter(params),
     )
@@ -186,7 +186,7 @@ fn update_row(
     conn.execute(
         &format!(
             "UPDATE {} SET {} WHERE {}",
-            quote(&change.table),
+            quote_ident(&change.table),
             sets.join(", "),
             wheres
         ),
@@ -204,7 +204,7 @@ fn delete_row(
 ) -> Result<(), String> {
     let (wheres, params) = pk_where(change, &change.old, skip, rewrite, 0)?;
     conn.execute(
-        &format!("DELETE FROM {} WHERE {wheres}", quote(&change.table)),
+        &format!("DELETE FROM {} WHERE {wheres}", quote_ident(&change.table)),
         params_from_iter(params),
     )
     .map(|_| ())
@@ -303,8 +303,4 @@ fn row_key(
         }
     }
     key
-}
-
-fn quote(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }

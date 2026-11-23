@@ -10,9 +10,10 @@ use kronik_api::types::{
     PreviewCreateRequest, PreviewCreateResponse, PreviewDeleteResponse, PreviewInfo,
     PreviewsResponse, ResendRequest,
 };
+use kronik_core::http::percent_encode;
 
 use super::render::{field, next, shell_quote, table};
-use super::{Ctx, Error, Mutation, http, reason, units};
+use super::{Ctx, Error, Mutation, reason, units};
 
 #[derive(Debug, Subcommand)]
 pub enum PreviewCommand {
@@ -171,7 +172,7 @@ fn delete(ctx: &Ctx, id: &str, mutation: &Mutation) -> Result<ExitCode, Error> {
     let reason = reason(mutation)?;
     let body = ctx.send_json(
         "DELETE",
-        &format!("/v1/previews/{}", http::encode(id)),
+        &format!("/v1/previews/{}", percent_encode(id)),
         &ResendRequest {
             reason: reason.to_owned(),
             dry_run: mutation.dry_run,

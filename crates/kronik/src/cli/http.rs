@@ -6,7 +6,6 @@
 //! timeout; SSE uses the same transport with incremental bounded decoding.
 
 use std::error::Error as _;
-use std::fmt::Write as _;
 use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs as _};
 use std::os::unix::net::UnixStream;
@@ -549,20 +548,6 @@ async fn hyper_handshake(
         .handshake(TokioIo::new(transport))
         .await
         .map_err(|e| Failure::Io(io::Error::other(format!("the HTTP connection failed: {e}"))))
-}
-
-/// Percent-encodes a path segment or query value: everything except
-/// unreserved characters (RFC 3986).
-pub fn encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(char::from(b));
-        } else {
-            let _ = write!(out, "%{b:02X}");
-        }
-    }
-    out
 }
 
 /// An incremental response: reading the body applies HTTP transfer framing.
@@ -1585,14 +1570,6 @@ mod tests {
             matches!(&r, Err(Failure::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof),
             "{r:?}"
         );
-    }
-
-    #[test]
-    fn encodes_everything_but_unreserved_characters() {
-        assert_eq!(encode("main:12"), "main%3A12");
-        assert_eq!(encode("a b/c?d&e"), "a%20b%2Fc%3Fd%26e");
-        assert_eq!(encode("ok-._~09AZ"), "ok-._~09AZ");
-        assert_eq!(encode("ä"), "%C3%A4");
     }
 
     #[test]

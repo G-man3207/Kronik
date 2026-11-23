@@ -272,16 +272,6 @@ pub fn reseal_progress(data: &Path) -> ResealProgress {
     }
 }
 
-fn is_tombstone(s: &pb::Sealable, version: u32) -> bool {
-    matches!(
-        &s.value,
-        Some(pb::sealable::Value::Sealed(x))
-            if x.key_version == version
-                && x.ciphertext.is_empty()
-                && x.nonce.iter().all(|b| *b == 0)
-    )
-}
-
 fn needs_reseal(record: &Record, erased: &HashMap<String, u32>) -> bool {
     let mut need = false;
     let mut copy = record.clone();
@@ -290,7 +280,7 @@ fn needs_reseal(record: &Record, erased: &HashMap<String, u32>) -> bool {
             return;
         };
         if let Some(&ver) = erased.get(subject) {
-            if !is_tombstone(s, ver) {
+            if !kronik_privacy::sealer::is_tombstone(s, ver) {
                 need = true;
             }
         } else if matches!(s.value, Some(pb::sealable::Value::Plain(_))) {

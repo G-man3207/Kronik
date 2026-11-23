@@ -3,9 +3,7 @@
 use std::io;
 use std::os::unix::fs::MetadataExt as _;
 
-fn insecure_file() -> io::Error {
-    io::Error::new(io::ErrorKind::PermissionDenied, "insecure private file")
-}
+use crate::env::insecure_file;
 
 fn secure_parent(
     path: &std::path::Path,
