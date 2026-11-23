@@ -32,16 +32,6 @@ pub(crate) struct DataPublisher {
 }
 
 impl DataPublisher {
-    pub(crate) fn revision_for(
-        &self,
-        identity: Option<(u64, u64)>,
-        stage: Option<u64>,
-    ) -> Result<u64, PublicationError> {
-        let state = self.try_state()?;
-        Self::certified(&state, identity, stage)?;
-        Ok(state.generation)
-    }
-
     fn try_state(&self) -> Result<std::sync::MutexGuard<'_, State>, PublicationError> {
         self.state.try_lock().map_err(|error| match error {
             TryLockError::WouldBlock => PublicationError::Busy,
@@ -49,11 +39,7 @@ impl DataPublisher {
         })
     }
 
-    fn certified(
-        state: &State,
-        identity: Option<(u64, u64)>,
-        stage: Option<u64>,
-    ) -> Result<(), PublicationError> {
+    fn certified(state: &State, stage: Option<u64>) -> Result<(), PublicationError> {
         let active = if stage.is_some() && stage == state.stage {
             1
         } else {
@@ -62,15 +48,12 @@ impl DataPublisher {
         if state.failed || state.mutations != active || stage != state.stage {
             return Err(PublicationError::Uncertified);
         }
-        if identity.is_some() && identity != state.live {
-            return Err(PublicationError::Unowned);
-        }
         Ok(())
     }
 
     pub(crate) fn select_initial(&self, identity: (u64, u64)) -> Result<(), PublicationError> {
         let mut state = self.try_state()?;
-        Self::certified(&state, None, None)?;
+        Self::certified(&state, None)?;
         match state.live {
             Some(current) if current != identity => Err(PublicationError::Unowned),
             _ => {
@@ -86,23 +69,6 @@ impl DataPublisher {
             return Err(PublicationError::Uncertified);
         }
         Ok(())
-    }
-
-    pub(crate) fn publish_for<T>(
-        &self,
-        expected: u64,
-        identity: Option<(u64, u64)>,
-        stage: Option<u64>,
-        publish: impl FnOnce() -> T,
-    ) -> Result<Option<T>, PublicationError> {
-        let state = self.try_state()?;
-        Self::certified(&state, identity, stage)?;
-        if state.generation != expected {
-            return Ok(None);
-        }
-        let result = publish();
-        drop(state);
-        Ok(Some(result))
     }
 
     /// Invalidate before the first destructive write; this returns no lock.

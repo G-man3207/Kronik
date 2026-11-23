@@ -295,18 +295,6 @@ fn outcome_budget(
     Ok(())
 }
 
-pub fn outcome_output<N: AsRef<str>, V: AsRef<[u8]>>(
-    o: &mut Option<pb::outcome::Output>,
-    secrets: &[(N, V)],
-) -> Result<(), ScrubError> {
-    if o.is_none() {
-        return Ok(());
-    }
-    let matcher = CompiledScrubber::new(secrets, MAX_SECRET_PATTERN_BYTES)?;
-    let mut remaining = MAX_JSON_OUTPUT_BYTES;
-    outcome_budget(o, &matcher, &mut remaining)
-}
-
 /// Prepare original guest log fields once with the canonical output policy.
 /// On failure the caller must withhold the entire event batch.
 pub fn logs<N: AsRef<str>, V: AsRef<[u8]>>(

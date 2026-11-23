@@ -206,25 +206,6 @@ impl Mapper {
         )
     }
 
-    pub fn operational_lines(
-        &self,
-        lsn: u64,
-        record: &Record,
-        secrets: &[(&str, &[u8])],
-    ) -> Result<Vec<Line>, ApiError> {
-        self.operational_lines_at(SourcePos::Actor { shard: None, lsn }, record, secrets)
-    }
-
-    /// The same Mapper pipeline, with actual actor or metadata source positions.
-    pub fn operational_lines_at(
-        &self,
-        source: SourcePos,
-        record: &Record,
-        secrets: &[(&str, &[u8])],
-    ) -> Result<Vec<Line>, ApiError> {
-        self.operational_lines_in(source, &self.branch, record, secrets)
-    }
-
     pub fn operational_lines_actor_at(
         &self,
         source: &pb::ActorSource,

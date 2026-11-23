@@ -231,12 +231,6 @@ impl Dir {
         Dir::from_fd(fd, path.to_owned())
     }
 
-    /// A second handle on the directory `file` holds, for example the one
-    /// [`DataOwnership`](crate::key_source::DataOwnership) locks.
-    pub fn from_file(file: &File, label: &Path) -> io::Result<Dir> {
-        Dir::from_fd(file.try_clone()?.into(), label.to_owned())
-    }
-
     /// The directory at the absolute `path`, reached from `/` without
     /// following any symbolic link, through directories that only `owner`
     /// (root in production) can write. With `create`, missing directories

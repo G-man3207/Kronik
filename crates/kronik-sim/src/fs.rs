@@ -847,13 +847,3 @@ impl File for SimFile {
         })
     }
 }
-
-impl Disk {
-    pub fn durable_suffix_of(
-        disk: &Mutex<Disk>,
-        path: &Path,
-        from: usize,
-    ) -> Option<(usize, Vec<u8>)> {
-        lock(disk).durable_suffix(path, from)
-    }
-}

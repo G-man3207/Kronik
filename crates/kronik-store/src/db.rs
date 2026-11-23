@@ -769,17 +769,6 @@ impl StateDb {
         }
     }
 
-    /// Immutable installation identity, including when fleet control is disabled.
-    pub fn installation_id(&self) -> Result<Option<String>, StoreError> {
-        match self.control_state(kronik_proto::control::ControlKind::Installation)? {
-            Some((_, pb::audit_event::Operation::InstallationIdentity(identity))) => {
-                Ok(Some(identity.installation))
-            }
-            None => Ok(None),
-            _ => Err(corrupt("installation control family mismatch")),
-        }
-    }
-
     /// The same native self-session validation used by durable apply.
     pub fn validate_auth_session_revoked(
         &self,

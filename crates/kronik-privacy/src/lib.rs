@@ -336,22 +336,6 @@ impl MasterKey {
         ProtectedKey::derive(context, self.bytes())
     }
 
-    /// Pure secret version identities using one protected derivation, without opening a store.
-    // The returned derivation closure is the API; naming its full type would
-    // only restate the impl-trait line above it.
-    #[allow(clippy::type_complexity)]
-    pub fn secret_version_hasher(
-        &self,
-    ) -> Result<
-        impl Fn(&str, u64, &[u8]) -> Result<Vec<u8>, PrivacyError> + Send + Sync + 'static,
-        PrivacyError,
-    > {
-        let key = self.derive("kronik secret version v1")?;
-        Ok(move |name: &str, version: u64, value: &[u8]| {
-            secret_version_hash(&key, name, version, value)
-        })
-    }
-
     /// What each store's `key_check` row holds: a deliberately persisted verifier.
     fn check_value(&self) -> [u8; 32] {
         let mut hasher = Zeroizing::new(blake3::Hasher::new_derive_key("kronik master check v1"));
