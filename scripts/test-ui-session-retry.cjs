@@ -15,65 +15,18 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
-const ui = path.join(__dirname, '..', 'ui');
+const { chromeBin, sleep, connect, chromeArgs, serveUi } = require('./test-ui-common.cjs');
 const TOKEN = 'fixture-bearer';
 const KEPT = 'kept-secret';
 const PRINCIPAL = 'fixture-operator';
-const chromeBin = process.env.KRONIK_CHROME || '/usr/bin/google-chrome';
 let activeProfile = '';
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function devtoolsPort(profile) {
-  const file = path.join(profile, 'DevToolsActivePort');
-  const start = Date.now();
-  for (;;) {
-    if (fs.existsSync(file)) {
-      const port = Number(fs.readFileSync(file, 'utf8').split('\n')[0]);
-      if (port) return port;
-    }
-    if (Date.now() - start > 8000) throw new Error('devtools port missing');
-    await sleep(50);
-  }
-}
-
 async function withPage(profile, fn) {
-  const port = await devtoolsPort(profile);
-  const list = await fetch(`http://127.0.0.1:${port}/json/list`).then((reply) => reply.json());
-  const page = list.find((item) => item.type === 'page' && item.webSocketDebuggerUrl);
-  if (!page) throw new Error('no page target');
-  const ws = new WebSocket(page.webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => {
-    ws.addEventListener('open', resolve);
-    ws.addEventListener('error', () => reject(new Error('devtools socket failed')));
-  });
-  let next = 0;
-  const pending = new Map();
-  ws.addEventListener('message', (event) => {
-    const msg = JSON.parse(event.data);
-    if (msg.id && pending.has(msg.id)) {
-      pending.get(msg.id)(msg);
-      pending.delete(msg.id);
-    }
-  });
-  function send(method, params = {}) {
-    const id = ++next;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('cdp timeout ' + method)), 5000);
-      pending.set(id, (msg) => {
-        clearTimeout(timer);
-        if (msg.error) reject(new Error(method + ': ' + JSON.stringify(msg.error)));
-        else resolve(msg.result);
-      });
-      ws.send(JSON.stringify({ id, method, params }));
-    });
-  }
+  const page = await connect(profile);
   try {
-    return await fn(send);
+    return await fn(page.send);
   } finally {
-    ws.close();
+    page.close();
   }
 }
 
@@ -496,13 +449,7 @@ function replyBytes(reply) {
 async function runCase(origin, item) {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'kronik-ui-'));
   activeProfile = profile;
-  const args = [
-    '--headless=new', '--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage',
-    '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-sync',
-    '--remote-debugging-port=0',
-    `--user-data-dir=${profile}`, `${origin}/ui/?case=${item.name}${item.hash || ''}`,
-  ];
-  const child = spawn(chromeBin, args, { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
+  const child = spawn(chromeBin, chromeArgs(profile, `${origin}/ui/?case=${item.name}${item.hash || ''}`), { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
   let stderr = '';
   child.stderr.on('data', (chunk) => { stderr += chunk; });
   const result = await new Promise((resolve) => {
@@ -549,26 +496,9 @@ async function main() {
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
-    if (req.method === 'GET' && (url.pathname === '/ui' || url.pathname === '/ui/')) {
-      seen.pages += 1;
-      const html = fs.readFileSync(path.join(ui, 'index.html'), 'utf8').replace(
-        '<script src="/ui/app.js" defer></script>',
-        '<script src="/ui/app.js" defer></script>\n  <script src="/ui/driver.js" defer></script>',
-      );
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-      res.end(html);
-      return;
-    }
-    if (req.method === 'GET' && url.pathname === '/ui/driver.js') {
-      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
-      res.end(driver());
-      return;
-    }
-    if (req.method === 'GET' && (url.pathname === '/ui/app.js' || url.pathname === '/ui/app.css')) {
-      const file = path.basename(url.pathname);
-      const type = file.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'text/css; charset=utf-8';
-      res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-store' });
-      res.end(fs.readFileSync(path.join(ui, file)));
+    const served = serveUi(req, res, driver());
+    if (served) {
+      if (served === 'page') seen.pages += 1;
       return;
     }
     if (req.method === 'GET' && url.pathname === '/held') {

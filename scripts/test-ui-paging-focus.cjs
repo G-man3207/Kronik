@@ -14,8 +14,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
-const ui = path.join(__dirname, '..', 'ui');
-const chromeBin = process.env.KRONIK_CHROME || '/usr/bin/google-chrome';
+const { chromeBin, sleep, connect, chromeArgs, serveUi } = require('./test-ui-common.cjs');
 
 function actor(n) {
   return { kind: 'counter', key: 'a' + n, schema_version: 1, turns: 1, last_turn_id: 't' + n, sql: false };
@@ -113,9 +112,6 @@ run().then(() => finish(true, 'ok')).catch((error) => finish(false, String(error
 `;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -123,52 +119,6 @@ function readBody(req) {
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
-}
-async function devtoolsPort(profile) {
-  const file = path.join(profile, 'DevToolsActivePort');
-  const start = Date.now();
-  for (;;) {
-    if (fs.existsSync(file)) {
-      const port = Number(fs.readFileSync(file, 'utf8').split('\n')[0]);
-      if (port) return port;
-    }
-    if (Date.now() - start > 8000) throw new Error('devtools port missing');
-    await sleep(50);
-  }
-}
-async function connect(profile) {
-  const port = await devtoolsPort(profile);
-  const list = await fetch(`http://127.0.0.1:${port}/json/list`).then((reply) => reply.json());
-  const page = list.find((item) => item.type === 'page' && item.url.includes('/ui/'))
-    || list.find((item) => item.type === 'page' && item.webSocketDebuggerUrl);
-  if (!page) throw new Error('no page target');
-  const ws = new WebSocket(page.webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => {
-    ws.addEventListener('open', resolve);
-    ws.addEventListener('error', () => reject(new Error('devtools socket failed')));
-  });
-  let next = 0;
-  const pending = new Map();
-  ws.addEventListener('message', (event) => {
-    const msg = JSON.parse(event.data);
-    if (msg.id && pending.has(msg.id)) {
-      pending.get(msg.id)(msg);
-      pending.delete(msg.id);
-    }
-  });
-  function send(method, params = {}) {
-    const id = ++next;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('cdp timeout ' + method)), 5000);
-      pending.set(id, (msg) => {
-        clearTimeout(timer);
-        if (msg.error) reject(new Error(method + ': ' + JSON.stringify(msg.error)));
-        else resolve(msg.result);
-      });
-      ws.send(JSON.stringify({ id, method, params }));
-    });
-  }
-  return send;
 }
 async function activate(send, body) {
   const selector = body.testid ? `[data-testid="${body.testid}"]` : `#${body.id}`;
@@ -201,28 +151,7 @@ async function main() {
       res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify(body));
     };
-    if (req.method === 'GET' && (url.pathname === '/ui' || url.pathname === '/ui/')) {
-      const html = fs.readFileSync(path.join(ui, 'index.html'), 'utf8').replace(
-        '<script src="/ui/app.js" defer></script>',
-        '<script src="/ui/app.js" defer></script>\n  <script src="/ui/driver.js" defer></script>',
-      );
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-      res.end(html);
-      return;
-    }
-    if (req.method === 'GET' && url.pathname === '/ui/driver.js') {
-      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
-      res.end(driver());
-      return;
-    }
-    if (req.method === 'GET' && ['/ui/app.js', '/ui/app.css', '/ui/icon.svg'].includes(url.pathname)) {
-      const file = path.basename(url.pathname);
-      const type = file.endsWith('.js') ? 'text/javascript; charset=utf-8'
-        : file.endsWith('.css') ? 'text/css; charset=utf-8' : 'image/svg+xml';
-      res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-store' });
-      res.end(fs.readFileSync(path.join(ui, file)));
-      return;
-    }
+    if (serveUi(req, res, driver())) return;
     if (req.method === 'POST' && url.pathname === '/result') {
       readBody(req).then((raw) => {
         res.writeHead(204);
@@ -281,16 +210,12 @@ async function main() {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'kronik-ui-'));
-  const child = spawn(chromeBin, [
-    '--headless=new', '--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage',
-    '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-sync',
-    '--remote-debugging-port=0', `--user-data-dir=${profile}`, `${origin}/ui/`,
-  ], { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
+  const child = spawn(chromeBin, chromeArgs(profile, `${origin}/ui/`), { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
   let stderr = '';
   child.stderr.on('data', (chunk) => { stderr += chunk; });
-  sendReady = connect(profile).then(async (cdp) => {
-    await cdp('Emulation.setFocusEmulationEnabled', { enabled: true });
-    return cdp;
+  sendReady = connect(profile).then(async (page) => {
+    await page.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+    return page.send;
   });
   let timer;
   const timed = new Promise((resolve) => { timer = setTimeout(() => resolve({ ok: false, detail: 'chrome timeout' }), 45000); });
