@@ -84,7 +84,7 @@ api() { # METHOD PATH [JSON] (the body goes through stdin: components are big)
 field() { # JSON PYTHON-EXPR (on v)
     python3 -c 'import json,sys; v=json.loads(sys.argv[1]); print(eval(sys.argv[2]))' "$1" "$2"
 }
-b64() { python3 -c 'import base64,sys; print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "$1"; }
+b64() { base64 -w0 "$1"; }
 traffic() { # COUNT
     for i in $(seq 1 "$1"); do
         curl -sf -X POST "$gw$(inc "k$((i % 10))")" >/dev/null || fail "request $i"
