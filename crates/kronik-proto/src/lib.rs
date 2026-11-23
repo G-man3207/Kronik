@@ -49,192 +49,89 @@ fn invalid(what: &'static str, detail: impl Into<String>) -> DecodeError {
     }
 }
 
-/// One log record. The discriminant is the envelope `kind` byte.
-// Records are built once per turn and moved a few times; boxing the large
-// variants would only add noise at every construction and match.
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq)]
-pub enum Record {
-    TurnBegin(pb::TurnBegin),
-    EffectResult(pb::EffectResult),
-    TurnRecord(pb::TurnRecord),
-    Deployment(pb::Deployment),
-    Grant(pb::Grant),
-    Limits(pb::Limits),
-    Policy(pb::Policy),
-    Approval(pb::Approval),
-    PrivacyMode(pb::PrivacyMode),
-    ForeignActor(pb::ForeignActor),
-    BranchCreated(pb::BranchCreated),
-    Erasure(pb::Erasure),
-    EngineUpgrade(pb::EngineUpgrade),
-    SnapshotMarker(pb::SnapshotMarker),
-    SimulatorConfig(pb::SimulatorConfig),
-    StateRebase(pb::StateRebase),
-    GuardTriggered(pb::GuardTriggered),
-    AuditEvent(pb::AuditEvent),
-    SecretVersion(pb::SecretVersion),
-    SecretLink(pb::SecretLink),
+// The one table of record kinds: a variant is named after its protobuf type
+// (the same name under `pb::`), with its constant in `kind` and its envelope
+// kind byte. The bytes are a persisted format: never rename or reuse one.
+macro_rules! records {
+    ($($variant:ident = $kind:ident = $byte:literal),* $(,)?) => {
+        /// One log record. The discriminant is the envelope `kind` byte.
+        // Records are built once per turn and moved a few times; boxing the large
+        // variants would only add noise at every construction and match.
+        #[allow(clippy::large_enum_variant)]
+        #[derive(Clone, Debug, PartialEq)]
+        pub enum Record {
+            $($variant(pb::$variant),)*
+        }
+
+        /// Envelope kind bytes. 0 and every value not listed here are invalid.
+        pub mod kind {
+            $(pub const $kind: u8 = $byte;)*
+            /// All valid kinds, in order.
+            pub const ALL: [u8; { [$($kind,)*].len() }] = [$($kind,)*];
+        }
+
+        impl Record {
+            /// The envelope kind byte.
+            pub fn kind(&self) -> u8 {
+                match self {
+                    $(Record::$variant(_) => kind::$kind,)*
+                }
+            }
+
+            /// The protobuf encoding of the record body (without envelope).
+            pub fn encode(&self) -> Vec<u8> {
+                match self {
+                    $(Record::$variant(m) => m.encode_to_vec(),)*
+                }
+            }
+
+            /// The length of [`Record::encode`], without encoding.
+            pub fn encoded_len(&self) -> usize {
+                match self {
+                    $(Record::$variant(m) => m.encoded_len(),)*
+                }
+            }
+
+            /// Decodes and validates a record body.
+            pub fn decode(kind: u8, bytes: &[u8]) -> Result<Record, DecodeError> {
+                fn de<M: prost::Message + Default>(kind: u8, bytes: &[u8]) -> Result<M, DecodeError> {
+                    M::decode(bytes).map_err(|source| DecodeError::Protobuf { kind, source })
+                }
+                let record = match kind {
+                    $(kind::$kind => Record::$variant(de(kind, bytes)?),)*
+                    other => return Err(DecodeError::UnknownKind(other)),
+                };
+                record.validate()?;
+                Ok(record)
+            }
+        }
+    };
 }
 
-/// Envelope kind bytes. 0 and every value not listed here are invalid.
-pub mod kind {
-    pub const TURN_BEGIN: u8 = 1;
-    pub const EFFECT_RESULT: u8 = 2;
-    pub const TURN_RECORD: u8 = 3;
-    pub const DEPLOYMENT: u8 = 4;
-    pub const GRANT: u8 = 5;
-    pub const LIMITS: u8 = 6;
-    pub const POLICY: u8 = 7;
-    pub const APPROVAL: u8 = 8;
-    pub const PRIVACY_MODE: u8 = 9;
-    pub const FOREIGN_ACTOR: u8 = 10;
-    pub const BRANCH_CREATED: u8 = 11;
-    pub const ERASURE: u8 = 12;
-    pub const ENGINE_UPGRADE: u8 = 13;
-    pub const SNAPSHOT_MARKER: u8 = 14;
-    pub const SIMULATOR_CONFIG: u8 = 15;
-    pub const STATE_REBASE: u8 = 16;
-    pub const GUARD_TRIGGERED: u8 = 17;
-    pub const AUDIT_EVENT: u8 = 40;
-    pub const SECRET_VERSION: u8 = 45;
-    pub const SECRET_LINK: u8 = 46;
-    /// All valid kinds, in order.
-    pub const ALL: [u8; 20] = [
-        TURN_BEGIN,
-        EFFECT_RESULT,
-        TURN_RECORD,
-        DEPLOYMENT,
-        GRANT,
-        LIMITS,
-        POLICY,
-        APPROVAL,
-        PRIVACY_MODE,
-        FOREIGN_ACTOR,
-        BRANCH_CREATED,
-        ERASURE,
-        ENGINE_UPGRADE,
-        SNAPSHOT_MARKER,
-        SIMULATOR_CONFIG,
-        STATE_REBASE,
-        GUARD_TRIGGERED,
-        AUDIT_EVENT,
-        SECRET_VERSION,
-        SECRET_LINK,
-    ];
+records! {
+    TurnBegin = TURN_BEGIN = 1,
+    EffectResult = EFFECT_RESULT = 2,
+    TurnRecord = TURN_RECORD = 3,
+    Deployment = DEPLOYMENT = 4,
+    Grant = GRANT = 5,
+    Limits = LIMITS = 6,
+    Policy = POLICY = 7,
+    Approval = APPROVAL = 8,
+    PrivacyMode = PRIVACY_MODE = 9,
+    ForeignActor = FOREIGN_ACTOR = 10,
+    BranchCreated = BRANCH_CREATED = 11,
+    Erasure = ERASURE = 12,
+    EngineUpgrade = ENGINE_UPGRADE = 13,
+    SnapshotMarker = SNAPSHOT_MARKER = 14,
+    SimulatorConfig = SIMULATOR_CONFIG = 15,
+    StateRebase = STATE_REBASE = 16,
+    GuardTriggered = GUARD_TRIGGERED = 17,
+    AuditEvent = AUDIT_EVENT = 40,
+    SecretVersion = SECRET_VERSION = 45,
+    SecretLink = SECRET_LINK = 46,
 }
 
 impl Record {
-    /// The envelope kind byte.
-    pub fn kind(&self) -> u8 {
-        match self {
-            Record::TurnBegin(_) => kind::TURN_BEGIN,
-            Record::EffectResult(_) => kind::EFFECT_RESULT,
-            Record::TurnRecord(_) => kind::TURN_RECORD,
-            Record::Deployment(_) => kind::DEPLOYMENT,
-            Record::Grant(_) => kind::GRANT,
-            Record::Limits(_) => kind::LIMITS,
-            Record::Policy(_) => kind::POLICY,
-            Record::Approval(_) => kind::APPROVAL,
-            Record::PrivacyMode(_) => kind::PRIVACY_MODE,
-            Record::ForeignActor(_) => kind::FOREIGN_ACTOR,
-            Record::BranchCreated(_) => kind::BRANCH_CREATED,
-            Record::Erasure(_) => kind::ERASURE,
-            Record::EngineUpgrade(_) => kind::ENGINE_UPGRADE,
-            Record::SnapshotMarker(_) => kind::SNAPSHOT_MARKER,
-            Record::SimulatorConfig(_) => kind::SIMULATOR_CONFIG,
-            Record::StateRebase(_) => kind::STATE_REBASE,
-            Record::GuardTriggered(_) => kind::GUARD_TRIGGERED,
-            Record::AuditEvent(_) => kind::AUDIT_EVENT,
-            Record::SecretVersion(_) => kind::SECRET_VERSION,
-            Record::SecretLink(_) => kind::SECRET_LINK,
-        }
-    }
-
-    /// The protobuf encoding of the record body (without envelope).
-    pub fn encode(&self) -> Vec<u8> {
-        match self {
-            Record::TurnBegin(m) => m.encode_to_vec(),
-            Record::EffectResult(m) => m.encode_to_vec(),
-            Record::TurnRecord(m) => m.encode_to_vec(),
-            Record::Deployment(m) => m.encode_to_vec(),
-            Record::Grant(m) => m.encode_to_vec(),
-            Record::Limits(m) => m.encode_to_vec(),
-            Record::Policy(m) => m.encode_to_vec(),
-            Record::Approval(m) => m.encode_to_vec(),
-            Record::PrivacyMode(m) => m.encode_to_vec(),
-            Record::ForeignActor(m) => m.encode_to_vec(),
-            Record::BranchCreated(m) => m.encode_to_vec(),
-            Record::Erasure(m) => m.encode_to_vec(),
-            Record::EngineUpgrade(m) => m.encode_to_vec(),
-            Record::SnapshotMarker(m) => m.encode_to_vec(),
-            Record::SimulatorConfig(m) => m.encode_to_vec(),
-            Record::StateRebase(m) => m.encode_to_vec(),
-            Record::GuardTriggered(m) => m.encode_to_vec(),
-            Record::AuditEvent(m) => m.encode_to_vec(),
-            Record::SecretVersion(m) => m.encode_to_vec(),
-            Record::SecretLink(m) => m.encode_to_vec(),
-        }
-    }
-
-    /// The length of [`Record::encode`], without encoding.
-    pub fn encoded_len(&self) -> usize {
-        match self {
-            Record::TurnBegin(m) => m.encoded_len(),
-            Record::EffectResult(m) => m.encoded_len(),
-            Record::TurnRecord(m) => m.encoded_len(),
-            Record::Deployment(m) => m.encoded_len(),
-            Record::Grant(m) => m.encoded_len(),
-            Record::Limits(m) => m.encoded_len(),
-            Record::Policy(m) => m.encoded_len(),
-            Record::Approval(m) => m.encoded_len(),
-            Record::PrivacyMode(m) => m.encoded_len(),
-            Record::ForeignActor(m) => m.encoded_len(),
-            Record::BranchCreated(m) => m.encoded_len(),
-            Record::Erasure(m) => m.encoded_len(),
-            Record::EngineUpgrade(m) => m.encoded_len(),
-            Record::SnapshotMarker(m) => m.encoded_len(),
-            Record::SimulatorConfig(m) => m.encoded_len(),
-            Record::StateRebase(m) => m.encoded_len(),
-            Record::GuardTriggered(m) => m.encoded_len(),
-            Record::AuditEvent(m) => m.encoded_len(),
-            Record::SecretVersion(m) => m.encoded_len(),
-            Record::SecretLink(m) => m.encoded_len(),
-        }
-    }
-
-    /// Decodes and validates a record body.
-    pub fn decode(kind: u8, bytes: &[u8]) -> Result<Record, DecodeError> {
-        fn de<M: prost::Message + Default>(kind: u8, bytes: &[u8]) -> Result<M, DecodeError> {
-            M::decode(bytes).map_err(|source| DecodeError::Protobuf { kind, source })
-        }
-        let record = match kind {
-            kind::TURN_BEGIN => Record::TurnBegin(de(kind, bytes)?),
-            kind::EFFECT_RESULT => Record::EffectResult(de(kind, bytes)?),
-            kind::TURN_RECORD => Record::TurnRecord(de(kind, bytes)?),
-            kind::DEPLOYMENT => Record::Deployment(de(kind, bytes)?),
-            kind::GRANT => Record::Grant(de(kind, bytes)?),
-            kind::LIMITS => Record::Limits(de(kind, bytes)?),
-            kind::POLICY => Record::Policy(de(kind, bytes)?),
-            kind::APPROVAL => Record::Approval(de(kind, bytes)?),
-            kind::PRIVACY_MODE => Record::PrivacyMode(de(kind, bytes)?),
-            kind::FOREIGN_ACTOR => Record::ForeignActor(de(kind, bytes)?),
-            kind::BRANCH_CREATED => Record::BranchCreated(de(kind, bytes)?),
-            kind::ERASURE => Record::Erasure(de(kind, bytes)?),
-            kind::ENGINE_UPGRADE => Record::EngineUpgrade(de(kind, bytes)?),
-            kind::SNAPSHOT_MARKER => Record::SnapshotMarker(de(kind, bytes)?),
-            kind::SIMULATOR_CONFIG => Record::SimulatorConfig(de(kind, bytes)?),
-            kind::STATE_REBASE => Record::StateRebase(de(kind, bytes)?),
-            kind::GUARD_TRIGGERED => Record::GuardTriggered(de(kind, bytes)?),
-            kind::AUDIT_EVENT => Record::AuditEvent(de(kind, bytes)?),
-            kind::SECRET_VERSION => Record::SecretVersion(de(kind, bytes)?),
-            kind::SECRET_LINK => Record::SecretLink(de(kind, bytes)?),
-            other => return Err(DecodeError::UnknownKind(other)),
-        };
-        record.validate()?;
-        Ok(record)
-    }
-
     /// Checks enum values (0 and unknown are invalid), required fields and
     /// every blob reference ([`blobs::validate`]).
     pub fn validate(&self) -> Result<(), DecodeError> {
@@ -1135,6 +1032,18 @@ mod tests {
             Record::decode(18, &[]),
             Err(DecodeError::UnknownKind(18))
         ));
+    }
+
+    /// The envelope kind bytes are a persisted format, pinned here as a
+    /// compatibility fixture would: the list a new kind is appended to.
+    #[test]
+    fn kind_bytes_are_unchanged() {
+        assert_eq!(
+            kind::ALL,
+            [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 40, 45, 46
+            ]
+        );
     }
 
     /// The committed bytes of an M28 `EffectRecord` with `offset_us` (field
