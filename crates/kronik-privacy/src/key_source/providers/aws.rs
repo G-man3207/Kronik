@@ -10,7 +10,7 @@ struct Credentials {
     secret: Zeroizing<String>,
     token: Option<Zeroizing<String>>,
 }
-fn unsupported_source() -> Option<&'static str> {
+pub(super) fn unsupported_source() -> Option<&'static str> {
     [
         "AWS_PROFILE",
         "AWS_DEFAULT_PROFILE",
@@ -37,17 +37,58 @@ fn env_value(name: &str) -> Result<Option<Zeroizing<String>>, BackendError> {
     }
 }
 
-fn http_status(status: u16) -> Result<(), BackendError> {
-    match status {
-        200..=299 => Ok(()),
-        401 | 403 => Err(BackendError::Denied),
-        404 => Err(BackendError::NotFound),
-        410 => Err(BackendError::VersionGone),
-        408 | 425 | 429 | 500..=599 => Err(BackendError::Unavailable),
-        _ => Err(BackendError::Invalid),
-    }
+// KMS and Secrets Manager speak one SigV4 JSON-POST dialect; only the service,
+// the x-amz-target prefix and the endpoint differ.
+struct SigV4Post {
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
 }
 
+fn sigv4_post(
+    wall_ms: u64,
+    credentials: &Credentials,
+    c: &Aws,
+    service: &str,
+    target: &str,
+    default_endpoint: &str,
+    value: &SecretJson,
+) -> Result<SigV4Post, String> {
+    let url = config::endpoint(c.endpoint.as_deref().unwrap_or(default_endpoint))?;
+    let host = match url.port() {
+        Some(p) => format!("{}:{p}", url.host_str().ok_or("missing AWS host")?),
+        None => url.host_str().ok_or("missing AWS host")?.into(),
+    };
+    let date = sigv4::timestamp(wall_ms)?;
+    let mut headers = vec![
+        ("host".into(), host),
+        ("x-amz-date".into(), date.clone()),
+        ("x-amz-target".into(), target.to_owned()),
+        ("content-type".into(), "application/x-amz-json-1.1".into()),
+    ];
+    if let Some(token) = &credentials.token {
+        headers.push(("x-amz-security-token".into(), token.to_string()));
+    }
+    let mut body = Zeroizing::new(serde_json::to_vec(&value.0).map_err(|_| "invalid AWS request")?);
+    let authorization = sigv4::authorization(
+        "POST",
+        "/",
+        "",
+        &headers,
+        &body,
+        &credentials.access,
+        &credentials.secret,
+        &c.region,
+        service,
+        &date,
+    )?;
+    headers.push(("authorization".into(), authorization));
+    Ok(SigV4Post {
+        url: url.to_string(),
+        headers,
+        body: std::mem::take(&mut *body),
+    })
+}
 async fn imds(
     env: &Env,
     method: &str,
@@ -167,44 +208,16 @@ async fn kms(env: &Env, c: &Aws, operation: &str, value: SecretJson) -> Result<S
     } else {
         format!("https://kms.{}.amazonaws.com", c.region)
     };
-    let endpoint = c.endpoint.as_deref().unwrap_or(&default_endpoint);
-    let url = config::endpoint(endpoint)?;
-    let host = match url.port() {
-        Some(p) => format!("{}:{p}", url.host_str().ok_or("missing AWS host")?),
-        None => url.host_str().ok_or("missing AWS host")?.into(),
-    };
-    let date = sigv4::timestamp(env.clock.wall_ms())?;
-    let mut headers = vec![
-        ("host".into(), host),
-        ("x-amz-date".into(), date.clone()),
-        ("x-amz-target".into(), format!("TrentService.{operation}")),
-        ("content-type".into(), "application/x-amz-json-1.1".into()),
-    ];
-    if let Some(token) = &creds.token {
-        headers.push(("x-amz-security-token".into(), token.to_string()));
-    }
-    let mut body = Zeroizing::new(serde_json::to_vec(&value.0).map_err(|_| "invalid AWS request")?);
-    let authorization = sigv4::authorization(
-        "POST",
-        "/",
-        "",
-        &headers,
-        &body,
-        &creds.access,
-        &creds.secret,
-        &c.region,
+    let post = sigv4_post(
+        env.clock.wall_ms(),
+        &creds,
+        c,
         "kms",
-        &date,
+        &format!("TrentService.{operation}"),
+        &default_endpoint,
+        &value,
     )?;
-    headers.push(("authorization".into(), authorization));
-    request(
-        env,
-        "POST",
-        url.to_string(),
-        headers,
-        std::mem::take(&mut *body),
-    )
-    .await
+    request(env, "POST", post.url, post.headers, post.body).await
 }
 pub(super) async fn encrypt(
     env: &Env,

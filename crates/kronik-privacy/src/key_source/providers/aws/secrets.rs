@@ -236,52 +236,28 @@ impl Secrets {
             "amazonaws.com"
         };
         let default = format!("https://secretsmanager.{}.{domain}", self.config.region);
-        let url = config::endpoint(self.config.endpoint.as_deref().unwrap_or(&default))
-            .map_err(|_| BackendError::Invalid)?;
-        let host = url.host_str().ok_or(BackendError::Invalid)?;
-        let host = match url.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_owned(),
-        };
-        let date = sigv4::timestamp(env.clock.wall_ms()).map_err(|_| BackendError::Invalid)?;
-        let mut headers = vec![
-            ("host".into(), host),
-            ("x-amz-date".into(), date.clone()),
-            ("x-amz-target".into(), format!("secretsmanager.{operation}")),
-            ("content-type".into(), "application/x-amz-json-1.1".into()),
-        ];
-        if let Some(token) = &credentials.token {
-            headers.push(("x-amz-security-token".into(), token.to_string()));
-        }
-        let mut body =
-            Zeroizing::new(serde_json::to_vec(&value.0).map_err(|_| BackendError::Invalid)?);
-        let authorization = sigv4::authorization(
-            "POST",
-            "/",
-            "",
-            &headers,
-            &body,
-            &credentials.access,
-            &credentials.secret,
-            &self.config.region,
+        let post = sigv4_post(
+            env.clock.wall_ms(),
+            &credentials,
+            &self.config,
             "secretsmanager",
-            &date,
+            &format!("secretsmanager.{operation}"),
+            &default,
+            &value,
         )
         .map_err(|_| BackendError::Invalid)?;
-        headers.push(("authorization".into(), authorization));
         let (status, bytes) = request_raw(
             &env,
             "POST",
-            url.to_string(),
-            headers,
-            std::mem::take(&mut *body),
+            post.url,
+            post.headers,
+            post.body,
             SECRET_RESPONSE_CAP,
             dispatch,
         )
         .await?;
         response(status, &bytes)
     }
-
     async fn get(
         &self,
         path: &str,
@@ -458,25 +434,6 @@ impl SecretBackend for Secrets {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct NoNetwork;
-    impl kronik_core::env::Net for NoNetwork {
-        fn http_authorized(
-            &self,
-            _: HttpRequest,
-            _: kronik_core::authority::AuthLease,
-        ) -> BoxFuture<'static, Result<kronik_core::env::HttpResponse, kronik_core::env::NetError>>
-        {
-            panic!("malformed local identity must not initiate authorized provider I/O")
-        }
-        fn http(
-            &self,
-            _: HttpRequest,
-        ) -> BoxFuture<'static, Result<kronik_core::env::HttpResponse, kronik_core::env::NetError>>
-        {
-            panic!("malformed local identity must not initiate provider I/O");
-        }
-    }
 
     #[tokio::test]
     async fn malformed_references_versions_and_cursors_never_authenticate() {

@@ -9,6 +9,21 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
+/// Provider tests share one network that malformed local inputs must never reach.
+pub(crate) struct NoNetwork;
+impl Net for NoNetwork {
+    fn http_authorized(
+        &self,
+        _: HttpRequest,
+        _: kronik_core::authority::AuthLease,
+    ) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
+        panic!("provider tests must not initiate authorized network I/O")
+    }
+    fn http(&self, _: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
+        panic!("provider tests must not initiate network I/O");
+    }
+}
+
 struct Step {
     method: &'static str,
     url: String,

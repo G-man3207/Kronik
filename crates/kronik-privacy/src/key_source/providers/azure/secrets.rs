@@ -1,7 +1,6 @@
 use super::*;
 use crate::secret_backend::{BackendError, Fetched, SecretBackend, VersionPage};
 use kronik_core::env::BoxFuture;
-use std::sync::Mutex;
 
 const API_VERSION: &str = "7.4";
 
@@ -9,7 +8,7 @@ pub(crate) struct Secrets {
     env: Env,
     config: Azure,
     origins: Vec<String>,
-    token: Mutex<Option<(Zeroizing<String>, Duration)>>,
+    bearer: BearerCache,
 }
 
 fn vault_origin(url: &url::Url) -> Result<(), BackendError> {
@@ -177,6 +176,14 @@ fn fetched(path: &str, expected: Option<&str>, response: &Value) -> Result<Fetch
     })
 }
 
+// Key Vault answers `expires_in` as a JSON string or a number.
+fn expires_in(response: &Value) -> Option<u64> {
+    let lifetime = response.get("expires_in")?;
+    lifetime
+        .as_u64()
+        .or_else(|| lifetime.as_str().and_then(|s| s.parse().ok()))
+}
+
 fn version_page(
     path: &str,
     cursor: Option<&str>,
@@ -255,72 +262,25 @@ impl Secrets {
             env,
             config,
             origins: trusted_origins,
-            token: Mutex::new(None),
+            bearer: BearerCache::new(),
         })
     }
 
-    async fn token(
-        &self,
-        net: &Env,
-        original: &AuthLease,
-    ) -> Result<Zeroizing<String>, BackendError> {
-        original.check().map_err(|_| BackendError::Unauthorized)?;
-        let now = self.env.clock.monotonic();
-        {
-            let cache = self.token.lock().map_err(|_| BackendError::Invalid)?;
-            if let Some((token, expires)) = &*cache
-                && now < *expires
-            {
-                return Ok(Zeroizing::new(token.to_string()));
-            }
-        }
-        let response = auth_response(net, &self.config, Dispatch::Authorized(original)).await?;
-        let token = field(&response, "access_token").map_err(|_| BackendError::Invalid)?;
-        header_secret(token).map_err(|_| BackendError::Invalid)?;
-        let lifetime = response.get("expires_in").ok_or(BackendError::Invalid)?;
-        let seconds = lifetime
-            .as_u64()
-            .or_else(|| lifetime.as_str().and_then(|s| s.parse::<u64>().ok()))
-            .filter(|seconds| *seconds > 0)
-            .ok_or(BackendError::Invalid)?;
-        let expires = now
-            .checked_add(Duration::from_secs(seconds.saturating_sub(30)))
-            .ok_or(BackendError::Invalid)?;
-        let mut cache = self.token.lock().map_err(|_| BackendError::Invalid)?;
-        original
-            .admit(&mut || {
-                *cache = Some((Zeroizing::new(token.to_owned()), expires));
-                Ok(())
-            })
-            .map_err(|_| BackendError::Denied)?;
-        Ok(Zeroizing::new(token.to_owned()))
-    }
-
     async fn get(&self, url: String, original: &AuthLease) -> Result<SecretJson, BackendError> {
-        let dispatch = Dispatch::Authorized(original);
-        let net = dispatch
-            .wait(tls_env(
+        self.bearer
+            .get(
                 &self.env,
                 self.config.ca_file.as_deref(),
-                None,
-                dispatch,
-            ))
-            .await?
-            .map_err(|_| BackendError::Invalid)?;
-        let token = self.token(&net, original).await?;
-        let result = secret_request(
-            &net,
-            "GET",
-            url,
-            bearer(&token).map_err(|_| BackendError::Invalid)?,
-            vec![],
-            dispatch,
-        )
-        .await;
-        if matches!(result, Err(BackendError::Denied)) {
-            *self.token.lock().map_err(|_| BackendError::Invalid)? = None;
-        }
-        result
+                url,
+                original,
+                |net| {
+                    Box::pin(async move {
+                        auth_response(&net, &self.config, Dispatch::Authorized(original)).await
+                    })
+                },
+                expires_in,
+            )
+            .await
     }
 
     async fn access(
@@ -396,28 +356,6 @@ mod tests {
 
     #[tokio::test]
     async fn empty_origins_deny_all_operations_before_network() {
-        struct NoNetwork;
-        impl kronik_core::env::Net for NoNetwork {
-            fn http_authorized(
-                &self,
-                _: HttpRequest,
-                _: kronik_core::authority::AuthLease,
-            ) -> BoxFuture<
-                'static,
-                Result<kronik_core::env::HttpResponse, kronik_core::env::NetError>,
-            > {
-                panic!("deny-all backend attempted authorized network access")
-            }
-            fn http(
-                &self,
-                _: HttpRequest,
-            ) -> BoxFuture<
-                'static,
-                Result<kronik_core::env::HttpResponse, kronik_core::env::NetError>,
-            > {
-                panic!("deny-all backend attempted network access");
-            }
-        }
         let mut env = Env::real(tokio::runtime::Handle::current());
         env.net = std::sync::Arc::new(NoNetwork);
         let backend = Secrets::new(env, Azure::default(), vec![]).unwrap();
