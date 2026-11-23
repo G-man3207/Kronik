@@ -20,12 +20,13 @@ use kronik_api::types::{
     WatchRequest, WatchResponse, WatchTriggered, WatchesResponse,
 };
 use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::http::percent_encode;
 use kronik_fork::stubs::StubRule;
 use kronik_fork::watch::EVAL_ERROR;
 use serde_json::Value;
 
 use super::render::{clip, field, next, shell_quote, table};
-use super::{Ctx, Error, Mutation, http, read_file, reason, required_reason, units};
+use super::{Ctx, Error, Mutation, read_file, reason, required_reason, units};
 
 #[derive(Debug, Subcommand)]
 pub enum ForkCommand {
@@ -455,11 +456,11 @@ pub fn fork(ctx: &Ctx, c: ForkCommand) -> Result<ExitCode, Error> {
 }
 
 fn fork_path(name: &str) -> String {
-    format!("/v1/forks/{}", http::encode(name))
+    format!("/v1/forks/{}", percent_encode(name))
 }
 
 fn proposal_path(id: &str) -> String {
-    format!("/v1/proposals/{}", http::encode(id))
+    format!("/v1/proposals/{}", percent_encode(id))
 }
 
 /// Prints the API's body for `--json`, else parses it for `render`.
@@ -2049,7 +2050,7 @@ pub fn watches(ctx: &Ctx, c: WatchesCommand) -> Result<ExitCode, Error> {
         WatchesCommand::Stop { id, mutation } => {
             let reason = reason(&mutation)?;
             let body = ctx.post(
-                &format!("/v1/watches/{}/stop", http::encode(&id)),
+                &format!("/v1/watches/{}/stop", percent_encode(&id)),
                 &ResendRequest {
                     reason: reason.to_owned(),
                     dry_run: mutation.dry_run,
@@ -2323,6 +2324,7 @@ mod tests {
     #![allow(clippy::disallowed_methods)]
 
     use super::*;
+    use crate::cli::http;
     use serde_json::json;
 
     /// A guard that could not be evaluated is shown as an error, not as an

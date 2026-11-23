@@ -8,6 +8,7 @@ use std::sync::{
 };
 
 use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::http::percent_encode;
 use kronik_core::ids::SourcePos;
 use kronik_fleet::events::ResumeCursor;
 use serde_json::json;
@@ -153,7 +154,7 @@ pub(super) fn events(ctx: &Ctx, command: EventsCommand) -> Result<ExitCode, Erro
             let why = reason(&mutation)?;
             let cursor = read_cursor(&cursor, &mut io::stdin().lock())?;
             ctx.post(
-                &format!("/v1/events/webhooks/{}/replay", http::encode(&name)),
+                &format!("/v1/events/webhooks/{}/replay", percent_encode(&name)),
                 &json!({"cursor": cursor, "reason": why, "dry_run": mutation.dry_run}),
             )?
         }

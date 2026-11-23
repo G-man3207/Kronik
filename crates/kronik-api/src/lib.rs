@@ -180,37 +180,13 @@ fn ok<T: Serialize>(v: &T) -> Result<ApiResponse> {
 /// Percent-decodes a path segment. `+` is a literal character in a path
 /// (RFC 3986 §3.3): an actor key `a+b` arrives as `a+b`, as at the gateway.
 fn decode_path(s: &str) -> Option<String> {
-    percent_decode(s, false)
+    kronik_core::http::percent_decode(s, false)
 }
 
 /// Percent-decodes a query name or value, where `+` stands for a space
 /// (`application/x-www-form-urlencoded`).
 fn decode_query(s: &str) -> Option<String> {
-    percent_decode(s, true)
-}
-
-fn percent_decode(s: &str, plus_is_space: bool) -> Option<String> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'%' => {
-                let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
-                out.push(u8::from_str_radix(hex, 16).ok()?);
-                i += 3;
-            }
-            b'+' if plus_is_space => {
-                out.push(b' ');
-                i += 1;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok()
+    kronik_core::http::percent_decode(s, true)
 }
 
 struct Query(Vec<(String, String)>);

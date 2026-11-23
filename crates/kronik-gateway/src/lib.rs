@@ -338,7 +338,7 @@ fn find_in(
     let mut params = Vec::new();
     for (p, s) in r.segs.iter().zip(&segs) {
         if let Seg::Param(name) = p {
-            let v = percent_decode(s).ok_or_else(|| {
+            let v = kronik_core::http::percent_decode(s, false).ok_or_else(|| {
                 ApiError::new(ErrorCode::BadRequest, format!("invalid path segment {s:?}"))
             })?;
             params.push((name.clone(), v));
@@ -481,23 +481,6 @@ impl Drop for AbandonGuard {
 
 /// How long a client waits before it reconnects after `CONNECTION_LIMIT`.
 const CONNECTION_LIMIT_RETRY_SECS: &str = "5";
-
-fn percent_decode(s: &str) -> Option<String> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
-            let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
 
 fn error(e: &ApiError) -> HttpResponse {
     // A failure inside Kronik may name files of the data directory: the log

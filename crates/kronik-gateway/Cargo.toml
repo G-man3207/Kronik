@@ -12,7 +12,7 @@ publish.workspace = true
 server = [
     "dep:futures-util", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "tokio/net", "tokio/process", "tokio/rt", "tokio/time",
     "dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:instant-acme", "dep:rcgen",
-    "dep:x509-parser", "dep:rustix",
+    "dep:x509-parser", "dep:rustix", "kronik-core/real",
 ]
 
 [dependencies]

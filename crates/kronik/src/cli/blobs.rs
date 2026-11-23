@@ -8,14 +8,14 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use super::render::{next, shell_quote, table};
+use super::{Ctx, Error, Mutation, units};
 use kronik_api::types::{
     ActorBlobsResponse, BlobGcPlanResponse, BlobGcRequest, BlobGcResponse, BlobInspectResponse,
     BlobsStatusResponse,
 };
 use kronik_core::error::{ApiError, ErrorCode};
-
-use super::render::{next, shell_quote, table};
-use super::{Ctx, Error, Mutation, http, units};
+use kronik_core::http::percent_encode;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum BlobsCommand {
@@ -92,7 +92,7 @@ pub(super) fn blobs(ctx: &Ctx, command: BlobsCommand) -> Result<ExitCode, Error>
 /// A hash for a path segment: hex, `b3:` or `b3s:`; anything else is
 /// percent-encoded, and the daemon refuses it.
 fn segment(hash: &str) -> String {
-    http::encode(hash)
+    percent_encode(hash)
 }
 
 fn status(ctx: &Ctx) -> Result<ExitCode, Error> {
@@ -310,15 +310,15 @@ fn list(ctx: &Ctx, a: ListArgs) -> Result<ExitCode, Error> {
     };
     let mut query = Vec::new();
     if let Some(after) = &a.after {
-        query.push(format!("after={}", http::encode(after)));
+        query.push(format!("after={}", percent_encode(after)));
     }
     if let Some(limit) = a.limit {
         query.push(format!("limit={limit}"));
     }
     let mut path = format!(
         "/v1/actors/{}/{}/blobs",
-        http::encode(kind),
-        http::encode(key)
+        percent_encode(kind),
+        percent_encode(key)
     );
     if !query.is_empty() {
         path.push('?');

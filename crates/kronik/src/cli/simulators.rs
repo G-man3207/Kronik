@@ -8,10 +8,11 @@ use std::process::ExitCode;
 use clap::Subcommand;
 use kronik_api::m12::{SimulatorsResponse, SimulatorsSetRequest, SimulatorsSetResponse};
 use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::http::percent_encode;
 use kronik_fork::stubs::StubRule;
 
 use super::render::{next, shell_quote, table};
-use super::{Ctx, Error, Mutation, http, read_file, reason};
+use super::{Ctx, Error, Mutation, read_file, reason};
 
 #[derive(Debug, Subcommand)]
 pub enum StubsCommand {
@@ -109,7 +110,7 @@ pub(super) fn stubs(ctx: &Ctx, command: StubsCommand) -> Result<ExitCode, Error>
     let summary = describe(&body);
     let raw = ctx.send_json(
         "PUT",
-        &format!("/v1/simulators/{}", http::encode(&target)),
+        &format!("/v1/simulators/{}", percent_encode(&target)),
         &body,
     )?;
     if ctx.json {

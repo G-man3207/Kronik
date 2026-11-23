@@ -43,7 +43,7 @@ pub async fn serve(
         let (stream, _) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(error) => {
-                kronik_api::server::pause_after_accept_error(&mut failures, &error, "admin").await;
+                kronik_core::http::pause_after_accept_error(&mut failures, &error, "admin").await;
                 continue;
             }
         };

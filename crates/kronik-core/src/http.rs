@@ -45,8 +45,81 @@ pub fn credential_header(name: &str) -> bool {
         || name.ends_with("secret")
 }
 
+/// Percent-encodes a path segment or a query value: everything except
+/// unreserved characters (RFC 3986). The API server builds its URLs with it,
+/// and so does the client the CLI uses against that server.
+pub fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Percent-decodes a path segment or a query value. `plus_is_space` says
+/// whether `+` stands for a space (`application/x-www-form-urlencoded`);
+/// in a path it is a literal character (RFC 3986 §3.3), so an actor key
+/// `a+b` arrives as `a+b`.
+pub fn percent_decode(s: &str, plus_is_space: bool) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' => {
+                let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            }
+            b'+' if plus_is_space => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// After a failed `accept()` (EMFILE when the descriptors run out, say): a
+/// warning and a pause that doubles from 10 ms to about a second, instead
+/// of ending the server. `failures` counts the failures in a row.
+// The accept loops this serves are the production boundary, like the API
+// and gateway servers' own loops, which allow tokio directly.
+#[allow(clippy::disallowed_methods)]
+#[cfg(feature = "real")]
+pub async fn pause_after_accept_error(failures: &mut u32, error: &std::io::Error, listener: &str) {
+    tracing::warn!(%error, listener, "accept failed; retrying");
+    let pause = std::time::Duration::from_millis(10 << (*failures).min(7));
+    *failures += 1;
+    tokio::time::sleep(pause).await;
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn percent_encoding_round_trips() {
+        for (raw, encoded) in [
+            ("main:12", "main%3A12"),
+            ("a b/c?d&e", "a%20b%2Fc%3Fd%26e"),
+            ("ok-._~09AZ", "ok-._~09AZ"),
+            ("ä", "%C3%A4"),
+        ] {
+            assert_eq!(super::percent_encode(raw), encoded);
+            assert_eq!(super::percent_decode(encoded, false).as_deref(), Some(raw));
+        }
+        assert_eq!(super::percent_decode("a+b", false).as_deref(), Some("a+b"));
+        assert_eq!(super::percent_decode("a+b", true).as_deref(), Some("a b"));
+        assert_eq!(super::percent_decode("%2", false), None);
+    }
+
     #[test]
     fn hop_by_hop_headers() {
         for name in [

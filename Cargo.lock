@@ -2016,6 +2016,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tower-service",
+ "tracing",
  "zeroize",
 ]
 
