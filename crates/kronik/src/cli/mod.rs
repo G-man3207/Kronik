@@ -900,7 +900,6 @@ impl Ctx {
             .as_ref()
             .map_err(|e| Error::Local(e.clone()))?;
         let token = self.token.as_ref().map_err(|e| Error::Local(e.clone()))?;
-        let shown = endpoint.shown();
         let r = http::request(
             endpoint,
             method,
@@ -910,26 +909,15 @@ impl Ctx {
             cursor,
             timeout,
         )
-        .map_err(|f| match f {
-            http::Failure::Connect(e) => connect_error(endpoint, &e),
-            http::Failure::Tls(m) => ApiError::new(
-                ErrorCode::Unavailable,
-                format!("TLS to {shown} failed: {m}"),
-            )
-            .with_hint(TLS_HINT),
-            http::Failure::Io(e) => ApiError::new(
-                ErrorCode::Unavailable,
-                format!("the connection to the daemon on {shown} broke: {e}"),
-            ),
-            http::Failure::Timeout => ApiError::new(
-                ErrorCode::Unavailable,
-                format!(
-                    "the daemon on {shown} did not answer within {}",
+        .map_err(|f| {
+            failure_error(
+                endpoint,
+                f,
+                &format!(
+                    "within {}",
                     units::duration(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
                 ),
-            ),
-            http::Failure::Malformed(m) => ApiError::new(ErrorCode::Internal, m)
-                .with_hint(format!("Check that {shown} is a Kronik API.")),
+            )
         })?;
         if (200..300).contains(&r.status) {
             Ok(r.body)
@@ -949,7 +937,6 @@ impl Ctx {
             .as_ref()
             .map_err(|e| Error::Local(e.clone()))?;
         let token = self.token.as_ref().map_err(|e| Error::Local(e.clone()))?;
-        let shown = endpoint.shown();
         http::stream(
             endpoint,
             target,
@@ -957,26 +944,7 @@ impl Ctx {
             None,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
-        .map_err(|f| {
-            Error::Local(match f {
-                http::Failure::Connect(e) => connect_error(endpoint, &e),
-                http::Failure::Tls(m) => ApiError::new(
-                    ErrorCode::Unavailable,
-                    format!("TLS to {shown} failed: {m}"),
-                )
-                .with_hint(TLS_HINT),
-                http::Failure::Io(e) => ApiError::new(
-                    ErrorCode::Unavailable,
-                    format!("the connection to the daemon on {shown} broke: {e}"),
-                ),
-                http::Failure::Timeout => ApiError::new(
-                    ErrorCode::Unavailable,
-                    format!("the daemon on {shown} did not answer in time"),
-                ),
-                http::Failure::Malformed(m) => ApiError::new(ErrorCode::Internal, m)
-                    .with_hint(format!("Check that {shown} is a Kronik API.")),
-            })
-        })
+        .map_err(|f| Error::Local(failure_error(endpoint, f, "in time")))
     }
 
     /// Parses a successful response for human output.
@@ -1145,6 +1113,31 @@ fn connect_error(endpoint: &http::Endpoint, e: &io::Error) -> ApiError {
         _ => (format!("cannot connect to {shown}: {e}"), start),
     };
     ApiError::new(ErrorCode::Unavailable, message).with_hint(hint)
+}
+
+/// An [`http::Failure`] as the error the CLI reports. `timeout` completes
+/// "did not answer …": a request names its deadline, a streamed GET only
+/// says "in time".
+fn failure_error(endpoint: &http::Endpoint, failure: http::Failure, timeout: &str) -> ApiError {
+    let shown = endpoint.shown();
+    match failure {
+        http::Failure::Connect(e) => connect_error(endpoint, &e),
+        http::Failure::Tls(m) => ApiError::new(
+            ErrorCode::Unavailable,
+            format!("TLS to {shown} failed: {m}"),
+        )
+        .with_hint(TLS_HINT),
+        http::Failure::Io(e) => ApiError::new(
+            ErrorCode::Unavailable,
+            format!("the connection to the daemon on {shown} broke: {e}"),
+        ),
+        http::Failure::Timeout => ApiError::new(
+            ErrorCode::Unavailable,
+            format!("the daemon on {shown} did not answer {timeout}"),
+        ),
+        http::Failure::Malformed(m) => ApiError::new(ErrorCode::Internal, m)
+            .with_hint(format!("Check that {shown} is a Kronik API.")),
+    }
 }
 
 /// The reason of a mutation; a missing or blank one fails before anything
@@ -2448,5 +2441,22 @@ mod tests {
             .map(|value| value.get_name().to_owned())
             .collect();
         assert_eq!(accepted, ["openbao", "aws", "gcp", "azure", "pkcs11"]);
+    }
+
+    /// A request that times out says within how long the daemon had to
+    /// answer; the streamed GET only says "in time".
+    #[test]
+    fn a_timeout_names_the_wait_that_was_requested() {
+        let endpoint = http::Endpoint::Unix(std::path::PathBuf::from("/none/kronik.sock"));
+        let message =
+            |timeout: &str| failure_error(&endpoint, http::Failure::Timeout, timeout).message;
+        assert_eq!(
+            message("in time"),
+            "the daemon on /none/kronik.sock did not answer in time"
+        );
+        assert_eq!(
+            message("within 30s"),
+            "the daemon on /none/kronik.sock did not answer within 30s"
+        );
     }
 }
