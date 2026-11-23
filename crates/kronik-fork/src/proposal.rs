@@ -1862,6 +1862,67 @@ impl Proposals {
         Ok((approved, meta.verified_through_lsn))
     }
 
+    /// Builds the diff and runs the policy on it, stamps `meta` with what
+    /// they saw, and saves and errors when the policy denies the proposal
+    /// or the approval it needs is missing. A rebase (`rebase: true`)
+    /// switches main's state, so every diff of it needs an approval; a
+    /// promote only when the policy's outcome asks for one.
+    async fn judge(
+        &self,
+        id: &str,
+        live: &Live,
+        options: &DiffOptions,
+        meta: &mut Proposal,
+        dry_run: bool,
+        rebase: bool,
+    ) -> Result<(diff::Diff, Vec<u8>, Value), ApiError> {
+        let (d, bytes, hash) = self.build(id, live, options)?;
+        let policy = self.evaluate(&bytes)?;
+        let outcome = policy["outcome"].as_str().unwrap_or("deny").to_owned();
+        let sampled = live.sampled();
+        meta.verified_through_lsn = live.index.to_lsn;
+        meta.diff_hash = hash.clone();
+        meta.policy = policy.clone();
+        meta.summary = serde_json::to_value(&d.summary).map_err(internal)?;
+        meta.sampled = Some(sampled.clone());
+        if outcome == "deny" {
+            if !dry_run {
+                meta.status = "rejected".into();
+                self.save(meta, Some(&bytes))?;
+                self.save_samples(id, live, &d).await?;
+            }
+            return Err(ApiError::new(
+                ErrorCode::PolicyDenied,
+                format!("the policy denies proposal {id}: {}", fired_names(&policy)),
+            ));
+        }
+        let needs_approval = rebase || outcome == "require_approval";
+        let approved = !needs_approval
+            || meta.approved.as_ref().is_some_and(|a| {
+                approval_holds(a, &outcome, &hash, &sampled, &changed_targets(&d))
+            });
+        if !approved {
+            if !dry_run {
+                self.save(meta, Some(&bytes))?;
+                self.save_samples(id, live, &d).await?;
+            }
+            let need = if rebase {
+                "a rollback via replay switches main's state and needs an approval for this diff"
+                    .to_owned()
+            } else {
+                format!(
+                    "proposal {id} needs an approval for this diff ({})",
+                    fired_names(&policy)
+                )
+            };
+            return Err(ApiError::new(
+                ErrorCode::ApprovalRequired,
+                format!("{need}; run: kronik approve {id} --reason '...'"),
+            ));
+        }
+        Ok((d, bytes, policy))
+    }
+
     /// `kronik promote`: catch-up, the policy again, then the switch.
     pub async fn promote(
         &self,
@@ -2012,51 +2073,23 @@ impl Proposals {
             self.write_log(id, live).await?;
         }
         // 2. The policy on the whole diff.
-        let (d, bytes, hash) = self.build(id, live, &options)?;
-        let policy = self.evaluate(&bytes)?;
-        let outcome = policy["outcome"].as_str().unwrap_or("deny").to_owned();
         let mut dry_meta = None;
         let meta = if dry_run {
             dry_meta.insert(entry.meta.clone())
         } else {
             &mut entry.meta
         };
-        let sampled = live.sampled();
-        meta.verified_through_lsn = live.index.to_lsn;
-        meta.diff_hash = hash.clone();
-        meta.policy = policy.clone();
-        meta.summary = serde_json::to_value(&d.summary).map_err(internal)?;
-        meta.sampled = Some(sampled.clone());
-        if outcome == "deny" {
-            if !dry_run {
-                meta.status = "rejected".into();
-                self.save(meta, Some(&bytes))?;
-                self.save_samples(id, live, &d).await?;
-                copies::retire(entry.live.take()).await;
-            }
-            return Err(ApiError::new(
-                ErrorCode::PolicyDenied,
-                format!("the policy denies proposal {id}: {}", fired_names(&policy)),
-            ));
-        }
-        if outcome == "require_approval" {
-            let ok = meta.approved.as_ref().is_some_and(|a| {
-                approval_holds(a, &outcome, &hash, &sampled, &changed_targets(&d))
-            });
-            if !ok {
-                if !dry_run {
-                    self.save(meta, Some(&bytes))?;
-                    self.save_samples(id, live, &d).await?;
+        let (d, bytes, policy) = match self.judge(id, live, &options, meta, dry_run, false).await {
+            Ok(judged) => judged,
+            Err(e) => {
+                // A denied proposal is rejected for good: its replay state
+                // goes with it.
+                if e.code == ErrorCode::PolicyDenied && !dry_run {
+                    copies::retire(entry.live.take()).await;
                 }
-                return Err(ApiError::new(
-                    ErrorCode::ApprovalRequired,
-                    format!(
-                        "proposal {id} needs an approval for this diff ({}); run: kronik approve {id} --reason '...'",
-                        fired_names(&policy)
-                    ),
-                ));
+                return Err(e);
             }
-        }
+        };
         // 3. The switch. The node counts the root inputs in
         // `(verified, lsn]` under its gate: the ones that commit while the
         // switch waits are unverified too, and no earlier count sees them.

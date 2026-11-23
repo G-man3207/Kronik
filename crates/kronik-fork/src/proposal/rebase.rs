@@ -539,45 +539,10 @@ impl Proposals {
         if !dry_run {
             self.write_log(id, live).await?;
         }
-        let (d, bytes, hash) = self.build(id, live, &options)?;
-        let policy = self.evaluate(&bytes)?;
-        let outcome = policy["outcome"].as_str().unwrap_or("deny").to_owned();
-        let sampled = live.sampled();
-        meta.verified_through_lsn = live.index.to_lsn;
-        meta.diff_hash = hash.clone();
-        meta.policy = policy.clone();
-        meta.summary = serde_json::to_value(&d.summary).map_err(internal)?;
-        meta.sampled = Some(sampled.clone());
+        // 2. The policy on the whole diff; the switch always needs an
+        // approval for it.
+        let (d, bytes, policy) = self.judge(id, live, &options, meta, dry_run, true).await?;
         let irreversible = d.irreversible.as_ref().map_or(0, |i| i.count);
-        if outcome == "deny" {
-            if !dry_run {
-                meta.status = "rejected".into();
-                self.save(meta, Some(&bytes))?;
-                self.save_samples(id, live, &d).await?;
-            }
-            return Err(ApiError::new(
-                ErrorCode::PolicyDenied,
-                format!("the policy denies proposal {id}: {}", fired_names(&policy)),
-            ));
-        }
-        // 2. The switch always needs an approval for this diff.
-        let approved = meta
-            .approved
-            .as_ref()
-            .is_some_and(|a| approval_holds(a, &outcome, &hash, &sampled, &changed_targets(&d)));
-        if !approved {
-            if !dry_run {
-                self.save(meta, Some(&bytes))?;
-                self.save_samples(id, live, &d).await?;
-            }
-            return Err(ApiError::new(
-                ErrorCode::ApprovalRequired,
-                format!(
-                    "a rollback via replay switches main's state and needs an approval for \
-                     this diff; run: kronik approve {id} --reason '...'"
-                ),
-            ));
-        }
         let turns = live
             .continuous
             .as_ref()
@@ -697,7 +662,7 @@ impl Proposals {
             base_lsn: fork_lsn,
             rolled_back_epoch: info.rolled_back_epoch,
             verified_through_lsn: live.index.to_lsn,
-            diff_hash: hash,
+            diff_hash: meta.diff_hash.clone(),
             irreversible_effects: irreversible,
             ..Default::default()
         };
