@@ -41,16 +41,9 @@ if [ ! -x "$dir/mdbook" ]; then
     url="https://github.com/rust-lang/mdBook/releases/download/v$VERSION/mdbook-v$VERSION-$target.tar.gz"
     curl -fsSL --retry 3 -o "$tmp/mdbook.tar.gz" "$url"
     if command -v sha256sum >/dev/null 2>&1; then
-        actual="$(sha256sum "$tmp/mdbook.tar.gz")"
+        echo "$sha256  $tmp/mdbook.tar.gz" | sha256sum -c - >&2
     else
-        actual="$(shasum -a 256 "$tmp/mdbook.tar.gz")"
-    fi
-    actual="${actual%% *}"
-    if [ "$actual" != "$sha256" ]; then
-        echo "install-mdbook: checksum mismatch for $url" >&2
-        echo "  expected $sha256" >&2
-        echo "  got      $actual" >&2
-        exit 1
+        echo "$sha256  $tmp/mdbook.tar.gz" | shasum -a 256 -c - >&2
     fi
     tar -xzf "$tmp/mdbook.tar.gz" -C "$tmp"
     mkdir -p "$dir"

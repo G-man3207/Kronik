@@ -28,14 +28,9 @@ if [ ! -x "$dir/actionlint" ]; then
     url="https://github.com/rhysd/actionlint/releases/download/v$version/actionlint_${version}_${target}.tar.gz"
     curl -fsSL --retry 3 -o "$tmp/actionlint.tar.gz" "$url"
     if command -v sha256sum >/dev/null 2>&1; then
-        actual="$(sha256sum "$tmp/actionlint.tar.gz")"
+        echo "$sha256  $tmp/actionlint.tar.gz" | sha256sum -c - >&2
     else
-        actual="$(shasum -a 256 "$tmp/actionlint.tar.gz")"
-    fi
-    actual="${actual%% *}"
-    if [ "$actual" != "$sha256" ]; then
-        echo "install-actionlint: checksum mismatch for $url: expected $sha256, got $actual" >&2
-        exit 1
+        echo "$sha256  $tmp/actionlint.tar.gz" | shasum -a 256 -c - >&2
     fi
     tar -xzf "$tmp/actionlint.tar.gz" -C "$tmp" actionlint
     mkdir -p "$dir"
