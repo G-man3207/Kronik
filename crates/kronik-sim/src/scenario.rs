@@ -57,7 +57,7 @@ use crate::service::{ServiceFaults, SimService};
 mod blobs;
 mod connections;
 mod secrets;
-use crate::{SimClock, SimEntropy, SimNoNet, SimProcs, SimRng, SimSpawner, Trace};
+use crate::{SimClock, SimEntropy, SimProcs, SimRng, SimSpawner, Trace};
 pub use blobs::{BlobMutation, BlobWorkload};
 pub use connections::ConnWorkload;
 use kronik_effects::{Delivery, Rate};
@@ -501,6 +501,16 @@ fn log_dir() -> PathBuf {
         .join("log")
 }
 
+/// The audit a scenario acts under: the DST harness itself, at wall time 0
+/// (virtual time governs the run).
+pub(super) fn audit() -> pb::Audit {
+    pb::Audit {
+        token_id: "sim".into(),
+        reason: "dst".into(),
+        wall_time_ms: 0,
+    }
+}
+
 impl World {
     fn st(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
@@ -551,7 +561,10 @@ impl World {
                     service: service.as_ref().map(|s| s.net(node)),
                 }),
                 (Some(s), None) => s.net(node),
-                (None, None) => Arc::new(SimNoNet),
+                (None, None) => Arc::new(SimNet {
+                    bao: None,
+                    service: None,
+                }),
             },
             procs: Arc::new(SimProcs {
                 clock: self.clock.clone(),
@@ -764,12 +777,7 @@ impl World {
             if !wanted || node.kind_exists(kind) {
                 continue;
             }
-            let audit = pb::Audit {
-                token_id: "sim".into(),
-                reason: "dst".into(),
-                wall_time_ms: 0,
-            };
-            if let Err(e) = node.deploy(guest, audit, false, authority.clone()).await {
+            if let Err(e) = node.deploy(guest, audit(), false, authority.clone()).await {
                 self.event(format!("deploy failed: {}", e.code));
                 let _ = self.fatal_tx.send(node_id);
                 return;
@@ -783,11 +791,6 @@ impl World {
                 .grant("room", kronik_effects::Capability::SEND_NOW)
                 .is_none()
         {
-            let audit = pb::Audit {
-                token_id: "sim".into(),
-                reason: "dst".into(),
-                wall_time_ms: 0,
-            };
             if let Err(e) = node
                 .grant(
                     "room",
@@ -795,7 +798,7 @@ impl World {
                     None,
                     None,
                     kronik_effects::InForks::default(),
-                    audit,
+                    audit(),
                     false,
                     authority.clone(),
                 )
@@ -813,11 +816,6 @@ impl World {
                 .http_grant("counter", "payments")
                 .is_none()
         {
-            let audit = pb::Audit {
-                token_id: "sim".into(),
-                reason: "dst".into(),
-                wall_time_ms: 0,
-            };
             if let Err(e) = node
                 .grant(
                     "counter",
@@ -825,7 +823,7 @@ impl World {
                     Some(fx.delivery),
                     fx.rate,
                     kronik_effects::InForks::Recorded,
-                    audit,
+                    audit(),
                     false,
                     authority.clone(),
                 )
@@ -891,11 +889,6 @@ impl World {
     async fn setup_webhook(&self, node: &Node, authority: &AuthLease) -> Result<(), String> {
         let Some(fx) = self.cfg.effects else {
             return Ok(());
-        };
-        let audit = || pb::Audit {
-            token_id: "sim".into(),
-            reason: "dst".into(),
-            wall_time_ms: 0,
         };
         let kind = "webhook-relay";
         if !node.kind_exists(kind) {

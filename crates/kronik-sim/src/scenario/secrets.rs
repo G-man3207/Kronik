@@ -30,7 +30,7 @@ use kronik_proto::log::v1 as pb;
 use kronik_sched::Node;
 use prost::Message as _;
 
-use super::{World, hex};
+use super::{World, audit, hex};
 use crate::bao::{self, Mode, SimBao};
 
 /// The token file the daemon's backend reads, on the simulated disk.
@@ -191,11 +191,6 @@ impl World {
     ) -> Result<(), String> {
         let Some(workload) = self.workload() else {
             return Ok(());
-        };
-        let audit = || pb::Audit {
-            token_id: "sim".into(),
-            reason: "dst".into(),
-            wall_time_ms: 0,
         };
         for name in workload.names() {
             let capability = format!("secret:{name}");

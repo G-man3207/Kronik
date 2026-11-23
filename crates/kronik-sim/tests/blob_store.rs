@@ -16,9 +16,10 @@ use kronik_blob::{
     BlobId, BlobKeys, BlobMeta, BlobStore, KeyAccess, KeyAnswer, Space, StoreConfig,
 };
 use kronik_core::env::{Env, OpenMode};
+use kronik_sim::bao::SimNet;
 use kronik_sim::exec::{Executor, Handle, NodeId, RunEnd, SUPERVISOR};
 use kronik_sim::fs::{CrashModel, Disk, DiskFaults, SimFs};
-use kronik_sim::{SimClock, SimEntropy, SimNoNet, SimProcs, SimRng, SimSpawner};
+use kronik_sim::{SimClock, SimEntropy, SimProcs, SimRng, SimSpawner};
 use zeroize::Zeroizing;
 
 fn derived(label: &str, subject: &str, version: u32) -> Zeroizing<[u8; 32]> {
@@ -85,7 +86,10 @@ fn env(
                 fsync_error: 0.0,
             },
         )),
-        net: Arc::new(SimNoNet),
+        net: Arc::new(SimNet {
+            bao: None,
+            service: None,
+        }),
         procs: Arc::new(SimProcs { clock }),
     }
 }

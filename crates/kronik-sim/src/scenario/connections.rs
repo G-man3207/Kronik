@@ -44,6 +44,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use kronik_core::env::Env;
 use kronik_core::ids::Lsn;
 use kronik_gateway::{Gateway, HttpRequest, HttpResponse};
@@ -530,24 +532,6 @@ fn content(f: &pb::Frame) -> Content {
     (f.kind, data, f.event.clone(), f.id.clone())
 }
 
-/// Standard base64 with padding: a WebSocket key.
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let at = |i: usize| u32::from(chunk.get(i).copied().unwrap_or(0));
-        let n = (at(0) << 16) | (at(1) << 8) | at(2);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
 /// What the log says about the connections (C1, C2, C4).
 #[derive(Default)]
 struct LogFacts {
@@ -968,7 +952,7 @@ impl World {
                 ("upgrade".into(), "websocket".into()),
                 ("connection".into(), "Upgrade".into()),
                 ("sec-websocket-version".into(), "13".into()),
-                ("sec-websocket-key".into(), base64(&key)),
+                ("sec-websocket-key".into(), STANDARD.encode(key)),
             ]);
             if self.work.chance(0.5) {
                 headers.push(("sec-websocket-protocol".into(), "room.v1".into()));
