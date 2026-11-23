@@ -1,7 +1,9 @@
 """A real `kronik serve` for the scripts that drive one: scripts/chaos.py,
-scripts/identity-examples.py and scripts/acceptance_m24.py. Not a test framework: the daemon process, its
-API over the Unix socket, and the CLI with --json."""
+scripts/identity-examples.py and scripts/acceptance_m24.py, plus the socket,
+process and command helpers the e2e scripts share. Not a test framework: the
+daemon process, its API over the Unix socket, and the CLI with --json."""
 
+import contextlib
 import http.client
 import json
 import os
@@ -15,16 +17,96 @@ class Violation(Exception):
     """Something a script checks does not hold; the message says what."""
 
 
+def command(*args, timeout=120, check=True, data=None, env=None, pass_fds=()):
+    """Runs a command with captured output; `check` turns a failure into an
+    AssertionError that quotes the end of both streams."""
+    r = subprocess.run([str(a) for a in args], input=data, capture_output=True,
+                       timeout=timeout, env=env, pass_fds=pass_fds)
+    if check and r.returncode:
+        raise AssertionError(f"{[str(a) for a in args[:4]]} exited {r.returncode}: "
+                             f"{r.stdout[-2000:].decode(errors='replace')}{r.stderr[-2000:].decode(errors='replace')}")
+    return r
+
+
+def write(path, text, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(text if isinstance(text, bytes) else text.encode())
+    path.chmod(mode)
+
+
+def wait_for(description, predicate, seconds=90, step=0.1, retry=()):
+    """Waits until `predicate()` returns a truthy value, which it returns.
+    Exceptions in `retry` mean not-yet; the last one is reported on timeout."""
+    deadline = time.monotonic() + seconds
+    failure = None
+    while time.monotonic() < deadline:
+        try:
+            value = predicate()
+        except retry as error:
+            failure = error
+        else:
+            failure = None
+            if value:
+                return value
+        time.sleep(step)
+    message = f"timed out: {description}"
+    raise AssertionError(message + (f" ({failure})" if failure is not None else ""))
+
+
+def free_port():
+    """A loopback port for a fixture listener to bind."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def docker_image(ref, pull_timeout=240):
+    """The `docker image inspect` info of `ref`, pulling the image if absent."""
+    info = command("docker", "image", "inspect", ref, check=False)
+    if info.returncode:
+        command("docker", "pull", ref, timeout=pull_timeout)
+        info = command("docker", "image", "inspect", ref)
+    return json.loads(info.stdout)[0]
+
+
+def stop_process(process, grace=60):
+    """SIGTERM, then SIGKILL if the process outlives `grace`; None is gone."""
+    if process and process.poll() is None:
+        process.send_signal(signal.SIGTERM)
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
 class UnixConnection(http.client.HTTPConnection):
-    def __init__(self, path, timeout):
+    def __init__(self, path, timeout=60):
         super().__init__("kronik", timeout=timeout)
         self.unix_path = path
 
     def connect(self):
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(self.timeout)
-        s.connect(self.unix_path)
+        s.connect(str(self.unix_path))
         self.sock = s
+
+
+def unix_api(sock, method, path, data=None, status=200, timeout=60, token=None):
+    """One JSON request over the daemon's Unix socket; `status` is the one
+    expected answer, or None for the (status, value) pair."""
+    with contextlib.closing(UnixConnection(sock, timeout)) as conn:
+        headers = {"Content-Type": "application/json", "Host": "localhost"}
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        conn.request(method, path, body=None if data is None else json.dumps(data), headers=headers)
+        response = conn.getresponse()
+        raw = response.read()
+        value = json.loads(raw) if raw.strip() else {}
+        if status is None:
+            return response.status, value
+        assert response.status == status, (method, path, response.status, value)
+        return value
 
 
 class Daemon:
@@ -74,15 +156,7 @@ class Daemon:
             raise Violation("the daemon did not stop within 60 s of SIGTERM") from None
 
     def api(self, method, path, body=None, timeout=60):
-        conn = UnixConnection(self.sock, timeout)
-        try:
-            data = json.dumps(body).encode() if body is not None else None
-            conn.request(method, path, body=data, headers={"content-type": "application/json"})
-            resp = conn.getresponse()
-            raw = resp.read()
-            return resp.status, (json.loads(raw) if raw else {})
-        finally:
-            conn.close()
+        return unix_api(self.sock, method, path, body, status=None, timeout=timeout)
 
     def cli(self, *args):
         out = subprocess.run([self.bin, "--socket", self.sock, "--json", *args],

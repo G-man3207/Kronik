@@ -8,7 +8,6 @@ A probe-only run establishes emulator capabilities, not a Kronik acceptance pass
 """
 import argparse
 import base64
-import contextlib
 import hashlib
 import http.client
 import http.server
@@ -29,6 +28,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+sys.dont_write_bytecode = True  # no __pycache__ in scripts/
+from kronikd import command, docker_image, unix_api, wait_for, write  # noqa: E402
+
 IMAGES = {
     "openbao": "openbao/openbao@sha256:5046911075e137e154ce49ab051502f4ec7cf367d484ae4a4dce665d9b90561f",
     "aws": "motoserver/moto@sha256:59a1965d845249b04def37a0e2565f9cc6c44543cb89b68e90f28f344b3b0d1a",
@@ -47,29 +49,6 @@ DUMMY = b"0123456789abcdef0123456789abcdef"
 SECRET = "m23-secret-round-trip"
 OWNED = set()
 CREATED = set()
-
-
-def command(*args, timeout=60, check=True, data=None):
-    r = subprocess.run([str(a) for a in args], input=data, capture_output=True, timeout=timeout)
-    if check and r.returncode:
-        raise AssertionError(f"{args[:3]} exited {r.returncode}: "
-                             f"{r.stdout[-3000:].decode(errors='replace')}{r.stderr[-3000:].decode(errors='replace')}")
-    return r
-
-
-def write(path, text, mode=0o600):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
-    path.chmod(mode)
-
-
-def wait_for(description, predicate, seconds=90):
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.1)
-    raise AssertionError(f"timed out: {description}")
 
 
 def request(base, path, data=None, headers=None, tls=None, status=200, method=None):
@@ -97,11 +76,7 @@ def wait_http(base):
 
 
 def image(ref):
-    info = command("docker", "image", "inspect", ref, check=False)
-    if info.returncode:
-        command("docker", "pull", ref, timeout=240)
-        info = command("docker", "image", "inspect", ref)
-    info = json.loads(info.stdout)[0]
+    info = docker_image(ref)
     return {"requested": ref, "id": info["Id"], "digests": info.get("RepoDigests", [])}
 
 
@@ -477,17 +452,6 @@ class Runtime:
         remove(self.name, self.p.root / "runtime.log")
 
 
-class UnixConnection(http.client.HTTPConnection):
-    def __init__(self, path):
-        super().__init__("localhost", timeout=30)
-        self.path = path
-
-    def connect(self):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect(str(self.path))
-
-
 class Daemon:
     def __init__(self, runtime, config, name, env):
         self.runtime, self.config = runtime, config
@@ -521,17 +485,7 @@ class Daemon:
         ), text
 
     def api(self, method, path, data=None, token=None, status=200):
-        with contextlib.closing(UnixConnection(self.socket)) as conn:
-            headers = {"Content-Type": "application/json"}
-            if token:
-                headers["Authorization"] = "Bearer " + token
-            conn.request(method, path, body=None if data is None else json.dumps(data), headers=headers)
-            response = conn.getresponse()
-            value = json.loads(response.read())
-            if status is None:
-                return response.status, value
-            assert response.status == status, (method, path, response.status, value)
-            return value
+        return unix_api(self.socket, method, path, data, status=status, timeout=30, token=token)
 
     def send(self, actor, name, text):
         return self.api("POST", "/v1/actors/" + actor + "/messages", {"name": name, "text": text, "reason": REASON})

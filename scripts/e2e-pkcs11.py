@@ -23,6 +23,7 @@ import argparse
 import base64
 import contextlib
 import ctypes
+import functools
 import hashlib
 import hmac
 import http.client
@@ -32,11 +33,16 @@ from pathlib import Path
 import secrets as random
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
-import time
+
+sys.dont_write_bytecode = True  # no __pycache__ in scripts/
+from kronikd import command, stop_process, unix_api, write  # noqa: E402
+from kronikd import wait_for as kronik_wait_for  # noqa: E402
+
+# A daemon or API that is not answering yet is a wait, not a failure.
+wait_for = functools.partial(kronik_wait_for, retry=(OSError, http.client.HTTPException, ValueError, KeyError))
 
 ROOT = Path(__file__).resolve().parent.parent
 GUESTS = ROOT / "tests/guests"
@@ -44,32 +50,6 @@ TOKEN_DIR = Path("/var/lib/softhsm/tokens")
 MODULE_CANDIDATES = ["/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so", "/usr/lib/softhsm/libsofthsm2.so"]
 REASON = "M23 PKCS#11 acceptance"
 GATEWAY = 47180
-
-
-def command(*args, timeout=120, check=True, data=None, env=None, pass_fds=()):
-    r = subprocess.run([str(a) for a in args], input=data, capture_output=True, timeout=timeout, env=env,
-                       pass_fds=pass_fds)
-    if check and r.returncode:
-        raise AssertionError(f"{[str(a) for a in args[:4]]} exited {r.returncode}: "
-                             f"{r.stdout[-2000:].decode(errors='replace')}{r.stderr[-2000:].decode(errors='replace')}")
-    return r
-
-
-def write(path, text, mode=0o600):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(text if isinstance(text, bytes) else text.encode())
-    path.chmod(mode)
-
-
-def wait_for(description, predicate, seconds=120, step=0.2):
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        with contextlib.suppress(OSError, http.client.HTTPException, ValueError, KeyError):
-            value = predicate()
-            if value:
-                return value
-        time.sleep(step)
-    raise AssertionError("timed out: " + description)
 
 
 # ------------------------------------------------------------------ PKCS#11
@@ -172,16 +152,6 @@ class Pkcs11:
 
 # ------------------------------------------------------------------- daemon
 
-class UnixConnection(http.client.HTTPConnection):
-    def __init__(self, path, timeout=60):
-        super().__init__("localhost", timeout=timeout)
-        self.path = path
-
-    def connect(self):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect(str(self.path))
-
 
 class Daemon:
     def __init__(self, binary, config, data, socket_path, log, env):
@@ -203,29 +173,14 @@ class Daemon:
             if self.process.poll() is not None:
                 raise SystemExit("daemon exited: " + self.log.read_text(errors="replace")[-4000:])
             return self.api("GET", "/v1/health", status=None)[0] == 200
-        wait_for("healthy", healthy, seconds)
+        wait_for("healthy", healthy, seconds, 0.2)
         return 0
 
     def stop(self):
-        if self.process and self.process.poll() is None:
-            self.process.send_signal(signal.SIGTERM)
-            try:
-                self.process.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
+        stop_process(self.process)
 
     def api(self, method, path, data=None, status=200):
-        with contextlib.closing(UnixConnection(self.socket)) as conn:
-            conn.request(method, path, body=None if data is None else json.dumps(data),
-                         headers={"Content-Type": "application/json", "Host": "localhost"})
-            response = conn.getresponse()
-            raw = response.read()
-            value = json.loads(raw) if raw.strip() else {}
-            if status is None:
-                return response.status, value
-            assert response.status == status, (method, path, response.status, value)
-            return value
+        return unix_api(self.socket, method, path, data, status=status)
 
     def mutate(self, method, path, data):
         def ok():
@@ -234,7 +189,7 @@ class Daemon:
                 return [value]
             assert status == 503 and value["error"]["code"] == "SECRET_UNAVAILABLE", (path, status, value)
             return None
-        return wait_for(method + " " + path, ok)[0]
+        return wait_for(method + " " + path, ok, 120, 0.2)[0]
 
     def cli(self, *args):
         return command(self.binary, "--socket", self.socket, *args, env=self.env).stdout.decode()

@@ -50,7 +50,6 @@ import json
 import os
 import random
 import shutil
-import socket
 import subprocess
 import sys
 import threading
@@ -60,15 +59,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.dont_write_bytecode = True  # no __pycache__ in scripts/
-from kronikd import Daemon, Violation  # noqa: E402
+from kronikd import Daemon, Violation, free_port  # noqa: E402
 
 REASON = "identity replay of the examples"
-
-
-def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 class Example:

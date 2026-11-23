@@ -23,8 +23,10 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
 import uuid
+
+sys.dont_write_bytecode = True  # no __pycache__ in scripts/
+from kronikd import wait_for  # noqa: E402
 
 CAP = 1_048_576
 IMAGE = "debian:13-slim"
@@ -111,15 +113,6 @@ class Proof:
     def inspect(self, kind, name):
         return json.loads(self.docker(kind, "inspect", name).stdout)[0]
 
-    def wait(self, description, predicate, seconds=45):
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            value = predicate()
-            if value:
-                return value
-            time.sleep(0.1)
-        raise AssertionError("timed out: " + description)
-
     def create(self, name, network, address, command, mounts=(), extra=(), memory="512m"):
         arguments = ["create", "--pull=never", "--name", name, "--label", OWNER + "=" + self.id,
                      "--network", network, "--ip", address, "--read-only", "--cap-drop=ALL",
@@ -192,9 +185,9 @@ class Proof:
 
     def start_installation(self):
         self.docker("start", self.install_name)
-        self.wait("ordinary API socket", lambda: self.install_exec("python3", "-c",
+        wait_for("ordinary API socket", lambda: self.install_exec("python3", "-c",
                   "import os,sys;sys.exit(0 if os.path.exists('/work/api.sock') else 1)", check=False).returncode == 0)
-        self.wait("ordinary API readiness", lambda: self.api("/v1/health", allow_unready=True).get("status") == 200)
+        wait_for("ordinary API readiness", lambda: self.api("/v1/health", allow_unready=True).get("status") == 200)
         observe = ("import json; wanted={'CapEff','CapPrm','CapInh','CapAmb','CapBnd','NoNewPrivs'};"
                    "values=dict(line.split(':',1) for line in open('/proc/1/status') if ':' in line);"
                    "print(json.dumps({k:values[k].strip() for k in wanted}))")
@@ -325,7 +318,7 @@ class Proof:
         self.create(self.controller_name, self.wan, self.controller_ip, command,
                     mounts=[(self.controller, "/fixture", False), (Path(__file__).with_name("fleet-controller.py").resolve(), "/opt/fleet-controller.py", True)], memory="128m")
         self.docker("start", self.controller_name)
-        self.wait("owned controller TLS listener", lambda: self.docker("exec", self.controller_name, "python3", "-c",
+        wait_for("owned controller TLS listener", lambda: self.docker("exec", self.controller_name, "python3", "-c",
                   "import socket,ssl;c=ssl.create_default_context(cafile='/fixture/realm.pem');"
                   "s=c.wrap_socket(socket.create_connection(('" + self.controller_ip + "',8443),1),"
                   "server_hostname='controller.test');s.close()", check=False).returncode == 0)
@@ -416,7 +409,7 @@ class Proof:
         requested = self.cli("status")["state"]
         assert requested["phase"] == "requested"
         self.phase = "waiting_lost_reply"
-        self.wait("actual lost enrollment reply", lambda: self.events("enrollment_reply_lost", requested["request_id"]))
+        wait_for("actual lost enrollment reply", lambda: self.events("enrollment_reply_lost", requested["request_id"]))
         before = len(self.events("enrollment_request"))
         self.phase = "tokenless_resume"
         self.cli("enroll", URL, "--token", "fixture-one-time-1", "--reason", REASON, succeeds=False)
@@ -430,7 +423,7 @@ class Proof:
         assert attempts[0]["csr_sha256"] == attempts[1]["csr_sha256"]
         assert all(v["peer_ip"] == self.router_wan for v in attempts), "controller did not observe the SNAT hop"
         self.phase = "ordinary_read_scope_parity"
-        results = self.wait("ordinary HTTP and denied native stream responses", lambda: self.events("http_result", active["request_id"]) if len(self.events("http_result", active["request_id"])) == 4 else None)
+        results = wait_for("ordinary HTTP and denied native stream responses", lambda: self.events("http_result", active["request_id"]) if len(self.events("http_result", active["request_id"])) == 4 else None)
         assert [r["status"] for r in results] == [200, 403, 403, 403]
         for remote in results:
             path = remote["path"]
@@ -444,17 +437,17 @@ class Proof:
         old_bearer = self.install / "old-bearer"
         write(old_bearer, (self.install / "data/keys/fleet/bearer").read_bytes())
         self.docker("stop", "--time", "10", self.install_name)
-        self.wait("stream closed on daemon stop", lambda: self.events("stream_closed", active["request_id"]))
+        wait_for("stream closed on daemon stop", lambda: self.events("stream_closed", active["request_id"]))
         opened = len(self.events("stream_open", active["request_id"]))
         self.start_installation()
         assert self.cli("status")["state"] == active
-        self.wait("same identity reconnect after restart", lambda: len(self.events("stream_open", active["request_id"])) > opened)
+        wait_for("same identity reconnect after restart", lambda: len(self.events("stream_open", active["request_id"])) > opened)
         closed = len(self.events("stream_closed", active["request_id"]))
         revoked = self.cli("revoke", "--reason", REASON)["state"]
         assert revoked["phase"] == "revoked" and revoked["epoch"] == active["epoch"]
         assert all(revoked[key] == active[key] for key in
                    ("request_id", "csr_der", "client_key_sha256", "client_cert_der", "plan"))
-        self.wait("active stream closed by durable revoke", lambda: len(self.events("stream_closed", active["request_id"])) > closed, seconds=10)
+        wait_for("active stream closed by durable revoke", lambda: len(self.events("stream_closed", active["request_id"])) > closed, seconds=10)
         assert self.events("stream_closed", active["request_id"])[-1]["reason"] == "peer_closed"
         assert self.api("/v1/health", bearer_file="/work/old-bearer")["status"] in (401, 403)
         self.docker("stop", "--time", "10", self.install_name)
@@ -480,9 +473,9 @@ class Proof:
         assert renewed["phase"] == "active" and renewed["epoch"] > revoked["epoch"]
         assert renewed["request_id"] != active["request_id"]
         assert hashlib.sha256((self.install / "data/keys/fleet/client.key").read_bytes()).hexdigest() == key_before
-        self.wait("actual native SSE operational record", lambda: self.events("sse_event", renewed["request_id"]))
-        self.wait("actual native WebSocket operational record", lambda: self.events("ws_event", renewed["request_id"]))
-        self.wait("actual inner WebSocket masked ping/pong", lambda: self.events("ws_pong", renewed["request_id"]))
+        wait_for("actual native SSE operational record", lambda: self.events("sse_event", renewed["request_id"]))
+        wait_for("actual native WebSocket operational record", lambda: self.events("ws_event", renewed["request_id"]))
+        wait_for("actual inner WebSocket masked ping/pong", lambda: self.events("ws_pong", renewed["request_id"]))
         assert self.events("sse_http", renewed["request_id"])[-1]["status"] == 200
         assert self.events("ws_http", renewed["request_id"])[-1]["status"] == 101
         assert self.api("/v1/health", bearer_file="/work/old-bearer")["status"] in (401, 403)
@@ -491,7 +484,7 @@ class Proof:
         closed = len(self.events("stream_closed", renewed["request_id"]))
         final = self.cli("revoke", "--reason", REASON)["state"]
         assert final["phase"] == "revoked" and final["epoch"] == renewed["epoch"]
-        self.wait("native upgraded channel closed on revoke",
+        wait_for("native upgraded channel closed on revoke",
                   lambda: len(self.events("stream_closed", renewed["request_id"])) > closed, seconds=10)
         assert self.events("stream_closed", renewed["request_id"])[-1]["reason"] == "peer_closed"
         streams = self.events("stream_open", renewed["request_id"])
