@@ -105,36 +105,11 @@ fn main() -> ExitCode {
                 }
             },
             "--scenario" => match args.get(i + 1).map(String::as_str) {
-                Some("counter") => {
-                    scenarios = vec!["counter"];
-                    i += 1;
-                }
-                Some("effects") => {
-                    scenarios = vec!["effects"];
-                    i += 1;
-                }
-                Some("webhook") => {
-                    scenarios = vec!["webhook"];
-                    i += 1;
-                }
-                Some("rebuild") => {
-                    scenarios = vec!["rebuild"];
-                    i += 1;
-                }
-                Some("allocator") => {
-                    scenarios = vec!["allocator"];
-                    i += 1;
-                }
-                Some("secret-outage") => {
-                    scenarios = vec!["secret-outage"];
-                    i += 1;
-                }
-                Some("connections") => {
-                    scenarios = vec!["connections"];
-                    i += 1;
-                }
-                Some("blobs") => {
-                    scenarios = vec!["blobs"];
+                Some(
+                    name @ ("counter" | "effects" | "webhook" | "rebuild" | "allocator"
+                    | "secret-outage" | "connections" | "blobs"),
+                ) => {
+                    scenarios = vec![name];
                     i += 1;
                 }
                 Some("all") => i += 1,
