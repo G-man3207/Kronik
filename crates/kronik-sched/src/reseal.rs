@@ -245,13 +245,8 @@ fn save_progress(data: &Path, p: &ProgressFile) -> Result<(), ApiError> {
         .map_err(|e| ApiError::new(ErrorCode::Internal, format!("privacy directory: {e}")))?;
     let bytes = serde_json::to_vec_pretty(p)
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
-    let path = progress_path(data);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)
-        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("reseal progress: {e}")))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("reseal progress: {e}")))?;
-    Ok(())
+    crate::durable::write_synced(&progress_path(data), &bytes)
+        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("reseal progress: {e}")))
 }
 
 /// Progress for `GET /v1/privacy`. `data` is the node's data directory.

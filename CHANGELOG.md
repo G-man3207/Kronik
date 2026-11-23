@@ -363,6 +363,12 @@ until the v1.0 compatibility promise takes effect.
   those scripts print the tail of its log when it does not; the acceptance
   run of one hosted CI job failed on the tight wait after the rest of the
   same job had passed.
+- The report of `kronik upgrade check` and the reseal progress file are
+  written durably, as the blob roots files are: fsynced before the rename,
+  the directory fsynced after it, and no temporary file left behind when a
+  step fails. Before, a power loss right after a successful check could
+  take the report, and the next start refused until the check ran again
+  (#315).
 
 ## v0.5.0 — 2026-11-15
 
