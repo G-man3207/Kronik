@@ -323,14 +323,7 @@ fn response(
     content_type: &'static str,
     body: String,
 ) -> hyper::Response<kronik_api::server::Body> {
-    let mut resp = hyper::Response::new(Full::new(Bytes::from(body)).boxed());
-    *resp.status_mut() =
-        hyper::StatusCode::from_u16(status).unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
-    resp.headers_mut().insert(
-        hyper::header::CONTENT_TYPE,
-        hyper::header::HeaderValue::from_static(content_type),
-    );
-    resp
+    bytes_response(status, content_type, body.into())
 }
 
 /// The gauges read at scrape time, set before `/metrics` answers and

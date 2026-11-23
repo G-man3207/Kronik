@@ -74,18 +74,13 @@ pub(super) fn audit(ctx: &Ctx, command: AuditCommand) -> Result<ExitCode, Error>
 }
 
 fn show(ctx: &Ctx, from: Option<u64>, limit: Option<u64>) -> Result<ExitCode, Error> {
-    let mut query = Vec::new();
-    if let Some(f) = from {
-        query.push(format!("from={f}"));
-    }
-    if let Some(l) = limit {
-        query.push(format!("limit={l}"));
-    }
-    let target = if query.is_empty() {
-        "/v1/audit".to_owned()
-    } else {
-        format!("/v1/audit?{}", query.join("&"))
-    };
+    let target = format!(
+        "/v1/audit{}",
+        super::query(&[
+            ("from", from.map(|f| f.to_string())),
+            ("limit", limit.map(|l| l.to_string())),
+        ])
+    );
     let body = ctx.get(&target)?;
     let r: AuditResponse = ctx.decode(&body)?;
     if ctx.json {

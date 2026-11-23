@@ -164,12 +164,13 @@ pub(super) fn events(ctx: &Ctx, command: EventsCommand) -> Result<ExitCode, Erro
 }
 
 fn target(path: &str, source: Option<EventSource>, limit: Option<u64>) -> String {
-    match (source, limit) {
-        (Some(source), Some(limit)) => format!("{path}?source={source}&limit={limit}"),
-        (Some(source), None) => format!("{path}?source={source}"),
-        (None, Some(limit)) => format!("{path}?limit={limit}"),
-        (None, None) => path.to_owned(),
-    }
+    format!(
+        "{path}{}",
+        super::query(&[
+            ("source", source.map(|s| s.to_string())),
+            ("limit", limit.map(|l| l.to_string())),
+        ])
+    )
 }
 
 fn unavailable(message: &str) -> ApiError {

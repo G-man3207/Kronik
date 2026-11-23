@@ -131,25 +131,7 @@ pub fn json_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
 
 pub fn run(args: RestoreArgs, json: bool) -> ExitCode {
     match execute(args) {
-        Ok((text, value)) => {
-            if json {
-                match serde_json::to_string(&value) {
-                    Ok(body) => println!("{body}"),
-                    Err(e) => {
-                        return cli::report_error(
-                            true,
-                            &ApiError::new(
-                                ErrorCode::Internal,
-                                format!("encoding JSON failed: {e}"),
-                            ),
-                        );
-                    }
-                }
-            } else {
-                print!("{text}");
-            }
-            ExitCode::SUCCESS
-        }
+        Ok((text, value)) => crate::project::emit(value, json, |_| print!("{text}")),
         Err(e) => cli::report_error(json, &e),
     }
 }
