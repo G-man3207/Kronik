@@ -1167,14 +1167,7 @@ impl SqlActor {
 
     fn user_tables(&self) -> Result<Vec<String>, String> {
         lock(&self.shared).host = true;
-        self.conn
-            .prepare(
-                "SELECT name FROM sqlite_schema WHERE type = 'table' \
-                 AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
-                 AND name NOT LIKE '\\_kronik%' ESCAPE '\\' ORDER BY name",
-            )
-            .and_then(|mut st| st.query_map([], |r| r.get(0))?.collect())
-            .map_err(|e| e.to_string())
+        user_tables(&self.conn).map_err(|e| e.to_string())
     }
 
     fn table_columns(&self, table: &str) -> Result<Vec<String>, String> {
@@ -1740,15 +1733,7 @@ impl SqlActor {
     /// rowid order with the rowid as first column (behavior diffs).
     pub fn canonical_rows(&self) -> rusqlite::Result<Vec<TableRows>> {
         lock(&self.shared).host = true;
-        let names: Vec<String> = self
-            .conn
-            .prepare(
-                "SELECT name FROM sqlite_schema WHERE type = 'table' \
-                 AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
-                 AND name NOT LIKE '\\_kronik%' ESCAPE '\\' ORDER BY name",
-            )?
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
+        let names: Vec<String> = user_tables(&self.conn)?;
         let mut out = Vec::with_capacity(names.len());
         for name in names {
             let cols: Vec<(String, i64)> = self
@@ -1806,15 +1791,7 @@ impl SqlActor {
     /// User tables and their row counts (for `actors inspect`).
     pub fn table_rows(&self) -> rusqlite::Result<Vec<(String, u64)>> {
         lock(&self.shared).host = true;
-        let names: Vec<String> = self
-            .conn
-            .prepare(
-                "SELECT name FROM sqlite_schema WHERE type = 'table' \
-                 AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
-                 AND name NOT LIKE '\\_kronik%' ESCAPE '\\' ORDER BY name",
-            )?
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
+        let names: Vec<String> = user_tables(&self.conn)?;
         let mut out = Vec::with_capacity(names.len());
         for n in names {
             let rows: i64 = self.conn.query_row(
@@ -1895,7 +1872,7 @@ fn to_sql(v: &Val) -> Value {
     }
 }
 
-fn quote_ident(name: &str) -> String {
+pub(super) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
@@ -2336,18 +2313,13 @@ fn parent_key_columns(conn: &Connection, parent: &str) -> Result<Vec<String>, St
     }
 }
 
-fn user_tables(conn: &Connection) -> Result<Vec<String>, String> {
-    let mut st = conn
-        .prepare(
-            "SELECT name FROM sqlite_schema WHERE type = 'table' \
-             AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
-             AND name NOT LIKE '\\_kronik%' ESCAPE '\\' ORDER BY name",
-        )
-        .map_err(|e| e.to_string())?;
-    st.query_map([], |r| r.get(0))
-        .map_err(|e| e.to_string())?
-        .collect::<rusqlite::Result<_>>()
-        .map_err(|e| e.to_string())
+fn user_tables(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut st = conn.prepare(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' \
+         AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+         AND name NOT LIKE '\\_kronik%' ESCAPE '\\' ORDER BY name",
+    )?;
+    st.query_map([], |r| r.get(0))?.collect()
 }
 
 /// A row that is not `subject` references a row of `subject` that erasure
@@ -2359,7 +2331,7 @@ fn other_subject_reference(conn: &Connection, subject: &str) -> Result<Option<St
         return Ok(None);
     }
     let has = |name: &str| parents.iter().any(|t| t.eq_ignore_ascii_case(name));
-    for child in user_tables(conn)? {
+    for child in user_tables(conn).map_err(|e| e.to_string())? {
         let child_has_subject = has(&child);
         for fk in foreign_keys(conn, &child)? {
             if !has(&fk.parent) || fk.pairs.is_empty() {
