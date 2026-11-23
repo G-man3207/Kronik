@@ -921,39 +921,6 @@ pub(crate) struct FxState {
 }
 
 impl FxState {
-    /// Seed privacy matching only. These cache-held bytes never become an
-    /// operational credential, a provider fallback, or an actor grant.
-    // Unused since the certified-snapshot rework; kept for the M23 track.
-    #[allow(dead_code)]
-    pub(crate) fn seed_scrub_snapshot(
-        &mut self,
-        snapshot: &crate::secrets::CertifiedSecretSnapshot,
-    ) -> Result<(), GateError> {
-        self.secrets
-            .try_reserve(snapshot.values.len())
-            .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?;
-        if let Some(references) = &snapshot.references {
-            self.secret_refs
-                .try_reserve(references.len())
-                .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))?;
-        }
-        self.secrets.extend(
-            snapshot
-                .values
-                .iter()
-                .map(|(name, bytes)| (name.clone(), bytes.clone())),
-        );
-        match &snapshot.references {
-            Some(references) => self.secret_refs.extend(
-                references
-                    .iter()
-                    .map(|reference| header_reference(reference, "")),
-            ),
-            None => self.secret_scope_unknown = true,
-        }
-        Ok(())
-    }
-
     fn scope_complete(&self) -> bool {
         !self.secret_scope_unknown && scope_covers_values(&self.secrets, &self.secret_refs)
     }
@@ -3282,42 +3249,6 @@ mod secret_tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[test]
-    fn cleanup_scrub_seed_keeps_values_and_unknown_metadata_cannot_certify_output() {
-        let value = Arc::new(Zeroizing::new(b"old credential".to_vec()));
-        let identity = pb::SecretRef {
-            name: "old".into(),
-            version: 1,
-            version_hash: vec![1; 16],
-            ..Default::default()
-        };
-        let snapshot = crate::secrets::CertifiedSecretSnapshot {
-            values: vec![("old".into(), value.clone())],
-            references: Some(Arc::from([identity])),
-            fingerprint: [1; 32],
-        };
-        let mut state = FxState::default();
-        state.seed_scrub_snapshot(&snapshot).unwrap();
-        assert_eq!(state.secrets[0].1.as_slice(), b"old credential");
-        assert_eq!(state.secret_scope().unwrap()[0].name, "old");
-        let unknown = crate::secrets::CertifiedSecretSnapshot {
-            values: Vec::new(),
-            references: None,
-            fingerprint: [2; 32],
-        };
-        state.seed_scrub_snapshot(&unknown).unwrap();
-        assert!(state.secret_scope().is_none());
-        assert!(state.take_secret_scope().is_none());
-        let mismatched = crate::secrets::CertifiedSecretSnapshot {
-            values: vec![("old".into(), value)],
-            references: Some(Arc::from([])),
-            fingerprint: [3; 32],
-        };
-        let mut state = FxState::default();
-        state.seed_scrub_snapshot(&mismatched).unwrap();
-        assert!(state.secret_scope().is_none());
     }
 
     fn test_message(bytes: &[u8]) -> pb::Message {

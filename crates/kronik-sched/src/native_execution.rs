@@ -23,23 +23,16 @@ fn stopped() -> ApiError {
 
 pub(crate) struct Lifecycle {
     alive: AtomicBool,
-    native_mode: AtomicBool,
     changed: Notify,
     // Capabilities and admitted workers retain the SAME original root owner/File.
     // No File::try_clone and no lock reacquisition occurs.
     ownership: Option<kronik_privacy::key_source::DataOwnership>,
     source_roots: Arc<Mutex<kronik_core::snapshot_resources::SnapshotRootRegistry>>,
 }
-impl Default for Lifecycle {
-    fn default() -> Self {
-        Self::new(None)
-    }
-}
 impl Lifecycle {
     pub(crate) fn new(ownership: Option<kronik_privacy::key_source::DataOwnership>) -> Self {
         Self {
             alive: AtomicBool::new(true),
-            native_mode: AtomicBool::new(true),
             changed: Notify::new(),
             ownership,
             source_roots: Arc::new(Mutex::new(
@@ -63,9 +56,6 @@ impl Lifecycle {
     pub(crate) fn data_is_alive_under_publication(&self) -> bool {
         self.alive.load(Ordering::Acquire)
     }
-    pub(crate) fn data_is_native_under_publication(&self) -> bool {
-        self.alive.load(Ordering::Acquire) && self.native_mode.load(Ordering::Acquire)
-    }
     pub(crate) fn stop_under_publication(&self) {
         self.alive.store(false, Ordering::Release);
         self.changed.notify_waiters();
@@ -77,34 +67,7 @@ impl Lifecycle {
             Err(stopped())
         }
     }
-    // Unused since the publication rework; kept for the M23 track.
-    #[allow(dead_code)]
-    pub(crate) fn declare_member_under_publication(&self) {
-        self.native_mode.store(false, Ordering::Release);
-        self.changed.notify_waiters();
-    }
-    pub(crate) fn check_native(&self) -> Result<(), ApiError> {
-        self.check()?;
-        if self.native_mode.load(Ordering::Acquire) {
-            Ok(())
-        } else {
-            Err(stopped())
-        }
-    }
     pub(crate) async fn native_stopped(&self) {
-        loop {
-            let changed = self.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if self.check_native().is_err() {
-                return;
-            }
-            changed.await;
-        }
-    }
-    // Unused since the lifecycle rework; kept for the M23 track.
-    #[allow(dead_code)]
-    pub(crate) async fn stopped(&self) {
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -140,7 +103,6 @@ impl NativeExecution {
     }
     pub(crate) fn source_is_live_under_publication(&self) -> bool {
         self.physical.alive.load(Ordering::Acquire)
-            && self.physical.native_mode.load(Ordering::Acquire)
             && matches!(self.phase.load(Ordering::Acquire), PENDING | ACTIVE)
             && self.writer.is_open()
             && self.node.get().is_some_and(|node| node.strong_count() != 0)
@@ -188,7 +150,6 @@ impl NativeExecution {
                 .get()
                 .is_none_or(|original| !std::ptr::eq(original.as_ptr(), node))
             || !log.has_native_writer(&self.writer)
-            || !self.physical.native_mode.load(Ordering::Acquire)
         {
             return Err(ApiError::new(
                 ErrorCode::Unavailable,
@@ -199,7 +160,7 @@ impl NativeExecution {
     }
     pub(crate) fn activate(&self) -> Result<(), ApiError> {
         let _publication = lock(&self.publication);
-        self.physical.check_native()?;
+        self.physical.check()?;
         if self.node.get().is_none_or(|node| node.strong_count() == 0) {
             return Err(stopped());
         }
@@ -215,7 +176,7 @@ impl NativeExecution {
         self: &Arc<Self>,
     ) -> Result<kronik_core::authority::AuthLease, ApiError> {
         let _publication = lock(&self.publication);
-        self.physical.check_native()?;
+        self.physical.check()?;
         if self.phase.load(Ordering::Acquire) != PENDING || !self.writer.is_open() {
             return Err(stopped());
         }
@@ -233,7 +194,7 @@ impl NativeExecution {
     }
 
     fn check_recovery(&self) -> Result<(), ApiError> {
-        self.physical.check_native()?;
+        self.physical.check()?;
         // Checking custody must not upgrade/drop the last Node Arc under a publisher.
         if self.node.get().is_none_or(|node| node.strong_count() == 0) {
             return Err(stopped());

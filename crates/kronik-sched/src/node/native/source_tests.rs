@@ -127,14 +127,6 @@ async fn actual_turn_and_begin_sources_use_the_original_namespace_and_survive_ex
         lsn,
         "historical source evidence is not current mutation authority"
     );
-    {
-        let _publication = lock(&node.publication);
-        node.lifecycle.declare_member_under_publication();
-    }
-    assert!(
-        node.actor_source(lsn, exact).await.is_err(),
-        "unsupported member profile must not fall back to native"
-    );
 }
 
 #[tokio::test]
