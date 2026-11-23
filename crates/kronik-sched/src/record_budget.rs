@@ -242,15 +242,7 @@ pub fn fail(
     limit: usize,
     input_cost: usize,
 ) -> Fit {
-    record.writes.clear();
-    record.messages.clear();
-    record.timers.clear();
-    record.connection_ops.clear();
-    record.sql_changes.clear();
-    record.sql_schema.clear();
-    record.blob_refs.clear();
-    record.compensations = compensations.to_vec();
-    record.schema_version = 0;
+    drop_output(record, compensations);
     record.outcome = Some(too_large_outcome(limit));
     // The unknown outcome's code is longer than TURN_TOO_LARGE: it is set
     // before the size is checked, so the check sees the record as written.
@@ -266,15 +258,7 @@ pub fn fail(
 /// keeping its input, effects and compensations and dropping what it
 /// wrote, sent and answered.
 pub fn invalid(record: &mut pb::TurnRecord, compensations: &[pb::OutboundMessage], why: String) {
-    record.writes.clear();
-    record.messages.clear();
-    record.timers.clear();
-    record.connection_ops.clear();
-    record.sql_changes.clear();
-    record.sql_schema.clear();
-    record.blob_refs.clear();
-    record.compensations = compensations.to_vec();
-    record.schema_version = 0;
+    drop_output(record, compensations);
     record.outcome = Some(pb::Outcome {
         kind: pb::OutcomeKind::Trap as i32,
         error_code: ErrorCode::Internal.as_str().into(),
@@ -285,6 +269,21 @@ pub fn invalid(record: &mut pb::TurnRecord, compensations: &[pb::OutboundMessage
         output: None,
     });
     mark_unknown_outcome(record);
+}
+
+/// What a failed turn keeps (its input, effects and compensations) and
+/// what it drops (everything it wrote, sent or scheduled), shared by
+/// [`fail`] and [`invalid`].
+fn drop_output(record: &mut pb::TurnRecord, compensations: &[pb::OutboundMessage]) {
+    record.writes.clear();
+    record.messages.clear();
+    record.timers.clear();
+    record.connection_ops.clear();
+    record.sql_changes.clear();
+    record.sql_schema.clear();
+    record.blob_refs.clear();
+    record.compensations = compensations.to_vec();
+    record.schema_version = 0;
 }
 
 /// Leaves out of a failed record what an earlier release recorded past this
