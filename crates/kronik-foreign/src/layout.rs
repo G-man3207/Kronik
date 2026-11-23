@@ -20,7 +20,10 @@ const STAGING: &str = ".actors-new";
 /// What an actor named `blobs` kept next to the blob store.
 const ACTOR_FILES: [&str; 4] = ["bundle", "data", "output.log", "output.log.1"];
 
-fn private_dir(path: &Path) -> io::Result<()> {
+/// Creates `path` with its parents and leaves it mode 0700: the private
+/// custody of the data directory, shared by the layout, the checkpoint
+/// copies and the microVM launcher.
+pub(crate) fn private_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path).map_err(|e| at("creating", path, e))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .map_err(|e| at("setting the mode of", path, e))

@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 
 use crate::blobs::BlobStore;
 use crate::bridge::{self, Dialer, Pool};
+use crate::checkpoint::write_private;
 use crate::fetch::FetchOptions;
 use crate::image::ImageRef;
 use crate::oci;
@@ -922,7 +923,7 @@ async fn ready(ctx: &Ctx, a: &Actor, child: &Arc<dyn Process>) -> Result<(), Str
             Err(status) => {
                 return Err(format!(
                     "the sandbox exited while starting ({}); see `kronik foreign logs {}`",
-                    describe(status),
+                    describe_exit(status),
                     a.name()
                 ));
             }
@@ -943,7 +944,7 @@ async fn ready(ctx: &Ctx, a: &Actor, child: &Arc<dyn Process>) -> Result<(), Str
             r = child.wait() => {
                 return Err(format!(
                     "the sandbox exited while starting ({}); see `kronik foreign logs {}`",
-                    describe(r),
+                    describe_exit(r),
                     a.name()
                 ));
             }
@@ -952,7 +953,9 @@ async fn ready(ctx: &Ctx, a: &Actor, child: &Arc<dyn Process>) -> Result<(), Str
     }
 }
 
-fn describe(status: std::io::Result<Option<i32>>) -> String {
+/// How a process that was waited for ended, for a message. The bridge and
+/// the microVM launcher share it.
+pub(crate) fn describe_exit(status: std::io::Result<Option<i32>>) -> String {
     match status {
         Ok(Some(c)) => format!("exit status {c}"),
         Ok(None) => "killed by a signal".into(),
@@ -1136,24 +1139,6 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .map_err(|e| format!("chmod {}: {e}", path.display()))
-}
-
-/// Writes a file only root can read (`config.json` holds secret values).
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let _ = std::fs::remove_file(path);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    let written = f.write_all(bytes).and_then(|()| f.sync_all());
-    if written.is_err() {
-        // A partial copy of the secret values must not stay either.
-        let _ = std::fs::remove_file(path);
-    }
-    written
 }
 
 #[cfg(test)]

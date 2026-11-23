@@ -13,9 +13,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::bridge::{Dialer, Pool};
-use crate::checkpoint::{Copy, CopyInner, Meta, copy_key, private_dir, prune, write_private};
+use crate::checkpoint::{Copy, CopyInner, Meta, copy_key, prune, write_private};
+use crate::layout::private_dir;
 use crate::manager::{Foreign, lock};
-use crate::microvm::{DATA_BYTES, Resources, Start, Vm};
+use crate::microvm::{DATA_BYTES, RemoveDirOnDrop, Resources, Start, Vm};
 use crate::microvm_assets::{Assets, Identity};
 use crate::runtime::{Engine, Runtime};
 use crate::supervisor::Actor;
@@ -119,22 +120,6 @@ fn sync_tree(path: &Path) -> io::Result<()> {
         }
     }
     File::open(path)?.sync_all()
-}
-
-struct PendingCopy(PathBuf);
-impl PendingCopy {
-    fn create(path: PathBuf) -> io::Result<Self> {
-        use std::os::unix::fs::DirBuilderExt as _;
-        fs::DirBuilder::new().mode(0o700).create(&path)?;
-        Ok(Self(path))
-    }
-}
-impl Drop for PendingCopy {
-    fn drop(&mut self) {
-        if !self.0.as_os_str().is_empty() {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
 }
 
 impl Foreign {
@@ -371,7 +356,7 @@ impl Foreign {
         let pending = directory.clone();
         let mut pending = env
             .blocking("foreign-vm-copy-private", move || {
-                PendingCopy::create(pending)
+                RemoveDirOnDrop::create(pending)
             })
             .await
             .ok_or("private copy task dropped")?
@@ -489,7 +474,7 @@ mod tests {
         fs::write(&source, b"unchanged").unwrap();
         let target = root.path().join("copy");
         {
-            let pending = PendingCopy::create(target.clone()).unwrap();
+            let pending = RemoveDirOnDrop::create(target.clone()).unwrap();
             fs::write(pending.0.join("memory"), b"guest-secret").unwrap();
             assert_eq!(
                 fs::metadata(&pending.0).unwrap().permissions().mode() & 0o777,
@@ -500,7 +485,7 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), b"unchanged");
         fs::create_dir(&target).unwrap();
         fs::write(target.join("existing"), b"keep").unwrap();
-        assert!(PendingCopy::create(target.clone()).is_err());
+        assert!(RemoveDirOnDrop::create(target.clone()).is_err());
         assert_eq!(fs::read(target.join("existing")).unwrap(), b"keep");
     }
 
