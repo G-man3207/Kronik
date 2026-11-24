@@ -5,12 +5,12 @@ with the release binary. A reader without a public DNS name or a bucket can
 do every step; the steps that need one say what to do instead.
 
 Releases are on [GitHub](https://github.com/G-man3207/Kronik/releases).
-Current consumers require an actually signed exact tag: `v0.4.1` and `v0.4.0`
-are attested, while the historical `v0.3.0` and `v0.1.0` remain unsigned and are
-refused. Follow the [installation trust contract](install.md), or build
-unreleased code from a trusted checkout with `cargo build -p kronik` and put
-`target/debug` on `PATH`. The rest of this journey uses that trusted binary or
-an actually signed release, not an unsigned fallback.
+Current consumers require an actually signed exact tag: `v0.5.0`, `v0.4.1` and
+`v0.4.0` are attested, while the historical `v0.3.0` and `v0.1.0` remain
+unsigned and are refused. Follow the [installation trust contract](install.md),
+or build unreleased code from a trusted checkout with `cargo build -p kronik`
+and put `target/debug` on `PATH`. The rest of this journey uses that trusted
+binary or an actually signed release, not an unsigned fallback.
 
 ## 1. Install
 
@@ -22,8 +22,7 @@ Node.js 24 from NodeSource:
 apt-get update && apt-get install -y curl ca-certificates
 curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
 apt-get install -y nodejs
-# Replace VERSION only after that signed release is actually published:
-curl -fsSL "https://github.com/G-man3207/Kronik/releases/download/vVERSION/install.sh" | sh
+curl -fsSL "https://github.com/G-man3207/Kronik/releases/download/v0.5.0/install.sh" | sh
 kronik doctor
 ```
 

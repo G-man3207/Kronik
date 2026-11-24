@@ -1028,8 +1028,8 @@ C allocator (`mimalloc` or `jemalloc`) through `#[global_allocator]` would be
 a new C dependency beyond SQLite and needs a maintainer decision with
 measurements before it ships.
 
-The other lever is Wasmtime's `linear_memory_keep_resident` (default
-[`LINEAR_MEMORY_KEEP_RESIDENT_BYTES`](../crates/kronik-runtime/src/engine.rs),
+The other lever is Wasmtime’s `linear_memory_keep_resident` (default
+`LINEAR_MEMORY_KEEP_RESIDENT_BYTES`,
 2 MiB): less resident memory means less `memset` on the turn path but more
 page faults on replay (see [Memory cost of the resident Wasm
 memories](#memory-cost-of-the-resident-wasm-memories)). Any change must be
