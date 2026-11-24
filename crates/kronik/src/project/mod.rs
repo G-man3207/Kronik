@@ -8,10 +8,10 @@
 //! the deploy allowlist, as `kronik deploy` would. `test-host` (hidden) runs
 //! a project in an in-memory node for the SDKs' testkits.
 
-mod build;
+pub(crate) mod build;
 mod build_sdk;
 mod embed;
-mod init;
+pub(crate) mod init;
 mod testhost;
 
 pub use testhost::TestHostArgs;
@@ -186,18 +186,6 @@ pub fn build(args: BuildArgs, json: bool) -> ExitCode {
 /// `kronik test-host`.
 pub fn test_host(args: TestHostArgs) -> ExitCode {
     report(testhost::run(args), false, |()| {})
-}
-
-/// The schema of `kronik init --json` (docs/reference/json.md).
-#[cfg(test)]
-pub fn init_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    g.subschema_for::<init::Created>()
-}
-
-/// The schema of `kronik build --json` (docs/reference/json.md).
-#[cfg(test)]
-pub fn build_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    g.subschema_for::<build::BuildOutput>()
 }
 
 #[cfg(test)]

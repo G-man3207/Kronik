@@ -69,7 +69,7 @@ pub struct RestoreArgs {
 
 /// What `kronik restore --json` prints.
 #[derive(Debug, Serialize, JsonSchema)]
-struct RestoreOutput {
+pub(crate) struct RestoreOutput {
     dry_run: bool,
     from: String,
     /// Absent when no endpoint was given.
@@ -122,11 +122,6 @@ struct RestoredBlobs {
     /// With `--allow-missing-blobs`: missing from the bucket or failing
     /// their check; the node reads them as BLOB_MISSING.
     missing: Vec<String>,
-}
-
-#[cfg(test)]
-pub fn json_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    g.subschema_for::<RestoreOutput>()
 }
 
 pub fn run(args: RestoreArgs, json: bool) -> ExitCode {

@@ -142,16 +142,10 @@ pub(super) fn foreign(ctx: &Ctx, command: ForeignCommand) -> Result<ExitCode, Er
     }
 }
 
-/// The JSON schema of `kronik foreign cleanup --json`.
-#[cfg(test)]
-pub fn cleanup_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    g.subschema_for::<CleanupOutput>()
-}
-
 /// What `kronik foreign cleanup --json` prints: how many leftovers it
 /// removed, and how many it could not (then it exits 1).
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
-struct CleanupOutput {
+pub(super) struct CleanupOutput {
     sandboxes: u64,
     namespaces: u64,
     configs: u64,

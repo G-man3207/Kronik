@@ -93,7 +93,7 @@ impl KronikUser {
 
 /// What `kronik userns pin|unpin|status --json` prints.
 #[derive(Debug, Serialize, JsonSchema)]
-struct UsernsReport {
+pub(crate) struct UsernsReport {
     /// Where the namespace is pinned: /run/kronik-userns/user.
     path: String,
     /// What `pin` or `unpin` did (with `--dry-run`: would do); absent for
@@ -121,12 +121,6 @@ struct UsernsReport {
     /// Whether the owner and maps are what `user` gives and `setgroups` is
     /// denied (absent when either is unknown).
     matches: Option<bool>,
-}
-
-/// The JSON schema of `kronik userns pin|unpin|status --json`.
-#[cfg(test)]
-pub fn schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    g.subschema_for::<UsernsReport>()
 }
 
 fn rootless(msg: String, hint: &str) -> ApiError {
