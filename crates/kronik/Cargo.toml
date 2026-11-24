@@ -58,6 +58,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # kronik doctor: temporary directories for the namespace and sandbox checks.
 tempfile = { workspace = true }
+# `kronik build` reads back the custom section that records a build's inputs.
+wasmparser = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]

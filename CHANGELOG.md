@@ -5,6 +5,10 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- `kronik build` builds again when the component in `dist/` is damaged
+  before its `kronik-build-input` section, instead of stopping with
+  `BAD_REQUEST` on every build until the file is removed; a section
+  shorter than its own name no longer panics (#325).
 - `kronik secret set` turns the terminal's echo off and back on itself
   instead of running `stty`. A value typed at the prompt is hidden on a
   host without coreutils too (#321).
