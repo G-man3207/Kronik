@@ -45,8 +45,9 @@ rusqlite = { workspace = true }
 # ring, as the gateway, and the system's root certificates.
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
+# termios: `secret set` turns the terminal's echo off itself, without `stty`.
+rustix = { workspace = true, features = ["termios"] }
 # The JSON Schemas of the local commands' --json output (docs/reference/json.md).
-rustix = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -65,6 +66,8 @@ boon = { workspace = true }
 libc = { workspace = true }
 # otel.rs decodes OTLP requests with the vendored types.
 prost = { workspace = true }
+# The echo-off test of `secret set` opens a pseudo-terminal.
+rustix = { workspace = true, features = ["pty"] }
 rcgen = { workspace = true }
 sha2 = { workspace = true }
 # connections.rs: a real WebSocket client (tungstenite's synchronous one).
