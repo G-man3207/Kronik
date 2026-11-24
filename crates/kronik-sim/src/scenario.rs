@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use kronik_core::authority::AuthLease;
 use kronik_core::env::{BoxFuture, Clock, Env};
-use kronik_core::ids::{ActorRef, Lsn};
+use kronik_core::ids::{ActorRef, Lsn, hex};
 use kronik_gateway::{Gateway, GatewayConfig, HttpRequest, HttpResponse};
 use kronik_log::{LogConfig, LogError};
 use kronik_proto::Record;
@@ -2091,10 +2091,6 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
         notes: st.notes.clone(),
         start_failures: st.start_failures.clone(),
     }
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 #[cfg(test)]
