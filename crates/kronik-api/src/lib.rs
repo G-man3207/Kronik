@@ -2097,7 +2097,7 @@ impl Api {
         SecretView {
             name: m.name.clone(),
             version: m.version,
-            version_hash: m.version_hash.iter().map(|b| format!("{b:02x}")).collect(),
+            version_hash: kronik_core::ids::hex(&m.version_hash),
             created_wall_ms: m.created_wall_ms,
         }
     }

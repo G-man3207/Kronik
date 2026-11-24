@@ -132,15 +132,7 @@ pub(crate) fn validate_identity(issuer: &str, subject: &str) -> Result<(), ApiEr
 }
 
 pub(crate) fn principal(hash: &[u8; 32]) -> String {
-    use std::fmt::Write as _;
-    let mut value = String::with_capacity(69);
-    value.push_str("oidc:");
-    for byte in hash {
-        // `fmt::Write for String` is infallible: this cannot fail. (Hygiene
-        // requires no expect() outside test code, so write byte-by-byte.)
-        let _ = write!(&mut value, "{byte:02x}");
-    }
-    value
+    format!("oidc:{}", kronik_core::ids::hex(hash))
 }
 
 fn binding_hash(
