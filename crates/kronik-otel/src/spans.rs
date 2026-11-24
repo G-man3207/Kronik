@@ -54,16 +54,18 @@ fn keyed<const N: usize>(ids: &IdKey, parts: &[&[u8]]) -> [u8; N] {
     digest(blake3::Hasher::new_keyed(&ids.0), parts)
 }
 
+/// Lowercase hex only: ids and state files are written in it, and
+/// `kronik_core::ids::unhex` alone would also take uppercase.
+pub(crate) fn is_lower_hex(s: &str) -> bool {
+    s.bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// `N` bytes from exactly `2N` lowercase hex characters.
-fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
-    if s.len() != 2 * N || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        return None;
-    }
-    let mut out = [0; N];
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
-    }
-    Some(out)
+pub(crate) fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    kronik_core::ids::unhex(s)
+        .filter(|_| is_lower_hex(s))
+        .and_then(|bytes| bytes.try_into().ok())
 }
 
 /// The trace id of a causal root: its 16 bytes, or for a root that is not
