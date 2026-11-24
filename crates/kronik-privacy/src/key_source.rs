@@ -816,12 +816,18 @@ fn operation_deadline(env: &Env, config: &Keys) -> Result<Duration, KeySourceErr
         .saturating_add(config.start_timeout().map_err(KeySourceError::Config)?))
 }
 
-async fn encrypt_retry(
+/// One provider call, tried again with backoff until `deadline`, which also
+/// bounds the preflight. A PKCS#11 answer is final: repeating a refused
+/// request, such as a rejected PIN, can lock the token.
+async fn retry<T, Fut>(
     env: &Env,
     config: &Keys,
-    master: &MasterKey,
     deadline: Duration,
-) -> Result<Wrapped, KeySourceError> {
+    mut op: impl FnMut() -> Fut,
+) -> Result<T, KeySourceError>
+where
+    Fut: Future<Output = Result<T, String>> + Send,
+{
     let left = deadline.saturating_sub(env.clock.monotonic());
     if left.is_zero() {
         return Err(KeySourceError::Unavailable);
@@ -836,17 +842,8 @@ async fn encrypt_retry(
         if left.is_zero() {
             return Err(KeySourceError::Unavailable);
         }
-        match env
-            .timeout(
-                left,
-                providers::encrypt(env, config, master.bytes(), PURPOSE.as_bytes()),
-            )
-            .await
-        {
-            Ok(Ok(w)) => {
-                Wrapped::parse(&w.bytes()?, config)?;
-                return Ok(w);
-            }
+        match env.timeout(left, op()).await {
+            Ok(Ok(value)) => return Ok(value),
             Ok(Err(code)) if config.source == Source::Pkcs11 => {
                 return Err(KeySourceError::Pkcs11(code));
             }
@@ -862,52 +859,37 @@ async fn encrypt_retry(
     }
 }
 
+async fn encrypt_retry(
+    env: &Env,
+    config: &Keys,
+    master: &MasterKey,
+    deadline: Duration,
+) -> Result<Wrapped, KeySourceError> {
+    let wrapped = retry(env, config, deadline, || {
+        providers::encrypt(env, config, master.bytes(), PURPOSE.as_bytes())
+    })
+    .await?;
+    Wrapped::parse(&wrapped.bytes()?, config)?;
+    Ok(wrapped)
+}
+
 async fn unwrap_retry(
     env: &Env,
     config: &Keys,
     wrapped: &Wrapped,
     deadline: Duration,
 ) -> Result<MasterKey, KeySourceError> {
-    let left = deadline.saturating_sub(env.clock.monotonic());
-    if left.is_zero() {
-        return Err(KeySourceError::Unavailable);
+    let mut bytes = retry(env, config, deadline, || {
+        providers::decrypt(env, config, wrapped)
+    })
+    .await?;
+    let mut seed = Zeroizing::new([0u8; 32]);
+    if bytes.len() != seed.len() {
+        return Err(KeySourceError::InvalidEnvelope);
     }
-    env.timeout(left, providers::preflight(env, config))
-        .await
-        .map_err(|_| KeySourceError::Unavailable)?
-        .map_err(KeySourceError::Config)?;
-    let mut delay = Duration::from_millis(100);
-    loop {
-        let left = deadline.saturating_sub(env.clock.monotonic());
-        if left.is_zero() {
-            return Err(KeySourceError::Unavailable);
-        }
-        match env
-            .timeout(left, providers::decrypt(env, config, wrapped))
-            .await
-        {
-            Ok(Ok(mut bytes)) => {
-                let mut seed = Zeroizing::new([0u8; 32]);
-                if bytes.len() != seed.len() {
-                    return Err(KeySourceError::InvalidEnvelope);
-                }
-                seed.copy_from_slice(&bytes);
-                bytes.zeroize();
-                return MasterKey::from_bytes(*seed).map_err(Into::into);
-            }
-            Ok(Err(code)) if config.source == Source::Pkcs11 => {
-                return Err(KeySourceError::Pkcs11(code));
-            }
-            _ if config.source == Source::Pkcs11 => return Err(KeySourceError::Unavailable),
-            _ if env.clock.monotonic() < deadline => {
-                env.clock
-                    .sleep(delay.min(deadline.saturating_sub(env.clock.monotonic())))
-                    .await;
-                delay = (delay * 2).min(Duration::from_secs(5));
-            }
-            _ => return Err(KeySourceError::Unavailable),
-        }
-    }
+    seed.copy_from_slice(&bytes);
+    bytes.zeroize();
+    MasterKey::from_bytes(*seed).map_err(Into::into)
 }
 
 #[cfg(test)]
