@@ -2,9 +2,10 @@ use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use kronik_core::env::{
-    BoxFuture, Clock, File, Fs, HttpRequest, HttpResponse, Net, NetError, OpenMode,
+    BoxFuture, Clock, File, Fs, HttpRequest, HttpResponse, Net, NetError, OpenMode, Process,
+    ProcessRunner, ProcessSpec, SensitiveProcessRequest,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::Poll;
@@ -107,7 +108,10 @@ impl Fs for ReadFs {
     }
 }
 struct Transit {
-    calls: AtomicUsize,
+    /// The clock, in ms, at each request.
+    times: Mutex<Vec<u64>>,
+    /// How many further requests are refused with a transient HTTP error.
+    outage: AtomicUsize,
     seed: std::sync::Mutex<Vec<u8>>,
     clock: Arc<AtomicU64>,
     wrong: bool,
@@ -122,7 +126,18 @@ impl Net for Transit {
         panic!("fixed-cause B1 master fixture must not receive an ordinary secret operation")
     }
     fn http(&self, r: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let now = self.clock.load(Ordering::SeqCst);
+        self.times.lock().unwrap().push(now);
+        if self.outage.load(Ordering::SeqCst) > 0 {
+            self.outage.fetch_sub(1, Ordering::SeqCst);
+            return Box::pin(async move {
+                Ok(HttpResponse {
+                    status: 503,
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+            });
+        }
         let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         let response = if r.url.contains("/encrypt/") {
             *self.seed.lock().unwrap() = STANDARD
@@ -152,6 +167,87 @@ impl Net for Transit {
         })
     }
 }
+impl Transit {
+    fn times(&self) -> Vec<u64> {
+        self.times.lock().unwrap().clone()
+    }
+}
+/// A `kronik-keyhelper` that answers each exchange from the next reply.
+struct Helper(Mutex<VecDeque<Reply>>);
+#[derive(Clone, Copy)]
+enum Reply {
+    Refused(&'static str),
+    Silent,
+}
+impl ProcessRunner for Helper {
+    fn spawn(&self, _: ProcessSpec) -> BoxFuture<'static, std::io::Result<Arc<dyn Process>>> {
+        panic!("loading a key starts no ordinary process")
+    }
+    fn exchange(
+        &self,
+        _: SensitiveProcessRequest,
+    ) -> BoxFuture<'static, std::io::Result<Zeroizing<Vec<u8>>>> {
+        let reply = self.0.lock().unwrap().pop_front().expect("one exchange");
+        Box::pin(async move {
+            match reply {
+                Reply::Refused(code) => Ok(Zeroizing::new(
+                    serde_json::to_vec(&serde_json::json!({
+                        "schema": "kronik.pkcs11/v1", "ok": false, "code": code
+                    }))
+                    .unwrap(),
+                )),
+                Reply::Silent => std::future::pending().await,
+            }
+        })
+    }
+}
+/// A file system whose `open` never answers.
+struct StalledFs;
+impl Fs for StalledFs {
+    fn open(&self, _: PathBuf, _: OpenMode) -> BoxFuture<'static, std::io::Result<Arc<dyn File>>> {
+        Box::pin(std::future::pending())
+    }
+    fn create_dir_all(&self, _: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
+        unreachable!("only open is asked")
+    }
+    fn exists(&self, _: PathBuf) -> BoxFuture<'static, std::io::Result<bool>> {
+        unreachable!("only open is asked")
+    }
+    fn read_dir(&self, _: PathBuf) -> BoxFuture<'static, std::io::Result<Vec<String>>> {
+        unreachable!("only open is asked")
+    }
+    fn rename(&self, _: PathBuf, _: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
+        unreachable!("only open is asked")
+    }
+    fn remove_file(&self, _: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
+        unreachable!("only open is asked")
+    }
+    fn sync_dir(&self, _: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
+        unreachable!("only open is asked")
+    }
+}
+/// A `[keys.pkcs11]` that passes the preflight; the helper is a [`Helper`].
+fn pkcs11() -> Keys {
+    Keys {
+        source: Source::Pkcs11,
+        pkcs11: Some(config::Pkcs11 {
+            helper_path: "/opt/kronik/bin/kronik-keyhelper".into(),
+            module: "/opt/hsm/module.so".into(),
+            module_sha256: "a1".repeat(32),
+            pin_file: "/opt/kronik/private/pin".into(),
+            manufacturer: "Example HSM".into(),
+            model: "AES model".into(),
+            serial: "123456789".into(),
+            key_id: "0001".into(),
+            key_version: "v1".into(),
+            probe: Some(config::Probe {
+                nonce: "ab".repeat(12),
+                ciphertext: "cd".repeat(48),
+            }),
+        }),
+        ..Keys::default()
+    }
+}
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -161,7 +257,8 @@ fn runtime() -> tokio::runtime::Runtime {
 fn setup(runtime: &tokio::runtime::Runtime, wrong: bool, hang: bool) -> (Env, Arc<Transit>, Keys) {
     let now = Arc::new(AtomicU64::new(0));
     let net = Arc::new(Transit {
-        calls: AtomicUsize::new(0),
+        times: Mutex::new(Vec::new()),
+        outage: AtomicUsize::new(0),
         seed: Default::default(),
         clock: now.clone(),
         wrong,
@@ -276,7 +373,7 @@ fn malformed_envelope_is_refused_without_a_provider_request() {
     wrapped.key_version = "1".into();
     wrapped.key = "different/keys/kronik".into();
     assert!(Wrapped::parse(&wrapped.bytes().unwrap(), &cfg).is_err());
-    assert_eq!(net.calls.load(Ordering::SeqCst), 0);
+    assert!(net.times().is_empty());
 }
 #[test]
 fn existing_or_unreadable_store_never_becomes_fresh() {
@@ -293,7 +390,7 @@ fn existing_or_unreadable_store_never_becomes_fresh() {
         rt.block_on(KeySource::load(env, cfg, dir.path(), true)),
         Err(KeySourceError::Key(PrivacyError::KeyMissing(_)))
     ));
-    assert_eq!(net.calls.load(Ordering::SeqCst), 0);
+    assert!(net.times().is_empty());
     // A non-directory path is a metadata I/O error, not evidence of absent stores.
     assert!(encrypted_stores(&dir.path().join("keys/secrets.db/subdir")).is_err());
 }
@@ -349,6 +446,118 @@ fn wrong_key_and_failed_rewrap_preserve_the_existing_envelope() {
         Err(KeySourceError::Key(PrivacyError::KeyMismatch(_)))
     ));
     assert_eq!(std::fs::read(path).unwrap(), old);
+}
+/// The loop behind `encrypt_retry` and `unwrap_retry`: what is retried, when,
+/// and how a run ends. The test clock jumps to the end of every sleep, so the
+/// request times are exact.
+#[test]
+fn a_transient_provider_failure_is_retried_with_backoff_capped_at_5s() {
+    let rt = runtime();
+    let master = MasterKey::from_bytes([7; 32]).unwrap();
+    // 100, 200, 400, 800, 1600 and 3200 ms of backoff, then the 5 s cap.
+    let times = [0, 100, 300, 700, 1500, 3100, 6300, 11300, 16300];
+    let (env, net, mut cfg) = setup(&rt, false, false);
+    cfg.start_timeout = "30s".into();
+    net.outage.store(8, Ordering::SeqCst);
+    let deadline = operation_deadline(&env, &cfg).unwrap();
+    let wrapped = rt
+        .block_on(encrypt_retry(&env, &cfg, &master, deadline))
+        .unwrap();
+    assert_eq!(net.times(), times);
+
+    let (env, net, mut cfg) = setup(&rt, false, false);
+    cfg.start_timeout = "30s".into();
+    net.outage.store(8, Ordering::SeqCst);
+    *net.seed.lock().unwrap() = master.bytes().to_vec();
+    let deadline = operation_deadline(&env, &cfg).unwrap();
+    let key = rt
+        .block_on(unwrap_retry(&env, &cfg, &wrapped, deadline))
+        .unwrap();
+    assert!(key.same_key(&master));
+    assert_eq!(net.times(), times);
+}
+#[test]
+fn no_retry_begins_after_the_deadline_and_the_run_ends_unavailable() {
+    let rt = runtime();
+    let master = MasterKey::from_bytes([7; 32]).unwrap();
+    let (env, net, mut cfg) = setup(&rt, false, false);
+    cfg.start_timeout = "250ms".into();
+    net.outage.store(100, Ordering::SeqCst);
+    let deadline = operation_deadline(&env, &cfg).unwrap();
+    let run = || rt.block_on(encrypt_retry(&env, &cfg, &master, deadline));
+    assert!(matches!(run(), Err(KeySourceError::Unavailable)));
+    // The backoff after the request at 100 ms ends at the deadline, and none
+    // begins there.
+    assert_eq!(net.times(), [0, 100]);
+    assert_eq!(env.clock.monotonic(), Duration::from_millis(250));
+    // A deadline that has passed asks the provider for nothing.
+    assert!(matches!(run(), Err(KeySourceError::Unavailable)));
+    assert_eq!(net.times(), [0, 100]);
+}
+#[test]
+fn a_pkcs11_answer_is_final_and_a_silent_helper_ends_at_the_deadline() {
+    let rt = runtime();
+    let master = MasterKey::from_bytes([7; 32]).unwrap();
+    let cfg = pkcs11();
+    // One reply is queued, so a second exchange fails the test.
+    let run = |reply| {
+        let (mut env, net, _) = setup(&rt, false, false);
+        env.procs = Arc::new(Helper(Mutex::new(vec![reply].into())));
+        let deadline = operation_deadline(&env, &cfg).unwrap();
+        let error = rt
+            .block_on(encrypt_retry(&env, &cfg, &master, deadline))
+            .err()
+            .unwrap();
+        (error, net.clock.load(Ordering::SeqCst))
+    };
+    // A refusal ends the run at once: one exchange, no backoff.
+    assert!(matches!(
+        run(Reply::Refused("pin")),
+        (KeySourceError::Pkcs11(code), 0) if code == "PKCS11_PIN"
+    ));
+    // A helper that stays silent is given all of `start_timeout`, 60 s here.
+    assert!(matches!(
+        run(Reply::Silent),
+        (KeySourceError::Unavailable, 60_000)
+    ));
+}
+#[test]
+fn the_preflight_ends_at_the_deadline_and_refuses_a_bad_helper_configuration() {
+    let rt = runtime();
+    let master = MasterKey::from_bytes([7; 32]).unwrap();
+    // No probe: refused before the helper is asked anything.
+    let (mut env, _, _) = setup(&rt, false, false);
+    let helper = Arc::new(Helper(Mutex::new(vec![Reply::Refused("pin")].into())));
+    env.procs = helper.clone();
+    let mut cfg = pkcs11();
+    cfg.pkcs11.as_mut().unwrap().probe = None;
+    let result = rt.block_on(encrypt_retry(
+        &env,
+        &cfg,
+        &master,
+        operation_deadline(&env, &cfg).unwrap(),
+    ));
+    assert!(matches!(
+        result,
+        Err(KeySourceError::Config(code)) if code == "PKCS11_CONFIG"
+    ));
+    assert_eq!(helper.0.lock().unwrap().len(), 1);
+
+    // A GCP service account read that is still pending at the deadline.
+    let (mut env, _, _) = setup(&rt, false, false);
+    env.fs = Arc::new(StalledFs);
+    let cfg = Keys {
+        source: Source::Gcp,
+        gcp: Some(config::Gcp {
+            service_account_file: Some("/token".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let deadline = operation_deadline(&env, &cfg).unwrap();
+    let result = rt.block_on(encrypt_retry(&env, &cfg, &master, deadline));
+    assert!(matches!(result, Err(KeySourceError::Unavailable)));
+    assert_eq!(env.clock.monotonic(), deadline);
 }
 
 /// Root working in the tree of the nonroot service. The tests play "another
