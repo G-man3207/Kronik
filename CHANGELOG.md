@@ -8,6 +8,10 @@ until the v1.0 compatibility promise takes effect.
 - `kronik secret set` turns the terminal's echo off and back on itself
   instead of running `stty`. A value typed at the prompt is hidden on a
   host without coreutils too (#321).
+- `kronik doctor` reads the free space of the data directory's file system
+  itself instead of parsing `df`'s output. The `disk` check still counts the
+  room an ordinary user has, and it also answers on a host without coreutils
+  (#321).
 - Recording a metric allocates nothing once its label set is in the
   registry, and each metric's series have a lock of their own instead of
   one mutex for them all: every turn, connection frame, log write and
