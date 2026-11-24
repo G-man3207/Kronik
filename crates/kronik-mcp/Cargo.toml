@@ -9,7 +9,6 @@ publish.workspace = true
 [dependencies]
 bytes = { workspace = true }
 http = { workspace = true }
-http-body-util = { workspace = true }
 kronik-api = { workspace = true, features = ["server"] }
 kronik-core = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
