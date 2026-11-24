@@ -399,264 +399,252 @@ mod flow {
         String::from_utf8(res.body).unwrap()
     }
 
-    #[test]
-    fn a_test_plays_the_client() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+    #[tokio::test]
+    async fn a_test_plays_the_client() {
+        let host = host().await;
+        let ada = open(&host, "lobby", "ada").await.unwrap();
+        let welcome = host.frames_sent(&ada, true).unwrap();
+        assert_eq!(welcome.frames.len(), 1, "{welcome:?}");
+        assert!(texts(&welcome)[0].starts_with(r#"{"type":"welcome""#));
+        assert_eq!(
+            host.frames_sent(&ada, false).unwrap(),
+            Sent::default(),
+            "cleared"
+        );
+
+        // A second member: the first gets `joined`.
+        let bob = open(&host, "lobby", "bob").await.unwrap();
+        host.frames_sent(&bob, true).unwrap();
+        assert_eq!(
+            texts(&host.frames_sent(&ada, true).unwrap()),
+            [r#"{"type":"joined","user":"bob"}"#]
+        );
+
+        // A frame's turn broadcasts; the host answers after it settled.
+        host.send_frame(&ada, text_frame("say hi")).await.unwrap();
+        for member in [&ada, &bob] {
+            let sent = host.frames_sent(member, true).unwrap();
+            assert_eq!(sent.frames.len(), 1, "{sent:?}");
+            let (_, frame) = &sent.frames[0];
+            assert_eq!(frame.kind, pb::frame::Kind::Event as i32);
+            assert_eq!(frame.id, "1");
+            assert!(texts(&sent)[0].contains(r#""text":"hi""#), "{sent:?}");
+        }
+
+        // The actor closes: the close is recorded, the other member gets
+        // `left`, and the closed connection takes no more frames.
+        host.send_frame(&bob, text_frame("bye")).await.unwrap();
+        let sent = host.frames_sent(&bob, false).unwrap();
+        assert_eq!(sent.closed, Some((1000, "bye".to_string())));
+        assert_eq!(
+            texts(&host.frames_sent(&ada, true).unwrap()),
+            [r#"{"type":"left","user":"bob"}"#]
+        );
+        let e = host
+            .send_frame(&bob, text_frame("say late"))
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("is closed"), "{e}");
+
+        // The host closes for a restart; a client goes away.
+        host.close_connection(&ada, CloseBy::Host(pb::CloseCause::Restart))
+            .await
             .unwrap();
-        rt.block_on(async {
-            let host = host().await;
-            let ada = open(&host, "lobby", "ada").await.unwrap();
-            let welcome = host.frames_sent(&ada, true).unwrap();
-            assert_eq!(welcome.frames.len(), 1, "{welcome:?}");
-            assert!(texts(&welcome)[0].starts_with(r#"{"type":"welcome""#));
-            assert_eq!(
-                host.frames_sent(&ada, false).unwrap(),
-                Sent::default(),
-                "cleared"
-            );
+        assert_eq!(
+            host.frames_sent(&ada, false).unwrap().closed,
+            Some((1012, "restart".to_string()))
+        );
+        let cy = open(&host, "lobby", "cy").await.unwrap();
+        host.close_connection(&cy, CloseBy::Gone).await.unwrap();
+        let e = host.close_connection(&cy, CloseBy::Gone).await.unwrap_err();
+        assert!(e.to_string().contains("is closed"), "{e}");
 
-            // A second member: the first gets `joined`.
-            let bob = open(&host, "lobby", "bob").await.unwrap();
-            host.frames_sent(&bob, true).unwrap();
-            assert_eq!(
-                texts(&host.frames_sent(&ada, true).unwrap()),
-                [r#"{"type":"joined","user":"bob"}"#]
-            );
-
-            // A frame's turn broadcasts; the host answers after it settled.
-            host.send_frame(&ada, text_frame("say hi")).await.unwrap();
-            for member in [&ada, &bob] {
-                let sent = host.frames_sent(member, true).unwrap();
-                assert_eq!(sent.frames.len(), 1, "{sent:?}");
-                let (_, frame) = &sent.frames[0];
-                assert_eq!(frame.kind, pb::frame::Kind::Event as i32);
-                assert_eq!(frame.id, "1");
-                assert!(texts(&sent)[0].contains(r#""text":"hi""#), "{sent:?}");
-            }
-
-            // The actor closes: the close is recorded, the other member gets
-            // `left`, and the closed connection takes no more frames.
-            host.send_frame(&bob, text_frame("bye")).await.unwrap();
-            let sent = host.frames_sent(&bob, false).unwrap();
-            assert_eq!(sent.closed, Some((1000, "bye".to_string())));
-            assert_eq!(
-                texts(&host.frames_sent(&ada, true).unwrap()),
-                [r#"{"type":"left","user":"bob"}"#]
-            );
-            let e = host
-                .send_frame(&bob, text_frame("say late"))
-                .await
-                .unwrap_err();
-            assert!(e.to_string().contains("is closed"), "{e}");
-
-            // The host closes for a restart; a client goes away.
-            host.close_connection(&ada, CloseBy::Host(pb::CloseCause::Restart))
-                .await
-                .unwrap();
-            assert_eq!(
-                host.frames_sent(&ada, false).unwrap().closed,
-                Some((1012, "restart".to_string()))
-            );
-            let cy = open(&host, "lobby", "cy").await.unwrap();
-            host.close_connection(&cy, CloseBy::Gone).await.unwrap();
-            let e = host.close_connection(&cy, CloseBy::Gone).await.unwrap_err();
-            assert!(e.to_string().contains("is closed"), "{e}");
-
-            // Each close input ran the room's close handler once.
-            let closes = closes(&host).await;
-            for line in [
-                format!("{bob} actor 1000 bye"),
-                format!("{ada} host 1012 restart"),
-                format!("{cy} client 1006 "),
-            ] {
-                assert!(closes.lines().any(|l| l == line), "{line:?} in {closes:?}");
-            }
-            assert_eq!(closes.lines().count(), 3, "{closes:?}");
-            let e = host
-                .frames_sent("c-00000000000000000000000000000000", false)
-                .unwrap_err();
-            assert!(e.to_string().contains("was not opened"), "{e}");
-        });
+        // Each close input ran the room's close handler once.
+        let closes = closes(&host).await;
+        for line in [
+            format!("{bob} actor 1000 bye"),
+            format!("{ada} host 1012 restart"),
+            format!("{cy} client 1006 "),
+        ] {
+            assert!(closes.lines().any(|l| l == line), "{line:?} in {closes:?}");
+        }
+        assert_eq!(closes.lines().count(), 3, "{closes:?}");
+        let e = host
+            .frames_sent("c-00000000000000000000000000000000", false)
+            .unwrap_err();
+        assert!(e.to_string().contains("was not opened"), "{e}");
     }
 
     /// The same through the JSON lines that the testkits send.
-    #[test]
-    fn the_protocol_drives_a_connection() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let host = host().await;
-            let ada = open(&host, "lobby", "ada").await.unwrap();
-            let call = |line: serde_json::Value| {
-                let host = &host;
-                async move {
-                    let out = host.handle_line(&line.to_string()).await;
-                    serde_json::from_str::<serde_json::Value>(&out).unwrap()
-                }
-            };
-            let sent = call(serde_json::json!({ "op": "frames-sent", "connection": ada, "clear": true })).await;
-            assert_eq!(sent["ok"], true, "{sent}");
-            assert_eq!(sent["frames"][0]["seq"], 0);
-            assert_eq!(sent["frames"][0]["kind"], "text");
-            assert!(sent["frames"][0]["body"].as_str().unwrap().starts_with(r#"{"type":"welcome""#));
-            assert_eq!(sent["closed"], serde_json::Value::Null);
+    #[tokio::test]
+    async fn the_protocol_drives_a_connection() {
+        let host = host().await;
+        let ada = open(&host, "lobby", "ada").await.unwrap();
+        let call = |line: serde_json::Value| {
+            let host = &host;
+            async move {
+                let out = host.handle_line(&line.to_string()).await;
+                serde_json::from_str::<serde_json::Value>(&out).unwrap()
+            }
+        };
+        let sent =
+            call(serde_json::json!({ "op": "frames-sent", "connection": ada, "clear": true }))
+                .await;
+        assert_eq!(sent["ok"], true, "{sent}");
+        assert_eq!(sent["frames"][0]["seq"], 0);
+        assert_eq!(sent["frames"][0]["kind"], "text");
+        assert!(
+            sent["frames"][0]["body"]
+                .as_str()
+                .unwrap()
+                .starts_with(r#"{"type":"welcome""#)
+        );
+        assert_eq!(sent["closed"], serde_json::Value::Null);
 
-            let ok = call(serde_json::json!({ "op": "send-frame", "connection": ada, "body_base64": "YmluYXJ5IHJhdw==" })).await;
-            assert_eq!(ok, serde_json::json!({ "ok": true }));
-            let ok = call(serde_json::json!({ "op": "send-frame", "connection": ada, "body": "binary raw" })).await;
-            assert_eq!(ok, serde_json::json!({ "ok": true }));
-            let sent = call(serde_json::json!({ "op": "frames-sent", "connection": ada })).await;
-            // The room reads a binary frame's bytes as a command too: both
-            // `binary raw` frames echo `raw` as a binary frame.
-            assert_eq!(
-                sent["frames"],
-                serde_json::json!([
-                    { "seq": 1, "kind": "binary", "body_base64": "cmF3" },
-                    { "seq": 2, "kind": "binary", "body_base64": "cmF3" },
-                ])
-            );
+        let ok = call(serde_json::json!({ "op": "send-frame", "connection": ada, "body_base64": "YmluYXJ5IHJhdw==" })).await;
+        assert_eq!(ok, serde_json::json!({ "ok": true }));
+        let ok = call(
+            serde_json::json!({ "op": "send-frame", "connection": ada, "body": "binary raw" }),
+        )
+        .await;
+        assert_eq!(ok, serde_json::json!({ "ok": true }));
+        let sent = call(serde_json::json!({ "op": "frames-sent", "connection": ada })).await;
+        // The room reads a binary frame's bytes as a command too: both
+        // `binary raw` frames echo `raw` as a binary frame.
+        assert_eq!(
+            sent["frames"],
+            serde_json::json!([
+                { "seq": 1, "kind": "binary", "body_base64": "cmF3" },
+                { "seq": 2, "kind": "binary", "body_base64": "cmF3" },
+            ])
+        );
 
-            let bad = call(serde_json::json!({ "op": "close-connection", "connection": ada, "initiator": "client", "code": 1005 })).await;
-            assert_eq!(bad["ok"], false, "{bad}");
-            let ok = call(serde_json::json!({ "op": "close-connection", "connection": ada, "initiator": "client", "code": 4001, "reason": "done" })).await;
-            assert_eq!(ok, serde_json::json!({ "ok": true }));
-            let closes = closes(&host).await;
-            assert_eq!(closes.trim_end(), format!("{ada} client 4001 done"));
-            let late = call(serde_json::json!({ "op": "send-frame", "connection": ada, "body": "say late" })).await;
-            assert_eq!(late["ok"], false, "{late}");
-        });
+        let bad = call(serde_json::json!({ "op": "close-connection", "connection": ada, "initiator": "client", "code": 1005 })).await;
+        assert_eq!(bad["ok"], false, "{bad}");
+        let ok = call(serde_json::json!({ "op": "close-connection", "connection": ada, "initiator": "client", "code": 4001, "reason": "done" })).await;
+        assert_eq!(ok, serde_json::json!({ "ok": true }));
+        let closes = closes(&host).await;
+        assert_eq!(closes.trim_end(), format!("{ada} client 4001 done"));
+        let late =
+            call(serde_json::json!({ "op": "send-frame", "connection": ada, "body": "say late" }))
+                .await;
+        assert_eq!(late["ok"], false, "{late}");
     }
 
     /// What the gateway answers: a refusal, a bad handshake, an event
     /// stream, and the protocol's `open-connection`.
-    #[test]
-    fn opens_go_through_the_gateway() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+    #[tokio::test]
+    async fn opens_go_through_the_gateway() {
+        let host = host().await;
+        let refused = host
+            .open_connection("/room/lobby/ws?user=ada&deny=1", Vec::new(), "websocket")
+            .await
             .unwrap();
-        rt.block_on(async {
-            let host = host().await;
-            let refused = host
-                .open_connection("/room/lobby/ws?user=ada&deny=1", Vec::new(), "websocket")
-                .await
-                .unwrap();
-            assert_eq!((refused.response.status, refused.connection), (403, None));
-            let bad = host
-                .open_connection(
-                    "/room/lobby/ws?user=ada",
-                    vec![("sec-websocket-version".into(), "12".into())],
-                    "websocket",
-                )
-                .await
-                .unwrap();
-            assert_eq!((bad.response.status, bad.connection), (400, None));
-            let e = host
-                .open_connection("/room/lobby/ws", Vec::new(), "carrier-pigeon")
-                .await
-                .unwrap_err();
-            assert!(e.to_string().contains("unknown protocol"), "{e}");
+        assert_eq!((refused.response.status, refused.connection), (403, None));
+        let bad = host
+            .open_connection(
+                "/room/lobby/ws?user=ada",
+                vec![("sec-websocket-version".into(), "12".into())],
+                "websocket",
+            )
+            .await
+            .unwrap();
+        assert_eq!((bad.response.status, bad.connection), (400, None));
+        let e = host
+            .open_connection("/room/lobby/ws", Vec::new(), "carrier-pigeon")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("unknown protocol"), "{e}");
 
-            // An event stream gets the messages after its Last-Event-ID.
-            let ada = open(&host, "lobby", "ada").await.unwrap();
-            for text in ["one", "two", "three"] {
-                host.send_frame(&ada, text_frame(&format!("say {text}")))
-                    .await
-                    .unwrap();
-            }
-            let stream = host
-                .open_connection(
-                    "/room/lobby/events",
-                    vec![("last-event-id".into(), "1".into())],
-                    "sse",
-                )
+        // An event stream gets the messages after its Last-Event-ID.
+        let ada = open(&host, "lobby", "ada").await.unwrap();
+        for text in ["one", "two", "three"] {
+            host.send_frame(&ada, text_frame(&format!("say {text}")))
                 .await
                 .unwrap();
-            assert_eq!(stream.response.status, 200, "{stream:?}");
-            assert_eq!(stream.protocol, Some(pb::ConnectionProtocol::Sse));
-            let follower = stream.connection.unwrap();
-            let sent = host.frames_sent(&follower, true).unwrap();
-            assert_eq!(
-                sent.frames
-                    .iter()
-                    .map(|(_, f)| f.id.as_str())
-                    .collect::<Vec<_>>(),
-                ["2", "3"]
-            );
+        }
+        let stream = host
+            .open_connection(
+                "/room/lobby/events",
+                vec![("last-event-id".into(), "1".into())],
+                "sse",
+            )
+            .await
+            .unwrap();
+        assert_eq!(stream.response.status, 200, "{stream:?}");
+        assert_eq!(stream.protocol, Some(pb::ConnectionProtocol::Sse));
+        let follower = stream.connection.unwrap();
+        let sent = host.frames_sent(&follower, true).unwrap();
+        assert_eq!(
+            sent.frames
+                .iter()
+                .map(|(_, f)| f.id.as_str())
+                .collect::<Vec<_>>(),
+            ["2", "3"]
+        );
 
-            let line = serde_json::json!({ "op": "open-connection", "path": "/room/lobby/ws?user=bob", "headers": [["sec-websocket-protocol", "x, room.v1"]] });
-            let out: serde_json::Value =
-                serde_json::from_str(&host.handle_line(&line.to_string()).await).unwrap();
-            assert_eq!(out["ok"], true, "{out}");
-            assert_eq!(out["status"], 101);
-            let bob = out["connection"].as_str().unwrap().to_string();
-            assert!(kronik_proto::connection::valid_id(&bob), "{bob}");
-            let headers = out["headers"].as_array().unwrap();
-            assert!(
-                headers.contains(&serde_json::json!(["sec-websocket-protocol", "room.v1"])),
-                "the room selects room.v1: {headers:?}"
-            );
-            assert!(out["turn"].as_str().is_some(), "{out}");
-            assert!(
-                host.frames_sent(&bob, false).unwrap().frames.len() == 1,
-                "the welcome"
-            );
-        });
+        let line = serde_json::json!({ "op": "open-connection", "path": "/room/lobby/ws?user=bob", "headers": [["sec-websocket-protocol", "x, room.v1"]] });
+        let out: serde_json::Value =
+            serde_json::from_str(&host.handle_line(&line.to_string()).await).unwrap();
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["status"], 101);
+        let bob = out["connection"].as_str().unwrap().to_string();
+        assert!(kronik_proto::connection::valid_id(&bob), "{bob}");
+        let headers = out["headers"].as_array().unwrap();
+        assert!(
+            headers.contains(&serde_json::json!(["sec-websocket-protocol", "room.v1"])),
+            "the room selects room.v1: {headers:?}"
+        );
+        assert!(out["turn"].as_str().is_some(), "{out}");
+        assert!(
+            host.frames_sent(&bob, false).unwrap().frames.len() == 1,
+            "the welcome"
+        );
     }
 
     /// #248: the guest, the 101 and turn JSON share one split of
     /// `Sec-WebSocket-Protocol`. A leading empty piece, surrounding spaces
     /// and a bearer token must not move the value the actor accepted.
-    #[test]
-    fn offered_subprotocols_agree_in_the_guest_the_101_and_turn_json() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+    #[tokio::test]
+    async fn offered_subprotocols_agree_in_the_guest_the_101_and_turn_json() {
+        let host = host().await;
+        const TOKEN: &str = "bearer.tok-secret";
+        let header = format!(" , {TOKEN} ,  room.v1 , ");
+        let answer = host
+            .open_connection(
+                "/room/lobby/ws?user=ada",
+                vec![("sec-websocket-protocol".into(), header)],
+                "websocket",
+            )
+            .await
             .unwrap();
-        rt.block_on(async {
-            let host = host().await;
-            const TOKEN: &str = "bearer.tok-secret";
-            let header = format!(" , {TOKEN} ,  room.v1 , ");
-            let answer = host
-                .open_connection(
-                    "/room/lobby/ws?user=ada",
-                    vec![("sec-websocket-protocol".into(), header)],
-                    "websocket",
-                )
-                .await
-                .unwrap();
-            assert_eq!(answer.response.status, 101, "{answer:?}");
-            let selected = answer
-                .response
-                .headers
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case("sec-websocket-protocol"))
-                .map(|(_, v)| v.as_str());
-            // The room selects `room.v1` by name. Index 1 means the leading
-            // empty piece was dropped; anything else here is the token.
-            assert_eq!(selected, Some("room.v1"), "{answer:?}");
-            let turn = answer
-                .response
-                .headers
-                .iter()
-                .find(|(n, _)| n == kronik_gateway::TURN_ID_HEADER)
-                .map(|(_, v)| v.clone())
-                .unwrap();
-            let res = host
-                .api("GET", &format!("/v1/turns/{turn}"), "", Vec::new())
-                .await;
-            assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
-            let t: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
-            assert_eq!(t["output"]["accept"]["subprotocol_index"], 1, "{t}");
-            assert_eq!(t["output"]["accept"]["subprotocol"], "room.v1", "{t}");
-            assert!(
-                t["input"]["request"].to_string().contains(TOKEN),
-                "the token was offered: {t}"
-            );
-        });
+        assert_eq!(answer.response.status, 101, "{answer:?}");
+        let selected = answer
+            .response
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("sec-websocket-protocol"))
+            .map(|(_, v)| v.as_str());
+        // The room selects `room.v1` by name. Index 1 means the leading
+        // empty piece was dropped; anything else here is the token.
+        assert_eq!(selected, Some("room.v1"), "{answer:?}");
+        let turn = answer
+            .response
+            .headers
+            .iter()
+            .find(|(n, _)| n == kronik_gateway::TURN_ID_HEADER)
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        let res = host
+            .api("GET", &format!("/v1/turns/{turn}"), "", Vec::new())
+            .await;
+        assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+        let t: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
+        assert_eq!(t["output"]["accept"]["subprotocol_index"], 1, "{t}");
+        assert_eq!(t["output"]["accept"]["subprotocol"], "room.v1", "{t}");
+        assert!(
+            t["input"]["request"].to_string().contains(TOKEN),
+            "the token was offered: {t}"
+        );
     }
 }
