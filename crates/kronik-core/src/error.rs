@@ -596,6 +596,21 @@ mod tests {
         assert!(serde_json::from_value::<ErrorCode>(json!(404)).is_err());
     }
 
+    /// Reading JSON names the code it does not know, and reads a code that
+    /// arrives escaped: an escaped string cannot be borrowed.
+    #[test]
+    fn a_reader_names_an_unknown_code_and_reads_an_escaped_one() {
+        let err = serde_json::from_value::<ErrorCode>(json!("NO_SUCH_CODE"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("unknown variant `NO_SUCH_CODE`, expected one of `ACTOR_NOT_FOUND`"),
+            "{err}"
+        );
+        let code: ErrorCode = serde_json::from_str(r#""ACTOR\u005fNOT_FOUND""#).unwrap();
+        assert_eq!(code, ErrorCode::ActorNotFound);
+    }
+
     #[test]
     fn every_code_has_a_status_milestone_title_hint_and_explanation() {
         const MILESTONES: [&str; 17] = [
@@ -619,17 +634,14 @@ mod tests {
             "billing is not allowed to call payments.internal",
         )
         .with_hint("kronik grant billing http:payments.internal --reason '...'");
-        let v = serde_json::to_value(&e).unwrap();
-        assert_eq!(
-            v,
-            json!({"error": {
-                "code": "CAPABILITY_NOT_GRANTED",
-                "message": "billing is not allowed to call payments.internal",
-                "hint": "kronik grant billing http:payments.internal --reason '...'",
-                "docs": "kronik explain CAPABILITY_NOT_GRANTED",
-            }})
-        );
-        assert_eq!(e.to_json(), v);
+        let expected = json!({"error": {
+            "code": "CAPABILITY_NOT_GRANTED",
+            "message": "billing is not allowed to call payments.internal",
+            "hint": "kronik grant billing http:payments.internal --reason '...'",
+            "docs": "kronik explain CAPABILITY_NOT_GRANTED",
+        }});
+        assert_eq!(serde_json::to_value(&e).unwrap(), expected);
+        assert_eq!(e.to_json(), expected);
     }
 
     #[test]
