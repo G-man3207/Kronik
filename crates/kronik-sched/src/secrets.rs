@@ -1350,9 +1350,9 @@ impl SecretRuntime {
         let stamp = self.cache.read_stamp(scope)?;
         let result = if scope.backend == "file" {
             self.file_source
-                .version(
+                .fetch(
                     &scope.reference,
-                    version.ok_or(BackendError::Invalid)?,
+                    Some(version.ok_or(BackendError::Invalid)?),
                     original.clone(),
                 )
                 .await
@@ -1362,20 +1362,10 @@ impl SecretRuntime {
             let result = self
                 .env
                 .timeout(self.settings.fetch_timeout, async {
-                    match version {
-                        Some(version) => {
-                            source
-                                .client
-                                .version(&scope.reference, version, original.clone())
-                                .await
-                        }
-                        None => {
-                            source
-                                .client
-                                .current(&scope.reference, original.clone())
-                                .await
-                        }
-                    }
+                    source
+                        .client
+                        .fetch(&scope.reference, version, original.clone())
+                        .await
                 })
                 .await
                 .unwrap_or(Err(BackendError::Unavailable));
@@ -2597,7 +2587,7 @@ impl Node {
                     .env
                     .timeout(
                         runtime.settings.fetch_timeout,
-                        source.client.current(&reference, auth.clone()),
+                        source.client.fetch(&reference, None, auth.clone()),
                     )
                     .await
                     .unwrap_or(Err(BackendError::Unavailable));

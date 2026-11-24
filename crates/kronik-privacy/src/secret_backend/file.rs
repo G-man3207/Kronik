@@ -75,9 +75,10 @@ pub fn source_highwater(
     Ok(high)
 }
 impl SecretBackend for FileBackend {
-    fn current<'a>(
+    fn fetch<'a>(
         &'a self,
         path: &'a str,
+        id: Option<&'a str>,
         original: AuthLease,
     ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
         Box::pin(async move {
@@ -85,45 +86,24 @@ impl SecretBackend for FileBackend {
             if !valid_name(path) {
                 return Err(BackendError::Invalid);
             }
+            let version = id.map(version).transpose()?;
             let store = self.store.clone();
             let path = path.to_owned();
             let result = self
                 .env
-                .blocking("secret-current", move || {
-                    store
-                        .current(&path)
-                        .map_err(error)?
+                .blocking("secret-fetch", move || {
+                    let read = match version {
+                        Some(version) => store.version(&path, version),
+                        None => store.current(&path),
+                    };
+                    let missing = if version.is_some() {
+                        BackendError::VersionGone
+                    } else {
+                        BackendError::NotFound
+                    };
+                    read.map_err(error)?
                         .map(|value| fetched(path, value))
-                        .ok_or(BackendError::NotFound)
-                })
-                .await
-                .ok_or(BackendError::Unavailable)?;
-            original.check().map_err(|_| BackendError::Unauthorized)?;
-            result
-        })
-    }
-    fn version<'a>(
-        &'a self,
-        path: &'a str,
-        id: &'a str,
-        original: AuthLease,
-    ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
-        Box::pin(async move {
-            original.check().map_err(|_| BackendError::Unauthorized)?;
-            if !valid_name(path) {
-                return Err(BackendError::Invalid);
-            }
-            let version = version(id)?;
-            let store = self.store.clone();
-            let path = path.to_owned();
-            let result = self
-                .env
-                .blocking("secret-version", move || {
-                    store
-                        .version(&path, version)
-                        .map_err(error)?
-                        .map(|value| fetched(path, value))
-                        .ok_or(BackendError::VersionGone)
+                        .ok_or(missing)
                 })
                 .await
                 .ok_or(BackendError::Unavailable)?;

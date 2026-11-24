@@ -373,11 +373,13 @@ pub struct Fetched { pub value: Zeroizing<Vec<u8>>, pub source_version: String }
 pub enum BackendError { Unavailable(String), NotFound, VersionGone, Denied(String), Invalid(String) }
 ```
 
-As built, the trait has a third method, `versions` (the retained catalogue of a
-path, one page at a time), every method takes the caller's original lease, and
-`Fetched` also returns the canonical reference of what it read. `BackendError`
-carries no message and has one more variant, `Unauthorized` (the original
-authority ended).
+As built, `current` and `version` are one method, `fetch`: its `version`
+argument names a retained version by the backend's own id, and `None` asks
+for the current value. The trait also has a third method, `versions` (the
+retained catalogue of a path, one page at a time), every method takes the
+caller's original lease, and `Fetched` also returns the canonical reference of
+what it read. `BackendError` carries no message and has one more variant,
+`Unauthorized` (the original authority ended).
 
 The built-in store is the `file` backend. It keeps its own write path
 (`secret set`, `secret delete`), which no other backend has: Kronik never
@@ -577,7 +579,7 @@ The third criterion: "Rotation of a secret shows up as a new version in
   never the current one: crash recovery of a reveal, and an effect that must
   be re-sent.
   1. `secret_versions` gives the `source_version`.
-  2. `SecretBackend::version` fetches that version.
+  2. `SecretBackend::fetch` with that version fetches it.
   3. The hash is checked against the recorded `version_hash`; a mismatch is
      `VersionGone`.
 - **A recorded outcome is never changed** (I1). A reveal (or a

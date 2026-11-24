@@ -197,20 +197,13 @@ impl Secrets {
 }
 
 impl SecretBackend for Secrets {
-    fn current<'a>(
+    fn fetch<'a>(
         &'a self,
         path: &'a str,
+        version: Option<&'a str>,
         original: AuthLease,
     ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
-        Box::pin(async move { self.access(path, None, &original).await })
-    }
-    fn version<'a>(
-        &'a self,
-        path: &'a str,
-        id: &'a str,
-        original: AuthLease,
-    ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
-        Box::pin(async move { self.access(path, Some(id), &original).await })
+        Box::pin(async move { self.access(path, version, &original).await })
     }
     fn versions<'a>(
         &'a self,
