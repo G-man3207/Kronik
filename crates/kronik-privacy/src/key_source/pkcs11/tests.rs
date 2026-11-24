@@ -204,7 +204,7 @@ fn stable_helper_failures_never_contain_response_data() {
 
 #[test]
 fn seed_decode_is_exact_and_zeroizing() {
-    let encoded = encode_hex(&[0xa5; 32]);
+    let encoded = Zeroizing::new(crate::hex(&[0xa5; 32]));
     let decoded = decode_seed(&encoded).unwrap();
     assert_eq!(decoded.as_slice(), &[0xa5; 32]);
     for invalid in [
