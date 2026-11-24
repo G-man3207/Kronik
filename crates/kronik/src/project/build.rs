@@ -644,6 +644,20 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_custom_section_does_not_count() {
+        // A component whose core module carries the section too.
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+        append_custom_section(&mut module, INPUT_SECTION, b"nested");
+        let mut bytes = b"\0asm\x0d\x00\x01\x00".to_vec();
+        bytes.push(1); // the core module section
+        leb128(module.len(), &mut bytes);
+        bytes.extend_from_slice(&module);
+        assert_eq!(custom_section(&bytes, INPUT_SECTION), None);
+        append_custom_section(&mut bytes, INPUT_SECTION, b"top");
+        assert_eq!(custom_section(&bytes, INPUT_SECTION), Some(b"top".to_vec()));
+    }
+
+    #[test]
     fn the_world_follows_the_sdks_wit() {
         let dir = tempfile::tempdir().unwrap();
         let wit = dir.path().join("kronik-actor.wit");
