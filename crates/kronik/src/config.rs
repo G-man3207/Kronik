@@ -128,7 +128,7 @@ impl Default for Connections {
 pub struct Blobs {
     /// Below this much free disk no new blob is written: a multiple of
     /// `[log] disk_reserve` (`"2x"`) or a size.
-    pub disk_reserve: BlobReserve,
+    pub disk_reserve: DiskThreshold,
     /// How long a lease lives without renewal.
     pub lease_ttl: Dur,
     /// The collector's pass, besides the one after every retention pass;
@@ -139,7 +139,7 @@ pub struct Blobs {
 impl Default for Blobs {
     fn default() -> Self {
         Blobs {
-            disk_reserve: BlobReserve::Times(2),
+            disk_reserve: DiskThreshold::Times(2),
             lease_ttl: Dur::secs(300),
             gc_interval: Dur::secs(3600),
         }
@@ -218,32 +218,39 @@ impl std::str::FromStr for Rate {
 impl Blobs {
     /// `disk_reserve` in bytes.
     pub fn disk_reserve_bytes(&self, log_disk_reserve: u64) -> u64 {
-        match self.disk_reserve {
-            BlobReserve::Times(n) => log_disk_reserve.saturating_mul(n),
-            BlobReserve::Bytes(b) => b,
-        }
+        self.disk_reserve.bytes(log_disk_reserve)
     }
 }
 
-/// `[blobs] disk_reserve`: a multiple of `[log] disk_reserve` (`"2x"`) or a
-/// size (`"2GiB"`).
+/// `[blobs] disk_reserve` and `[audit] hold_release`: a multiple of
+/// `[log] disk_reserve` (`"2x"`) or a size (`"2GiB"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlobReserve {
+pub enum DiskThreshold {
     Times(u64),
     Bytes(u64),
 }
 
-impl std::str::FromStr for BlobReserve {
+impl DiskThreshold {
+    /// In bytes, given `[log] disk_reserve`.
+    pub fn bytes(self, log_disk_reserve: u64) -> u64 {
+        match self {
+            DiskThreshold::Times(n) => log_disk_reserve.saturating_mul(n),
+            DiskThreshold::Bytes(b) => b,
+        }
+    }
+}
+
+impl std::str::FromStr for DiskThreshold {
     type Err = String;
 
-    fn from_str(s: &str) -> Result<BlobReserve, String> {
+    fn from_str(s: &str) -> Result<DiskThreshold, String> {
         match s.trim().strip_suffix('x') {
-            Some(n) => n.parse().map(BlobReserve::Times).map_err(|_| {
+            Some(n) => n.parse().map(DiskThreshold::Times).map_err(|_| {
                 format!(
-                    "invalid [blobs] disk_reserve {s:?}: use a multiple such as \"2x\" or a size"
+                    "invalid {s:?}: use a multiple of [log] disk_reserve such as \"2x\", or a size"
                 )
             }),
-            None => s.parse::<Size>().map(|b| BlobReserve::Bytes(b.0)),
+            None => s.parse::<Size>().map(|b| DiskThreshold::Bytes(b.0)),
         }
     }
 }
@@ -688,7 +695,7 @@ pub struct Audit {
     pub max_hold: Dur,
     /// Retention ignores the hold below this much free disk: `"2x"` (of
     /// `[log] disk_reserve`) or a size.
-    pub hold_release: HoldRelease,
+    pub hold_release: DiskThreshold,
 }
 
 impl Default for Audit {
@@ -702,7 +709,7 @@ impl Default for Audit {
             headers_env: None,
             from: AuditFrom::Start,
             max_hold: Dur::secs(0),
-            hold_release: HoldRelease::Times(2),
+            hold_release: DiskThreshold::Times(2),
         }
     }
 }
@@ -780,10 +787,7 @@ impl Audit {
 
     /// `hold_release` in bytes.
     pub fn hold_release_bytes(&self, disk_reserve: u64) -> u64 {
-        match self.hold_release {
-            HoldRelease::Times(n) => disk_reserve.saturating_mul(n),
-            HoldRelease::Bytes(b) => b,
-        }
+        self.hold_release.bytes(disk_reserve)
     }
 }
 
@@ -792,27 +796,6 @@ impl Audit {
 pub enum AuditFrom {
     Start,
     Now,
-}
-
-/// `[audit] hold_release`: a multiple of `[log] disk_reserve` (`"2x"`) or a
-/// size (`"1GiB"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HoldRelease {
-    Times(u64),
-    Bytes(u64),
-}
-
-impl std::str::FromStr for HoldRelease {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<HoldRelease, String> {
-        match s.trim().strip_suffix('x') {
-            Some(n) => n.parse().map(HoldRelease::Times).map_err(|_| {
-                format!("invalid hold_release {s:?}: use a multiple such as \"2x\" or a size")
-            }),
-            None => s.parse::<Size>().map(|b| HoldRelease::Bytes(b.0)),
-        }
-    }
 }
 
 impl Otel {
@@ -998,7 +981,7 @@ macro_rules! from_string {
     )*};
 }
 
-from_string!(Dur, Size, Percent, HoldRelease, Rate, BlobReserve);
+from_string!(Dur, Size, Percent, DiskThreshold, Rate);
 
 /// A file that can't be used: where, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1656,7 +1639,13 @@ gc_interval = "1h"
         assert_eq!(set.blobs.lease_ttl, Dur::secs(60));
         let sized = parse("[blobs]\ndisk_reserve = \"2GiB\"\n").unwrap();
         assert_eq!(sized.blobs.disk_reserve_bytes(1), 2 << 30);
-        assert!(parse("[blobs]\ndisk_reserve = \"zx\"\n").is_err());
+        let bad = parse("[blobs]\ndisk_reserve = \"zx\"\n").unwrap_err();
+        assert!(
+            bad.message.contains(
+                "invalid \"zx\": use a multiple of [log] disk_reserve such as \"2x\", or a size"
+            ),
+            "{bad}"
+        );
         assert!(parse("[blobs]\nunknown = 1\n").is_err());
         assert!(parse("[blobs]\nenabled = true\n").is_err());
     }
@@ -1980,6 +1969,10 @@ gc_interval = "1h"
                 "s3:// sink only",
             ),
             ("[audit]\nhold_release = \"2y\"\n", "invalid size"),
+            (
+                "[audit]\nhold_release = \"zx\"\n",
+                "use a multiple of [log] disk_reserve",
+            ),
             ("[audit]\nfrom = \"later\"\n", "unknown variant"),
         ] {
             let e = parse(text).unwrap_err();
