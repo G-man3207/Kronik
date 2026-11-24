@@ -253,59 +253,9 @@ when = "diff.resources.fuel_p99_change > 0.5"
 action = "deny"
 "#;
 
-/// [`DEFAULT_RULES_TOML`] as data; a test checks that the two agree.
-const DEFAULT_RULES: [(&str, &str, Action); 6] = [
-    ("no-new-errors", "diff.errors.introduced > 0", Action::Deny),
-    (
-        "no-new-orphans",
-        "diff.errors.new_orphans > 0",
-        Action::RequireApproval,
-    ),
-    (
-        "low-grounding-needs-approval",
-        "diff.summary.confidence < 0.9",
-        Action::RequireApproval,
-    ),
-    (
-        "payments-must-be-exact",
-        "diff.grounding.exists(t, t.host.endsWith('payments.internal') && t.approximate + t.synthetic > 0)",
-        Action::RequireApproval,
-    ),
-    (
-        "payments-full-coverage",
-        "diff.summary.sample < 1.0 && diff.grounding.exists(t, t.host.endsWith('payments.internal'))",
-        Action::Deny,
-    ),
-    (
-        "fuel-regression",
-        "diff.resources.fuel_p99_change > 0.5",
-        Action::Deny,
-    ),
-];
-
-static DEFAULTS: LazyLock<RuleSet> = LazyLock::new(|| {
-    let rules: Vec<Rule> = DEFAULT_RULES
-        .iter()
-        .map(|&(name, when, action)| Rule {
-            name: name.to_owned(),
-            when: when.to_owned(),
-            action,
-        })
-        .collect();
-    // Tested to compile. A rule that did not would be compiled again, and
-    // fail, at every evaluation: it would fire, never be skipped.
-    let compiled = rules
-        .iter()
-        .filter_map(|rule| Some((rule.when.clone(), Arc::new(Expr::compile(&rule.when).ok()?))))
-        .collect();
-    RuleSet {
-        rules,
-        guards: Vec::new(),
-        has_guard_key: false,
-        compiled,
-        compiled_guards: Vec::new(),
-    }
-});
+/// [`DEFAULT_RULES_TOML`] parsed; a test checks that it parses.
+static DEFAULTS: LazyLock<RuleSet> =
+    LazyLock::new(|| RuleSet::parse_toml(DEFAULT_RULES_TOML).unwrap_or_else(|_| RuleSet::empty()));
 
 /// The guards `kronik watch` uses while the policy has no `guard` key: a
 /// rollback when the error rate rises by more than 5 points with at least
