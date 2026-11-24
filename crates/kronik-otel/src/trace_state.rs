@@ -24,16 +24,9 @@ const FORMAT: &str = "kronik.trace-state/v1";
 const MAX_FRAME_BYTES: usize = kronik_log::MAX_RECORD as usize;
 const MAX_SELECTED_BYTES: u64 = HEADER + 2 * (FRAME_HEADER + MAX_FRAME_BYTES as u64);
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("trace metadata exceeds the log record byte budget")]
 struct LimitExceeded;
-
-impl std::fmt::Display for LimitExceeded {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("trace metadata exceeds the log record byte budget")
-    }
-}
-
-impl std::error::Error for LimitExceeded {}
 
 fn limit_error() -> io::Error {
     io::Error::new(io::ErrorKind::FileTooLarge, LimitExceeded)
@@ -180,6 +173,8 @@ struct Candidate {
     snapshot_bytes: u64,
 }
 
+// Hand-written: `Arc<io::Error>` is an `Error` itself, so `thiserror`'s derive
+// would answer `source()` with the `Arc`, not with the I/O error it holds.
 #[derive(Clone, Debug)]
 struct Failure {
     source: Arc<io::Error>,
