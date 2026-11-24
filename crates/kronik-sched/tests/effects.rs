@@ -1215,10 +1215,10 @@ fn secrets_never_leak_without_reveal() {
     p.grant("secret:api-key", None, None);
     // HMAC on the host matches a local computation.
     let r = p.send("counter/a", msg("hmac", "api-key\nhello"));
-    let want: String = kronik_effects::crypto::hmac_sha256(SECRET.as_bytes(), b"hello")
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let want = kronik_core::ids::hex(&kronik_effects::crypto::hmac_sha256(
+        SECRET.as_bytes(),
+        b"hello",
+    ));
     assert_eq!(reply(&r), want);
     // Without secret-reveal, every exfiltration path comes back empty.
     let r = p.send(

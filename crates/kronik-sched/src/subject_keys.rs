@@ -8,7 +8,7 @@ use std::sync::Arc;
 /// accepted key state. The sealer receives data, never a minting capability.
 pub struct SubjectKeyPlan {
     authority: AuthLease,
-    native: Option<(Arc<PreparedSubjectKey>, SessionLease)>,
+    native: (Arc<PreparedSubjectKey>, SessionLease),
 }
 
 impl SubjectKeyPlan {
@@ -19,7 +19,7 @@ impl SubjectKeyPlan {
     ) -> Self {
         Self {
             authority,
-            native: Some((prepared, original)),
+            native: (prepared, original),
         }
     }
 
@@ -27,12 +27,7 @@ impl SubjectKeyPlan {
         self,
         original: &SessionLease,
     ) -> Result<(Arc<PreparedSubjectKey>, AuthLease), ApiError> {
-        let (prepared, bound) = self.native.ok_or_else(|| {
-            ApiError::new(
-                ErrorCode::Unavailable,
-                "this identity plan has no native prepared-key binding",
-            )
-        })?;
+        let (prepared, bound) = self.native;
         if !Arc::ptr_eq(&bound, original) {
             return Err(ApiError::new(
                 ErrorCode::Unauthenticated,

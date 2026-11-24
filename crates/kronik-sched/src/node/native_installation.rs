@@ -69,17 +69,7 @@ mod tests {
             "../../../kronik-proto/tests/fixtures/control-fleet-pending-v1.json"
         ))
         .unwrap();
-        let bytes = |field: &str| {
-            value[field]
-                .as_str()
-                .unwrap()
-                .as_bytes()
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-                .collect()
-        };
+        let bytes = |field: &str| kronik_core::ids::unhex(value[field].as_str().unwrap()).unwrap();
         pb::FleetState {
             installation: value["installation"].as_str().unwrap().into(),
             node: None,

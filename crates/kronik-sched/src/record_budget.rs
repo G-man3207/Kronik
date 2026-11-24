@@ -371,10 +371,6 @@ impl Budget {
         Budget { limit, used: base }
     }
 
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-
     /// What is left.
     pub fn remaining(&self) -> usize {
         self.limit.saturating_sub(self.used)
@@ -487,10 +483,6 @@ impl EffectBytes {
     /// A turn of an actor type whose `effect_bytes_per_turn` is `limit`.
     pub fn new(limit: u64) -> EffectBytes {
         EffectBytes { limit, used: 0 }
-    }
-
-    pub fn limit(&self) -> u64 {
-        self.limit
     }
 
     /// What is left.

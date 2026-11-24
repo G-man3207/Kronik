@@ -685,11 +685,7 @@ impl Node {
         }
         let tmp = root.join(format!(
             ".tmp-{}",
-            self.env
-                .random_bytes::<8>()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
+            kronik_core::ids::hex(&self.env.random_bytes::<8>())
         ));
         let (manifest, bytes) = match self.write_snapshot(&storage, &branch, &tmp, reason) {
             Ok(done) => done,
