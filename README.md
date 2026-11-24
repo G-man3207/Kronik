@@ -36,10 +36,10 @@ answering as it did, and the result is a behavior diff: what would answer
 differently, what would change, and what it would cost.
 
 The idea in full, told from the beginning for readers who do not want to start
-with the code, is at [kronik.se](https://www.kronik.se/). Kronik is for the
-agents that write and change software at machine pace, the people who review
-their work without time to read all the code, and small teams that want safe
-deploys on a VPS without Kubernetes.
+with the code, is at [demo.kronik.se](https://demo.kronik.se/). Kronik is for
+the agents that write and change software at machine pace, the people who
+review their work without time to read all the code, and small teams that want
+safe deploys on a VPS without Kubernetes.
 
 ## How it works
 
