@@ -1101,6 +1101,18 @@ mod tests {
         assert_eq!(writer.bytes.capacity(), capacity);
     }
 
+    #[test]
+    fn sync_error_shows_its_cause_and_keeps_it_as_the_source() {
+        let error = sync_error(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "read-only file system",
+        ));
+        assert_eq!(error.to_string(), "read-only file system");
+        let source = std::error::Error::source(error.get_ref().unwrap()).unwrap();
+        assert_eq!(source.to_string(), "read-only file system");
+        assert!(source.is::<io::Error>());
+    }
+
     struct FaultFs {
         inner: Arc<dyn Fs>,
         fail: Arc<AtomicU8>,
