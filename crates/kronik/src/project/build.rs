@@ -25,6 +25,7 @@ use kronik_runtime::KRONIK_VERSION;
 use kronik_runtime::allowlist;
 use schemars::JsonSchema;
 use serde::Serialize;
+use wasmparser::{Parser, Payload};
 
 use super::Failure;
 
@@ -579,19 +580,6 @@ fn leb128(mut n: usize, out: &mut Vec<u8>) {
     }
 }
 
-fn read_leb128(bytes: &[u8], pos: &mut usize) -> Option<usize> {
-    let mut n = 0usize;
-    for shift in (0..35).step_by(7) {
-        let byte = *bytes.get(*pos)?;
-        *pos += 1;
-        n |= usize::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some(n);
-        }
-    }
-    None
-}
-
 /// Appends a custom section (id 0) to a component or module.
 pub(super) fn append_custom_section(bytes: &mut Vec<u8>, name: &str, payload: &[u8]) {
     let mut body = Vec::new();
@@ -603,23 +591,21 @@ pub(super) fn append_custom_section(bytes: &mut Vec<u8>, name: &str, payload: &[
     bytes.extend_from_slice(&body);
 }
 
-/// The payload of the top-level custom section `name`, if there is one.
+/// The payload of the top-level custom section `name`, if there is one;
+/// `None` when wasmparser cannot read the file.
 pub(super) fn custom_section(bytes: &[u8], name: &str) -> Option<Vec<u8>> {
-    let mut pos = 8; // magic and version
-    while pos < bytes.len() {
-        let id = bytes[pos];
-        pos += 1;
-        let size = read_leb128(bytes, &mut pos)?;
-        let end = pos.checked_add(size).filter(|&e| e <= bytes.len())?;
-        if id == 0 {
-            let mut p = pos;
-            let len = read_leb128(bytes, &mut p)?;
-            let section_name = bytes.get(p..p.checked_add(len)?)?;
-            if section_name == name.as_bytes() {
-                return Some(bytes[p + len..end].to_vec());
+    // Only the outer component's sections count: the core modules nested
+    // in it have their own, which `parse_all` yields too.
+    let mut depth = 0usize;
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload.ok()? {
+            Payload::Version { .. } => depth += 1,
+            Payload::End(_) => depth = depth.saturating_sub(1),
+            Payload::CustomSection(section) if depth == 1 && section.name() == name => {
+                return Some(section.data().to_vec());
             }
+            _ => {}
         }
-        pos = end;
     }
     None
 }
@@ -641,6 +627,25 @@ mod tests {
             custom_section(&bytes[..bytes.len() - 1], INPUT_SECTION),
             None
         );
+        // A section that declares fewer bytes than its own name.
+        let mut short = b"\0asm\x0d\x00\x01\x00".to_vec();
+        append_custom_section(&mut short, INPUT_SECTION, b"x");
+        short[9] = 5; // its size, where its name alone needs 18
+        assert_eq!(custom_section(&short, INPUT_SECTION), None);
+    }
+
+    #[test]
+    fn a_nested_custom_section_does_not_count() {
+        // A component whose core module carries the section too.
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+        append_custom_section(&mut module, INPUT_SECTION, b"nested");
+        let mut bytes = b"\0asm\x0d\x00\x01\x00".to_vec();
+        bytes.push(1); // the core module section
+        leb128(module.len(), &mut bytes);
+        bytes.extend_from_slice(&module);
+        assert_eq!(custom_section(&bytes, INPUT_SECTION), None);
+        append_custom_section(&mut bytes, INPUT_SECTION, b"top");
+        assert_eq!(custom_section(&bytes, INPUT_SECTION), Some(b"top".to_vec()));
     }
 
     #[test]
