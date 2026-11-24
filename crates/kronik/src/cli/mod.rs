@@ -421,15 +421,6 @@ enum InForks {
     Recorded,
 }
 
-impl InForks {
-    fn as_str(self) -> &'static str {
-        match self {
-            InForks::Compute => "compute",
-            InForks::Recorded => "recorded",
-        }
-    }
-}
-
 /// How a target tolerates retries: the delivery class of an `http:` grant.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum Delivery {
@@ -439,16 +430,6 @@ pub enum Delivery {
     IdempotencyKeyed,
     /// Neither: after a crash the request is not repeated.
     Unsafe,
-}
-
-impl Delivery {
-    fn as_str(self) -> &'static str {
-        match self {
-            Delivery::ReplaySafe => "replay-safe",
-            Delivery::IdempotencyKeyed => "idempotency-keyed",
-            Delivery::Unsafe => "unsafe",
-        }
-    }
 }
 
 #[derive(Debug, Args)]
@@ -1178,6 +1159,14 @@ fn read_file(path: &Path, what: &str) -> Result<Vec<u8>, Error> {
     })
 }
 
+/// A `value_enum` flag's value as the API and a rerun command spell it:
+/// the variant's kebab-case name, as clap derives it.
+fn arg_value<E: clap::ValueEnum>(e: E) -> String {
+    e.to_possible_value()
+        .map(|v| v.get_name().to_owned())
+        .unwrap_or_default()
+}
+
 /// `?k=v&…` with the given values, encoded; empty without any.
 fn query(pairs: &[(&str, Option<String>)]) -> String {
     let mut out = String::new();
@@ -1452,14 +1441,7 @@ fn connections_list(
     after: Option<String>,
     limit: Option<u32>,
 ) -> Result<ExitCode, Error> {
-    let state = state.map(|s| {
-        match s {
-            ConnectionStateArg::Open => "open",
-            ConnectionStateArg::Closed => "closed",
-            ConnectionStateArg::All => "all",
-        }
-        .to_owned()
-    });
+    let state = state.map(arg_value);
     let body = ctx.get(&format!(
         "/v1/connections{}",
         query(&[
@@ -1604,9 +1586,9 @@ fn grant(ctx: &Ctx, a: GrantArgs) -> Result<ExitCode, Error> {
         &GrantRequest {
             kind: a.kind.clone(),
             capability: a.capability.clone(),
-            delivery: a.delivery.map(|d| d.as_str().to_owned()),
+            delivery: a.delivery.map(arg_value),
             rate: a.rate.clone(),
-            in_forks: Some(a.in_forks.as_str().to_owned()),
+            in_forks: Some(arg_value(a.in_forks)),
             reason: reason.to_owned(),
             dry_run: a.mutation.dry_run,
         },
@@ -1622,7 +1604,7 @@ fn grant(ctx: &Ctx, a: GrantArgs) -> Result<ExitCode, Error> {
         shell_quote(&a.capability)
     );
     if let Some(d) = a.delivery {
-        rerun.push_str(&format!(" --delivery {}", d.as_str()));
+        rerun.push_str(&format!(" --delivery {}", arg_value(d)));
     }
     if let Some(rate) = &a.rate {
         rerun.push_str(&format!(" --rate {}", shell_quote(rate)));
@@ -2229,6 +2211,31 @@ mod tests {
             ]),
             "?source=actor-native&after=a%20b%26c%3Dd"
         );
+    }
+
+    /// #320: a `value_enum` flag reaches the API and the rerun command as
+    /// the kebab-case name clap derives from its variant, for every
+    /// variant of the six enums.
+    #[test]
+    fn value_enum_flags_send_the_names_clap_derives() {
+        fn names<E: clap::ValueEnum>() -> Vec<String> {
+            E::value_variants()
+                .iter()
+                .map(|v| arg_value(v.clone()))
+                .collect()
+        }
+        assert_eq!(names::<InForks>(), ["compute", "recorded"]);
+        assert_eq!(
+            names::<Delivery>(),
+            ["replay-safe", "idempotency-keyed", "unsafe"]
+        );
+        assert_eq!(names::<ConnectionStateArg>(), ["open", "closed", "all"]);
+        assert_eq!(names::<fork::Mode>(), ["isolated", "continuous", "both"]);
+        assert_eq!(
+            names::<foreign::Isolation>(),
+            ["gvisor", "trusted", "microvm"]
+        );
+        assert_eq!(names::<foreign::ForkMode>(), ["recorded", "sandbox"]);
     }
 
     /// A file at the repository root, such as docs/reference/cli.md.
