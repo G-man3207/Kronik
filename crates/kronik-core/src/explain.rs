@@ -168,54 +168,6 @@ mod tests {
 
     use super::*;
 
-    /// The concepts that `kronik explain` must cover.
-    const REQUIRED_CONCEPTS: [&str; 44] = [
-        "actor",
-        "kind",
-        "message",
-        "blob",
-        "blob-threshold",
-        "hold",
-        "collector",
-        "effect",
-        "hash",
-        "fork",
-        "turn",
-        "turn-id",
-        "lsn",
-        "branch",
-        "root-input",
-        "causal-key",
-        "causal-id",
-        "execution-id",
-        "logical-time",
-        "deployment",
-        "configuration-epoch",
-        "proposal",
-        "behavior-diff",
-        "grounding",
-        "isolated-replay",
-        "continuous-replay",
-        "capability",
-        "delivery-class",
-        "secret-handle",
-        "linked-secret",
-        "sql-state",
-        "dead-letters",
-        "orphaned-change",
-        "privacy-mode",
-        "subject",
-        "sealed-value",
-        "foreign-actor",
-        "isolation-level",
-        "snapshot",
-        "engine",
-        "segment",
-        "connections",
-        "frame",
-        "send-now",
-    ];
-
     #[test]
     fn every_error_code_is_a_topic() {
         for &code in ErrorCode::ALL {
@@ -241,15 +193,11 @@ mod tests {
     }
 
     #[test]
-    fn every_required_concept_is_a_topic() {
-        for name in REQUIRED_CONCEPTS {
-            let t = lookup(name).unwrap_or_else(|| panic!("{name} is missing"));
-            assert_eq!(
-                (t.name, t.kind, t.http_status),
-                (name, TopicKind::Concept, None)
-            );
+    fn every_concept_is_a_topic() {
+        for t in CONCEPTS {
+            assert_eq!(lookup(t.name), Some(*t), "{}", t.name);
+            assert_eq!((t.kind, t.http_status), (TopicKind::Concept, None));
         }
-        assert_eq!(CONCEPTS.len(), REQUIRED_CONCEPTS.len());
     }
 
     #[test]

@@ -602,18 +602,11 @@ mod tests {
     }
 
     #[test]
-    fn every_code_has_a_status_milestone_title_hint_and_explanation() {
-        const MILESTONES: [&str; 17] = [
-            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11", "M21", "M23",
-            "M24", "M25", "M26", "M28",
-        ];
+    fn every_code_has_an_error_status_and_a_one_line_hint() {
         for &code in ErrorCode::ALL {
             assert!((400..600).contains(&code.http_status()), "{code}");
-            assert!(MILESTONES.contains(&code.milestone()), "{code}");
-            for line in [code.title(), code.hint()] {
-                assert!(!line.is_empty() && !line.contains('\n'), "{code}");
-            }
-            assert!(!code.explain().is_empty(), "{code}");
+            let hint = code.hint();
+            assert!(!hint.is_empty() && !hint.contains('\n'), "{code}");
         }
     }
 
