@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OpenFlags};
-use rustix::fs::{AtFlags, FileType};
 
 use super::Keystore;
 use super::ffi::{FileIdentity, file_identity};
@@ -104,25 +103,18 @@ impl OwnedStore {
     }
 
     fn check(&self) -> Result<(), PrivacyError> {
-        self.owner.check_location()?;
-        self.owner
-            .check_directory(&self.relative, &self.directory)?;
-        let named = rustix::fs::statat(
-            self.directory.as_ref(),
+        if self.owner.holds_file(
+            &self.relative,
+            &self.directory,
             "keystore.db",
-            AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(|source| self.owner.io(source.into()))?;
-        if FileType::from_raw_mode(named.st_mode) != FileType::RegularFile
-            || named.st_dev as u64 != self.identity.device
-            || named.st_ino as u64 != self.identity.inode
-        {
-            return Err(PublicationError::FileIdentity(
-                "the opened keystore no longer matches its held directory entry",
-            )
-            .into());
+            self.identity,
+        )? {
+            return Ok(());
         }
-        Ok(())
+        Err(PublicationError::FileIdentity(
+            "the opened keystore no longer matches its held directory entry",
+        )
+        .into())
     }
 }
 
