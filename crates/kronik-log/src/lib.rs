@@ -1490,6 +1490,34 @@ impl LogReader {
         read_file(&self.env, self.dir.join(segment_name(start))).await
     }
 
+    /// The validated header of the segment that starts at `start`.
+    fn segment_header(&self, image: &[u8], start: Lsn, path: &Path) -> Result<Header, LogError> {
+        let header = parse_header(image)
+            .ok_or_else(|| corrupt(format!("segment {} has no valid header", path.display())))?;
+        if header.start_lsn != start || header.branch != self.branch {
+            return Err(corrupt(format!(
+                "segment {} header mismatch",
+                path.display()
+            )));
+        }
+        Ok(header)
+    }
+
+    /// Opens the segment that starts at `start` and takes its length and header.
+    async fn open_segment(
+        &self,
+        start: Lsn,
+    ) -> Result<(PathBuf, Arc<dyn File>, u64, Header), LogError> {
+        // The native writer has one configured namespace. Never allocate a
+        // header buffer from an untrusted on-disk branch length.
+        let path = self.dir.join(segment_name(start));
+        let file = self.env.fs.open(path.clone(), OpenMode::Read).await?;
+        let length = file.len().await?;
+        let image = file.read_at(0, 24 + self.branch.len()).await?;
+        let header = self.segment_header(&image, start, &path)?;
+        Ok((path, file, length, header))
+    }
+
     /// Calls `f` for every record with `from <= lsn <= upto`, in LSN order.
     pub async fn read(
         &self,
@@ -1511,15 +1539,7 @@ impl LogReader {
             }
             let path = self.dir.join(segment_name(start));
             let image = read_file(&self.env, path.clone()).await?;
-            let header = parse_header(&image).ok_or_else(|| {
-                corrupt(format!("segment {} has no valid header", path.display()))
-            })?;
-            if header.start_lsn != start || header.branch != self.branch {
-                return Err(corrupt(format!(
-                    "segment {} header mismatch",
-                    path.display()
-                )));
-            }
+            let header = self.segment_header(&image, start, &path)?;
             if let Some(exp) = expected
                 && exp != start
             {
@@ -1589,19 +1609,7 @@ impl LogReader {
             if start > upto {
                 break;
             }
-            let path = self.dir.join(segment_name(start));
-            let file = self.env.fs.open(path.clone(), OpenMode::Read).await?;
-            let length = file.len().await?;
-            let image = file.read_at(0, 24 + self.branch.len()).await?;
-            let header = parse_header(&image).ok_or_else(|| {
-                corrupt(format!("segment {} has no valid header", path.display()))
-            })?;
-            if header.start_lsn != start || header.branch != self.branch {
-                return Err(corrupt(format!(
-                    "segment {} header mismatch",
-                    path.display()
-                )));
-            }
+            let (path, file, length, header) = self.open_segment(start).await?;
             let progress = readset::read_segment(
                 file.as_ref(),
                 length,

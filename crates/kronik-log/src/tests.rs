@@ -600,6 +600,78 @@ async fn bounded_reads_preserve_segment_boundaries_and_reject_damaged_frames() {
     ));
 }
 
+/// `read`, `read_while` and `capture_readset` share the segment open and
+/// header check, so a damaged header reads the same through all three.
+#[tokio::test]
+async fn every_segment_reader_reports_the_same_header_errors() {
+    let h = harness();
+    std::fs::create_dir_all(&h.cfg.dir).unwrap();
+    let path = h.cfg.dir.join(segment_name(10));
+    let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
+
+    std::fs::write(&path, b"not a segment header").unwrap();
+    let no_header = format!(
+        "STORAGE_CORRUPT: segment {} has no valid header",
+        path.display()
+    );
+    assert_eq!(
+        reader
+            .read(10, 10, |_| Ok(()))
+            .await
+            .unwrap_err()
+            .to_string(),
+        no_header
+    );
+    assert_eq!(
+        reader
+            .read_while(10, 10, |_| Ok(true))
+            .await
+            .unwrap_err()
+            .to_string(),
+        no_header
+    );
+    assert_eq!(
+        reader
+            .capture_readset(10, 10)
+            .await
+            .err()
+            .unwrap()
+            .to_string(),
+        no_header
+    );
+
+    std::fs::write(&path, header_bytes("main", 11)).unwrap();
+    let mismatch = format!(
+        "STORAGE_CORRUPT: segment {} header mismatch",
+        path.display()
+    );
+    assert_eq!(
+        reader
+            .read(10, 10, |_| Ok(()))
+            .await
+            .unwrap_err()
+            .to_string(),
+        mismatch
+    );
+    assert_eq!(
+        reader
+            .read_while(10, 10, |_| Ok(true))
+            .await
+            .unwrap_err()
+            .to_string(),
+        mismatch
+    );
+    assert_eq!(
+        reader
+            .capture_readset(10, 10)
+            .await
+            .err()
+            .unwrap()
+            .to_string(),
+        mismatch
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn lsn_strictly_increases_across_all_record_kinds() {
     let h = harness();
