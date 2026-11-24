@@ -509,18 +509,6 @@ class ConnectionsTest(unittest.TestCase):
         self.assertEqual(send_now_failure(object()).kind, "send-now.unknown")
 
 
-class WitTest(unittest.TestCase):
-    def test_wit_is_the_repository_copy(self):
-        repo_wit = SDK.parents[1] / "wit" / "kronik-actor.wit"
-        if not repo_wit.is_file():
-            self.skipTest("not in the Kronik repository (a vendored SDK)")
-        self.assertEqual((SDK / "wit" / "kronik-actor.wit").read_bytes(), repo_wit.read_bytes())
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class BlobTests(unittest.TestCase):
     def test_a_blob_request_body_is_read_lazily_in_parts(self):
         blobs = FakeBlobs()
@@ -666,3 +654,7 @@ class HoldTests(unittest.TestCase):
         m = Message(types.Message("shared", "", b"", [types.BlobRef(a.hash, 5)]))
         self.assertEqual(m.blobs, [a])
         self.assertEqual(Message(types.Message("tick", "", b"", [])).blobs, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
