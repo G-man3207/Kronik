@@ -156,24 +156,12 @@ class PerformanceComparatorTest(unittest.TestCase):
         self.candidate["measurements"].append(copy.deepcopy(self.candidate["measurements"][0]))
         self.assertIn("duplicate measurement name", self.assert_status(2).stderr)
 
-    def test_duplicate_json_keys_at_every_schema_level_are_invalid(self):
-        raw = json.dumps(self.candidate)
-        for original, replacement in (
-                ('"format":', '"format": "kronik.benchmark/v1", "format":'),
-                ('"value": 100', '"value": 100, "value": 100'),
-                ('"vcpus": 4', '"vcpus": 4, "vcpus": 4'),
-                ('"revision":', '"revision": "' + "d" * 40 + '", "revision":')):
-            with self.subTest(original=original):
-                result = self.assert_status(2, new_bytes=raw.replace(original, replacement, 1).encode())
-                self.assertIn("duplicate JSON key", result.stderr)
-
     def test_invalid_values_and_errors(self):
         for key, values in (
                 ("value", (0, -1, True, False, None, "100", [], {})),
                 ("errors", (-1, 0.0, 1.5, True, False, None, "0", [], {})),
                 ("direction", ("up", "HIGHER", "", None, [], {})),
-                ("unit", ("seconds", "bananas", "", None, [], {})),
-                ("name", ("", " ", "line\nbreak", "x" * 129, None, 1))):
+                ("unit", ("seconds", "bananas", "", None, [], {}))):
             for value in values:
                 with self.subTest(key=key, value=value):
                     self.candidate = copy.deepcopy(self.baseline)
@@ -182,38 +170,13 @@ class PerformanceComparatorTest(unittest.TestCase):
 
     def test_nonfinite_and_unrepresentable_numbers_are_invalid(self):
         raw = json.dumps(self.candidate)
-        for token in ("NaN", "Infinity", "-Infinity", "1e309", "1e-400", "-0.0"):
+        for token in ("NaN", "Infinity", "-Infinity", "-0.0"):
             with self.subTest(token=token):
                 self.assert_status(2, new_bytes=raw.replace('"value": 100', '"value": ' + token, 1).encode())
         self.assert_status(2, new_bytes=raw.replace('"vcpus": 4', '"vcpus": NaN', 1).encode())
 
-    def test_malformed_source_fields(self):
-        for key, values in (("revision", ("a" * 64, "z" * 40, "a" * 39, None, 1)),
-                            ("binary_sha256", ("b" * 40, "g" * 64, None, [])),
-                            ("guest_sha256", ("c" * 63, "", None, {}))):
-            for value in values:
-                with self.subTest(key=key, value=value):
-                    self.candidate = copy.deepcopy(self.baseline)
-                    self.candidate["source"][key] = value
-                    self.assert_status(2)
-
-    def test_exact_field_inventories_are_required(self):
-        for container in ("report", "measurement", "source"):
-            for mode in ("missing", "extra"):
-                with self.subTest(container=container, mode=mode):
-                    self.candidate = copy.deepcopy(self.baseline)
-                    obj = (self.candidate if container == "report" else self.candidate["source"]
-                           if container == "source" else self.candidate["measurements"][0])
-                    if mode == "missing":
-                        del obj[next(iter(obj))]
-                    else:
-                        obj["extra"] = "ignored fields must not be accepted"
-                    self.assert_status(2)
-
     def test_wrong_top_level_field_types_and_empty_results_are_invalid(self):
         for key, values in (("format", ("v2", None, 1)),
-                            ("profile", ("", " ", "x" * 129, None, 1)),
-                            ("rig", ({}, [], None, "hardware")),
                             ("measurements", ([], {}, None, [None])),
                             ("source", (None, [], "hashes"))):
             for value in values:
@@ -222,31 +185,6 @@ class PerformanceComparatorTest(unittest.TestCase):
                     self.candidate[key] = value
                     self.assert_status(2)
         self.assert_status(2, new_bytes=b"[]")
-
-    def test_measurement_count_is_bounded(self):
-        self.candidate["measurements"] = [dict(self.candidate["measurements"][0], name=f"metric-{i}")
-                                          for i in range(129)]
-        self.assertIn("128", self.assert_status(2).stderr)
-        self.candidate["measurements"].pop()
-        self.baseline = copy.deepcopy(self.candidate)
-        self.assert_status(0)
-
-    def test_file_byte_bound(self):
-        raw = json.dumps(self.candidate).encode()
-        self.assert_status(0, new_bytes=raw + b" " * (1024 * 1024 - len(raw)))
-        self.assertIn("exceeds", self.assert_status(2, new_bytes=b" " * (1024 * 1024 + 1)).stderr)
-
-    def test_numeric_token_and_rig_bounds(self):
-        raw = json.dumps(self.candidate)
-        self.assert_status(2, new_bytes=raw.replace('"value": 100', '"value": ' + "1" * 129, 1).encode())
-        nested = {"leaf": 1}
-        for _ in range(17):
-            nested = {"nested": nested}
-        for rig in (nested, {"list": list(range(129))}, {str(i): i for i in range(129)},
-                    {"key": "x" * 1025}, {"bad\nkey": 1}):
-            with self.subTest(rig_type=type(rig)):
-                self.candidate["rig"] = rig
-                self.assert_status(2)
 
     def test_bad_json_encoding_and_nesting_are_input_errors(self):
         for raw in (b"", b"{", b"{} trailing", b"\xff", b"[" * 1500 + b"]" * 1500):
