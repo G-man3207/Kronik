@@ -216,12 +216,6 @@ pub fn refs(record: &Record) -> Vec<&pb::BlobRef> {
     out
 }
 
-/// Calls `f` for every reference of `record` outside sealed payloads.
-#[cfg(test)]
-fn for_each(record: &Record, f: &mut dyn FnMut(&pb::BlobRef)) {
-    refs(record).into_iter().for_each(f);
-}
-
 /// Validates every reference of `record`: each is well formed, every
 /// reference operation names a blob, and one identity has one size, subject
 /// and key version throughout the record.
@@ -403,9 +397,6 @@ mod tests {
         let record = Record::TurnRecord(turn_with_every_reference());
         let sizes: Vec<u64> = refs(&record).iter().map(|r| r.size).collect();
         assert_eq!(sizes, [1, 2, 3, 4, 5, 6, 7]);
-        let mut visited = Vec::new();
-        for_each(&record, &mut |r| visited.push(r.size));
-        assert_eq!(visited, sizes);
         // The mutable walk visits the same references in the same order.
         let mut t = turn_with_every_reference();
         let mut changed = Vec::new();

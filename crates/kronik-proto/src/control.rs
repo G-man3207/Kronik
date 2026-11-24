@@ -54,30 +54,8 @@ pub fn fleet_token_name(epoch: u64, request: &[u8]) -> Result<String, DecodeErro
     let mut name = String::with_capacity(59);
     std::fmt::Write::write_fmt(&mut name, format_args!("fleet-{epoch}-"))
         .map_err(|_| invalid("FleetToken.name"))?;
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in &request[..16] {
-        name.push(HEX[(byte >> 4) as usize] as char);
-        name.push(HEX[(byte & 15) as usize] as char);
-    }
+    name.push_str(&hex(&request[..16]));
     Ok(name)
-}
-
-/// Validate a public managed name without allocating or treating it as provenance.
-#[cfg(test)]
-fn fleet_token_name_matches(name: &str, epoch: u64, request: &[u8]) -> bool {
-    if epoch == 0 || request.len() != 32 || name.len() > 59 {
-        return false;
-    }
-    let Some(name) = name.strip_prefix("fleet-") else {
-        return false;
-    };
-    let Some((number, suffix)) = name.split_once('-') else {
-        return false;
-    };
-    !number.starts_with('0')
-        && number.bytes().all(|byte| byte.is_ascii_digit())
-        && number.parse::<u64>() == Ok(epoch)
-        && matches_hex(suffix, &request[..16])
 }
 
 #[cfg(test)]
@@ -91,33 +69,11 @@ mod native_managed_name_tests {
             let name = fleet_token_name(epoch, &request).unwrap();
             assert_eq!(name, format!("fleet-{epoch}-{}", "ab".repeat(16)));
             assert!(name.len() <= 59);
-            assert!(fleet_token_name_matches(&name, epoch, &request));
-            assert!(!fleet_token_name_matches(&name, epoch, &[0xcd; 32]));
-            assert!(!fleet_token_name_matches(
-                &name.to_uppercase(),
-                epoch,
-                &request
-            ));
         }
         assert!(fleet_token_name(0, &request).is_err());
         for request in [&[][..], &[0; 31][..], &[0; 33][..]] {
             assert!(fleet_token_name(1, request).is_err());
-            assert!(!fleet_token_name_matches("fleet-1-ab", 1, request));
         }
-        let name = fleet_token_name(1, &request).unwrap();
-        assert!(!fleet_token_name_matches(&name, 0, &request));
-        assert!(!fleet_token_name_matches(&name, 2, &request));
-        assert!(!fleet_token_name_matches(
-            &name.replacen("fleet-1-", "fleet-01-", 1),
-            1,
-            &request
-        ));
-        assert!(!fleet_token_name_matches(
-            &name.replacen("fleet-1-", "fleet-+1-", 1),
-            1,
-            &request
-        ));
-        assert!(!fleet_token_name_matches(&(name + "0"), 1, &request));
     }
 }
 
@@ -229,7 +185,7 @@ pub fn validate_fleet_plan(
     Ok(())
 }
 
-fn request_hex(request: &[u8]) -> String {
+fn hex(request: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut text = String::with_capacity(request.len() * 2);
     for byte in request {
@@ -337,7 +293,7 @@ pub fn validate_fleet_state(state: &pb::FleetState) -> Result<(), DecodeError> {
         }
         let binding = format!(
             "urn:kronik:fleet:request:{}:{}",
-            request_hex(&state.request_id),
+            hex(&state.request_id),
             state.epoch
         );
         let alternative = cert
@@ -935,14 +891,7 @@ mod tests {
             Operation::InstallationIdentity(_) => "system:installation".into(),
             Operation::AuthSessionRevoked(pb::AuthSessionRevoked { principal_hash, .. })
             | Operation::AuthOidcLogin(pb::AuthOidcLogin { principal_hash, .. }) => {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                let mut identity = String::with_capacity(69);
-                identity.push_str("oidc:");
-                for byte in principal_hash {
-                    identity.push(HEX[(byte >> 4) as usize] as char);
-                    identity.push(HEX[(byte & 15) as usize] as char);
-                }
-                identity
+                format!("oidc:{}", hex(principal_hash))
             }
             _ => "token:operator".into(),
         };
