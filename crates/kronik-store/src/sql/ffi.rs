@@ -1064,19 +1064,3 @@ pub(crate) fn arm_cow_vfs(name: &str) -> Result<(), String> {
     }
     Ok(())
 }
-
-/// Bytes of `conn`'s main database, including a WAL a raw file read would miss.
-pub(crate) fn serialize_main(conn: &Connection) -> Result<Vec<u8>, String> {
-    // SAFETY: `handle` is the connection's live db; serialize's buffer is
-    // freed with `sqlite3_free` before we return.
-    unsafe {
-        let mut size: ffi::sqlite3_int64 = 0;
-        let ptr = ffi::sqlite3_serialize(conn.handle(), c"main".as_ptr(), &mut size, 0);
-        if ptr.is_null() || size < 0 {
-            return Err("sqlite3_serialize failed".into());
-        }
-        let bytes = std::slice::from_raw_parts(ptr, size as usize).to_vec();
-        ffi::sqlite3_free(ptr.cast());
-        Ok(bytes)
-    }
-}

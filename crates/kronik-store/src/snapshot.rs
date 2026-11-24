@@ -785,7 +785,9 @@ fn consistent_image(path: &Path) -> Result<Vec<u8>, StoreError> {
             .run_to_completion(64, std::time::Duration::ZERO, None)
             .map_err(sqlite)?;
     }
-    crate::sql::serialize_main(&mem).map_err(StoreError::Corrupt)
+    mem.serialize(MAIN_DB)
+        .map_err(sqlite)
+        .map(|data| data.to_vec())
 }
 
 fn actor_names(state_db: &Path) -> Result<Vec<String>, StoreError> {
