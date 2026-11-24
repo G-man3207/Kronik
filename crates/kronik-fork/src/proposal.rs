@@ -93,7 +93,7 @@ pub struct Promoted {
 }
 
 /// The persisted proposal (`branches/<id>/proposal.json`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Proposal {
     pub id: String,
     pub fork: String,
@@ -1281,21 +1281,12 @@ impl Proposals {
             fork_lsn: p.fork_lsn,
             created_lsn: p.head,
             verified_through_lsn: p.fork_lsn,
-            diff_hash: String::new(),
-            policy: Value::Null,
-            summary: Value::Null,
-            sampled: None,
             options: p.options.clone(),
             kinds: p.kinds.iter().map(encode_kind).collect(),
             reason: p.reason.clone(),
-            approved: None,
-            promoted: None,
-            plain_fork: false,
             unchanged: p.unchanged.iter().map(encode_kind).collect(),
             window_cut: p.window_cut.clone(),
-            error: None,
-            preview: None,
-            rebase: None,
+            ..Default::default()
         };
         let details: BTreeMap<String, String> = [
             (
@@ -1586,14 +1577,9 @@ impl Proposals {
             options: p.options.clone(),
             kinds: p.kinds.iter().map(encode_kind).collect(),
             reason: p.reason.clone(),
-            approved: None,
-            promoted: None,
-            plain_fork: false,
             unchanged: p.unchanged.iter().map(encode_kind).collect(),
             window_cut: p.window_cut.clone(),
-            error: None,
-            preview: None,
-            rebase: None,
+            ..Default::default()
         };
         if dry_run {
             return Ok(meta);
@@ -2300,24 +2286,13 @@ impl Proposals {
                 fork_lsn,
                 created_lsn: head,
                 verified_through_lsn: fork_lsn,
-                diff_hash: String::new(),
-                policy: Value::Null,
-                summary: Value::Null,
-                sampled: None,
                 options: DiffOptions {
                     no_pii,
                     ..DiffOptions::default()
                 },
-                kinds: Vec::new(),
                 reason: audit.reason,
-                approved: None,
-                promoted: None,
                 plain_fork: true,
-                error: None,
-                preview: None,
-                unchanged: Vec::new(),
-                window_cut: None,
-                rebase: None,
+                ..Default::default()
             };
             if dry_run {
                 return Ok((meta, true));

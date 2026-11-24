@@ -20,26 +20,26 @@ use kronik_proto::log::v1 as pb;
 use kronik_sched::{NodeConfig, SwitchHold, TurnResult};
 use serde_json::Value;
 
+fn request(guests: &[&str]) -> ProposeRequest {
+    ProposeRequest {
+        wasm: guests
+            .iter()
+            .map(|g| std::fs::read(guest(g)).unwrap())
+            .collect(),
+        names: guests.iter().map(|g| (*g).to_owned()).collect(),
+        window_ms: None,
+        at: None,
+        options: DiffOptions::default(),
+        workers: Some(2),
+        audit: audit(),
+        dry_run: false,
+    }
+}
+
 fn try_propose(p: &Proc, props: &Arc<Proposals>, guests: &[&str]) -> Result<Proposal, ApiError> {
-    let wasm = guests
-        .iter()
-        .map(|g| std::fs::read(guest(g)).unwrap())
-        .collect();
     p.settle();
-    p.rt.block_on(props.propose(
-        ProposeRequest {
-            wasm,
-            names: guests.iter().map(|g| (*g).to_owned()).collect(),
-            window_ms: None,
-            at: None,
-            options: DiffOptions::default(),
-            workers: Some(2),
-            audit: audit(),
-            dry_run: false,
-        },
-        p.owner(),
-    ))
-    .map(|(prop, _)| prop)
+    p.rt.block_on(props.propose(request(guests), p.owner()))
+        .map(|(prop, _)| prop)
 }
 
 fn diff(p: &Proc, props: &Proposals, id: &str) -> Value {
@@ -206,7 +206,16 @@ fn unchanged_components_are_skipped_and_nothing_changed_is_refused() {
     let p = system(dir.path(), None);
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
 
-    let prop = try_propose(&p, &props, &["counter-step2", "notes"]).unwrap();
+    // The set is known before a turn is replayed: the proposal names the
+    // kinds it skips while it runs, not only once it is evaluated.
+    p.settle();
+    let running =
+        p.rt.block_on(props.propose_job(request(&["counter-step2", "notes"]), false, p.owner()))
+            .unwrap()
+            .0;
+    assert_eq!(running.status, "running");
+    let prop = p.rt.block_on(props.wait(&running.id)).unwrap();
+    assert_eq!(running.unchanged, prop.unchanged);
     assert_eq!(prop.kinds.len(), 1, "notes is already deployed");
     let skipped = prop.unchanged_versions().unwrap();
     assert_eq!(skipped.len(), 1);

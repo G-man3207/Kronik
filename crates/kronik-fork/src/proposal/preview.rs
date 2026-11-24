@@ -27,7 +27,6 @@ use kronik_core::ids::{ActorRef, TurnId, random_id};
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{RouteEntry, TurnResult};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::{
     Entry, Live, Proposal, Proposals, encode_kind, internal, lock, replay_error, shown_record,
@@ -418,20 +417,10 @@ impl Proposals {
             fork_lsn: head,
             created_lsn: head,
             verified_through_lsn: head,
-            diff_hash: String::new(),
-            policy: Value::Null,
-            summary: Value::Null,
-            sampled: None,
             options,
             kinds: kinds.iter().map(encode_kind).collect(),
             reason: audit.reason.clone(),
-            approved: None,
-            promoted: None,
             plain_fork: true,
-            unchanged: Vec::new(),
-            window_cut: None,
-            error: None,
-            rebase: None,
             preview: Some(Preview {
                 proposal: proposal.to_owned(),
                 expires_ms: self.now().saturating_add(ttl_ms),
@@ -444,6 +433,7 @@ impl Proposals {
                     })
                     .collect(),
             }),
+            ..Default::default()
         };
         if dry_run {
             return Ok((meta, true));

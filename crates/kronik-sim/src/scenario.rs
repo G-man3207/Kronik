@@ -350,7 +350,7 @@ impl ScenarioConfig {
 }
 
 /// The result of one run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Report {
     pub seed: u64,
     pub violations: Vec<String>,
@@ -1922,18 +1922,8 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
             return Report {
                 seed,
                 violations: vec![format!("loading the guest: {e}")],
-                trace_hash: String::new(),
-                events: 0,
-                crashes: 0,
-                requests: 0,
-                turns: 0,
-                end: RunEnd::Quiescent,
-                polls: 0,
-                virtual_time: Duration::ZERO,
                 wall: started.elapsed(),
-                recent: vec![],
-                notes: String::new(),
-                start_failures: Vec::new(),
+                ..Default::default()
             };
         }
     };
@@ -1952,18 +1942,8 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
             return Report {
                 seed,
                 violations: vec![format!("secret store root: {e}")],
-                trace_hash: String::new(),
-                events: 0,
-                crashes: 0,
-                requests: 0,
-                turns: 0,
-                end: RunEnd::Quiescent,
-                polls: 0,
-                virtual_time: Duration::ZERO,
                 wall: started.elapsed(),
-                recent: vec![],
-                notes: String::new(),
-                start_failures: Vec::new(),
+                ..Default::default()
             };
         }
     };
@@ -2005,18 +1985,8 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
             return Report {
                 seed,
                 violations: vec![format!("keystore: {e}")],
-                trace_hash: String::new(),
-                events: 0,
-                crashes: 0,
-                requests: 0,
-                turns: 0,
-                end: RunEnd::Quiescent,
-                polls: 0,
-                virtual_time: Duration::ZERO,
                 wall: started.elapsed(),
-                recent: Vec::new(),
-                notes: String::new(),
-                start_failures: Vec::new(),
+                ..Default::default()
             };
         }
     };
@@ -2026,18 +1996,8 @@ pub fn run(seed: u64, cfg: ScenarioConfig) -> Report {
             return Report {
                 seed,
                 violations: vec![format!("storage root: {e}")],
-                trace_hash: String::new(),
-                events: 0,
-                crashes: 0,
-                requests: 0,
-                turns: 0,
-                end: RunEnd::Quiescent,
-                polls: 0,
-                virtual_time: Duration::ZERO,
                 wall: started.elapsed(),
-                recent: Vec::new(),
-                notes: String::new(),
-                start_failures: Vec::new(),
+                ..Default::default()
             };
         }
     };
