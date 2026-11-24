@@ -784,36 +784,39 @@ impl Args {
         }
     }
 
-    /// A mutation: the given arguments plus `reason` and `dry_run`, as JSON.
-    /// An absent reason is sent empty, so that the API answers with its
-    /// `REASON_REQUIRED` rather than a generic malformed-body error.
-    fn post(&self, path: String, keys: &[&str]) -> Request {
+    /// The given arguments plus `reason` and `dry_run`; an absent reason is
+    /// sent empty, so that the API answers with its `REASON_REQUIRED` rather
+    /// than a generic malformed-body error.
+    fn mutation_body(&self, keys: &[&str]) -> Map<String, Value> {
         let mut body: Map<String, Value> = keys
             .iter()
             .chain(&["reason", "dry_run"])
             .filter_map(|key| Some((key.to_string(), self.0.get(*key)?.clone())))
             .collect();
         body.entry("reason").or_insert_with(|| json!(""));
+        body
+    }
+
+    fn post(&self, path: String, keys: &[&str]) -> Request {
         Request {
             method: "POST",
             path,
             query: String::new(),
-            body: Value::Object(body).to_string().into_bytes(),
+            body: Value::Object(self.mutation_body(keys))
+                .to_string()
+                .into_bytes(),
         }
     }
 
     fn propose(&self) -> Result<Request, Value> {
-        let mut request = self.post(
-            "/v1/proposals".into(),
-            &[
-                "window_ms",
-                "at",
-                "mode",
-                "sample",
-                "ignore_headers",
-                "ignore_json_paths",
-            ],
-        );
+        let mut body = self.mutation_body(&[
+            "window_ms",
+            "at",
+            "mode",
+            "sample",
+            "ignore_headers",
+            "ignore_json_paths",
+        ]);
         let wasm = match self.0.get("wasm_base64") {
             Some(Value::String(one)) => json!([one]),
             Some(Value::Array(list)) => Value::Array(list.clone()),
@@ -824,11 +827,13 @@ impl Args {
                 ));
             }
         };
-        let mut body: Map<String, Value> =
-            serde_json::from_slice(&request.body).unwrap_or_default();
         body.insert("wasm_base64".into(), wasm);
-        request.body = Value::Object(body).to_string().into_bytes();
-        Ok(request)
+        Ok(Request {
+            method: "POST",
+            path: "/v1/proposals".into(),
+            query: String::new(),
+            body: Value::Object(body).to_string().into_bytes(),
+        })
     }
 
     fn diff(&self) -> Result<Request, Value> {
@@ -901,5 +906,60 @@ fn explain(args: &Args) -> CallToolResult {
             format!("no topic {topic:?}"),
             "Call explain without a topic to list them, or run `kronik explain --list`.",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(value: Value) -> Args {
+        Args(value.as_object().unwrap().clone())
+    }
+
+    #[test]
+    fn mutation_body_sends_selected_arguments_and_an_empty_reason() {
+        let body = args(json!({
+            "name": "increment",
+            "dry_run": true,
+            "reason": "a test",
+            "ignored": "no"
+        }))
+        .mutation_body(&["name"]);
+        assert_eq!(
+            Value::Object(body),
+            json!({"name": "increment", "reason": "a test", "dry_run": true})
+        );
+    }
+
+    #[test]
+    fn mutation_body_sends_an_absent_reason_empty() {
+        let body = args(json!({"name": "increment"})).mutation_body(&["name"]);
+        assert_eq!(
+            Value::Object(body),
+            json!({"name": "increment", "reason": ""})
+        );
+    }
+
+    #[test]
+    fn propose_builds_and_serializes_its_body_once() {
+        let request = args(json!({
+            "wasm_base64": "wa",
+            "window_ms": 60_000,
+            "reason": "a test"
+        }))
+        .propose()
+        .unwrap();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1/proposals");
+        assert_eq!(request.query, "");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body).unwrap(),
+            json!({
+                "wasm_base64": ["wa"],
+                "window_ms": 60_000,
+                "reason": "a test"
+            })
+        );
     }
 }
