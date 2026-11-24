@@ -12,18 +12,10 @@ fn mac(key: &[u8], bytes: &[u8]) -> Zeroizing<[u8; 32]> {
     result.copy_from_slice(tag.as_ref());
     result
 }
-/// UTC from Env's Unix milliseconds, using the same civil-date algorithm as the CLI.
+/// UTC from Env's Unix milliseconds.
 pub fn timestamp(wall_ms: u64) -> Result<String, String> {
     let seconds = wall_ms / 1000;
-    let z = seconds / 86_400 + 719_468;
-    let era = z / 146_097;
-    let doe = z % 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + u64::from(m <= 2);
+    let (y, m, d) = kronik_core::time::civil_from_days(seconds / 86_400);
     if y > 9999 {
         return Err("AWS signing clock out of range".into());
     }
