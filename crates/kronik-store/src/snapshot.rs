@@ -938,9 +938,11 @@ pub fn install(snapshot: &Path, branch_dir: &Path) -> Result<(), StoreError> {
     let staged = (|| {
         std::fs::create_dir_all(stage.join("sql")).map_err(io)?;
         std::fs::copy(snapshot.join("state.db"), stage.join("state.db")).map_err(io)?;
-        copy_tree(&snapshot.join("sql"), &stage.join("sql"))?;
+        copy_tree(&snapshot.join("sql"), &stage.join("sql")).map_err(io)?;
         stamp_installed(snapshot, &stage.join("sql"))?;
-        sync_tree(&stage)?;
+        for path in sync_order(&stage).map_err(io)? {
+            sync_path(&path)?;
+        }
         // The stage's name, before anything live is removed.
         sync_path(branch_dir)
     })();
@@ -1011,27 +1013,31 @@ fn publish_install(stage: &Path, branch_dir: &Path) -> Result<(), StoreError> {
     sync_path(branch_dir)
 }
 
-/// fsyncs every file under `dir`, then each directory, children first.
-fn sync_tree(dir: &Path) -> Result<(), StoreError> {
+/// Every file under `dir` (breadth first), then each directory, children
+/// first: the order in which to fsync a tree. Empty if `dir` does not exist.
+pub fn sync_order(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !dir.exists() {
+        return Ok(files);
+    }
     let mut dirs = vec![dir.to_path_buf()];
     let mut i = 0;
     while i < dirs.len() {
         let current = dirs[i].clone();
-        for entry in std::fs::read_dir(&current).map_err(io)? {
-            let entry = entry.map_err(io)?;
+        for entry in std::fs::read_dir(&current)? {
+            let entry = entry?;
             let path = entry.path();
-            if entry.file_type().map_err(io)?.is_dir() {
+            if entry.file_type()?.is_dir() {
                 dirs.push(path);
             } else {
-                sync_path(&path)?;
+                files.push(path);
             }
         }
         i += 1;
     }
-    for dir in dirs.iter().rev() {
-        sync_path(dir)?;
-    }
-    Ok(())
+    dirs.reverse();
+    files.extend(dirs);
+    Ok(files)
 }
 
 fn sync_path(path: &Path) -> Result<(), StoreError> {
@@ -1343,18 +1349,19 @@ fn applied_lsn_from_private_copy(file: &Path) -> Option<Lsn> {
     open_applied_lsn(&dest, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).ok()
 }
 
-fn copy_tree(from: &Path, to: &Path) -> Result<(), StoreError> {
+/// Copies the files under `from` into `to`, creating subdirectories; nothing if `from` is missing.
+pub fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     if !from.exists() {
         return Ok(());
     }
-    for e in std::fs::read_dir(from).map_err(io)? {
-        let e = e.map_err(io)?;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
         let dest = to.join(e.file_name());
-        if e.file_type().map_err(io)?.is_dir() {
-            std::fs::create_dir_all(&dest).map_err(io)?;
+        if e.file_type()?.is_dir() {
+            std::fs::create_dir_all(&dest)?;
             copy_tree(&e.path(), &dest)?;
         } else {
-            std::fs::copy(e.path(), &dest).map_err(io)?;
+            std::fs::copy(e.path(), &dest)?;
         }
     }
     Ok(())

@@ -1909,7 +1909,7 @@ async fn stage_after_keys(
     let state = stage.join("branch");
     std::fs::create_dir_all(state.join("sql"))?;
     std::fs::copy(snap.join("state.db"), state.join("state.db"))?;
-    copy_tree(&snap.join("sql"), &state.join("sql"))?;
+    kronik_store::snapshot::copy_tree(&snap.join("sql"), &state.join("sql"))?;
     if snap.join("secrets.db").exists() {
         std::fs::copy(snap.join("secrets.db"), stage.join("secrets.db"))?;
     }
@@ -2130,23 +2130,6 @@ fn remove_precompiled(code: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
-    if !from.exists() {
-        return Ok(());
-    }
-    for e in std::fs::read_dir(from)? {
-        let e = e?;
-        let dest = to.join(e.file_name());
-        if e.file_type()?.is_dir() {
-            std::fs::create_dir_all(&dest)?;
-            copy_tree(&e.path(), &dest)?;
-        } else {
-            std::fs::copy(e.path(), dest)?;
-        }
-    }
-    Ok(())
-}
-
 /// "a, b, c and 4 more".
 fn list_some(items: &[String]) -> String {
     let shown = items.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
@@ -2154,34 +2137,6 @@ fn list_some(items: &[String]) -> String {
         n if n > 5 => format!("{shown} and {} more", n - 5),
         _ => shown,
     }
-}
-
-/// fsyncs every file under `dir`, then each directory, children first. A
-/// renamed directory keeps those entries: the inode was synced before the
-/// rename.
-fn sync_tree(dir: &Path) -> std::io::Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    let mut dirs = vec![dir.to_path_buf()];
-    let mut i = 0;
-    while i < dirs.len() {
-        let current = dirs[i].clone();
-        for entry in std::fs::read_dir(&current)? {
-            let entry = entry?;
-            let path = entry.path();
-            if entry.file_type()?.is_dir() {
-                dirs.push(path);
-            } else {
-                sync_path(&path)?;
-            }
-        }
-        i += 1;
-    }
-    for dir in dirs.iter().rev() {
-        sync_path(dir)?;
-    }
-    Ok(())
 }
 
 fn sync_path(path: &Path) -> std::io::Result<()> {
@@ -2278,7 +2233,9 @@ fn install_staged(
     // Bytes and the names inside the stage, before any live name is
     // replaced. A failure here leaves the previous state.db.
     fault("sync")?;
-    sync_tree(stage)?;
+    for path in kronik_store::snapshot::sync_order(stage)? {
+        sync_path(&path)?;
+    }
     std::fs::create_dir_all(branch_dir)?;
     // Seam only: the previous state.db is not removed here.
     fault("state")?;
