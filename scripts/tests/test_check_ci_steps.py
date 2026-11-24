@@ -6,6 +6,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 CHECK = runpy.run_path(str(ROOT / "scripts/check-ci-steps.py"))
 SCRIPT = 'if [ "$#" -eq 0 ]; then\n    set -- fmt clippy test musl action\nfi\n'
+SMALL = 'if [ "$#" -eq 0 ]; then\n    set -- fmt test action\nfi\n'
 
 
 def workflow(**jobs):
@@ -72,6 +73,39 @@ class CheckCiSteps(unittest.TestCase):
                                     "        run: scripts/ci.sh identity\n"))
         with self.assertRaisesRegex(ValueError, "identity without KRONIK_TEST_FAKETIME=require"):
             CHECK["check"](script, text("      - run: scripts/ci.sh identity\n"))
+
+    def test_a_call_may_span_continued_lines_and_end_in_a_comment(self):
+        CHECK["check"](SMALL, "run: scripts/ci.sh fmt test\\\n    action # selected checks\n")
+
+    def test_a_sudo_call_and_a_shell_failure_handler_are_calls(self):
+        CHECK["check"](SMALL, "run: scripts/ci.sh fmt test\n"
+                              "  sudo -E env PATH=x scripts/ci.sh action || status=$?\n")
+
+    def test_a_bare_call_runs_the_defaults_and_comment_lines_are_not_calls(self):
+        CHECK["check"](SMALL, "# scripts/ci.sh unknown\nrun: scripts/ci.sh # all defaults\n")
+
+    def test_hyphenated_step_names_are_whole_steps(self):
+        script = "set -- foreign foreign-extra other-job\n"
+        run = "run: KRONIK_FOREIGN_TESTS=require scripts/ci.sh "
+        CHECK["check"](script, run + "foreign foreign-extra other-job\n")
+        with self.assertRaisesRegex(ValueError, "missing"):
+            CHECK["check"](script, run + "foreign other-job\n")
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            CHECK["check"](script, run + "foreign foreign-extr other-job\n")
+
+    def test_a_workflow_without_calls_misses_every_step(self):
+        with self.assertRaisesRegex(ValueError, "missing"):
+            CHECK["check"](SMALL, "# no CI calls")
+
+    def test_a_script_without_a_default_list_fails(self):
+        with self.assertRaisesRegex(ValueError, "no default"):
+            CHECK["check"]("# no defaults", "run: scripts/ci.sh fmt")
+
+    def test_jobs_may_run_their_steps_in_any_job_order(self):
+        CHECK["check"](SMALL, "on:\n  workflow_dispatch:\njobs:\n"
+                              "  first:\n    steps:\n      - run: scripts/ci.sh action\n\n"
+                              "  second:  # the other job\n    steps:\n"
+                              "      - run: scripts/ci.sh fmt\n      - run: scripts/ci.sh test\n")
 
     def test_the_repository_runs_every_step_and_musl_in_a_job_of_its_own(self):
         script = (ROOT / "scripts/ci.sh").read_text()
