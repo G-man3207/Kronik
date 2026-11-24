@@ -5975,17 +5975,7 @@ impl Node {
     /// no turn has been applied at or before that point (logical time has
     /// not started; only turns advance it).
     pub async fn logical_time_at(&self, at_most: Lsn) -> Result<Option<u64>, ApiError> {
-        let pos = {
-            let db = self.store.db();
-            let turn = db.latest_turn_at(at_most).map_err(store_err)?;
-            let open = db.latest_open_turn_at(at_most).map_err(store_err)?;
-            match (turn, open) {
-                (Some(t), Some(o)) if o.lsn > t.lsn => Some(o),
-                (Some(t), _) => Some(t),
-                (None, o) => o,
-            }
-        };
-        let Some(t) = pos else {
+        let Some(t) = self.store.db().latest_turn_at(at_most).map_err(store_err)? else {
             return Ok(None);
         };
         let c = self.reader.read_at(t.pos).await.map_err(|e| match e {
@@ -6002,17 +5992,12 @@ impl Node {
     /// Logical time of the earliest turn with `lsn > after`. `None` when
     /// no later turn has been applied.
     pub async fn logical_time_after(&self, after: Lsn) -> Result<Option<u64>, ApiError> {
-        let pos = {
-            let db = self.store.db();
-            let turn = db.earliest_turn_after(after).map_err(store_err)?;
-            let open = db.earliest_open_turn_after(after).map_err(store_err)?;
-            match (turn, open) {
-                (Some(t), Some(o)) if o.lsn < t.lsn => Some(o),
-                (Some(t), _) => Some(t),
-                (None, o) => o,
-            }
-        };
-        let Some(t) = pos else {
+        let Some(t) = self
+            .store
+            .db()
+            .earliest_turn_after(after)
+            .map_err(store_err)?
+        else {
             return Ok(None);
         };
         let c = self.reader.read_at(t.pos).await.map_err(|e| match e {

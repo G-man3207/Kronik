@@ -1556,48 +1556,30 @@ impl StateDb {
             .optional()?)
     }
 
-    /// The newest completed turn at or below `at_most`.
+    /// The newest turn at or below `at_most`: a completed turn, or an open
+    /// one (a `TurnBegin` not yet closed).
     pub fn latest_turn_at(&self, at_most: Lsn) -> Result<Option<TurnRef>, StoreError> {
+        // An LSN is one record, so it is in one of the two tables only.
         Ok(self
             .conn
             .prepare_cached(
                 "SELECT lsn, segment, offset FROM turn_index WHERE lsn <= ?1 \
+                 UNION ALL \
+                 SELECT lsn, segment, offset FROM open_turns WHERE lsn <= ?1 \
                  ORDER BY lsn DESC LIMIT 1",
             )?
             .query_row([i(at_most)], turn_ref)
             .optional()?)
     }
 
-    /// The newest open turn (a `TurnBegin` not yet closed) at or below `at_most`.
-    pub fn latest_open_turn_at(&self, at_most: Lsn) -> Result<Option<TurnRef>, StoreError> {
-        Ok(self
-            .conn
-            .prepare_cached(
-                "SELECT lsn, segment, offset FROM open_turns WHERE lsn <= ?1 \
-                 ORDER BY lsn DESC LIMIT 1",
-            )?
-            .query_row([i(at_most)], turn_ref)
-            .optional()?)
-    }
-
-    /// The oldest completed turn strictly after `after`.
+    /// The oldest turn strictly after `after`: a completed turn, or an open one.
     pub fn earliest_turn_after(&self, after: Lsn) -> Result<Option<TurnRef>, StoreError> {
         Ok(self
             .conn
             .prepare_cached(
                 "SELECT lsn, segment, offset FROM turn_index WHERE lsn > ?1 \
-                 ORDER BY lsn ASC LIMIT 1",
-            )?
-            .query_row([i(after)], turn_ref)
-            .optional()?)
-    }
-
-    /// The oldest open turn strictly after `after`.
-    pub fn earliest_open_turn_after(&self, after: Lsn) -> Result<Option<TurnRef>, StoreError> {
-        Ok(self
-            .conn
-            .prepare_cached(
-                "SELECT lsn, segment, offset FROM open_turns WHERE lsn > ?1 \
+                 UNION ALL \
+                 SELECT lsn, segment, offset FROM open_turns WHERE lsn > ?1 \
                  ORDER BY lsn ASC LIMIT 1",
             )?
             .query_row([i(after)], turn_ref)
@@ -6493,6 +6475,61 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(ids, ["after".to_owned()]);
+    }
+
+    /// Issue #322: one lookup selects from the completed and the open
+    /// turns, up to `at_most` inclusive and strictly after `after`.
+    #[test]
+    fn turn_lookups_span_completed_and_open_turns() {
+        let db = StateDb::open(Connection::open_in_memory().unwrap()).unwrap();
+        // Completed turns at 2 and 6, an open one between them.
+        db.conn
+            .execute_batch(
+                "INSERT INTO turn_index (lsn, kind, key, segment, offset, outcome) VALUES \
+                 (2, 'notes', 'n', 1, 20, 0), (6, 'notes', 'n', 1, 60, 0);
+                 INSERT INTO open_turns (execution_id, lsn, kind, key, segment, offset) \
+                 VALUES ('e', 4, 'notes', 'n', 1, 40);",
+            )
+            .unwrap();
+        let turn = |lsn: u64| {
+            Some(TurnRef {
+                lsn,
+                pos: Position {
+                    segment: 1,
+                    offset: lsn * 10,
+                },
+            })
+        };
+        for (at_most, want) in [
+            (1, None),
+            (2, turn(2)),
+            (3, turn(2)),
+            (4, turn(4)),
+            (5, turn(4)),
+            (6, turn(6)),
+            (7, turn(6)),
+        ] {
+            assert_eq!(
+                db.latest_turn_at(at_most).unwrap(),
+                want,
+                "at_most {at_most}"
+            );
+        }
+        for (after, want) in [
+            (1, turn(2)),
+            (2, turn(4)),
+            (3, turn(4)),
+            (4, turn(6)),
+            (5, turn(6)),
+            (6, None),
+            (7, None),
+        ] {
+            assert_eq!(
+                db.earliest_turn_after(after).unwrap(),
+                want,
+                "after {after}"
+            );
+        }
     }
 
     /// An existing database gains the compaction indexes on open.
