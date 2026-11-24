@@ -48,21 +48,7 @@ impl LogReader {
             if start > through {
                 break;
             }
-            let path = self.dir.join(segment_name(start));
-            let file = self.env.fs.open(path.clone(), OpenMode::Read).await?;
-            let length = file.len().await?;
-            // The native writer has one configured namespace. Never allocate a
-            // header buffer from an untrusted on-disk branch length.
-            let image = file.read_at(0, 24 + self.branch.len()).await?;
-            let header = parse_header(&image).ok_or_else(|| {
-                corrupt(format!("segment {} has no valid header", path.display()))
-            })?;
-            if header.start_lsn != start || header.branch != self.branch {
-                return Err(corrupt(format!(
-                    "segment {} header mismatch",
-                    path.display()
-                )));
-            }
+            let (path, file, length, header) = self.open_segment(start).await?;
             files.push(CapturedSegment {
                 start,
                 path,
