@@ -30,8 +30,10 @@ use rustix::fs::{AtFlags, Mode, OFlags};
 pub const MAX_FILE_BYTES: u64 = 1 << 30;
 
 /// A sink I/O failure. Failed durability barriers and EIO poison the writer.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{}", source)]
 pub struct FileError {
+    #[source]
     source: std::io::Error,
     sync: bool,
 }
@@ -50,18 +52,6 @@ impl FileError {
             source: std::io::Error::other("audit file writer requires storage repair"),
             sync: true,
         }
-    }
-}
-
-impl std::fmt::Display for FileError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.source, f)
-    }
-}
-
-impl std::error::Error for FileError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
     }
 }
 
@@ -1367,6 +1357,19 @@ mod tests {
             let error = FileError::from(errno);
             assert_eq!(error.fatal(), errno == rustix::io::Errno::IO);
         }
+    }
+
+    #[test]
+    fn file_error_shows_its_cause_and_keeps_it_as_the_source() {
+        let error = FileError::from(std::io::Error::other("no space left on device"));
+        assert_eq!(error.to_string(), "no space left on device");
+        let source = std::error::Error::source(&error).unwrap();
+        assert_eq!(source.to_string(), "no space left on device");
+        assert!(source.is::<std::io::Error>());
+        assert_eq!(
+            FileError::poisoned().to_string(),
+            "audit file writer requires storage repair"
+        );
     }
 
     #[test]

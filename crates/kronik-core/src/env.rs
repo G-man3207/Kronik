@@ -243,16 +243,9 @@ pub struct HttpStreamResponse {
 
 /// The error a streamed response body gives past its request's
 /// `max_response_bytes` ([`is_response_too_large`]).
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("the response body exceeds its limit")]
 pub struct ResponseTooLarge;
-
-impl std::fmt::Display for ResponseTooLarge {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the response body exceeds its limit")
-    }
-}
-
-impl std::error::Error for ResponseTooLarge {}
 
 /// The I/O error of a response body read past its limit.
 pub fn response_too_large() -> std::io::Error {
@@ -748,5 +741,9 @@ mod stream_tests {
         assert!(matches!(streamed, Err(NetError::Connect(_))));
         assert!(is_response_too_large(&response_too_large()));
         assert!(!is_response_too_large(&std::io::Error::other("other")));
+        assert_eq!(
+            response_too_large().to_string(),
+            "the response body exceeds its limit"
+        );
     }
 }

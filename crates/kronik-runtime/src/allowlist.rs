@@ -60,22 +60,13 @@ const WASI_INTERFACES: &[(&str, &[&str])] = &[
     ("http", &["types", "outgoing-handler"]),
 ];
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CheckError {
+    #[error("input is a core module, not a component")]
     NotAComponent,
+    #[error("invalid component: {0}")]
     Parse(wasmparser::BinaryReaderError),
 }
-
-impl std::fmt::Display for CheckError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CheckError::NotAComponent => write!(f, "input is a core module, not a component"),
-            CheckError::Parse(e) => write!(f, "invalid component: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for CheckError {}
 
 /// Returns all top-level import names of a component, in binary order.
 pub fn component_imports(bytes: &[u8]) -> Result<Vec<String>, CheckError> {
@@ -152,7 +143,7 @@ fn version_in(version: &str, major: u64, minor: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_allowed;
+    use super::{CheckError, component_imports, is_allowed};
 
     #[test]
     fn allows_kronik_and_deterministic_wasi() {
@@ -192,5 +183,24 @@ mod tests {
         assert!(!is_allowed("kronik:actor/connections@0.2.0"));
         assert!(!is_allowed("kronik:actor/connections"));
         assert!(!is_allowed("my-func"));
+    }
+
+    #[test]
+    fn check_errors_name_a_core_module_and_the_parse_failure() {
+        assert_eq!(
+            CheckError::NotAComponent.to_string(),
+            "input is a core module, not a component"
+        );
+        let error = component_imports(b"\0asm\x01\0\0\0").unwrap_err();
+        assert!(matches!(error, CheckError::NotAComponent));
+        // The component header, then a section id without its size.
+        let error = component_imports(b"\0asm\x0d\0\x01\0\0").unwrap_err();
+        let CheckError::Parse(cause) = &error else {
+            panic!("expected a parse failure, got {error:?}")
+        };
+        assert_eq!(error.to_string(), format!("invalid component: {cause}"));
+        // The message carries the whole failure: neither variant has a source.
+        assert!(std::error::Error::source(&error).is_none());
+        assert!(std::error::Error::source(&CheckError::NotAComponent).is_none());
     }
 }
