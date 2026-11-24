@@ -58,7 +58,7 @@ human or integrated-cluster acceptance by assertion.
 
 The API mutation table and real CLI audit consumers reuse the same owned
 TLS/code/PKCE/JWT provider in `scripts/e2e-ui-oidc.py`. Prepare Python 3.11+ with
-`scripts/requirements-oidc-tests.txt` (cryptography, PyJWT and their pinned
+`scripts/requirements-oidc-tests.txt` (cryptography and its pinned
 closure), following `CONTRIBUTING.md`; tests use `KRONIK_TEST_PYTHON` and never
 download packages or rely on ambient imports. CI scopes that prepared runtime
 to its existing Cargo test step, not unrelated SDK/action Python callers.
