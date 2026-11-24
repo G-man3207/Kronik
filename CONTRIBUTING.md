@@ -34,7 +34,7 @@ export KRONIK_TEST_PYTHON="$PWD/target/oidc-test-python/bin/python3"
 
 On Debian/Ubuntu, creating that environment requires the `python3-venv` system
 package. The fixture uses that exact interpreter in isolated mode and checks
-the pinned packages, including PyJWT and cryptography. Do not globally activate
+the pinned packages, including cryptography. Do not globally activate
 the environment or replace Python for unrelated action/PyYAML or SDK steps;
 CI prepares its own private environment and scopes it to the existing test
 step. These are development dependencies, not daemon/runtime requirements.

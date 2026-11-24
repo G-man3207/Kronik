@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Finite, synthetic M27 browser acceptance; NEVER a human identity proof.
 
-Dependencies (no auto-install): Python 3.11+, cryptography, PyJWT, an OS sandbox, Node,
+Dependencies (no auto-install): Python 3.11+, cryptography, an OS sandbox, Node,
 Google Chrome, @playwright/test and axe-core. Packages default to ui/node_modules;
 --playwright/--axe explicitly select existing installations. Missing dependencies
 fail without auto-install. Run only prebuilt KRONIK_BIN/guest files.
@@ -125,13 +125,12 @@ sys.path.insert(0, str(ROOT / "scripts"))  # the Rust fixture loads this file th
 from kronikd import UnixConnection  # noqa: E402
 
 try:
-    import jwt
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
     from cryptography.x509.oid import NameOID
 except ImportError:
-    raise SystemExit("Missing Python cryptography/PyJWT; provision explicitly (no auto-install).")
+    raise SystemExit("Missing Python cryptography; provision explicitly (no auto-install).")
 
 SCOPES = ["read", "fork", "propose", "approve", "promote", "operate", "pii:read", "admin"]
 MODES = {"valid", "issuer", "audience", "nonce", "state", "keys", "signature", "expired", "short", "long", "algorithm", "azp", "nbf", "jku", "reader", "unmapped", "revoked"}
@@ -332,7 +331,10 @@ class Provider:
                 signing_key = fixture.other_key if mode == "signature" else fixture.key
                 # RS384 parses as a JWT algorithm; the daemon allows only RS256.
                 algorithm = "RS384" if mode == "algorithm" else "RS256"
-                token = jwt.encode(claims, signing_key, algorithm=algorithm, headers=header)
+                header["alg"] = algorithm
+                signing_input = ".".join(b64(json.dumps(part, separators=(",", ":")).encode()) for part in (header, claims))
+                digest = hashes.SHA384() if algorithm == "RS384" else hashes.SHA256()
+                token = signing_input + "." + b64(signing_key.sign(signing_input.encode("ascii"), padding.PKCS1v15(), digest))
                 return self.reply(200, {"token_type": "Bearer", "access_token": secrets.token_urlsafe(32), "expires_in": 300, "id_token": token})
 
         class EffectHandler(Handler):

@@ -193,7 +193,7 @@ PY
 # The OIDC tests run the pinned Python runtime of CONTRIBUTING.md and fail
 # without it rather than skip (ADR 0104), so it is checked before the long run.
 step_test() {
-    "${KRONIK_TEST_PYTHON:?Prepare the pinned Python runtime in CONTRIBUTING.md}" -I -c 'import jwt; from cryptography import x509'
+    "${KRONIK_TEST_PYTHON:?Prepare the pinned Python runtime in CONTRIBUTING.md}" -I -c 'from cryptography import x509'
     # --no-fail-fast: one failing test binary must not hide the others' results.
     cargo test --workspace --locked --no-fail-fast
 }
