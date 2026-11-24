@@ -12,9 +12,10 @@
 //! generated from this catalog with
 //! `cargo run -p kronik-core --example errors_md > docs/errors.md`.
 
+use std::borrow::Cow;
 use std::fmt;
 
-use serde::de::{self, Deserializer, Visitor};
+use serde::de::{self, Deserializer};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
@@ -361,21 +362,8 @@ impl Serialize for ErrorCode {
 
 impl<'de> Deserialize<'de> for ErrorCode {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<ErrorCode, D::Error> {
-        struct CodeVisitor;
-
-        impl Visitor<'_> for CodeVisitor {
-            type Value = ErrorCode;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a Kronik error code such as ACTOR_NOT_FOUND")
-            }
-
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<ErrorCode, E> {
-                ErrorCode::parse(v).ok_or_else(|| E::unknown_variant(v, ErrorCode::NAMES))
-            }
-        }
-
-        d.deserialize_str(CodeVisitor)
+        let code = Cow::<str>::deserialize(d)?;
+        ErrorCode::parse(&code).ok_or_else(|| de::Error::unknown_variant(&code, ErrorCode::NAMES))
     }
 }
 
@@ -412,14 +400,16 @@ impl ApiError {
 
     /// The serialized form as a JSON value.
     pub fn to_json(&self) -> serde_json::Value {
-        let mut body = serde_json::Map::new();
-        body.insert("code".into(), self.code.as_str().into());
-        body.insert("message".into(), self.message.as_str().into());
-        if let Some(hint) = &self.hint {
-            body.insert("hint".into(), hint.as_str().into());
-        }
-        body.insert("docs".into(), self.code.docs().into());
-        serde_json::json!({ "error": body })
+        serde_json::to_value(self).unwrap_or_else(|e| {
+            // Cannot fail: every field is a string. The daemon never unwraps,
+            // so a failure would still answer an error.
+            serde_json::json!({ "error": {
+                "code": ErrorCode::Internal,
+                "message": format!("encoding JSON failed: {e}"),
+                "hint": ErrorCode::Internal.hint(),
+                "docs": ErrorCode::Internal.docs(),
+            }})
+        })
     }
 }
 
@@ -654,10 +644,9 @@ mod tests {
         );
 
         let bare = ApiError { hint: None, ..e };
-        let v = serde_json::to_value(&bare).unwrap();
+        let v = bare.to_json();
         assert_eq!(v["error"].get("hint"), None);
         assert_eq!(v["error"]["docs"], "kronik explain STORAGE_CORRUPT");
-        assert_eq!(bare.to_json(), v);
         assert_eq!(serde_json::from_value::<ApiError>(v).unwrap(), bare);
     }
 
