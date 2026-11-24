@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use super::render::{field, next, shell_quote, table};
-use super::{Ctx, Error, Mutation, reason, units};
+use super::{Ctx, Error, Mutation, arg_value, reason, units};
 use clap::{Subcommand, ValueEnum};
 use kronik_api::m7::{
     ForeignAddRequest, ForeignAddResponse, ForeignListResponse, ForeignLogsResponse,
@@ -26,16 +26,6 @@ pub enum Isolation {
     /// pinned tool bundle; without
     /// KVM the add is refused with KVM_UNAVAILABLE (use gvisor).
     Microvm,
-}
-
-impl Isolation {
-    fn as_str(self) -> &'static str {
-        match self {
-            Isolation::Gvisor => "gvisor",
-            Isolation::Trusted => "trusted",
-            Isolation::Microvm => "microvm",
-        }
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -287,15 +277,6 @@ pub enum ForkMode {
     Sandbox,
 }
 
-impl ForkMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            ForkMode::Recorded => "recorded",
-            ForkMode::Sandbox => "sandbox",
-        }
-    }
-}
-
 fn local(code: ErrorCode, msg: String, hint: &str) -> Error {
     Error::from(ApiError::new(code, msg).with_hint(hint))
 }
@@ -382,13 +363,13 @@ fn add(ctx: &Ctx, a: AddArgs, mutation: &Mutation) -> Result<ExitCode, Error> {
         let _ = write!(rerun, " --memory {}", units::size_flag(m));
     }
     if let Some(i) = a.isolation {
-        let _ = write!(rerun, " --isolation {}", i.as_str());
+        let _ = write!(rerun, " --isolation {}", arg_value(i));
     }
     for s in &a.secrets {
         let _ = write!(rerun, " --secret {}", shell_quote(s));
     }
     if let Some(m) = a.fork_mode {
-        let _ = write!(rerun, " --fork-mode {}", m.as_str());
+        let _ = write!(rerun, " --fork-mode {}", arg_value(m));
     }
     let _ = write!(rerun, " --reason {}", shell_quote(reason));
     let body = ctx.post(
@@ -399,9 +380,9 @@ fn add(ctx: &Ctx, a: AddArgs, mutation: &Mutation) -> Result<ExitCode, Error> {
             port: a.port,
             cpu_millis: cpu,
             memory_bytes: memory,
-            isolation: a.isolation.map(|i| i.as_str().to_owned()),
+            isolation: a.isolation.map(arg_value),
             secrets: a.secrets.clone(),
-            fork_mode: a.fork_mode.map(|m| m.as_str().to_owned()),
+            fork_mode: a.fork_mode.map(arg_value),
             reason: reason.to_owned(),
             dry_run: mutation.dry_run,
         },
