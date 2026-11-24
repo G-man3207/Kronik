@@ -104,27 +104,12 @@ fn overlay_err(e: String) -> rusqlite::Error {
     )
 }
 
-/// Soft `Max open files`, or 1024 when `/proc` cannot be read. Parsing the
-/// file keeps `getrlimit` out of this crate: `unsafe` is denied here.
+/// The soft open-file limit; `1 << 20` when it is unlimited.
 fn open_file_soft_limit() -> usize {
-    let Ok(text) = std::fs::read_to_string("/proc/self/limits") else {
-        return 1024;
-    };
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix("Max open files") else {
-            continue;
-        };
-        let Some(soft) = rest.split_whitespace().next() else {
-            continue;
-        };
-        if soft == "unlimited" {
-            return 1 << 20;
-        }
-        if let Ok(n) = soft.parse() {
-            return n;
-        }
+    match rustix::process::getrlimit(rustix::process::Resource::Nofile).current {
+        Some(soft) => usize::try_from(soft).unwrap_or(usize::MAX),
+        None => 1 << 20, // RLIM_INFINITY
     }
-    1024
 }
 
 /// Actors the live pool may keep. Two descriptors each (the database and its

@@ -17,6 +17,7 @@ kronik-proto = { workspace = true }
 libc = { workspace = true }
 prost = { workspace = true }
 rusqlite = { workspace = true }
+rustix = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }

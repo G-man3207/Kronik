@@ -2422,6 +2422,7 @@ dependencies = [
  "libc",
  "prost",
  "rusqlite",
+ "rustix",
  "tempfile",
  "thiserror",
  "tokio",
