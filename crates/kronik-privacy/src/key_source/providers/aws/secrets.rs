@@ -387,20 +387,13 @@ fn catalogue(
 }
 
 impl SecretBackend for Secrets {
-    fn current<'a>(
+    fn fetch<'a>(
         &'a self,
         path: &'a str,
+        version: Option<&'a str>,
         original: AuthLease,
     ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
-        Box::pin(async move { self.get(path, None, &original).await })
-    }
-    fn version<'a>(
-        &'a self,
-        path: &'a str,
-        id: &'a str,
-        original: AuthLease,
-    ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
-        Box::pin(async move { self.get(path, Some(id), &original).await })
+        Box::pin(async move { self.get(path, version, &original).await })
     }
     fn versions<'a>(
         &'a self,
@@ -449,12 +442,14 @@ mod tests {
         };
         assert!(matches!(
             backend
-                .current("https://evil/secret", test_authority())
+                .fetch("https://evil/secret", None, test_authority())
                 .await,
             Err(BackendError::Invalid)
         ));
         assert!(matches!(
-            backend.version(ARN, "../version", test_authority()).await,
+            backend
+                .fetch(ARN, Some("../version"), test_authority())
+                .await,
             Err(BackendError::Invalid)
         ));
         let wrong_resource = cursor(&format!("{ARN}#other"), "opaque").unwrap();

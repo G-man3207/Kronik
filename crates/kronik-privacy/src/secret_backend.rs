@@ -57,15 +57,12 @@ pub struct VersionPage {
 /// Every operation carries its original caller/boot lease through credential
 /// renewal and final HTTP enqueue; backends never capture a replacement scope.
 pub trait SecretBackend: Send + Sync + 'static {
-    fn current<'a>(
+    /// One retained version by the backend's own id, or with `None` its
+    /// current value.
+    fn fetch<'a>(
         &'a self,
         path: &'a str,
-        original: AuthLease,
-    ) -> BoxFuture<'a, Result<Fetched, BackendError>>;
-    fn version<'a>(
-        &'a self,
-        path: &'a str,
-        id: &'a str,
+        version: Option<&'a str>,
         original: AuthLease,
     ) -> BoxFuture<'a, Result<Fetched, BackendError>>;
     fn versions<'a>(
@@ -100,43 +97,27 @@ impl EnvBackend {
         hash.update(value);
         format!("k:{}", &hash.finalize().to_hex().as_str()[..16])
     }
-
-    fn fetched(&self, path: &str) -> Result<Fetched, BackendError> {
-        let value = self.values.get(path).ok_or(BackendError::NotFound)?;
-        Ok(Fetched {
-            value: Zeroizing::new(value.to_vec()),
-            source_version: self.identity(path, value),
-            canonical_ref: path.to_owned(),
-        })
-    }
 }
 impl SecretBackend for EnvBackend {
-    fn current<'a>(
+    fn fetch<'a>(
         &'a self,
         path: &'a str,
+        version: Option<&'a str>,
         original: AuthLease,
     ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
         Box::pin(async move {
             original.check().map_err(|_| BackendError::Unauthorized)?;
-            self.fetched(path)
-        })
-    }
-
-    fn version<'a>(
-        &'a self,
-        path: &'a str,
-        id: &'a str,
-        original: AuthLease,
-    ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
-        Box::pin(async move {
-            original.check().map_err(|_| BackendError::Unauthorized)?;
-            let value = self.values.get(path).ok_or(BackendError::VersionGone)?;
-            if self.identity(path, value) != id {
+            let value = self.values.get(path).ok_or(match version {
+                Some(_) => BackendError::VersionGone,
+                None => BackendError::NotFound,
+            })?;
+            let identity = self.identity(path, value);
+            if version.is_some_and(|version| version != identity.as_str()) {
                 return Err(BackendError::VersionGone);
             }
             Ok(Fetched {
                 value: Zeroizing::new(value.to_vec()),
-                source_version: id.to_owned(),
+                source_version: identity,
                 canonical_ref: path.to_owned(),
             })
         })
@@ -181,23 +162,27 @@ mod tests {
         let old = snapshot(b"old-environment-secret");
         let original = test_authority();
         let old_id = old
-            .current("SERVICE_TOKEN", original.clone())
+            .fetch("SERVICE_TOKEN", None, original.clone())
             .await
             .unwrap()
             .source_version;
         let changed = snapshot(b"new-environment-secret");
         assert!(matches!(
             changed
-                .version("SERVICE_TOKEN", &old_id, original.clone())
+                .fetch("SERVICE_TOKEN", Some(&old_id), original.clone())
                 .await,
             Err(BackendError::VersionGone)
         ));
         let missing = EnvBackend::new(BTreeMap::new(), &master).unwrap();
         assert!(matches!(
             missing
-                .version("SERVICE_TOKEN", &old_id, original.clone())
+                .fetch("SERVICE_TOKEN", Some(&old_id), original.clone())
                 .await,
             Err(BackendError::VersionGone)
+        ));
+        assert!(matches!(
+            missing.fetch("SERVICE_TOKEN", None, original.clone()).await,
+            Err(BackendError::NotFound)
         ));
         let other = EnvBackend::new(
             BTreeMap::from([(
@@ -208,7 +193,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            other.version("OTHER_TOKEN", &old_id, original).await,
+            other.fetch("OTHER_TOKEN", Some(&old_id), original).await,
             Err(BackendError::VersionGone)
         ));
     }

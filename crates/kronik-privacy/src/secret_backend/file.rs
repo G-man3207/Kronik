@@ -75,9 +75,10 @@ pub fn source_highwater(
     Ok(high)
 }
 impl SecretBackend for FileBackend {
-    fn current<'a>(
+    fn fetch<'a>(
         &'a self,
         path: &'a str,
+        id: Option<&'a str>,
         original: AuthLease,
     ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
         Box::pin(async move {
@@ -85,45 +86,24 @@ impl SecretBackend for FileBackend {
             if !valid_name(path) {
                 return Err(BackendError::Invalid);
             }
+            let version = id.map(version).transpose()?;
             let store = self.store.clone();
             let path = path.to_owned();
             let result = self
                 .env
-                .blocking("secret-current", move || {
-                    store
-                        .current(&path)
-                        .map_err(error)?
+                .blocking("secret-fetch", move || {
+                    let read = match version {
+                        Some(version) => store.version(&path, version),
+                        None => store.current(&path),
+                    };
+                    let missing = if version.is_some() {
+                        BackendError::VersionGone
+                    } else {
+                        BackendError::NotFound
+                    };
+                    read.map_err(error)?
                         .map(|value| fetched(path, value))
-                        .ok_or(BackendError::NotFound)
-                })
-                .await
-                .ok_or(BackendError::Unavailable)?;
-            original.check().map_err(|_| BackendError::Unauthorized)?;
-            result
-        })
-    }
-    fn version<'a>(
-        &'a self,
-        path: &'a str,
-        id: &'a str,
-        original: AuthLease,
-    ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
-        Box::pin(async move {
-            original.check().map_err(|_| BackendError::Unauthorized)?;
-            if !valid_name(path) {
-                return Err(BackendError::Invalid);
-            }
-            let version = version(id)?;
-            let store = self.store.clone();
-            let path = path.to_owned();
-            let result = self
-                .env
-                .blocking("secret-version", move || {
-                    store
-                        .version(&path, version)
-                        .map_err(error)?
-                        .map(|value| fetched(path, value))
-                        .ok_or(BackendError::VersionGone)
+                        .ok_or(missing)
                 })
                 .await
                 .ok_or(BackendError::Unavailable)?;
@@ -174,5 +154,60 @@ impl SecretBackend for FileBackend {
             original.check().map_err(|_| BackendError::Unauthorized)?;
             result
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MasterKey, key_source::providers::test_authority};
+    use rusqlite::Connection;
+
+    /// A missing row is `NotFound` for the current value and `VersionGone`
+    /// for a retained version.
+    #[tokio::test]
+    async fn a_missing_row_is_not_found_for_the_current_value_and_gone_for_a_version() {
+        let master = MasterKey::from_bytes([7; 32]).unwrap();
+        let store =
+            Arc::new(SecretStore::open(Connection::open_in_memory().unwrap(), &master).unwrap());
+        let backend = FileBackend::new(Env::real(tokio::runtime::Handle::current()), store.clone());
+        assert!(matches!(
+            backend.fetch("token", None, test_authority()).await,
+            Err(BackendError::NotFound)
+        ));
+        assert!(matches!(
+            backend.fetch("token", Some("1"), test_authority()).await,
+            Err(BackendError::VersionGone)
+        ));
+        for version in 1u8..=2 {
+            store
+                .set_at(
+                    "token",
+                    u64::from(version),
+                    &[version; 3],
+                    [version; 24],
+                    12,
+                    "admin",
+                    "set",
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            backend.fetch("token", Some("0x1"), test_authority()).await,
+            Err(BackendError::Invalid)
+        ));
+        // The current value is the newest version; an older one stays readable.
+        for (asked, expected) in [(None, 2u8), (Some("2"), 2), (Some("1"), 1)] {
+            let fetched = backend
+                .fetch("token", asked, test_authority())
+                .await
+                .unwrap();
+            assert_eq!(&*fetched.value, &[expected; 3]);
+            assert_eq!(fetched.source_version, expected.to_string());
+        }
+        assert!(matches!(
+            backend.fetch("token", Some("3"), test_authority()).await,
+            Err(BackendError::VersionGone)
+        ));
     }
 }

@@ -306,20 +306,13 @@ impl Secrets {
 }
 
 impl SecretBackend for Secrets {
-    fn current<'a>(
+    fn fetch<'a>(
         &'a self,
         path: &'a str,
+        version: Option<&'a str>,
         original: AuthLease,
     ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
-        Box::pin(async move { self.access(path, None, &original).await })
-    }
-    fn version<'a>(
-        &'a self,
-        path: &'a str,
-        id: &'a str,
-        original: AuthLease,
-    ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
-        Box::pin(async move { self.access(path, Some(id), &original).await })
+        Box::pin(async move { self.access(path, version, &original).await })
     }
     fn versions<'a>(
         &'a self,
@@ -360,15 +353,17 @@ mod tests {
         env.net = std::sync::Arc::new(NoNetwork);
         let backend = Secrets::new(env, Azure::default(), vec![]).unwrap();
         assert!(matches!(
-            backend.current(PATH, test_authority()).await,
+            backend.fetch(PATH, None, test_authority()).await,
             Err(BackendError::Denied)
         ));
         assert!(matches!(
-            backend.current("invalid reference", test_authority()).await,
+            backend
+                .fetch("invalid reference", None, test_authority())
+                .await,
             Err(BackendError::Denied)
         ));
         assert!(matches!(
-            backend.version(PATH, ID, test_authority()).await,
+            backend.fetch(PATH, Some(ID), test_authority()).await,
             Err(BackendError::Denied)
         ));
         assert!(matches!(

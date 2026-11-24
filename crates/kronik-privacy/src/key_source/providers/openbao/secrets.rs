@@ -314,20 +314,13 @@ fn catalogue(path: &str, r: &Value) -> Result<VersionPage, BackendError> {
 }
 
 impl SecretBackend for Secrets {
-    fn current<'a>(
+    fn fetch<'a>(
         &'a self,
         path: &'a str,
+        version: Option<&'a str>,
         original: AuthLease,
     ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
-        Box::pin(async move { self.get(path, None, &original).await })
-    }
-    fn version<'a>(
-        &'a self,
-        path: &'a str,
-        id: &'a str,
-        original: AuthLease,
-    ) -> BoxFuture<'a, Result<Fetched, BackendError>> {
-        Box::pin(async move { self.get(path, Some(id), &original).await })
+        Box::pin(async move { self.get(path, version, &original).await })
     }
     fn versions<'a>(
         &'a self,
@@ -367,12 +360,14 @@ mod tests {
         .unwrap();
         assert!(matches!(
             backend
-                .current("secret/../escape#k", test_authority())
+                .fetch("secret/../escape#k", None, test_authority())
                 .await,
             Err(BackendError::Invalid)
         ));
         assert!(matches!(
-            backend.version("secret/a#k", "01", test_authority()).await,
+            backend
+                .fetch("secret/a#k", Some("01"), test_authority())
+                .await,
             Err(BackendError::Invalid)
         ));
         assert!(matches!(
@@ -453,7 +448,10 @@ mod tests {
                     .await
                     .err()
             } else {
-                backend.current("secret/a#k", test_authority()).await.err()
+                backend
+                    .fetch("secret/a#k", None, test_authority())
+                    .await
+                    .err()
             };
             assert_eq!(error, Some(BackendError::Denied));
             assert!(backend.session.lock().await.is_none());
@@ -541,7 +539,7 @@ mod tests {
                 })),
             };
             let error = backend
-                .current("secret/a#k", test_authority())
+                .fetch("secret/a#k", None, test_authority())
                 .await
                 .err()
                 .unwrap();

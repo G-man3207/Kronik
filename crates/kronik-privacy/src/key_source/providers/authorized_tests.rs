@@ -172,8 +172,11 @@ fn operation<'a>(
 ) -> BoxFuture<'a, Result<(), BackendError>> {
     Box::pin(async move {
         match kind {
-            0 => backend.current(path, original).await.map(|_| ()),
-            1 => backend.version(path, version, original).await.map(|_| ()),
+            0 => backend.fetch(path, None, original).await.map(|_| ()),
+            1 => backend
+                .fetch(path, Some(version), original)
+                .await
+                .map(|_| ()),
             2 => backend.versions(path, None, original).await.map(|_| ()),
             _ => unreachable!(),
         }
