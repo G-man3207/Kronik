@@ -633,7 +633,6 @@ impl Drop for SecretStoreMutation<'_> {
 
 enum SecretStoreCustody {
     Owned(std::sync::Arc<SecretStoreOwner>),
-    Memory(std::sync::Arc<dyn SecretStoreData>),
     ReadOnly,
     #[cfg(test)]
     Fixture,
@@ -793,23 +792,10 @@ impl SecretStore {
         Ok(&owned.root)
     }
 
-    /// Private memory has no file-owner certificate, but shares its actual runtime DATA state.
-    pub fn open_memory(
-        master: &MasterKey,
-        data: std::sync::Arc<dyn SecretStoreData>,
-    ) -> Result<Self, PrivacyError> {
-        Self::open_connection(
-            Connection::open_in_memory()?,
-            master,
-            SecretStoreCustody::Memory(data),
-        )
-    }
-
     /// The existing DATA adapter, never a caller authority or complete source proof.
     pub fn data(&self) -> Option<&std::sync::Arc<dyn SecretStoreData>> {
         match &self.custody {
             SecretStoreCustody::Owned(owned) => Some(&owned.data),
-            SecretStoreCustody::Memory(data) => Some(data),
             SecretStoreCustody::ReadOnly => None,
             #[cfg(test)]
             SecretStoreCustody::Fixture => None,
@@ -826,7 +812,6 @@ impl SecretStore {
         }
         let data = match &self.custody {
             SecretStoreCustody::Owned(owned) => owned.data.as_ref(),
-            SecretStoreCustody::Memory(data) => data.as_ref(),
             SecretStoreCustody::ReadOnly => return Err(PrivacyError::SecretStoreUnowned),
             #[cfg(test)]
             SecretStoreCustody::Fixture => return Ok(None),

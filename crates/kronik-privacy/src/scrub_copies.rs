@@ -103,7 +103,6 @@ impl SecretStore {
     fn copy_writer(&self) -> Result<(), PrivacyError> {
         match &self.custody {
             SecretStoreCustody::Owned(owned) => owned.check(),
-            SecretStoreCustody::Memory(_) => Ok(()),
             SecretStoreCustody::ReadOnly => Err(PrivacyError::SecretStoreUnowned),
             #[cfg(test)]
             SecretStoreCustody::Fixture => Ok(()),
