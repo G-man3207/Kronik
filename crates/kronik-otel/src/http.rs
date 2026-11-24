@@ -12,24 +12,53 @@ use kronik_sched::Node;
 /// A collector or webhook slower than this counts as a failed attempt.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// POSTs `body`. The error is a status code: `connect` (not sent), `io`
-/// (maybe delivered), `timeout`, or the actual original-admission error code.
-pub async fn post(
-    node: &Node,
+/// The POST every exporter sends: `content-type` last of the headers, and a
+/// response of at most 1 MiB.
+fn post_request(
     url: String,
     mut headers: Vec<(String, String)>,
     content_type: &str,
     body: Bytes,
-    original: AuthLease,
-) -> Result<HttpResponse, &'static str> {
+) -> HttpRequest {
     headers.push(("content-type".into(), content_type.into()));
-    let req = HttpRequest {
+    HttpRequest {
         method: "POST".into(),
         url,
         headers,
         body,
         max_response_bytes: 1 << 20,
-    };
+    }
+}
+
+/// `request` through `env.net` as `original`, with `timeout` for the whole
+/// exchange. The error is a status code: `connect` (not sent), `io` (maybe
+/// delivered) or `timeout`.
+async fn send(
+    env: &Env,
+    timeout: Duration,
+    request: HttpRequest,
+    original: AuthLease,
+) -> Result<HttpResponse, &'static str> {
+    let exchange = env.net.http_authorized(request, original);
+    match env.timeout(timeout, exchange).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(NetError::Connect(_))) => Err("connect"),
+        Ok(Err(NetError::Io(_) | NetError::TooLarge)) => Err("io"),
+        Err(_) => Err("timeout"),
+    }
+}
+
+/// POSTs `body`. The error is a status code: `connect` (not sent), `io`
+/// (maybe delivered), `timeout`, or the actual original-admission error code.
+pub async fn post(
+    node: &Node,
+    url: String,
+    headers: Vec<(String, String)>,
+    content_type: &str,
+    body: Bytes,
+    original: AuthLease,
+) -> Result<HttpResponse, &'static str> {
+    let req = post_request(url, headers, content_type, body);
     let env = node.env().clone();
     let deadline = env.clock.monotonic().saturating_add(TIMEOUT);
     let owned_env = env.clone();
@@ -38,17 +67,7 @@ pub async fn post(
         if remaining.is_zero() {
             return Ok(Err("timeout"));
         }
-        Ok(
-            match owned_env
-                .timeout(remaining, owned_env.net.http_authorized(req, original))
-                .await
-            {
-                Ok(Ok(resp)) => Ok(resp),
-                Ok(Err(NetError::Connect(_))) => Err("connect"),
-                Ok(Err(NetError::Io(_) | NetError::TooLarge)) => Err("io"),
-                Err(_) => Err("timeout"),
-            },
-        )
+        Ok(send(&owned_env, remaining, req, original).await)
     });
     match env.timeout(TIMEOUT, work).await {
         Ok(Ok(result)) => result,
@@ -63,28 +82,16 @@ pub async fn post(
 pub async fn post_authorized(
     env: &Env,
     url: String,
-    mut headers: Vec<(String, String)>,
+    headers: Vec<(String, String)>,
     content_type: &str,
     body: Bytes,
     original: AuthLease,
 ) -> Result<HttpResponse, &'static str> {
-    headers.push(("content-type".into(), content_type.into()));
-    let request = HttpRequest {
-        method: "POST".into(),
-        url,
-        headers,
-        body,
-        max_response_bytes: 1 << 20,
-    };
-    match env
-        .timeout(TIMEOUT, env.net.http_authorized(request, original))
-        .await
-    {
-        Ok(Ok(response)) if response.body.len() <= 1 << 20 => Ok(response),
-        Ok(Ok(_)) => Err("io"),
-        Ok(Err(NetError::Connect(_))) => Err("connect"),
-        Ok(Err(NetError::Io(_) | NetError::TooLarge)) => Err("io"),
-        Err(_) => Err("timeout"),
+    let request = post_request(url, headers, content_type, body);
+    match send(env, TIMEOUT, request, original).await {
+        Ok(response) if response.body.len() <= 1 << 20 => Ok(response),
+        Ok(_) => Err("io"),
+        Err(code) => Err(code),
     }
 }
 
@@ -176,6 +183,12 @@ pub fn is_loopback(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kronik_core::authority::Authority;
+    use kronik_core::env::{BoxFuture, Net};
+    use kronik_core::error::ApiError;
+    use std::sync::{Arc, Mutex};
+
+    const URL: &str = "http://collector.test/v1/traces";
 
     #[test]
     fn urls_show_scheme_and_host_only() {
@@ -227,5 +240,122 @@ mod tests {
         assert_eq!(ok, [("a".into(), "1".into()), ("b".into(), "2".into())]);
         let e = parse_headers("V", "x-id=1,authorization: Bearer NEEDLE").unwrap_err();
         assert_eq!(e, "$V: header 2 is not key=value");
+    }
+
+    /// A network that answers each authorized request with the queued
+    /// answer (`Io("hang")`: never) and keeps the requests it had.
+    #[derive(Default)]
+    struct Answered {
+        answer: Mutex<Option<Result<HttpResponse, NetError>>>,
+        requests: Mutex<Vec<HttpRequest>>,
+    }
+
+    impl Net for Answered {
+        fn http(&self, _req: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
+            Box::pin(async { Err(NetError::Connect("unused".into())) })
+        }
+        fn http_authorized(
+            &self,
+            req: HttpRequest,
+            _original: AuthLease,
+        ) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
+            self.requests.lock().unwrap().push(req);
+            let answer = self.answer.lock().unwrap().take();
+            Box::pin(async move {
+                if matches!(&answer, Some(Err(NetError::Io(m))) if m == "hang") {
+                    std::future::pending::<()>().await;
+                }
+                answer.unwrap_or(Err(NetError::Connect("no answer queued".into())))
+            })
+        }
+    }
+
+    /// Admits every effect: what a test sees is its network's answer.
+    struct Open;
+
+    impl Authority for Open {
+        fn check(&self) -> Result<(), ApiError> {
+            Ok(())
+        }
+        fn cancelled(&self) -> BoxFuture<'static, ()> {
+            Box::pin(std::future::pending())
+        }
+        fn admit(&self, effect: &mut dyn FnMut() -> Result<(), ApiError>) -> Result<(), ApiError> {
+            effect()
+        }
+    }
+
+    /// A real environment whose network is the returned [`Answered`].
+    fn answered() -> (Env, Arc<Answered>) {
+        let mut env = Env::real(tokio::runtime::Handle::current());
+        let net = Arc::new(Answered::default());
+        env.net = net.clone();
+        (env, net)
+    }
+
+    fn response(status: u16, body: Bytes) -> Result<HttpResponse, NetError> {
+        Ok(HttpResponse {
+            status,
+            headers: Vec::new(),
+            body,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_post_is_content_type_last_with_a_1_mib_response_cap() {
+        let (env, net) = answered();
+        let post = || {
+            post_authorized(
+                &env,
+                URL.into(),
+                vec![("x-id".to_owned(), "1".to_owned())],
+                "application/json",
+                Bytes::from_static(b"body"),
+                Arc::new(Open),
+            )
+        };
+        *net.answer.lock().unwrap() = Some(response(204, Bytes::new()));
+        assert_eq!(post().await.map(|r| r.status), Ok(204));
+        let request = net.requests.lock().unwrap().remove(0);
+        assert_eq!(
+            (
+                request.method.as_str(),
+                request.url.as_str(),
+                request.body.as_ref(),
+                request.max_response_bytes
+            ),
+            ("POST", URL, &b"body"[..], 1 << 20)
+        );
+        assert_eq!(
+            request.headers,
+            [
+                ("x-id".to_owned(), "1".to_owned()),
+                ("content-type".to_owned(), "application/json".to_owned())
+            ]
+        );
+        // A network that hands back more than the cap asked for: `io`.
+        *net.answer.lock().unwrap() = Some(response(204, Bytes::from(vec![b'x'; (1 << 20) + 1])));
+        assert_eq!(post().await.map(|r| r.status), Err("io"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_post_is_connect_io_or_timeout() {
+        let (env, net) = answered();
+        let original: AuthLease = Arc::new(Open);
+        // `connect` is the one outcome that says the request never left.
+        for (answer, code) in [
+            (response(200, Bytes::new()), None),
+            (Err(NetError::Connect("refused".into())), Some("connect")),
+            (Err(NetError::Io("reset".into())), Some("io")),
+            (Err(NetError::TooLarge), Some("io")),
+            (Err(NetError::Io("hang".into())), Some("timeout")),
+        ] {
+            *net.answer.lock().unwrap() = Some(answer);
+            let request = post_request(URL.into(), Vec::new(), "text/plain", Bytes::new());
+            let status = send(&env, Duration::from_millis(100), request, original.clone())
+                .await
+                .map(|r| r.status);
+            assert_eq!(status, code.map_or(Ok(200), Err), "{code:?}");
+        }
     }
 }
