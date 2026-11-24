@@ -26,7 +26,7 @@ use kronik_fork::watch::EVAL_ERROR;
 use serde_json::Value;
 
 use super::render::{clip, field, next, shell_quote, table};
-use super::{Ctx, Error, Mutation, read_file, reason, required_reason, units};
+use super::{Ctx, Error, Mutation, arg_value, read_file, reason, required_reason, units};
 
 #[derive(Debug, Subcommand)]
 pub enum ForkCommand {
@@ -82,19 +82,9 @@ pub enum Mode {
     Both,
 }
 
-impl Mode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Mode::Isolated => "isolated",
-            Mode::Continuous => "continuous",
-            Mode::Both => "both",
-        }
-    }
-}
-
 /// The replay mode as words, e.g. "isolated and continuous".
 fn mode_text(m: Option<Mode>) -> &'static str {
-    mode_words(m.unwrap_or(Mode::Both).as_str())
+    mode_words(&arg_value(m.unwrap_or(Mode::Both)))
 }
 
 fn mode_words(mode: &str) -> &'static str {
@@ -223,7 +213,7 @@ impl ReplayOptionArgs {
         Ok(ReplayOptions {
             mode: self
                 .mode
-                .map(|m| m.as_str().to_owned())
+                .map(arg_value)
                 .unwrap_or_else(|| config.replay.default_mode.as_str().to_owned()),
             sample: self.sample.unwrap_or(config.replay.sample.0 / 100.0),
             ignore_headers: self.ignore_headers.clone(),
@@ -239,7 +229,7 @@ impl ReplayOptionArgs {
     fn flags(&self) -> String {
         let mut out = String::new();
         if let Some(m) = self.mode {
-            let _ = write!(out, " --mode {}", m.as_str());
+            let _ = write!(out, " --mode {}", arg_value(m));
         }
         if let Some(s) = self.sample {
             let _ = write!(out, " --sample {s}");
