@@ -291,27 +291,11 @@ impl Host {
         let receipt = recorder(change, self.execution().clone())
             .await
             .map_err(|error| error.code.as_str().to_owned())?;
-        let valid = match receipt {
-            SourcePos::Actor { shard, lsn } => {
-                lsn > 0 && shard.is_none_or(|shard| shard < kronik_proto::MAX_SHARD_COUNT)
-            }
-            SourcePos::Metadata { index } => index > 0,
-        };
-        if valid {
+        if events::valid_source(receipt) {
             Ok(())
         } else {
             Err("webhook_config_audit".into())
         }
-    }
-}
-
-fn same_domain(left: SourcePos, right: SourcePos) -> bool {
-    match (left, right) {
-        (SourcePos::Actor { shard: left, .. }, SourcePos::Actor { shard: right, .. }) => {
-            left == right
-        }
-        (SourcePos::Metadata { .. }, SourcePos::Metadata { .. }) => true,
-        _ => false,
     }
 }
 
@@ -368,8 +352,8 @@ fn validate_state(state: &State, entry: &Entry) -> Result<(), String> {
         return Err("webhook_state".into());
     }
     if let Some(batch) = &state.pending {
-        if !same_domain(state.source, batch.source)
-            || !same_domain(batch.source, batch.through)
+        if events::domain(state.source) != events::domain(batch.source)
+            || events::domain(batch.source) != events::domain(batch.through)
             || !valid_pin(&batch.pin, &state.identity)
             || matches!(batch.source, SourcePos::Metadata { .. }) && batch.events.is_empty()
             || events::coordinate(batch.source) <= entry.lsn
@@ -519,9 +503,6 @@ impl Webhook {
     /// Capture returns that producer's ONE actual reader Arc, never a Node fallback.
     // The webhook stream's opening inputs; grouping them would only move
     // the same names into a struct every caller unpacks again.
-    #[allow(clippy::too_many_arguments)]
-    // The webhook stream's opening inputs; grouping them would only move
-    // the same names into a struct every caller unpacks again.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub async fn open_registered(
         runtime: MetadataRuntime,
@@ -576,9 +557,6 @@ impl Webhook {
         }
     }
 
-    // The webhook stream's opening inputs; grouping them would only move
-    // the same names into a struct every caller unpacks again.
-    #[allow(clippy::too_many_arguments)]
     // As open_registered: the webhook stream's opening inputs.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     async fn open_at(
@@ -707,8 +685,8 @@ impl Webhook {
         through: SourcePos,
         generation: Generation,
     ) -> Result<Arc<Batch>, String> {
-        if !same_domain(self.state.source, source)
-            || !same_domain(source, through)
+        if events::domain(self.state.source) != events::domain(source)
+            || events::domain(source) != events::domain(through)
             || events::coordinate(through) < events::coordinate(source)
             || projected.iter().any(|event| event.source != source)
             || matches!(source, SourcePos::Actor { .. })
@@ -869,7 +847,7 @@ impl Webhook {
     }
 
     fn checkpoint_value(&self, source: SourcePos) -> Result<serde_json::Value, String> {
-        if !same_domain(self.state.source, source) {
+        if events::domain(self.state.source) != events::domain(source) {
             return Err("webhook_source".into());
         }
         let mut state = self.state.clone();
