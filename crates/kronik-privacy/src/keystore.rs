@@ -480,8 +480,7 @@ impl Keystore {
         nonce: [u8; 24],
         wall_ms: u64,
     ) -> Result<SubjectKey, PrivacyError> {
-        let fresh = Zeroizing::new(fresh);
-        self.sealing_key_inner(subject, &fresh, nonce, wall_ms, None, Pick::Newest)
+        self.sealing_key_at_revision(subject, fresh, nonce, wall_ms)
             .map(|(_, key)| key)
     }
 
@@ -500,17 +499,6 @@ impl Keystore {
     /// seals its blobs (ADR 0118 §1). A subject without one gets a new key
     /// from `fresh` and `nonce`, numbered after any erased versions, in either
     /// privacy mode. Only an erasure of the subject changes the answer.
-    pub fn identity_key(
-        &self,
-        subject: &str,
-        fresh: [u8; 32],
-        nonce: [u8; 24],
-        wall_ms: u64,
-    ) -> Result<SubjectKey, PrivacyError> {
-        self.identity_key_at_revision(subject, fresh, nonce, wall_ms)
-            .map(|(_, key)| key)
-    }
-
     pub(crate) fn identity_key_at_revision(
         &self,
         subject: &str,
@@ -648,7 +636,7 @@ impl Keystore {
     }
 
     /// The subject's oldest key version that is not erased, as
-    /// [`Keystore::identity_key`] picks it, but never created: `None` when
+    /// `identity_key_at_revision` picks it, but never created: `None` when
     /// the subject has no live key. For readers and forks, which must not
     /// change the keystore.
     pub fn existing_identity_key(&self, subject: &str) -> Result<Option<SubjectKey>, PrivacyError> {
