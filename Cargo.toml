@@ -75,7 +75,7 @@ hyper-rustls = { version = "0.27.7", default-features = false, features = ["http
 libc = "0.2"
 # SQLite 3.54.0 compiled from source; the session extension is enabled via
 # LIBSQLITE3_FLAGS in .cargo/config.toml (ADR 0005).
-rusqlite = { version = "=0.41.0", features = ["bundled", "hooks", "functions", "limits", "backup"] }
+rusqlite = { version = "=0.41.0", features = ["bundled", "hooks", "functions", "limits", "backup", "serialize"] }
 # statvfs(2) without unsafe (free space for [log] disk_reserve); already in
 # the tree through tempfile, pure Rust on Linux.
 rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process", "mm", "param"] }
