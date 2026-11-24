@@ -9,6 +9,7 @@ use bytes::Bytes;
 use kronik_core::authority::AuthLease;
 use kronik_core::env::{BoxFuture, Env, HttpRequest, HttpResponse, Net, TlsConfig};
 use kronik_core::identity::LeafKeys;
+use kronik_core::ids::hex;
 use rustls_pki_types::pem::{PemObject as _, SectionKind};
 use rustls_pki_types::{CertificateDer, UnixTime};
 use serde::{Deserialize, Serialize};
@@ -343,16 +344,6 @@ impl ControllerClient {
     pub(crate) fn endpoint(&self, path: &str) -> String {
         format!("{}{path}", self.url)
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8] = b"0123456789abcdef";
-    let mut value = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        value.push(DIGITS[(b >> 4) as usize] as char);
-        value.push(DIGITS[(b & 15) as usize] as char);
-    }
-    value
 }
 
 fn csr_fingerprint(der: &[u8]) -> Result<String, FleetError> {

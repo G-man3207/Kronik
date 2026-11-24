@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use kronik_core::ids::hex;
 use kronik_core::sync::lock;
 use kronik_effects::foreign::{Checkpoint, CopySpec};
 use serde::{Deserialize, Serialize};
@@ -77,7 +78,7 @@ fn host_identity() -> Result<String, String> {
     if fields < 2 {
         return Err("host CPU identity is unavailable".into());
     }
-    Ok(crate::blobs::hex(&hash.finalize()))
+    Ok(hex(&hash.finalize()))
 }
 
 /// Copies the snapshot Firecracker wrote into `output` to `image/memory` and

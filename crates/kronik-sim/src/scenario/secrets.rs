@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kronik_core::authority::AuthLease;
+use kronik_core::ids::hex;
 use kronik_gateway::HttpRequest;
 use kronik_privacy::secret_backend::config::{Definition, Settings};
 use kronik_proto::Record;
@@ -30,7 +31,7 @@ use kronik_proto::log::v1 as pb;
 use kronik_sched::Node;
 use prost::Message as _;
 
-use super::{World, audit, hex};
+use super::{World, audit};
 use crate::bao::{self, Mode, SimBao};
 
 /// The token file the daemon's backend reads, on the simulated disk.

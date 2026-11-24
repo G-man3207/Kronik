@@ -16,7 +16,7 @@ use std::time::Duration;
 use kronik_core::authority::{AuthLease, Authority};
 use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
-use kronik_core::ids::Lsn;
+use kronik_core::ids::{Lsn, hex};
 use kronik_core::sync::lock;
 use kronik_effects::contract::Contract;
 use kronik_effects::http::ScrubError;
@@ -1702,10 +1702,6 @@ impl ModelAccess {
             .ok_or_else(|| unavailable("The model result is unavailable"))?;
         deliver_model_result(&source, original, saved)
     }
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 #[cfg(test)]

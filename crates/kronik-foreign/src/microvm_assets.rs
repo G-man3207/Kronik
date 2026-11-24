@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kronik_core::env::{Env, ProcessSpec, Stdio};
+use kronik_core::ids::hex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -173,7 +174,7 @@ fn sha256(file: &mut File) -> Result<String, String> {
     if count != bound {
         return Err(error("file changed while hashing"));
     }
-    Ok(crate::blobs::hex(&hash.finalize()))
+    Ok(hex(&hash.finalize()))
 }
 fn valid_digest(value: &str) -> bool {
     value.len() == 64
