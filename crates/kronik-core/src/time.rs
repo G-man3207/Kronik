@@ -45,6 +45,21 @@ impl LogicalClock {
     }
 }
 
+/// The proleptic Gregorian date `(year, month, day)` of a day count since
+/// 1970-01-01 (Howard Hinnant's `civil_from_days`, for non-negative days).
+pub fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    (year, month, day)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,5 +93,17 @@ mod tests {
         // After a restart with a clock behind the log.
         let lc = LogicalClock::new(2_000);
         assert_eq!(lc.next(&c, 0), 2_001);
+    }
+
+    #[test]
+    fn civil_dates_cover_leap_years_and_centuries() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(1), (1970, 1, 2));
+        assert_eq!(civil_from_days(59), (1970, 3, 1));
+        assert_eq!(civil_from_days(789), (1972, 2, 29));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_from_days(47_482), (2100, 1, 1));
+        assert_eq!(civil_from_days(47_541), (2100, 3, 1));
+        assert_eq!(civil_from_days(2_932_896), (9999, 12, 31));
     }
 }
