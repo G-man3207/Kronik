@@ -258,16 +258,6 @@ async fn exchange(
         .map_err(|_| "PKCS11_UNAVAILABLE".into())
 }
 
-fn encode_hex(bytes: &[u8]) -> Zeroizing<String> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = Zeroizing::new(String::with_capacity(bytes.len() * 2));
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 15) as usize] as char);
-    }
-    output
-}
-
 fn decode_seed(value: &str) -> Result<Zeroizing<Vec<u8>>, String> {
     if !is_hex(value, 32) {
         return Err(PROTOCOL.into());
@@ -285,7 +275,7 @@ pub(crate) async fn enroll(env: &Env, cfg: &Pkcs11) -> Result<Probe, String> {
     if let Some(probe) = &cfg.probe {
         // A wrap verifies the enrollment-domain probe inside the helper before encrypting.
         // Never replace a configured probe with a new key's successful enrollment.
-        let public = encode_hex(&[0x4b; 32]);
+        let public = Zeroizing::new(crate::hex(&[0x4b; 32]));
         let mut req = request(cfg, "wrap")?;
         req.probe = Some(ProbeData {
             nonce: &probe.nonce,
@@ -361,7 +351,7 @@ pub(crate) async fn encrypt(
         return Err(PROTOCOL.into());
     }
     let probe = cfg.probe.as_ref().ok_or(CONFIG)?;
-    let plaintext = encode_hex(seed);
+    let plaintext = Zeroizing::new(crate::hex(seed));
     let mut req = request(cfg, "wrap")?;
     req.probe = Some(ProbeData {
         nonce: &probe.nonce,
