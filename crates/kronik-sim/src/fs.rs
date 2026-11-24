@@ -279,15 +279,10 @@ impl Disk {
             .collect()
     }
 
-    /// Like `durable_contents`, but only the bytes from `from` on, plus the
-    /// total durable length (for incremental checks on long runs).
-    pub fn durable_suffix(&self, path: &Path, from: usize) -> Option<(usize, Vec<u8>)> {
+    /// The durable length of `path`, if it is durably named.
+    pub fn durable_len(&self, path: &Path) -> Option<usize> {
         let ino = self.durable_names.get(path)?;
-        let d = &self.inodes.get(ino)?.durable;
-        Some((
-            d.len(),
-            d.get(from..).map(<[u8]>::to_vec).unwrap_or_default(),
-        ))
+        Some(self.inodes.get(ino)?.durable.len())
     }
 
     /// Power failure: everything not synced is resolved by `model`.

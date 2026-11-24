@@ -330,7 +330,7 @@ impl DurableIndex {
             else {
                 continue;
             };
-            let Some((len, _)) = disk.durable_suffix(&path, usize::MAX) else {
+            let Some(len) = disk.durable_len(&path) else {
                 continue;
             };
             let (seen, next) = self.scanned.get(&path).copied().unwrap_or((0, start));
