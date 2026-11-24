@@ -60,22 +60,13 @@ const WASI_INTERFACES: &[(&str, &[&str])] = &[
     ("http", &["types", "outgoing-handler"]),
 ];
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CheckError {
+    #[error("input is a core module, not a component")]
     NotAComponent,
+    #[error("invalid component: {0}")]
     Parse(wasmparser::BinaryReaderError),
 }
-
-impl std::fmt::Display for CheckError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CheckError::NotAComponent => write!(f, "input is a core module, not a component"),
-            CheckError::Parse(e) => write!(f, "invalid component: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for CheckError {}
 
 /// Returns all top-level import names of a component, in binary order.
 pub fn component_imports(bytes: &[u8]) -> Result<Vec<String>, CheckError> {
