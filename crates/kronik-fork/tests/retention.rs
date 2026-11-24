@@ -372,23 +372,23 @@ fn fork_create_refuses_a_point_the_log_no_longer_covers() {
     );
 }
 
+fn window_request() -> ProposeRequest {
+    ProposeRequest {
+        wasm: vec![std::fs::read(guest("counter-step2")).unwrap()],
+        names: Vec::new(),
+        window_ms: None,
+        at: None,
+        options: DiffOptions::default(),
+        workers: Some(2),
+        audit: audit(),
+        dry_run: false,
+    }
+}
+
 fn propose_window(p: &Proc, props: &Arc<Proposals>) -> kronik_fork::proposal::Proposal {
-    let wasm = std::fs::read(guest("counter-step2")).unwrap();
-    p.rt.block_on(props.propose(
-        ProposeRequest {
-            wasm: vec![wasm],
-            names: Vec::new(),
-            window_ms: None,
-            at: None,
-            options: DiffOptions::default(),
-            workers: Some(2),
-            audit: audit(),
-            dry_run: false,
-        },
-        p.owner(),
-    ))
-    .unwrap()
-    .0
+    p.rt.block_on(props.propose(window_request(), p.owner()))
+        .unwrap()
+        .0
 }
 
 /// The quickstart walk on a young node (v0.1 gap): the first deployment
@@ -453,13 +453,26 @@ fn a_window_cut_by_retention_is_reported() {
     );
     p.send("counter/late", "increment", "");
     let props = open_props(&p, dir.path());
-    let prop = propose_window(&p, &props);
+    let snap = k5.turn_id;
     // The fork starts at the oldest point inside the 2 s window: k5's turn,
     // the first one in it (the point before it is k4's state, outside).
+    let expected_cut = (3_600_000, snap.lsn);
+    // The cut is known before a turn is replayed: the proposal reports it
+    // while it runs, not only once it is evaluated.
+    let running =
+        p.rt.block_on(props.propose_job(window_request(), false, p.owner()))
+            .unwrap()
+            .0;
+    assert_eq!(running.status, "running");
+    let cut = running
+        .window_cut
+        .clone()
+        .expect("the cut is recorded while the proposal runs");
+    assert_eq!((cut.window_ms, cut.kept_from_lsn), expected_cut);
+    let prop = p.rt.block_on(props.wait(&running.id)).unwrap();
     assert_eq!(prop.summary["root_inputs"], 1, "{}", prop.summary);
     let cut = prop.window_cut.clone().expect("the cut is recorded");
-    let snap = k5.turn_id;
-    assert_eq!((cut.window_ms, cut.kept_from_lsn), (3_600_000, snap.lsn));
+    assert_eq!((cut.window_ms, cut.kept_from_lsn), expected_cut);
     let warnings = prop.warnings();
     assert!(
         warnings.len() == 1 && warnings[0].contains("retention cut the window"),
