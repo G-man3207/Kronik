@@ -60,35 +60,44 @@ impl SpaceBudget {
 
     /// Takes `n` bytes, or answers [`BlobError::SpaceFull`] and takes none.
     pub(crate) fn charge(&self, n: u64) -> Result<(), BlobError> {
-        let mut used = self.used.load(Ordering::Acquire);
-        loop {
-            let next = used.saturating_add(n);
-            if next > self.limit {
-                return Err(BlobError::SpaceFull { limit: self.limit });
-            }
-            match self
-                .used
-                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return Ok(()),
-                Err(now) => used = now,
-            }
-        }
+        self.used
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_add(n)).filter(|next| *next <= self.limit)
+            })
+            .map(|_| ())
+            .map_err(|_| BlobError::SpaceFull { limit: self.limit })
     }
 
     /// Gives back `n` bytes a writer took and named no new object with.
     pub(crate) fn refund(&self, n: u64) {
-        let mut used = self.used.load(Ordering::Acquire);
-        loop {
-            match self.used.compare_exchange_weak(
-                used,
-                used.saturating_sub(n),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(now) => used = now,
-            }
-        }
+        let _ = self
+            .used
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(n))
+            });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn charge_and_refund_keep_the_space_within_its_limit() {
+        let budget = SpaceBudget::new(10);
+        budget.charge(6).unwrap();
+        assert!(matches!(
+            budget.charge(5),
+            Err(BlobError::SpaceFull { limit: 10 })
+        ));
+        assert_eq!(budget.used(), 6);
+
+        budget.refund(4);
+        assert_eq!(budget.used(), 2);
+        budget.refund(3);
+        assert_eq!(budget.used(), 0);
+        budget.charge(10).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        assert!(budget.charge(1).is_err());
     }
 }
