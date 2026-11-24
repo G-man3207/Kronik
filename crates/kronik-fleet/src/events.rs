@@ -64,7 +64,8 @@ pub fn coordinate(source: SourcePos) -> u64 {
     }
 }
 
-fn valid_source(source: SourcePos) -> bool {
+/// Past its source's origin, and an actor shard that exists.
+pub fn valid_source(source: SourcePos) -> bool {
     coordinate(source) > 0
         && match source {
             SourcePos::Actor {

@@ -15,7 +15,7 @@ use kronik_core::ids::{Lsn, hex};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 
-use crate::spans::{IdKey, Kept, OpenTurns};
+use crate::spans::{IdKey, Kept, OpenTurns, is_lower_hex};
 
 const MAGIC: &[u8; 16] = b"KRONIK-TRACE-V1\0";
 const HEADER: u64 = 24;
@@ -264,18 +264,7 @@ fn checksum(generation: u64, offset: u64, previous: &[u8; 32], payload: &[u8]) -
 }
 
 fn hash_bytes(text: &str) -> io::Result<[u8; 32]> {
-    if text.len() != 64
-        || !text
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(invalid("invalid trace metadata hash"));
-    }
-    let mut bytes = [0; 32];
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).map_err(invalid_error)?;
-    }
-    Ok(bytes)
+    crate::spans::unhex(text).ok_or_else(|| invalid("invalid trace metadata hash"))
 }
 
 fn invalid_error(error: impl std::fmt::Display) -> io::Error {
@@ -394,17 +383,9 @@ struct Legacy {
 }
 
 fn unhex(text: &str) -> io::Result<Vec<u8>> {
-    if !text.len().is_multiple_of(2)
-        || !text
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(invalid("invalid historical trace metadata hex"));
-    }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(invalid_error))
-        .collect()
+    kronik_core::ids::unhex(text)
+        .filter(|_| is_lower_hex(text))
+        .ok_or_else(|| invalid("invalid historical trace metadata hex"))
 }
 
 fn legacy(value: &serde_json::Value, ids: IdKey) -> io::Result<OpenTurns> {
@@ -760,6 +741,27 @@ mod tests {
         load(env, dir, &serde_json::Value::Null, 0, IDS)
             .await
             .unwrap()
+    }
+
+    /// The state is written in lowercase hex; another spelling is not ours.
+    #[test]
+    fn trace_state_hex_is_lowercase_only() {
+        assert_eq!(unhex("0a0b").unwrap(), [0x0a, 0x0b]);
+        for other in ["0A", "aF", "0a0", "0g"] {
+            assert_eq!(
+                unhex(other).unwrap_err().to_string(),
+                "invalid historical trace metadata hex",
+                "{other:?}"
+            );
+        }
+        assert_eq!(hash_bytes(&"ab".repeat(32)).unwrap(), [0xab; 32]);
+        for other in [&"AB".repeat(32)[..], &"ab".repeat(31)[..]] {
+            assert_eq!(
+                hash_bytes(other).unwrap_err().to_string(),
+                "invalid trace metadata hash",
+                "{other:?}"
+            );
+        }
     }
 
     #[tokio::test]

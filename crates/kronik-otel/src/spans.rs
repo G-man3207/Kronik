@@ -54,16 +54,18 @@ fn keyed<const N: usize>(ids: &IdKey, parts: &[&[u8]]) -> [u8; N] {
     digest(blake3::Hasher::new_keyed(&ids.0), parts)
 }
 
+/// Lowercase hex only: ids and state files are written in it, and
+/// `kronik_core::ids::unhex` alone would also take uppercase.
+pub(crate) fn is_lower_hex(s: &str) -> bool {
+    s.bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// `N` bytes from exactly `2N` lowercase hex characters.
-fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
-    if s.len() != 2 * N || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        return None;
-    }
-    let mut out = [0; N];
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
-    }
-    Some(out)
+pub(crate) fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    kronik_core::ids::unhex(s)
+        .filter(|_| is_lower_hex(s))
+        .and_then(|bytes| bytes.try_into().ok())
 }
 
 /// The trace id of a causal root: its 16 bytes, or for a root that is not
@@ -527,7 +529,7 @@ fn kv(key: &str, value: any_value::Value) -> KeyValue {
     }
 }
 
-fn s(key: &str, value: impl Into<String>) -> KeyValue {
+pub(crate) fn s(key: &str, value: impl Into<String>) -> KeyValue {
     kv(key, any_value::Value::StringValue(value.into()))
 }
 
@@ -539,7 +541,7 @@ fn int(key: &str, value: impl TryInto<i64>) -> KeyValue {
 }
 
 /// `OUTCOME_KIND_FUEL_EXHAUSTED` → `fuel_exhausted`.
-fn label(name: &str, prefix: &str) -> String {
+pub(crate) fn label(name: &str, prefix: &str) -> String {
     name.strip_prefix(prefix)
         .unwrap_or(name)
         .to_ascii_lowercase()
@@ -904,7 +906,7 @@ pub fn clamp(spans: &mut [Span]) {
     }
 }
 
-/// The node, as the OTLP resource of its spans (§3.4).
+/// The node, as the OTLP resource of its spans and metrics (§3.4).
 pub struct Resource<'a> {
     /// `[otel] service_name`.
     pub service_name: &'a str,
@@ -914,25 +916,37 @@ pub struct Resource<'a> {
     pub engine: &'a str,
 }
 
+impl Resource<'_> {
+    /// The resource attributes of every export, spans and metrics alike.
+    pub(crate) fn otlp(&self) -> OtlpResource {
+        OtlpResource {
+            attributes: vec![
+                s("service.name", self.service_name),
+                s("service.version", self.service_version),
+                s("kronik.node", self.node),
+                s("kronik.engine", self.engine),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// The `kronik` instrumentation scope of every export.
+    pub(crate) fn scope(&self) -> InstrumentationScope {
+        InstrumentationScope {
+            name: "kronik".into(),
+            version: self.service_version.into(),
+            ..Default::default()
+        }
+    }
+}
+
 /// One export request with `spans` under the node's resource.
 pub fn request(resource: &Resource, spans: Vec<Span>) -> ExportTraceServiceRequest {
     ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
-            resource: Some(OtlpResource {
-                attributes: vec![
-                    s("service.name", resource.service_name),
-                    s("service.version", resource.service_version),
-                    s("kronik.node", resource.node),
-                    s("kronik.engine", resource.engine),
-                ],
-                ..Default::default()
-            }),
+            resource: Some(resource.otlp()),
             scope_spans: vec![ScopeSpans {
-                scope: Some(InstrumentationScope {
-                    name: "kronik".into(),
-                    version: resource.service_version.into(),
-                    ..Default::default()
-                }),
+                scope: Some(resource.scope()),
                 spans,
                 schema_url: String::new(),
             }],

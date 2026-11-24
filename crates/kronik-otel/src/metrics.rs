@@ -15,22 +15,12 @@ use crate::follow::{Delivery, Stream};
 use crate::otlp::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
-use crate::otlp::common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value};
+use crate::otlp::common::v1::KeyValue;
 use crate::otlp::metrics::v1::{
     AggregationTemporality, Gauge, Histogram, HistogramDataPoint, Metric, NumberDataPoint,
     ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
 };
-use crate::otlp::resource::v1::Resource as OtlpResource;
-use crate::spans::Resource;
-
-fn kv(key: &str, value: &str) -> KeyValue {
-    KeyValue {
-        key: key.into(),
-        value: Some(AnyValue {
-            value: Some(any_value::Value::StringValue(value.into())),
-        }),
-    }
-}
+use crate::spans::{self, Resource};
 
 /// The samples as OTLP metrics: counters as monotonic cumulative sums,
 /// gauges as gauges, histograms as cumulative explicit-bound histograms.
@@ -68,7 +58,7 @@ pub fn request(
                 ..Default::default()
             });
         }
-        let attributes: Vec<KeyValue> = s.labels.iter().map(|(k, v)| kv(k, v)).collect();
+        let attributes: Vec<KeyValue> = s.labels.iter().map(|(k, v)| spans::s(k, v)).collect();
         let number = |value| NumberDataPoint {
             attributes: attributes.clone(),
             start_time_unix_nano: start_unix_nano,
@@ -119,21 +109,9 @@ pub fn request(
     }
     ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
-            resource: Some(OtlpResource {
-                attributes: vec![
-                    kv("service.name", resource.service_name),
-                    kv("service.version", resource.service_version),
-                    kv("kronik.node", resource.node),
-                    kv("kronik.engine", resource.engine),
-                ],
-                ..Default::default()
-            }),
+            resource: Some(resource.otlp()),
             scope_metrics: vec![ScopeMetrics {
-                scope: Some(InstrumentationScope {
-                    name: "kronik".into(),
-                    version: resource.service_version.into(),
-                    ..Default::default()
-                }),
+                scope: Some(resource.scope()),
                 metrics,
                 schema_url: String::new(),
             }],
@@ -254,6 +232,13 @@ mod tests {
             engine: "e",
         };
         let req = request(&resource, &kronik_metrics::snapshot(), 1, 2);
+        // Spans and metrics leave the node as one resource under one scope.
+        let traces = spans::request(&resource, Vec::new()).resource_spans;
+        assert_eq!(req.resource_metrics[0].resource, traces[0].resource);
+        assert_eq!(
+            req.resource_metrics[0].scope_metrics[0].scope,
+            traces[0].scope_spans[0].scope
+        );
         let metrics = &req.resource_metrics[0].scope_metrics[0].metrics;
         let find = |n: &str| metrics.iter().find(|m| m.name == n).unwrap();
         let Some(metric::Data::Sum(sum)) = &find("kronik_turns_total").data else {
