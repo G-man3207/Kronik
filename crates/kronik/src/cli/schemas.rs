@@ -32,15 +32,33 @@ enum Output {
 /// Every command, as `kronik <command>`, in the order of the CLI reference.
 const COMMANDS: &[(&str, Output)] = &[
     ("serve", Output::None("the daemon; it refuses --json")),
-    ("doctor", Output::Local(crate::doctor::json_schema)),
-    ("serve --init", Output::Local(crate::init::json_schema)),
-    ("userns pin", Output::Local(super::userns::schema)),
-    ("userns unpin", Output::Local(super::userns::schema)),
-    ("userns status", Output::Local(super::userns::schema)),
-    ("restore", Output::Local(crate::restore::json_schema)),
-    ("upgrade check", Output::Local(crate::upgrade::json_schema)),
-    ("init", Output::Local(crate::project::init_schema)),
-    ("build", Output::Local(crate::project::build_schema)),
+    ("doctor", Output::Local(of::<crate::doctor::Report>)),
+    ("serve --init", Output::Local(of::<crate::init::InitOutput>)),
+    (
+        "userns pin",
+        Output::Local(of::<super::userns::UsernsReport>),
+    ),
+    (
+        "userns unpin",
+        Output::Local(of::<super::userns::UsernsReport>),
+    ),
+    (
+        "userns status",
+        Output::Local(of::<super::userns::UsernsReport>),
+    ),
+    (
+        "restore",
+        Output::Local(of::<crate::restore::RestoreOutput>),
+    ),
+    (
+        "upgrade check",
+        Output::Local(of::<crate::upgrade::UpgradeCheckOutput>),
+    ),
+    ("init", Output::Local(of::<crate::project::init::Created>)),
+    (
+        "build",
+        Output::Local(of::<crate::project::build::BuildOutput>),
+    ),
     ("deploy", Output::Api(&[("", "POST", "/v1/deployments")])),
     (
         "deployments list",
@@ -134,8 +152,14 @@ const COMMANDS: &[(&str, Output)] = &[
         "keys rewrap",
         Output::Api(&[("", "POST", "/v1/keys/rewrap")]),
     ),
-    ("keys wrap", Output::Local(super::keys::wrap_schema)),
-    ("keys enroll", Output::Local(super::keys::enroll_schema)),
+    (
+        "keys wrap",
+        Output::Local(of::<kronik_api::types::KeysChangeResponse>),
+    ),
+    (
+        "keys enroll",
+        Output::Local(of::<kronik_privacy::key_source::config::Probe>),
+    ),
     ("fork create", Output::Api(&[("", "POST", "/v1/forks")])),
     ("fork list", Output::Api(&[("", "GET", "/v1/forks")])),
     (
@@ -242,7 +266,7 @@ const COMMANDS: &[(&str, Output)] = &[
     ),
     (
         "foreign cleanup",
-        Output::Local(super::foreign::cleanup_schema),
+        Output::Local(of::<super::foreign::CleanupOutput>),
     ),
     (
         "stubs set",
@@ -300,7 +324,10 @@ const COMMANDS: &[(&str, Output)] = &[
         Output::Api(&[("", "POST", "/v1/export/{stream}/rewind")]),
     ),
     ("audit show", Output::Api(&[("", "GET", "/v1/audit")])),
-    ("audit verify", Output::Local(super::audit::verify_schema)),
+    (
+        "audit verify",
+        Output::Local(of::<kronik_otel::audit::Report>),
+    ),
     (
         "fleet enroll",
         Output::Api(&[("", "POST", "/v1/fleet/enroll")]),
@@ -360,6 +387,11 @@ fn explain_schema(g: &mut SchemaGenerator) -> Schema {
         {"$ref": format!("{REF}Topic")},
         {"$ref": format!("{REF}TopicList")}
     ]}))
+}
+
+/// The schema of a local command's output type.
+fn of<T: schemars::JsonSchema>(g: &mut SchemaGenerator) -> Schema {
+    g.subschema_for::<T>()
 }
 
 fn to_schema(v: Value) -> Schema {

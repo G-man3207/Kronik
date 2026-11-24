@@ -678,11 +678,6 @@ impl InitHost {
     }
 }
 
-#[cfg(test)]
-pub fn json_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    g.subschema_for::<InitOutput>()
-}
-
 fn unit(
     template: &str,
     host: &InitHost,

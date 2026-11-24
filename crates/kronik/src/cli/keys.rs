@@ -44,16 +44,6 @@ pub struct WrapArgs {
     mutation: Mutation,
 }
 
-#[cfg(test)]
-pub fn wrap_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    g.subschema_for::<KeysChangeResponse>()
-}
-
-#[cfg(test)]
-pub fn enroll_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    g.subschema_for::<kronik_privacy::key_source::config::Probe>()
-}
-
 pub(super) fn keys(ctx: &Ctx, command: KeysCommand) -> Result<ExitCode, Error> {
     match command {
         KeysCommand::Status => {

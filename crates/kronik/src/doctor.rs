@@ -125,17 +125,11 @@ fn format_check(c: &Check) -> String {
 
 /// What `kronik doctor --json` prints.
 #[derive(Debug, Serialize, JsonSchema)]
-struct Report {
+pub(crate) struct Report {
     checks: Vec<Check>,
     pass: usize,
     warn: usize,
     fail: usize,
-}
-
-/// The schema of `kronik doctor --json` (docs/reference/json.md).
-#[cfg(test)]
-pub fn json_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    g.subschema_for::<Report>()
 }
 
 pub fn run(args: DoctorArgs, json: bool) -> ExitCode {

@@ -53,7 +53,7 @@ pub struct CheckArgs {
 /// What `kronik upgrade check --json` prints: the report, plus the diff
 /// path when one was written. `code` is set when the process exits 1.
 #[derive(Debug, Serialize, JsonSchema)]
-struct UpgradeCheckOutput {
+pub(crate) struct UpgradeCheckOutput {
     schema: String,
     from_engine: String,
     to_engine: String,
@@ -82,11 +82,6 @@ struct UpgradeCheckOutput {
     /// `ENGINE_UPGRADE_DIVERGED` when a verified difference remains.
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<String>,
-}
-
-#[cfg(test)]
-pub fn json_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    g.subschema_for::<UpgradeCheckOutput>()
 }
 
 struct Done {

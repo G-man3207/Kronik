@@ -60,12 +60,6 @@ pub struct VerifyArgs {
     data_dir: Option<PathBuf>,
 }
 
-/// The schema of `kronik audit verify --json` (docs/reference/json.md).
-#[cfg(test)]
-pub fn verify_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    g.subschema_for::<Report>()
-}
-
 pub(super) fn audit(ctx: &Ctx, command: AuditCommand) -> Result<ExitCode, Error> {
     match command {
         AuditCommand::Show { from, limit } => show(ctx, from, limit),
