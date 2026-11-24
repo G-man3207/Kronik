@@ -9,11 +9,11 @@ use std::io;
 
 use bytes::Bytes;
 use kronik_core::env::{BoxFuture, OpenMode};
+use kronik_core::ids::hex;
 
 use crate::format::{
     FrameKey, HEADER_LEN, Header, PLAIN_OVERHEAD, frame_count, open_plain_frame, seal_frame,
 };
-use crate::id::hex;
 use crate::{BlobError, BlobId, BlobStore, KeyAccess, KeyAnswer, Space};
 
 /// What sealing one blob file did.

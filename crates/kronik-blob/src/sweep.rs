@@ -29,10 +29,10 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use kronik_core::env::{File, OpenMode};
+use kronik_core::ids::hex;
 use kronik_core::sync::lock;
 
 use crate::format::{HEADER_LEN, Header};
-use crate::id::hex;
 use crate::{BlobError, BlobId, BlobStore, Space};
 
 /// What keeps the blobs of a space, shard by shard.

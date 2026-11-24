@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::io;
 
 use kronik_core::env::OpenMode;
+use kronik_core::ids::hex;
 
 use crate::{BlobError, BlobId, BlobStore, Space};
 
@@ -80,7 +81,7 @@ impl BlobStore {
         let root = self.root(space);
         let (mut files, mut bytes) = (0u64, 0u64);
         for shard in 0..=255u8 {
-            let dir_path = root.join("objects").join(crate::id::hex(&[shard]));
+            let dir_path = root.join("objects").join(hex(&[shard]));
             let names = match fs.read_dir(dir_path.clone()).await {
                 Ok(names) => names,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,

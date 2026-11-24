@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use kronik_core::ids::hex;
 use kronik_proto::blobs::{KEYED_PREFIX, PLAIN_PREFIX, parse_hash, validate_ref};
 use kronik_proto::log::v1 as pb;
 
@@ -13,16 +14,6 @@ use crate::BlobError;
 pub struct BlobId {
     keyed: bool,
     digest: [u8; 32],
-}
-
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(DIGITS[usize::from(b >> 4)] as char);
-        s.push(DIGITS[usize::from(b & 15)] as char);
-    }
-    s
 }
 
 impl BlobId {

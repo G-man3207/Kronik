@@ -9,12 +9,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kronik_core::env::{Env, File, OpenMode};
+use kronik_core::ids::hex;
 use kronik_core::sync::lock;
 use zeroize::Zeroizing;
 
 use crate::SpaceBudget;
 use crate::format::{self, FRAME_SIZE, FrameKey, HEADER_LEN, Header};
-use crate::id::hex;
 use crate::{BlobError, BlobId, BlobMeta, Lease, Leases};
 
 /// Where blobs are written and first looked for.
