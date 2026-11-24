@@ -245,23 +245,29 @@ async fn native_positional_read_binds_the_actual_header_and_record() {
     ));
 }
 
-struct ReadFs {
+/// A file system that records the reads, `(offset, len)`, and the syncs:
+/// `("dir", path)` and `("data", path)`.
+struct RecordingFs {
     inner: Arc<dyn Fs>,
-    calls: Arc<Mutex<Vec<(u64, usize)>>>,
+    reads: Arc<Mutex<Vec<(u64, usize)>>>,
+    syncs: Arc<Mutex<Vec<(&'static str, PathBuf)>>>,
 }
 
-impl Fs for ReadFs {
+impl Fs for RecordingFs {
     fn create_dir_all(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
         self.inner.create_dir_all(path)
     }
 
     fn open(&self, path: PathBuf, mode: OpenMode) -> BoxFuture<'static, io::Result<Arc<dyn File>>> {
-        let opened = self.inner.open(path, mode);
-        let calls = self.calls.clone();
+        let opened = self.inner.open(path.clone(), mode);
+        let reads = self.reads.clone();
+        let syncs = self.syncs.clone();
         Box::pin(async move {
-            Ok(Arc::new(ReadFile {
+            Ok(Arc::new(RecordingFile {
                 inner: opened.await?,
-                calls,
+                path,
+                reads,
+                syncs,
             }) as Arc<dyn File>)
         })
     }
@@ -283,22 +289,25 @@ impl Fs for ReadFs {
     }
 
     fn sync_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
+        self.syncs.lock().unwrap().push(("dir", path.clone()));
         self.inner.sync_dir(path)
     }
 }
 
-struct ReadFile {
+struct RecordingFile {
     inner: Arc<dyn File>,
-    calls: Arc<Mutex<Vec<(u64, usize)>>>,
+    path: PathBuf,
+    reads: Arc<Mutex<Vec<(u64, usize)>>>,
+    syncs: Arc<Mutex<Vec<(&'static str, PathBuf)>>>,
 }
 
-impl File for ReadFile {
+impl File for RecordingFile {
     fn len(&self) -> BoxFuture<'static, io::Result<u64>> {
         self.inner.len()
     }
 
     fn read_at(&self, offset: u64, len: usize) -> BoxFuture<'static, io::Result<Vec<u8>>> {
-        self.calls.lock().unwrap().push((offset, len));
+        self.reads.lock().unwrap().push((offset, len));
         self.inner.read_at(offset, len)
     }
 
@@ -311,6 +320,7 @@ impl File for ReadFile {
     }
 
     fn sync_data(&self) -> BoxFuture<'static, io::Result<()>> {
+        self.syncs.lock().unwrap().push(("data", self.path.clone()));
         self.inner.sync_data()
     }
 }
@@ -332,9 +342,10 @@ async fn bounded_reads_stop_at_each_batch_and_resume_without_loss() {
     }
     std::fs::write(h.cfg.dir.join(segment_name(1)), &image).unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
-    h.env.fs = Arc::new(ReadFs {
+    h.env.fs = Arc::new(RecordingFs {
         inner: h.env.fs.clone(),
-        calls: calls.clone(),
+        reads: calls.clone(),
+        syncs: Default::default(),
     });
     let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
     let mut consumed = Vec::new();
@@ -464,9 +475,10 @@ async fn bounded_reads_crc_check_large_skipped_payloads_in_small_chunks() {
     let path = h.cfg.dir.join(segment_name(1));
     std::fs::write(&path, &image).unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
-    h.env.fs = Arc::new(ReadFs {
+    h.env.fs = Arc::new(RecordingFs {
         inner: h.env.fs.clone(),
-        calls: calls.clone(),
+        reads: calls.clone(),
+        syncs: Default::default(),
     });
     let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
     let mut seen = Vec::new();
@@ -1398,9 +1410,10 @@ async fn an_incomplete_entry_is_torn_and_its_length_sizes_no_read() {
     // than the file has.
     let calls = Arc::new(Mutex::new(Vec::new()));
     let plain_env = h.env.clone();
-    h.env.fs = Arc::new(ReadFs {
+    h.env.fs = Arc::new(RecordingFs {
         inner: plain_env.fs.clone(),
-        calls: calls.clone(),
+        reads: calls.clone(),
+        syncs: Default::default(),
     });
     let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
     let pos = Position {
@@ -1541,81 +1554,6 @@ async fn canceling_an_unpolled_real_writer_publishes_native_closure_synchronousl
     assert!(h.read_all().await.unwrap().is_empty());
 }
 
-/// A file system that records the syncs: `("dir", path)` and
-/// `("data", path)`.
-struct SyncFs {
-    inner: Arc<dyn Fs>,
-    syncs: Arc<Mutex<Vec<(&'static str, PathBuf)>>>,
-}
-
-impl Fs for SyncFs {
-    fn create_dir_all(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.create_dir_all(path)
-    }
-
-    fn open(&self, path: PathBuf, mode: OpenMode) -> BoxFuture<'static, io::Result<Arc<dyn File>>> {
-        let opened = self.inner.open(path.clone(), mode);
-        let syncs = self.syncs.clone();
-        Box::pin(async move {
-            Ok(Arc::new(SyncFile {
-                inner: opened.await?,
-                path,
-                syncs,
-            }) as Arc<dyn File>)
-        })
-    }
-
-    fn exists(&self, path: PathBuf) -> BoxFuture<'static, io::Result<bool>> {
-        self.inner.exists(path)
-    }
-
-    fn read_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<Vec<String>>> {
-        self.inner.read_dir(path)
-    }
-
-    fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.rename(from, to)
-    }
-
-    fn remove_file(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.remove_file(path)
-    }
-
-    fn sync_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.syncs.lock().unwrap().push(("dir", path.clone()));
-        self.inner.sync_dir(path)
-    }
-}
-
-struct SyncFile {
-    inner: Arc<dyn File>,
-    path: PathBuf,
-    syncs: Arc<Mutex<Vec<(&'static str, PathBuf)>>>,
-}
-
-impl File for SyncFile {
-    fn len(&self) -> BoxFuture<'static, io::Result<u64>> {
-        self.inner.len()
-    }
-
-    fn read_at(&self, offset: u64, len: usize) -> BoxFuture<'static, io::Result<Vec<u8>>> {
-        self.inner.read_at(offset, len)
-    }
-
-    fn write_at(&self, offset: u64, data: Bytes) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.write_at(offset, data)
-    }
-
-    fn set_len(&self, len: u64) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.set_len(len)
-    }
-
-    fn sync_data(&self) -> BoxFuture<'static, io::Result<()>> {
-        self.syncs.lock().unwrap().push(("data", self.path.clone()));
-        self.inner.sync_data()
-    }
-}
-
 /// A process killed without a power loss leaves its last segment's tail,
 /// and the name of a segment it created before syncing the directory, in
 /// the page cache only. The next open makes both durable before it builds
@@ -1640,8 +1578,9 @@ async fn open_makes_what_the_last_process_left_durable() {
         let last = segments.last().unwrap().clone();
         let syncs = Arc::new(Mutex::new(Vec::new()));
         let mut env = h.env.clone();
-        env.fs = Arc::new(SyncFs {
+        env.fs = Arc::new(RecordingFs {
             inner: h.env.fs.clone(),
+            reads: Default::default(),
             syncs: syncs.clone(),
         });
         let (tx, _rx) = mpsc::unbounded_channel();
