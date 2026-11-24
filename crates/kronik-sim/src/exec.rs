@@ -57,9 +57,10 @@ pub struct Executor {
 }
 
 /// Why `run` returned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RunEnd {
     /// No task is ready and no timer is pending.
+    #[default]
     Quiescent,
     /// The step budget was exhausted (livelock or a very long run).
     StepLimit,
