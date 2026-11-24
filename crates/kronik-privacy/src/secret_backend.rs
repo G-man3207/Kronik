@@ -180,6 +180,10 @@ mod tests {
                 .await,
             Err(BackendError::VersionGone)
         ));
+        assert!(matches!(
+            missing.fetch("SERVICE_TOKEN", None, original.clone()).await,
+            Err(BackendError::NotFound)
+        ));
         let other = EnvBackend::new(
             BTreeMap::from([(
                 "OTHER_TOKEN".into(),

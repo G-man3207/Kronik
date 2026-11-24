@@ -156,3 +156,58 @@ impl SecretBackend for FileBackend {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MasterKey, key_source::providers::test_authority};
+    use rusqlite::Connection;
+
+    /// A missing row is `NotFound` for the current value and `VersionGone`
+    /// for a retained version.
+    #[tokio::test]
+    async fn a_missing_row_is_not_found_for_the_current_value_and_gone_for_a_version() {
+        let master = MasterKey::from_bytes([7; 32]).unwrap();
+        let store =
+            Arc::new(SecretStore::open(Connection::open_in_memory().unwrap(), &master).unwrap());
+        let backend = FileBackend::new(Env::real(tokio::runtime::Handle::current()), store.clone());
+        assert!(matches!(
+            backend.fetch("token", None, test_authority()).await,
+            Err(BackendError::NotFound)
+        ));
+        assert!(matches!(
+            backend.fetch("token", Some("1"), test_authority()).await,
+            Err(BackendError::VersionGone)
+        ));
+        for version in 1u8..=2 {
+            store
+                .set_at(
+                    "token",
+                    u64::from(version),
+                    &[version; 3],
+                    [version; 24],
+                    12,
+                    "admin",
+                    "set",
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            backend.fetch("token", Some("0x1"), test_authority()).await,
+            Err(BackendError::Invalid)
+        ));
+        // The current value is the newest version; an older one stays readable.
+        for (asked, expected) in [(None, 2u8), (Some("2"), 2), (Some("1"), 1)] {
+            let fetched = backend
+                .fetch("token", asked, test_authority())
+                .await
+                .unwrap();
+            assert_eq!(&*fetched.value, &[expected; 3]);
+            assert_eq!(fetched.source_version, expected.to_string());
+        }
+        assert!(matches!(
+            backend.fetch("token", Some("3"), test_authority()).await,
+            Err(BackendError::VersionGone)
+        ));
+    }
+}
