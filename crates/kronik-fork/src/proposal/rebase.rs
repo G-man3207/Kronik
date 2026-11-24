@@ -227,19 +227,13 @@ impl Proposals {
                     .map(|k| base64::engine::general_purpose::STANDARD.encode(k.encode_to_vec()))
                     .collect(),
                 reason: req.audit.reason.clone(),
-                approved: None,
-                promoted: None,
-                plain_fork: false,
-                unchanged: Vec::new(),
-                window_cut: None,
-                error: None,
-                preview: None,
                 rebase: Some(RebaseInfo {
                     rolled_back_epoch: req.epoch,
                     base_lsn,
                     irreversible_effects: d.irreversible.as_ref().map_or(0, |i| i.count),
                     switch_lsn: None,
                 }),
+                ..Default::default()
             };
             if req.dry_run {
                 return Ok((meta, true));
