@@ -55,12 +55,6 @@ pub struct PoolSize {
     pub concurrency: u32,
 }
 
-impl Default for PoolSize {
-    fn default() -> Self {
-        PoolSize { concurrency: 128 }
-    }
-}
-
 impl PoolSize {
     /// A pool of `instances` instances, at least one.
     pub fn instances(instances: usize) -> PoolSize {
