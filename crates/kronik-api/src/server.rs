@@ -53,10 +53,9 @@ pub type Mount = Arc<
 
 /// Binds the socket, replacing a stale socket file, with mode 0660.
 pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
-    prepare_socket(path)?;
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
-    Ok(listener)
+    let listener = bind_std(path)?;
+    listener.set_nonblocking(true)?;
+    UnixListener::from_std(listener)
 }
 
 /// [`bind`] without the runtime: the non-root daemon binds before it
@@ -156,13 +155,9 @@ pub fn bearer(headers: &hyper::HeaderMap) -> Result<Option<String>, ApiError> {
     }
 }
 
-/// Serves until the task is dropped. Each connection is a task.
-pub async fn serve(listener: UnixListener, api: Arc<Api>) -> std::io::Result<()> {
-    serve_with(listener, api, None).await
-}
-
-/// Like [`serve`], with `mount` answering the requests to its path, or
-/// below it, instead of the JSON API.
+/// Serves until the task is dropped, each connection a task; `mount`, if
+/// given, answers the requests to its path, or below it, instead of the JSON
+/// API.
 pub async fn serve_with(
     listener: UnixListener,
     api: Arc<Api>,
@@ -504,6 +499,30 @@ mod event_cursor_tests {
             hyper::header::HeaderValue::from_static("bad\tcursor"),
         );
         assert!(event_cursor_header(&headers).is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod bind_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bind_replaces_a_stale_file_with_a_0660_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        std::fs::write(&path, b"stale").unwrap();
+
+        let listener = bind(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o660);
+
+        let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(stream);
     }
 }
 
