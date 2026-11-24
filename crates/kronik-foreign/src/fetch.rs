@@ -13,6 +13,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use kronik_core::ids::hex;
 use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference, RegistryOperation};
@@ -20,7 +21,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWrite};
 
-use crate::blobs::{BlobStore, Descriptor, TempFile, check, hex, io_error, sha256_digest};
+use crate::blobs::{BlobStore, Descriptor, TempFile, check, io_error, sha256_digest};
 use crate::image::{ImageError, ImageRef, validate_digest};
 use crate::oci::{
     DOCKER_LIST, DOCKER_MANIFEST, MAX_JSON_BYTES, MEDIA_INDEX, MEDIA_MANIFEST, Parsed,

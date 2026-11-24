@@ -14,6 +14,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use kronik_core::ids::hex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -55,15 +56,6 @@ impl Descriptor {
 /// `sha256:<hex>` of `bytes`.
 pub fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{}", hex(&Sha256::digest(bytes)))
-}
-
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
 }
 
 /// A reader that hashes and counts everything read through it.
