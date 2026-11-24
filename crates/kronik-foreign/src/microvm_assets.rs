@@ -1,17 +1,17 @@
 //! Offline, digest-verified tools and immutable ext4 publication. No host mount or downloader.
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions, Permissions};
-use std::io::{self, Read};
+use std::io::{self, BufReader, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kronik_core::env::{Env, ProcessSpec, Stdio};
-use kronik_core::ids::hex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
+use crate::blobs::HashingReader;
 use crate::microvm::{DATA_BYTES, RemoveDirOnDrop};
+use crate::sys::euid;
 const MAX_BYTES: u64 = 8 << 30;
 const MAX_ENTRIES: u64 = 1_000_000;
 
@@ -116,9 +116,6 @@ fn check_bundle_path(dir: &Path, euid: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn euid() -> u32 {
-    crate::sys::euid()
-}
 fn regular(path: &Path, max: u64, private: bool) -> Result<File, String> {
     let file = OpenOptions::new()
         .read(true)
@@ -154,33 +151,20 @@ fn executable_here(path: &Path) -> Result<(), String> {
     Ok(())
 }
 fn sha256(file: &mut File) -> Result<String, String> {
-    let mut hash = Sha256::new();
-    let mut buffer = [0; 65536];
     let bound = file.metadata().map_err(error)?.len();
-    let mut count = 0u64;
-    loop {
-        let n = file.read(&mut buffer).map_err(error)?;
-        if n == 0 {
-            break;
-        }
-        count = count
-            .checked_add(n as u64)
-            .ok_or_else(|| error("digest size overflow"))?;
-        if count > bound {
-            return Err(error("file grew while hashing"));
-        }
-        hash.update(&buffer[..n]);
+    let mut reader =
+        HashingReader::new(BufReader::with_capacity(1 << 16, file).take(bound.saturating_add(1)));
+    io::copy(&mut reader, &mut io::sink()).map_err(error)?;
+    if reader.count() > bound {
+        return Err(error("file grew while hashing"));
     }
-    if count != bound {
+    if reader.count() != bound {
         return Err(error("file changed while hashing"));
     }
-    Ok(hex(&hash.finalize()))
+    Ok(reader.digest()["sha256:".len()..].to_owned())
 }
 fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    value.len() == 64 && value.bytes().all(crate::image::is_lower_hex)
 }
 fn verify(path: &Path, expected: &str, max: u64, executable: bool) -> Result<(), String> {
     if !valid_digest(expected) {
