@@ -141,14 +141,8 @@ impl MetadataSource {
             .fleet
             .as_ref()
             .ok_or_else(|| unauthenticated("managed fleet authority is unavailable"))?;
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let request = request_id.as_bytes();
-        let same_request = request.len() == 64
-            && state.request_id.len() == 32
-            && state.request_id.iter().enumerate().all(|(index, byte)| {
-                request[index * 2] == HEX[(byte >> 4) as usize]
-                    && request[index * 2 + 1] == HEX[(byte & 15) as usize]
-            });
+        let same_request =
+            state.request_id.len() == 32 && request_id == kronik_core::ids::hex(&state.request_id);
         if state.epoch != epoch || !same_request {
             return Err(unauthenticated("the managed fleet receipt was superseded"));
         }
@@ -544,7 +538,7 @@ impl TokenStore {
             .as_slice()
             .try_into()
             .map_err(|_| unauthenticated("the original browser principal binding is invalid"))?;
-        let audit_id = format!("oidc:{}", kronik_core::ids::hex(principal_hash));
+        let audit_id = crate::oidc::principal(principal_hash);
         if verified_identity.as_ref().is_some_and(|value| {
             value.subject.as_deref() != Some(audit_id.as_str())
                 || !matches!(
