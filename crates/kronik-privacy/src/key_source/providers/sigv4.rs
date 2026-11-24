@@ -1,16 +1,8 @@
 //! AWS Signature Version 4 for the fixed REST request shapes used by KMS.
+use kronik_core::ids::hex;
 use ring::{digest, hmac};
 use zeroize::Zeroizing;
 
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 15) as usize] as char);
-    }
-    s
-}
 fn sha(bytes: &[u8]) -> String {
     hex(digest::digest(&digest::SHA256, bytes).as_ref())
 }
