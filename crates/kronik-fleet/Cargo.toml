@@ -7,7 +7,6 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-base64 = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 kronik-core = { workspace = true, features = ["host-identity", "schemars"] }
@@ -31,7 +30,6 @@ zeroize = { workspace = true }
 hmac = { workspace = true }
 kronik-core = { workspace = true, features = ["real"] }
 kronik-privacy = { workspace = true }
-kronik-store = { workspace = true }
 prost = { workspace = true }
 rcgen = { workspace = true, features = ["x509-parser"] }
 tempfile = { workspace = true }

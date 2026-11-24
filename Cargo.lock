@@ -1959,7 +1959,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "sha2 0.11.1",
  "signature 2.2.0",
  "tempfile",
  "tokio",
@@ -2033,7 +2032,6 @@ dependencies = [
  "kronik-core",
  "kronik-privacy",
  "kronik-proto",
- "kronik-testhost",
  "prost",
  "serde",
  "serde_json",
@@ -2046,7 +2044,6 @@ dependencies = [
 name = "kronik-fleet"
 version = "0.6.0-dev"
 dependencies = [
- "base64 0.22.1",
  "bytes",
  "hmac",
  "http",
@@ -2056,7 +2053,6 @@ dependencies = [
  "kronik-privacy",
  "kronik-proto",
  "kronik-sched",
- "kronik-store",
  "prost",
  "rcgen",
  "rustls",
@@ -2209,7 +2205,6 @@ version = "0.6.0-dev"
 dependencies = [
  "bytes",
  "http",
- "http-body-util",
  "kronik-api",
  "kronik-core",
  "rmcp",
@@ -2415,7 +2410,6 @@ dependencies = [
  "blake3",
  "chacha20",
  "kronik-core",
- "kronik-effects",
  "kronik-log",
  "kronik-privacy",
  "kronik-proto",
