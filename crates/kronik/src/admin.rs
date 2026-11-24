@@ -9,11 +9,12 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt as _, Full, Limited};
+use http_body_util::{BodyExt as _, Limited};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use kronik_api::oidc::BrowserAuth;
+use kronik_api::server::response;
 use kronik_api::{Api, ApiRequest};
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_sched::Node;
@@ -153,7 +154,7 @@ async fn browser_request(
                 "static UI assets accept GET and HEAD only",
             ));
         }
-        return Ok(bytes_response(
+        return Ok(response(
             200,
             asset.content_type,
             if parts.method == hyper::Method::HEAD {
@@ -251,7 +252,7 @@ async fn browser_request(
                     "unknown authentication operation",
                 )
             })??;
-        let mut response = bytes_response(result.status, result.content_type, result.body);
+        let mut response = response(result.status, result.content_type, result.body);
         for (name, value) in result.headers.iter() {
             response.headers_mut().append(
                 hyper::header::HeaderName::from_static(name),
@@ -273,26 +274,7 @@ async fn browser_request(
     })?;
     req.bearer = None;
     let result = api.handle_admitted(req, captured).await;
-    Ok(bytes_response(
-        result.status,
-        result.content_type,
-        result.body.into(),
-    ))
-}
-
-fn bytes_response(
-    status: u16,
-    content_type: &'static str,
-    body: Bytes,
-) -> hyper::Response<kronik_api::server::Body> {
-    let mut response = hyper::Response::new(Full::new(body).boxed());
-    *response.status_mut() =
-        hyper::StatusCode::from_u16(status).unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
-    response.headers_mut().insert(
-        hyper::header::CONTENT_TYPE,
-        hyper::header::HeaderValue::from_static(content_type),
-    );
-    response
+    Ok(response(result.status, result.content_type, result.body))
 }
 
 fn secure(
@@ -316,14 +298,6 @@ fn secure(
         );
     }
     response
-}
-
-fn response(
-    status: u16,
-    content_type: &'static str,
-    body: String,
-) -> hyper::Response<kronik_api::server::Body> {
-    bytes_response(status, content_type, body.into())
 }
 
 /// The gauges read at scrape time, set before `/metrics` answers and
@@ -428,7 +402,7 @@ mod tests {
 
     #[test]
     fn browser_responses_never_cache_or_leak_referrers() {
-        let response = secure(bytes_response(200, "text/html", Bytes::new()));
+        let response = secure(response(200, "text/html", Bytes::new()));
         assert_eq!(response.headers()["cache-control"], "no-store");
         assert_eq!(response.headers()["referrer-policy"], "no-referrer");
         assert_eq!(

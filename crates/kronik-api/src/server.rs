@@ -79,8 +79,13 @@ fn prepare_socket(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn response(status: u16, content_type: &'static str, body: Vec<u8>) -> hyper::Response<Body> {
-    let mut resp = hyper::Response::new(Full::new(Bytes::from(body)).boxed());
+/// A response with `content_type` and a bearer challenge on a 401.
+pub fn response(
+    status: u16,
+    content_type: &'static str,
+    body: impl Into<Bytes>,
+) -> hyper::Response<Body> {
+    let mut resp = hyper::Response::new(Full::new(body.into()).boxed());
     *resp.status_mut() =
         hyper::StatusCode::from_u16(status).unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
     resp.headers_mut().insert(

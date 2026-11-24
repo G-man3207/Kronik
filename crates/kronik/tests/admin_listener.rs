@@ -455,6 +455,23 @@ fn the_admin_listener_streams_a_blobs_bytes() {
     }
 }
 
+/// A 401 from the TLS admin listener carries the bearer challenge RFC 9110
+/// §15.5.2 requires, as the other API listeners' do (issue #392).
+#[test]
+fn an_unauthorized_admin_response_carries_the_bearer_challenge() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
+    let answer = d.admin_get("/v1/actors", "kronik_wrong", false);
+    assert_eq!(
+        (answer.status, answer.error_code().as_deref()),
+        (401, Some("UNAUTHENTICATED")),
+        "{}\n{}",
+        String::from_utf8_lossy(&answer.body),
+        d.log()
+    );
+    assert_eq!(answer.header("www-authenticate"), Some("Bearer"));
+}
+
 /// Bytes the media guest writes for a blob of `n` bytes.
 fn pattern(n: u64) -> Vec<u8> {
     (0..n)
