@@ -691,3 +691,36 @@ fn physical_highwater_includes_orphans_and_floors_without_decrypting_or_allocati
         Err(PrivacyError::InvalidStoredVersion(0))
     ));
 }
+
+#[test]
+fn the_owned_file_check_accepts_the_held_file_and_refuses_a_replacement() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let owner = key_source::lock_data(dir.path()).unwrap();
+    let keys = dir.path().join("keys");
+    std::fs::create_dir(&keys).unwrap();
+    let database = keys.join("secrets.db");
+    let replacement = keys.join("replacement.db");
+    std::fs::write(&database, b"original").unwrap();
+    std::fs::write(&replacement, b"replacement").unwrap();
+
+    let held = owner.directory(Path::new("keys"), false).unwrap();
+    let original = std::fs::metadata(&database).unwrap();
+    let identity = keystore::ffi::FileIdentity {
+        device: original.dev(),
+        inode: original.ino(),
+    };
+    assert!(
+        owner
+            .holds_file(Path::new("keys"), &held, "secrets.db", identity)
+            .unwrap()
+    );
+
+    std::fs::rename(&replacement, &database).unwrap();
+    assert!(
+        !owner
+            .holds_file(Path::new("keys"), &held, "secrets.db", identity)
+            .unwrap()
+    );
+}

@@ -93,6 +93,27 @@ impl DataOwnership {
         Ok(())
     }
 
+    /// Checks the root and the held directory at `relative`, then whether
+    /// `name` in it is still the regular file `identity`. `Ok(false)` when it
+    /// is not; each store maps that to its own error.
+    pub(crate) fn holds_file(
+        &self,
+        relative: &Path,
+        held: &File,
+        name: &str,
+        identity: crate::keystore::ffi::FileIdentity,
+    ) -> Result<bool, PrivacyError> {
+        self.check_location()?;
+        self.check_directory(relative, held)?;
+        let named = rustix::fs::statat(held, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|source| self.io(source.into()))?;
+        Ok(
+            rustix::fs::FileType::from_raw_mode(named.st_mode) == rustix::fs::FileType::RegularFile
+                && named.st_dev as u64 == identity.device
+                && named.st_ino as u64 == identity.inode,
+        )
+    }
+
     /// Walk from the held root, never through a caller-supplied directory File.
     pub(crate) fn directory(
         &self,

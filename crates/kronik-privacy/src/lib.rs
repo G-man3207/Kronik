@@ -647,22 +647,16 @@ pub(crate) struct SecretStoreOwner {
 
 impl SecretStoreOwner {
     fn check(&self) -> Result<(), PrivacyError> {
-        self.root.check_location()?;
-        self.root
-            .check_directory(Path::new("keys"), &self.directory)?;
-        let named = rustix::fs::statat(
-            self.directory.as_ref(),
+        if self.root.holds_file(
+            Path::new("keys"),
+            &self.directory,
             "secrets.db",
-            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(|source| self.root.io(source.into()))?;
-        if rustix::fs::FileType::from_raw_mode(named.st_mode) != rustix::fs::FileType::RegularFile
-            || named.st_dev as u64 != self.identity.device
-            || named.st_ino as u64 != self.identity.inode
-        {
-            return Err(PrivacyError::SecretStoreUnowned);
+            self.identity,
+        )? {
+            Ok(())
+        } else {
+            Err(PrivacyError::SecretStoreUnowned)
         }
-        Ok(())
     }
 }
 
