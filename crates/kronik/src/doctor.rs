@@ -1117,13 +1117,8 @@ fn sandbox(runsc: &Path, platform: Platform) -> Check {
 /// Free bytes on the filesystem of `dir`, or of its nearest existing parent.
 fn free_bytes(dir: &Path) -> Option<u64> {
     let existing = dir.ancestors().find(|p| p.exists())?;
-    let out = Command::new("df")
-        .args(["-P", "-B1"])
-        .arg(existing)
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()
+    let s = rustix::fs::statvfs(existing).ok()?;
+    Some(s.f_bavail.saturating_mul(s.f_frsize))
 }
 
 fn disk(data_dir: &Path) -> Check {
@@ -2559,5 +2554,16 @@ mod tests {
         let held = export_streams(&config, &[stream("audit", Some(8 * 86_400_000))]);
         assert_eq!(held.status, Status::Warn);
         assert!(held.message.contains("held retention"), "{}", held.message);
+    }
+
+    /// #321: the free space is that of the nearest existing directory, and it
+    /// is the room an ordinary user has.
+    #[test]
+    fn free_space_comes_from_the_nearest_existing_directory() {
+        let s = rustix::fs::statvfs(".").unwrap();
+        let free = free_bytes(Path::new("./kronik-no-such-dir/data")).unwrap();
+        // Other work on the machine can move the free space between the two reads.
+        assert!(free.abs_diff(s.f_bavail * s.f_frsize) <= 64 << 20, "{free}");
+        assert_eq!(free_bytes(Path::new("kronik-no-such-dir")), None);
     }
 }

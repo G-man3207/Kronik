@@ -27,8 +27,9 @@ pub(crate) mod userns;
 
 use std::fmt::Write as _;
 use std::io::{self, BufRead as _, IsTerminal as _, Read as _, Write as _};
+use std::os::fd::{AsFd as _, BorrowedFd};
 use std::path::{Path, PathBuf};
-use std::process::{ExitCode, Stdio};
+use std::process::ExitCode;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -47,6 +48,7 @@ use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::explain;
 use kronik_core::http::percent_encode;
 use kronik_core::ids::ActorRef;
+use rustix::termios::{LocalModes, OptionalActions, Termios, tcgetattr, tcsetattr};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -1933,7 +1935,7 @@ fn read_secret(name: &str) -> Result<Vec<u8>, Error> {
     let mut value = Vec::new();
     if stdin.is_terminal() {
         prompt(&format!("Value of secret {name} (not shown): "));
-        let echo = EchoOff::new()?;
+        let echo = EchoOff::new(stdin.as_fd())?;
         let read = stdin.lock().read_until(b'\n', &mut value);
         drop(echo);
         prompt("\n");
@@ -1963,53 +1965,36 @@ fn prompt(text: &str) {
     let _ = err.flush();
 }
 
-/// Turns the terminal's echo off with `stty` while a secret is typed, and
-/// restores the previous settings when dropped.
-struct EchoOff {
-    saved: String,
+/// Turns a terminal's echo off while a secret is typed, and restores the
+/// previous settings when dropped.
+struct EchoOff<'a> {
+    tty: BorrowedFd<'a>,
+    saved: Termios,
 }
 
-impl EchoOff {
-    fn new() -> Result<EchoOff, Error> {
-        let saved = stty(&["-g"])?;
-        stty(&["-echo"])?;
-        Ok(EchoOff {
-            saved: saved.trim().to_owned(),
-        })
-    }
-}
-
-impl Drop for EchoOff {
-    fn drop(&mut self) {
-        let _ = stty(&[&self.saved]);
-    }
-}
-
-/// Runs `stty` on the terminal on stdin and returns what it printed.
-fn stty(args: &[&str]) -> Result<String, Error> {
-    let failed = |detail: String| {
-        Error::from(
-            ApiError::new(
-                ErrorCode::BadRequest,
-                format!("cannot turn off echo on the terminal: {detail}"),
+impl<'a> EchoOff<'a> {
+    fn new(tty: BorrowedFd<'a>) -> Result<Self, Error> {
+        let failed = |e: rustix::io::Errno| {
+            Error::from(
+                ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!("cannot turn off echo on the terminal: {e}"),
+                )
+                .with_hint("Give the value on stdin instead, e.g. printf %s \"$VALUE\" | kronik secret set <name> --reason \"...\"."),
             )
-            .with_hint("Give the value on stdin instead, e.g. printf %s \"$VALUE\" | kronik secret set <name> --reason \"...\"."),
-        )
-    };
-    let out = std::process::Command::new("stty")
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|e| failed(format!("stty: {e}")))?;
-    if !out.status.success() {
-        return Err(failed(format!(
-            "stty {} exited with {}",
-            args.join(" "),
-            out.status
-        )));
+        };
+        let saved = tcgetattr(tty).map_err(failed)?;
+        let mut quiet = saved.clone();
+        quiet.local_modes -= LocalModes::ECHO;
+        tcsetattr(tty, OptionalActions::Now, &quiet).map_err(failed)?;
+        Ok(EchoOff { tty, saved })
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+impl Drop for EchoOff<'_> {
+    fn drop(&mut self) {
+        let _ = tcsetattr(self.tty, OptionalActions::Now, &self.saved);
+    }
 }
 
 /// `{"topics":[…]}` for `explain --list --json`.
@@ -2076,8 +2061,11 @@ mod tests {
     use super::*;
 
     use std::collections::BTreeSet;
+    use std::os::fd::AsFd;
 
     use clap::CommandFactory as _;
+    use rustix::fs::{Mode, OFlags};
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 
     /// L2: with --json, stdout is the error JSON even when a proxy answered.
     #[test]
@@ -2465,5 +2453,37 @@ mod tests {
             message("within 30s"),
             "the daemon on /none/kronik.sock did not answer within 30s"
         );
+    }
+
+    /// #321: while a secret is typed the terminal does not echo it, nothing
+    /// else about the terminal changes, and dropping the guard restores it.
+    #[test]
+    fn echo_off_clears_only_the_echo_and_its_drop_restores_the_terminal() {
+        let user = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+        grantpt(&user).unwrap();
+        unlockpt(&user).unwrap();
+        let name = ptsname(&user, Vec::new()).unwrap();
+        let tty = rustix::fs::open(&name, OFlags::RDWR, Mode::empty()).unwrap();
+        let modes = |t: &Termios| {
+            (
+                t.input_modes,
+                t.output_modes,
+                t.control_modes,
+                t.local_modes,
+            )
+        };
+
+        // Not the state a new terminal starts in, so a restore is no coincidence.
+        let mut before = tcgetattr(&tty).unwrap();
+        before.local_modes |= LocalModes::ECHO;
+        before.local_modes -= LocalModes::ICANON;
+        tcsetattr(&tty, OptionalActions::Now, &before).unwrap();
+
+        let echo = EchoOff::new(tty.as_fd()).unwrap();
+        before.local_modes -= LocalModes::ECHO;
+        assert_eq!(modes(&tcgetattr(&tty).unwrap()), modes(&before));
+        drop(echo);
+        before.local_modes |= LocalModes::ECHO;
+        assert_eq!(modes(&tcgetattr(&tty).unwrap()), modes(&before));
     }
 }
