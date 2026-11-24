@@ -161,7 +161,7 @@ fn report<T: Serialize>(
         Ok(out) => emit(out, json, human),
         // shortcut: to_json sorts the keys and the CLI's report_error keeps
         // the declared order, so the JSON error is printed here; report can
-        // take an ApiError once the two agree (#326).
+        // take an ApiError once the two agree.
         Err(f) if json => {
             println!("{}", f.api_error().to_json());
             ExitCode::FAILURE
