@@ -1068,6 +1068,10 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(failure_code(&error), Some("trace_state_limit"));
+        assert_eq!(
+            error.to_string(),
+            "trace metadata exceeds the log record byte budget"
+        );
         reference["end"] = (MAX_SELECTED_BYTES + 1).into();
         let error = load(env, dir.path(), &reference, 1, IDS)
             .await

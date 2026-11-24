@@ -1370,6 +1370,19 @@ mod tests {
     }
 
     #[test]
+    fn file_error_shows_its_cause_and_keeps_it_as_the_source() {
+        let error = FileError::from(std::io::Error::other("no space left on device"));
+        assert_eq!(error.to_string(), "no space left on device");
+        let source = std::error::Error::source(&error).unwrap();
+        assert_eq!(source.to_string(), "no space left on device");
+        assert!(source.is::<std::io::Error>());
+        assert_eq!(
+            FileError::poisoned().to_string(),
+            "audit file writer requires storage repair"
+        );
+    }
+
+    #[test]
     fn a_poisoned_export_writer_never_acknowledges_but_node_turns_continue() {
         use crate::audit::Keys;
         use kronik_core::env::Env;

@@ -748,5 +748,9 @@ mod stream_tests {
         assert!(matches!(streamed, Err(NetError::Connect(_))));
         assert!(is_response_too_large(&response_too_large()));
         assert!(!is_response_too_large(&std::io::Error::other("other")));
+        assert_eq!(
+            response_too_large().to_string(),
+            "the response body exceeds its limit"
+        );
     }
 }
