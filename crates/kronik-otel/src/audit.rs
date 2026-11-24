@@ -14,7 +14,7 @@ use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::spans::ActorKeys;
+use crate::spans::{ActorKeys, label};
 
 /// The `schema` of every line.
 pub const SCHEMA: &str = "kronik.audit/v3";
@@ -1373,12 +1373,6 @@ fn obj(v: Value) -> Map<String, Value> {
         Value::Object(m) => m,
         _ => Map::new(),
     }
-}
-
-fn label(name: &str, prefix: &str) -> String {
-    name.strip_prefix(prefix)
-        .unwrap_or(name)
-        .to_ascii_lowercase()
 }
 
 /// The `name`s of a rules file's `[[rule]]` tables; the text itself stays

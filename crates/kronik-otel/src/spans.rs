@@ -529,7 +529,7 @@ fn kv(key: &str, value: any_value::Value) -> KeyValue {
     }
 }
 
-fn s(key: &str, value: impl Into<String>) -> KeyValue {
+pub(crate) fn s(key: &str, value: impl Into<String>) -> KeyValue {
     kv(key, any_value::Value::StringValue(value.into()))
 }
 
@@ -541,7 +541,7 @@ fn int(key: &str, value: impl TryInto<i64>) -> KeyValue {
 }
 
 /// `OUTCOME_KIND_FUEL_EXHAUSTED` → `fuel_exhausted`.
-fn label(name: &str, prefix: &str) -> String {
+pub(crate) fn label(name: &str, prefix: &str) -> String {
     name.strip_prefix(prefix)
         .unwrap_or(name)
         .to_ascii_lowercase()
@@ -906,7 +906,7 @@ pub fn clamp(spans: &mut [Span]) {
     }
 }
 
-/// The node, as the OTLP resource of its spans (§3.4).
+/// The node, as the OTLP resource of its spans and metrics (§3.4).
 pub struct Resource<'a> {
     /// `[otel] service_name`.
     pub service_name: &'a str,
@@ -916,25 +916,37 @@ pub struct Resource<'a> {
     pub engine: &'a str,
 }
 
+impl Resource<'_> {
+    /// The resource attributes of every export, spans and metrics alike.
+    pub(crate) fn otlp(&self) -> OtlpResource {
+        OtlpResource {
+            attributes: vec![
+                s("service.name", self.service_name),
+                s("service.version", self.service_version),
+                s("kronik.node", self.node),
+                s("kronik.engine", self.engine),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// The `kronik` instrumentation scope of every export.
+    pub(crate) fn scope(&self) -> InstrumentationScope {
+        InstrumentationScope {
+            name: "kronik".into(),
+            version: self.service_version.into(),
+            ..Default::default()
+        }
+    }
+}
+
 /// One export request with `spans` under the node's resource.
 pub fn request(resource: &Resource, spans: Vec<Span>) -> ExportTraceServiceRequest {
     ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
-            resource: Some(OtlpResource {
-                attributes: vec![
-                    s("service.name", resource.service_name),
-                    s("service.version", resource.service_version),
-                    s("kronik.node", resource.node),
-                    s("kronik.engine", resource.engine),
-                ],
-                ..Default::default()
-            }),
+            resource: Some(resource.otlp()),
             scope_spans: vec![ScopeSpans {
-                scope: Some(InstrumentationScope {
-                    name: "kronik".into(),
-                    version: resource.service_version.into(),
-                    ..Default::default()
-                }),
+                scope: Some(resource.scope()),
                 spans,
                 schema_url: String::new(),
             }],
