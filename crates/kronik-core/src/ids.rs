@@ -210,4 +210,13 @@ mod tests {
         assert_eq!(t.to_string(), "main:42");
         assert!(TurnId::parse("main:x").is_none());
     }
+
+    #[test]
+    fn hex_is_two_lowercase_digits_per_byte() {
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0x00, 0x0a, 0x10, 0xfe, 0xff]), "000a10feff");
+        for byte in 0..=255u8 {
+            assert_eq!(hex(&[byte]), format!("{byte:02x}"));
+        }
+    }
 }
