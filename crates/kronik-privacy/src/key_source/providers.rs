@@ -64,6 +64,20 @@ fn header_secret(s: &str) -> Result<(), String> {
     }
     Ok(())
 }
+/// A pagination token a backend returned: not empty, at most `CAP` bytes,
+/// no control byte. AWS has a stricter rule of its own.
+fn page_token(value: &str) -> Result<(), crate::secret_backend::BackendError> {
+    if value.is_empty() || value.len() > CAP || value.bytes().any(|b| b.is_ascii_control()) {
+        return Err(crate::secret_backend::BackendError::Invalid);
+    }
+    Ok(())
+}
+/// The `access_token` of an OAuth token response, checked to be usable as a header.
+fn access_token(response: &Value) -> Result<Zeroizing<String>, String> {
+    let token = Zeroizing::new(field(response, "access_token")?.to_owned());
+    header_secret(&token)?;
+    Ok(token)
+}
 fn secret_body(body: Vec<u8>) -> Bytes {
     Bytes::from_owner(Zeroizing::new(body))
 }
@@ -499,8 +513,7 @@ impl BearerCache {
             }
         }
         let response = auth(net.clone()).await?;
-        let token = field(&response, "access_token").map_err(|_| BackendError::Invalid)?;
-        header_secret(token).map_err(|_| BackendError::Invalid)?;
+        let token = access_token(&response).map_err(|_| BackendError::Invalid)?;
         let seconds = expires_in(&response)
             .filter(|seconds| *seconds > 0)
             .ok_or(BackendError::Invalid)?;
@@ -510,11 +523,11 @@ impl BearerCache {
         let mut cache = self.0.lock().map_err(|_| BackendError::Invalid)?;
         original
             .admit(&mut || {
-                *cache = Some((Zeroizing::new(token.to_owned()), expires));
+                *cache = Some((token.clone(), expires));
                 Ok(())
             })
             .map_err(|_| BackendError::Unauthorized)?;
-        Ok(Zeroizing::new(token.to_owned()))
+        Ok(token)
     }
 
     async fn get<'a>(

@@ -82,9 +82,7 @@ async fn auth(env: &Env, c: &Azure) -> Result<Zeroizing<String>, String> {
     let response = auth_response(env, c, Dispatch::StartupBootstrap)
         .await
         .map_err(|error| error.to_string())?;
-    let token = Zeroizing::new(field(&response, "access_token")?.to_owned());
-    header_secret(&token)?;
-    Ok(token)
+    access_token(&response)
 }
 async fn wrap(
     env: &Env,

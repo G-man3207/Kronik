@@ -422,3 +422,31 @@ fn timeout_uses_env_clock_and_transport_errors_are_redacted() {
     .unwrap();
     assert!(!e.contains("secret transport diagnostics"));
 }
+
+#[test]
+fn pagination_tokens_are_non_empty_bounded_and_not_control_bytes() {
+    assert!(page_token("next").is_ok());
+    assert!(page_token(&"x".repeat(CAP)).is_ok());
+    assert!(page_token("").is_err());
+    assert!(page_token("next\n").is_err());
+    assert!(page_token(&"x".repeat(CAP + 1)).is_err());
+}
+
+#[test]
+fn oauth_access_tokens_must_be_usable_as_headers() {
+    assert_eq!(
+        access_token(&json!({"access_token":"token"}))
+            .unwrap()
+            .as_str(),
+        "token"
+    );
+    for response in [
+        json!({}),
+        json!({"access_token":""}),
+        json!({"access_token":"token with space"}),
+        json!({"access_token":"token\n"}),
+        json!({"access_token":"x".repeat(CAP + 1)}),
+    ] {
+        assert!(access_token(&response).is_err());
+    }
+}

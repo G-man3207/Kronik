@@ -99,13 +99,6 @@ fn enabled(response: &Value) -> Result<(), BackendError> {
     }
 }
 
-fn page_token(token: &str) -> Result<(), BackendError> {
-    if token.is_empty() || token.len() > CAP || token.bytes().any(|b| b.is_ascii_control()) {
-        return Err(BackendError::Invalid);
-    }
-    Ok(())
-}
-
 fn list_url(path: &str, cursor: Option<&str>) -> Result<String, BackendError> {
     resource(path)?;
     let mut url =

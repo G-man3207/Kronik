@@ -42,13 +42,6 @@ fn expires_in(response: &Value) -> Option<u64> {
     response.get("expires_in").and_then(Value::as_u64)
 }
 
-fn page_token(value: &str) -> Result<(), BackendError> {
-    if value.is_empty() || value.len() > CAP || value.bytes().any(|b| b.is_ascii_control()) {
-        return Err(BackendError::Invalid);
-    }
-    Ok(())
-}
-
 fn fetched(path: &str, expected: Option<&str>, response: &Value) -> Result<Fetched, BackendError> {
     let name = field(response, "name").map_err(|_| BackendError::Invalid)?;
     let id = source_version(path, name)?;
