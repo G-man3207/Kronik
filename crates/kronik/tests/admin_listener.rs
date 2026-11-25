@@ -6,6 +6,9 @@
 // Test harness code: unwraps, std threads and std time are fine here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+#[path = "support/blob_fixtures.rs"]
+mod blob_fixtures;
+
 mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -17,6 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use blob_fixtures::pattern;
 use common::free_port;
 use serde_json::{Value, json};
 
@@ -446,7 +450,7 @@ fn the_admin_listener_streams_a_blobs_bytes() {
     assert_eq!(admin.body, local.body);
     assert_eq!(admin.body.len(), 1000);
     assert_eq!(
-        format!("b3:{}", blake3::hash(&admin.body).to_hex()),
+        blob_fixtures::hash(&admin.body),
         hash,
         "the admin listener answered with the addressed blob's bytes"
     );
@@ -470,13 +474,6 @@ fn an_unauthorized_admin_response_carries_the_bearer_challenge() {
         d.log()
     );
     assert_eq!(answer.header("www-authenticate"), Some("Bearer"));
-}
-
-/// Bytes the media guest writes for a blob of `n` bytes.
-fn pattern(n: u64) -> Vec<u8> {
-    (0..n)
-        .map(|i| ((i.wrapping_mul(31) + 7) % 251) as u8)
-        .collect()
 }
 
 /// `bytes` with every `secret` replaced by `[secret:name]`, as the output

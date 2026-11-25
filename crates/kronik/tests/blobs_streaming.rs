@@ -14,6 +14,9 @@
 // Test harness code: unwraps, std threads and std time are fine here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+#[path = "support/blob_fixtures.rs"]
+mod blob_fixtures;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -24,6 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
+use blob_fixtures::{hash, pattern};
 use serde_json::{Value, json};
 
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
@@ -736,11 +740,5 @@ fn large_responses(sizes: [u64; 2]) {
         Send::Bytes(Vec::new()),
     );
     assert_eq!(r.status, 200, "{}", r.text());
-    let mut h = blake3::Hasher::new();
-    let pattern: Vec<u8> = (0..size).map(|i| ((i * 31 + 7) % 251) as u8).collect();
-    h.update(&pattern);
-    assert_eq!(
-        (r.len, r.hash),
-        (size, format!("b3:{}", h.finalize().to_hex()))
-    );
+    assert_eq!((r.len, r.hash), (size, hash(&pattern(size))));
 }

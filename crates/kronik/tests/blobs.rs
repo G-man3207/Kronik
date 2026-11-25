@@ -9,6 +9,9 @@
 // Test harness code: unwraps, std threads and std time are fine here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+#[path = "support/blob_fixtures.rs"]
+mod blob_fixtures;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
@@ -17,6 +20,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use blob_fixtures::{hash, pattern, pattern_sum};
 use serde_json::{Value, json};
 
 /// A window of seconds: segments close after a second, a snapshot every
@@ -239,32 +243,12 @@ fn call(http: &str, request: &str) -> (u16, Vec<u8>) {
     (status, out[split + 4..].to_vec())
 }
 
-fn pattern(n: u64) -> Vec<u8> {
-    (0..n).map(|i| ((i * 31 + 7) % 251) as u8).collect()
-}
-
 /// `POST /media/a/<op>?<query>` without a body.
 fn request(op: &str, query: &str) -> String {
     format!(
         "POST /media/a/{op}?{query} HTTP/1.1\r\nhost: x\r\ncontent-length: 0\r\n\
          connection: close\r\n\r\n"
     )
-}
-
-/// The identity of a blob without a subject: `b3:` and its BLAKE3.
-fn hash(bytes: &[u8]) -> String {
-    format!("b3:{}", blake3::hash(bytes).to_hex())
-}
-
-/// What the media guest's `sum` and `held-sum` answer for `size` bytes of
-/// the pattern: the size and its FNV-1a 64 digest.
-fn pattern_sum(size: u64) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in pattern(size) {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{size} {h:016x}")
 }
 
 impl Daemon {

@@ -10,6 +10,9 @@
 // A test harness of a real daemon: unwraps, and deadlines on the wall clock.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+#[path = "support/blob_fixtures.rs"]
+mod blob_fixtures;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
@@ -17,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use blob_fixtures::{pattern, pattern_sum};
 use kronik_api::openapi::TURN_SCHEMA;
 use serde_json::{Value, json};
 
@@ -266,23 +270,6 @@ fn read_response(stream: impl Read) -> std::io::Result<Response> {
         r.read_to_end(&mut response.body)?;
     }
     Ok(response)
-}
-
-/// The bytes the guest's `write` and `put` produce.
-fn pattern(size: u64) -> Vec<u8> {
-    (0..size)
-        .map(|i| ((i.wrapping_mul(31) + 7) % 251) as u8)
-        .collect()
-}
-
-/// The guest's `held-sum` answer for the pattern of `size` bytes.
-fn pattern_sum(size: u64) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in pattern(size) {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{size} {h:016x}")
 }
 
 /// The blob of the `call` operation's answer `reply blob <hash> <size>`,

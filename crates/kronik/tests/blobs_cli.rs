@@ -10,6 +10,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/blob_fixtures.rs"]
+mod blob_fixtures;
+
 mod common;
 
 use std::io::{Read, Write};
@@ -18,6 +21,7 @@ use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
+use blob_fixtures::{hash, pattern};
 use common::free_port;
 use serde_json::Value;
 
@@ -188,17 +192,6 @@ fn finish(out: Output) -> Out {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
-}
-
-/// The bytes the media guest writes for a blob of `n` bytes.
-fn pattern(n: u64) -> Vec<u8> {
-    (0..n)
-        .map(|i| ((i.wrapping_mul(31) + 7) % 251) as u8)
-        .collect()
-}
-
-fn hash(bytes: &[u8]) -> String {
-    format!("b3:{}", blake3::hash(bytes).to_hex())
 }
 
 #[test]
