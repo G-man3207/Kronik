@@ -7,7 +7,6 @@
 mod common;
 
 use std::io::{Read as _, Write as _};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -99,32 +98,6 @@ fn reply(o: &Out) -> String {
         .unwrap_or_else(|| panic!("no reply: {o:?}"))
         .trim()
         .to_owned()
-}
-
-/// A plain HTTP server on a free port that answers every request with 200
-/// and the body `pong`, until the test process exits. Returns its address.
-// A test harness thread, not daemon code (ADR 0004).
-#[allow(clippy::disallowed_methods)]
-fn http_target() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut s) = stream else { continue };
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 1024];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                match s.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => request.extend_from_slice(&chunk[..n]),
-                }
-            }
-            let _ = s.write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\npong",
-            );
-        }
-    });
-    addr
 }
 
 /// Asserts the human form of an error: code and message, hint and docs on
@@ -1330,7 +1303,7 @@ fn deploy_names_the_grants_a_component_asks_for() {
 #[test]
 fn m2_commands_against_a_daemon() {
     let d = Daemon::start();
-    let target = http_target();
+    let (target, _) = common::http_target("127.0.0.1", "pong");
     assert_eq!(
         d.run(&["deploy", COUNTER, "--reason", "first deploy"]).code,
         0
@@ -1929,7 +1902,7 @@ fn gateway_post(addr: &str, path: &str, body: &str) -> String {
 #[test]
 fn replay_and_propose_take_stub_rules() {
     let d = Daemon::start();
-    let target = http_target();
+    let (target, _) = common::http_target("127.0.0.1", "pong");
     assert_eq!(d.run(&["deploy", COUNTER, "--reason", "stub test"]).code, 0);
     let o = d.run(&[
         "grant",
@@ -2218,7 +2191,7 @@ fn stubs_set_and_simulators_list_against_a_daemon() {
 /// state (docs/design/m13-rebase.md).
 #[test]
 fn rollback_by_replay_against_a_daemon() {
-    let target = http_target();
+    let (target, _) = common::http_target("127.0.0.1", "pong");
     let d = Daemon::start();
     assert_eq!(
         d.run(&["deploy", COUNTER, "--reason", "first deploy"]).code,

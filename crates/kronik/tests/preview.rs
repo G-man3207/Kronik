@@ -10,11 +10,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -123,33 +122,6 @@ fn wasm(guest: &str) -> String {
         .encode(std::fs::read(Path::new(GUESTS).join(format!("{guest}.wasm"))).unwrap())
 }
 
-/// A plain HTTP server on `ip` that answers `pong` and counts the
-/// requests it got. Returns its address and the count.
-fn counting_target(ip: &str) -> (String, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind((ip, 0)).unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    let hits = Arc::new(AtomicUsize::new(0));
-    let counted = hits.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut s) = stream else { continue };
-            counted.fetch_add(1, Ordering::SeqCst);
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 1024];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                match s.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => request.extend_from_slice(&chunk[..n]),
-                }
-            }
-            let _ = s.write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\npong",
-            );
-        }
-    });
-    (addr, hits)
-}
-
 fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
     for _ in 0..200 {
         if ok() {
@@ -164,8 +136,8 @@ fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
 fn a_preview_runs_new_requests_on_the_new_code_without_live_effects() {
     let tmp = tempfile::tempdir().unwrap();
     // 127.0.0.2 is loopback too: the allowlisted host, next to a denied one.
-    let (denied, denied_hits) = counting_target("127.0.0.1");
-    let (allowed, allowed_hits) = counting_target("127.0.0.2");
+    let (denied, denied_hits) = common::http_target("127.0.0.1", "pong");
+    let (allowed, allowed_hits) = common::http_target("127.0.0.2", "pong");
     let d = Daemon::start(
         tmp.path(),
         "[gateway]\npreview_domain = \"preview.test\"\n\n[fork]\nlive_allowlist = [\"127.0.0.2\"]\n",

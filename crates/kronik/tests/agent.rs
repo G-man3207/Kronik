@@ -17,7 +17,7 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
@@ -39,30 +39,6 @@ const WEBHOOKS: usize = 200;
 
 fn guest(name: &str) -> PathBuf {
     PathBuf::from(format!("{GUESTS}{name}.wasm"))
-}
-
-/// A local HTTP target that answers 200 to everything.
-// A test harness thread, not daemon code (ADR 0004).
-#[allow(clippy::disallowed_methods)]
-fn relay_target() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut s) = stream else { continue };
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 4096];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                match s.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => request.extend_from_slice(&chunk[..n]),
-                }
-            }
-            let _ =
-                s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
-        }
-    });
-    addr
 }
 
 /// `kronik serve` with its socket in a temporary directory; killed when
@@ -270,7 +246,7 @@ impl Agent {
 #[test]
 fn an_agent_runs_the_golden_path_with_only_the_guide() {
     let d = Daemon::start();
-    let target = relay_target();
+    let (target, _) = common::http_target("127.0.0.1", "ok");
 
     // The operator: two kinds, their grants, a signing secret, and tokens
     // for an agent and for a human.

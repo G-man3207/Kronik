@@ -413,31 +413,6 @@ fn privacy_mode_end_to_end() {
     assert!(!diff["samples"]["pii_masked"].as_array().unwrap().is_empty());
 }
 
-/// A plain HTTP server that answers every request with 200 and `body`.
-fn http_target(body: &'static str) -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut s) = stream else { continue };
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 1024];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                match s.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => request.extend_from_slice(&chunk[..n]),
-                }
-            }
-            let _ = write!(
-                s,
-                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-        }
-    });
-    addr
-}
-
 /// The body of a GET on the API socket, as text.
 fn api_text(d: &Daemon, path: &str, token: Option<&str>) -> String {
     let mut s = UnixStream::connect(d.dir.join("api.sock")).unwrap();
@@ -578,7 +553,7 @@ fn a_subjects_effect_values_stay_sealed_in_proposals() {
         .as_str()
         .unwrap()
         .to_owned();
-    let target = http_target(RESPONSE);
+    let target = common::http_target("127.0.0.1", RESPONSE).0;
     let r = d.send(
         "counter/bob",
         "fetch-ok",
@@ -1715,7 +1690,7 @@ fn the_diff_summary_shows_no_bodies_or_values() {
         "/v1/privacy/mode",
         json!({"mode": "on", "reason": "privacy test"}),
     );
-    let target = http_target("pong");
+    let target = common::http_target("127.0.0.1", "pong").0;
     let pay = |body: &str| format!("POST http://{target}/v1/pay\n\n{body}");
     // A plain value and a value with a subject, in effect bodies and state.
     d.send(
@@ -1789,7 +1764,7 @@ fn the_diff_summary_shows_no_url_paths() {
         "/v1/privacy/mode",
         json!({"mode": "on", "reason": "privacy test"}),
     );
-    let target = http_target("pong");
+    let target = common::http_target("127.0.0.1", "pong").0;
     d.send(
         "counter/alice",
         "fetch-ok",
