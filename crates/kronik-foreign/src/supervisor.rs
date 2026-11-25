@@ -632,9 +632,7 @@ async fn cleanup(ctx: &Ctx, a: &Actor, child: Option<Arc<dyn Process>>) -> bool 
     let name = a.name().to_owned();
     let id = container_id(&name);
     let log = ctx.paths.log(&name);
-    let events = PathBuf::from("/sys/fs/cgroup")
-        .join(a.cgroup.trim_start_matches('/'))
-        .join("memory.events");
+    let events = crate::sys::cgroup_dir(&a.cgroup).join("memory.events");
     let oom = std::fs::read_to_string(&events)
         .ok()
         .and_then(|s| {

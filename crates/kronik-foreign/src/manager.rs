@@ -332,6 +332,14 @@ pub async fn cleanup(env: Env, cfg: ForeignConfig) -> Result<Cleaned, String> {
     Foreign::create(env, cfg, true).cleanup().await
 }
 
+/// `/kronik/<instance>`: the cgroup parent of sandboxes when the daemon has no
+/// delegated cgroup, named after its runtime root.
+fn instance_cgroup(run: &std::path::Path) -> String {
+    let root = run.join("runsc");
+    let instance = blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex();
+    format!("/kronik/{}", &instance.as_str()[..8])
+}
+
 impl Foreign {
     pub fn new(env: Env, cfg: ForeignConfig) -> Arc<Foreign> {
         Foreign::create(env, cfg, false)
@@ -342,8 +350,6 @@ impl Foreign {
             data: cfg.data_dir.join("foreign"),
             run: cfg.run_dir.clone(),
         };
-        let root = paths.run.join("runsc");
-        let instance = blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex();
         let ctx = Ctx {
             env,
             blobs: BlobStore::new(paths.blobs()),
@@ -364,7 +370,7 @@ impl Foreign {
                 _ => crate::sys::own_cgroup()
                     .ok()
                     .and_then(|p| p.strip_suffix("/daemon").map(str::to_owned))
-                    .unwrap_or_else(|| format!("/kronik/{}", &instance.as_str()[..8])),
+                    .unwrap_or_else(|| instance_cgroup(&cfg.run_dir)),
             },
             injected: Mutex::new(BTreeMap::new()),
             fetching: tokio::sync::RwLock::new(()),
@@ -943,14 +949,10 @@ impl Foreign {
     /// while a sandbox's cgroup is still in it.
     fn remove_cgroup_parent(&self) {
         // A delegated service cgroup belongs to systemd, not this manager.
-        let root = self.ctx.paths.run.join("runsc");
-        let instance = blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex();
-        if self.ctx.cgroup_parent != format!("/kronik/{}", &instance.as_str()[..8]) {
+        if self.ctx.cgroup_parent != instance_cgroup(&self.ctx.paths.run) {
             return;
         }
-        let dir = std::path::Path::new("/sys/fs/cgroup")
-            .join(self.ctx.cgroup_parent.trim_start_matches('/'));
-        let _ = std::fs::remove_dir(dir);
+        let _ = std::fs::remove_dir(crate::sys::cgroup_dir(&self.ctx.cgroup_parent));
     }
 
     /// Kills and deletes every container under Kronik's runtime roots and

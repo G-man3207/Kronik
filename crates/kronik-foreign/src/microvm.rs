@@ -898,7 +898,7 @@ impl Vm {
         if self.output.exists() {
             fs::remove_dir_all(&self.output)?;
         }
-        let group = Path::new("/sys/fs/cgroup").join(self.cgroup.trim_start_matches('/'));
+        let group = crate::sys::cgroup_dir(&self.cgroup);
         match fs::remove_dir(group) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
