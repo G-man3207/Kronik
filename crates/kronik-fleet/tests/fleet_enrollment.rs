@@ -1959,7 +1959,7 @@ async fn bootstrap_creates_private_parent_and_reloads_the_same_owned_key() {
     assert_eq!(key.uid(), parent.uid());
     let persisted = Zeroizing::new(env.fs.read_secure(key_path.clone(), 262_144).await.unwrap());
     let loaded =
-        kronik_core::identity::LeafKeys::from_pem(std::str::from_utf8(&persisted).unwrap())
+        kronik_fleet::identity::LeafKeys::from_pem(std::str::from_utf8(&persisted).unwrap())
             .unwrap();
     assert!(loaded.csr_der().unwrap() == record.csr_der);
     let restored = load_controller(

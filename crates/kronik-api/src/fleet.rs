@@ -1532,7 +1532,7 @@ mod tests {
             rcgen::KeyUsagePurpose::KeyCertSign,
             rcgen::KeyUsagePurpose::CrlSign,
         ];
-        let root_key = kronik_core::identity::ed25519_key(&[31; 32]).unwrap();
+        let root_key = kronik_fleet::identity::ed25519_key(&[31; 32]).unwrap();
         let root = root_params.self_signed(&root_key).unwrap();
         *network.issuer.lock().unwrap() = Some(rcgen::Issuer::new(root_params, root_key));
         let mut ca = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
@@ -2442,7 +2442,7 @@ mod tests {
             rcgen::KeyUsagePurpose::KeyCertSign,
             rcgen::KeyUsagePurpose::CrlSign,
         ];
-        let root_key = kronik_core::identity::ed25519_key(&[32; 32]).unwrap();
+        let root_key = kronik_fleet::identity::ed25519_key(&[32; 32]).unwrap();
         let root = root_params.self_signed(&root_key).unwrap();
         std::fs::write(&fleet.config.controller.ca_file, root.pem()).unwrap();
         *network.issuer.lock().unwrap() = Some(rcgen::Issuer::new(root_params, root_key));
@@ -3212,14 +3212,14 @@ mod tests {
             rcgen::KeyUsagePurpose::KeyCertSign,
             rcgen::KeyUsagePurpose::CrlSign,
         ];
-        let ca_key = kronik_core::identity::ed25519_key(&[31; 32]).unwrap();
+        let ca_key = kronik_fleet::identity::ed25519_key(&[31; 32]).unwrap();
         let ca = ca_params.self_signed(&ca_key).unwrap();
         *issuer.issuer.lock().unwrap() = Some(rcgen::Issuer::new(ca_params, ca_key));
         let mut protected_ca = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
         protected_ca.write_all(ca.pem().as_bytes()).unwrap();
         let ca_file = directory.path().join("ca.pem");
         protected_ca.persist(&ca_file).unwrap();
-        let server_key = kronik_core::identity::ed25519_key(&[32; 32]).unwrap();
+        let server_key = kronik_fleet::identity::ed25519_key(&[32; 32]).unwrap();
         let mut server_params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
         server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
         let server_cert = server_params

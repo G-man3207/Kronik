@@ -1,4 +1,4 @@
-#![cfg(all(feature = "real", feature = "host-identity"))]
+#![cfg(feature = "real")]
 #![allow(
     clippy::disallowed_methods,
     clippy::unwrap_used,

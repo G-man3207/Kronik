@@ -157,14 +157,14 @@ async fn real_owned_wss_opening_and_each_command_keep_the_original_ordinary_auth
         rcgen::KeyUsagePurpose::KeyCertSign,
         rcgen::KeyUsagePurpose::CrlSign,
     ];
-    let ca_key = kronik_core::identity::ed25519_key(&[41; 32]).unwrap();
+    let ca_key = kronik_fleet::identity::ed25519_key(&[41; 32]).unwrap();
     let ca = ca_params.self_signed(&ca_key).unwrap();
     *issuer.issuer.lock().unwrap() = Some(rcgen::Issuer::new(ca_params, ca_key));
     let mut protected_ca = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
     protected_ca.write_all(ca.pem().as_bytes()).unwrap();
     let ca_file = directory.path().join("ca.pem");
     protected_ca.persist(&ca_file).unwrap();
-    let server_key = kronik_core::identity::ed25519_key(&[42; 32]).unwrap();
+    let server_key = kronik_fleet::identity::ed25519_key(&[42; 32]).unwrap();
     let mut server_params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
     server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let server_cert = server_params

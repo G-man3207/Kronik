@@ -5,5 +5,6 @@
 
 pub mod enrollment;
 pub mod events;
+pub mod identity;
 pub mod transport;
 pub mod webhook;

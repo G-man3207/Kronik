@@ -10,8 +10,6 @@ pub mod env;
 pub mod error;
 pub mod explain;
 pub mod http;
-#[cfg(feature = "host-identity")]
-pub mod identity;
 pub mod ids;
 pub mod sync;
 pub mod time;
