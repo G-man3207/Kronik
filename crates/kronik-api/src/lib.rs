@@ -257,6 +257,30 @@ fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
     }
 }
 
+/// The message a send names: its body plain, tagged with its subject;
+/// `application/octet-stream` when it names no content type.
+fn send_message(
+    name: String,
+    content_type: String,
+    subject: Option<String>,
+    body: Vec<u8>,
+) -> pb::Message {
+    pb::Message {
+        name,
+        content_type: if content_type.is_empty() {
+            "application/octet-stream".into()
+        } else {
+            content_type
+        },
+        body: Some(pb::Sealable {
+            subject,
+            value: Some(pb::sealable::Value::Plain(body)),
+        }),
+        blobs: Vec::new(),
+        retained_compensation_source: None,
+    }
+}
+
 fn outcome_kind(k: i32) -> &'static str {
     match pb::OutcomeKind::try_from(k) {
         Ok(pb::OutcomeKind::Committed) => "committed",
@@ -1273,6 +1297,16 @@ impl Api {
         }
     }
 
+    /// The caller's `Audit` with the reason as given: the node scrubs it
+    /// when it writes the record (unlike [`Self::audit`]).
+    fn node_scrubbed_audit(&self, req: &AuthorizedRequest, reason: String) -> pb::Audit {
+        pb::Audit {
+            token_id: req.token_id.clone(),
+            reason,
+            wall_time_ms: self.node.env().clock.wall_ms(),
+        }
+    }
+
     /// Writes a mutation event or intent, canonically scrubbed by Node.
     /// Never for a dry run: callers return before it.
     async fn audit_event(
@@ -1287,11 +1321,7 @@ impl Api {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), v.clone()))
             .collect();
-        let audit = pb::Audit {
-            token_id: req.token_id.clone(),
-            reason,
-            wall_time_ms: self.node.env().clock.wall_ms(),
-        };
+        let audit = self.node_scrubbed_audit(req, reason);
         self.node
             .record_audit_event_authorized(action, target, details, audit, req.authority.clone())
             .await?;
@@ -1650,20 +1680,7 @@ impl Api {
             return Err(bad("the message needs a name"));
         }
         let body = r.body.to_bytes().map_err(bad)?;
-        let msg = pb::Message {
-            name: r.name,
-            content_type: if r.content_type.is_empty() {
-                "application/octet-stream".into()
-            } else {
-                r.content_type
-            },
-            body: Some(pb::Sealable {
-                subject: r.subject,
-                value: Some(pb::sealable::Value::Plain(body)),
-            }),
-            blobs: Vec::new(),
-            retained_compensation_source: None,
-        };
+        let msg = send_message(r.name, r.content_type, r.subject, body);
         let t = self
             .node
             .send(
@@ -2110,11 +2127,7 @@ impl Api {
             return Err(bad("The secret value is empty"));
         }
         // The secret producer scrubs once with both the candidate and retained values.
-        let audit = pb::Audit {
-            token_id: req.token_id.clone(),
-            reason: r.reason,
-            wall_time_ms: self.node.env().clock.wall_ms(),
-        };
+        let audit = self.node_scrubbed_audit(req, r.reason);
         let metadata = self
             .node
             .secret_set(name, value, &audit, r.dry_run, req.authority.clone())
@@ -2136,11 +2149,7 @@ impl Api {
     async fn secret_delete(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: SecretDeleteRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let audit = pb::Audit {
-            token_id: req.token_id.clone(),
-            reason: r.reason,
-            wall_time_ms: self.node.env().clock.wall_ms(),
-        };
+        let audit = self.node_scrubbed_audit(req, r.reason);
         let versions = self
             .node
             .secret_delete(name, &audit, r.dry_run, req.authority.clone())
@@ -2168,11 +2177,7 @@ impl Api {
     async fn secret_link(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: SecretLinkRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let audit = pb::Audit {
-            token_id: req.token_id.clone(),
-            reason: r.reason,
-            wall_time_ms: self.node.env().clock.wall_ms(),
-        };
+        let audit = self.node_scrubbed_audit(req, r.reason);
         let (link, lsn) = self
             .node
             .secret_link(
@@ -2193,11 +2198,7 @@ impl Api {
     async fn secret_unlink(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: SecretDeleteRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let audit = pb::Audit {
-            token_id: req.token_id.clone(),
-            reason: r.reason,
-            wall_time_ms: self.node.env().clock.wall_ms(),
-        };
+        let audit = self.node_scrubbed_audit(req, r.reason);
         let (link, lsn) = self
             .node
             .secret_unlink(name, &audit, r.dry_run, req.authority.clone())
@@ -2211,11 +2212,7 @@ impl Api {
     async fn secret_refresh(&self, req: &AuthorizedRequest, name: &str) -> Result<ApiResponse> {
         let r: SecretRefreshRequest = json(&req.body)?;
         reason(&r.reason)?;
-        let audit = pb::Audit {
-            token_id: req.token_id.clone(),
-            reason: r.reason,
-            wall_time_ms: self.node.env().clock.wall_ms(),
-        };
+        let audit = self.node_scrubbed_audit(req, r.reason);
         let metadata = self
             .node
             .secret_refresh(name, &audit, r.dry_run, req.authority.clone())
