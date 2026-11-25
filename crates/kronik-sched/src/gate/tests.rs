@@ -72,6 +72,46 @@ async fn settle() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
+/// Polls `request` once, which must leave it pending (queued behind a
+/// drain or a held lock), revokes `authority`, and returns the error the
+/// request then ends with within 5 s, which must be `Unauthenticated`.
+async fn revoked_while_pending<T>(
+    request: impl std::future::Future<Output = Result<T, ApiError>>,
+    authority: &common::Revocable,
+) -> ApiError {
+    let mut request = std::pin::pin!(request);
+    std::future::poll_fn(|cx| {
+        assert!(request.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    authority.revoke();
+    let Err(error) = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .unwrap()
+    else {
+        panic!("the revoked request succeeded");
+    };
+    assert_eq!(error.code, ErrorCode::Unauthenticated, "{error}");
+    error
+}
+
+/// Admits, then revokes: a request revoked after its final admission.
+struct RevokeAfterAdmit(Arc<common::Revocable>);
+impl kronik_core::authority::Authority for RevokeAfterAdmit {
+    fn check(&self) -> Result<(), ApiError> {
+        kronik_core::authority::Authority::check(self.0.as_ref())
+    }
+    fn cancelled(&self) -> kronik_core::env::BoxFuture<'static, ()> {
+        kronik_core::authority::Authority::cancelled(self.0.as_ref())
+    }
+    fn admit(&self, effect: &mut dyn FnMut() -> Result<(), ApiError>) -> Result<(), ApiError> {
+        kronik_core::authority::Authority::admit(self.0.as_ref(), effect)?;
+        self.0.revoke();
+        Ok(())
+    }
+}
+
 /// While drained, the callee turn of a call whose caller still waits runs
 /// (the caller can finish); one whose caller gave up waits for the drain.
 /// One thread: the orphan's caller is gone before its worker looks.
@@ -208,26 +248,20 @@ async fn revoked_operator_root_queued_behind_drain_never_runs_or_logs() {
     let drain = node.drain(Duration::from_secs(5)).await.unwrap();
     let before = node.applied_lsn();
     let authority = common::Revocable::new();
-    let mut request = Box::pin(node.send(
-        ActorRef::parse("counter/revoked").unwrap(),
-        pb::Message {
-            name: "increment".into(),
-            ..Default::default()
-        },
-        audit(),
-        false,
-        authority.lease(),
-    ));
-    std::future::poll_fn(|cx| {
-        assert!(request.as_mut().poll(cx).is_pending());
-        std::task::Poll::Ready(())
-    })
+    revoked_while_pending(
+        node.send(
+            ActorRef::parse("counter/revoked").unwrap(),
+            pb::Message {
+                name: "increment".into(),
+                ..Default::default()
+            },
+            audit(),
+            false,
+            authority.lease(),
+        ),
+        &authority,
+    )
     .await;
-    authority.revoke();
-    assert_eq!(
-        request.await.unwrap_err().code,
-        kronik_core::error::ErrorCode::Unauthenticated
-    );
     assert_eq!(node.applied_lsn(), before);
     drop(drain);
     settle().await;
@@ -255,18 +289,11 @@ async fn revoked_deploy_waiting_for_lock_never_installs_or_logs() {
     ))
     .unwrap();
     let authority = common::Revocable::new();
-    let mut request = Box::pin(node.deploy(&wasm, audit(), false, authority.lease()));
-    std::future::poll_fn(|cx| {
-        assert!(request.as_mut().poll(cx).is_pending());
-        std::task::Poll::Ready(())
-    })
+    revoked_while_pending(
+        node.deploy(&wasm, audit(), false, authority.lease()),
+        &authority,
+    )
     .await;
-    authority.revoke();
-    let error = tokio::time::timeout(Duration::from_secs(5), request)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(error.code, kronik_core::error::ErrorCode::Unauthenticated);
     assert_eq!(node.applied_lsn(), before);
     assert_eq!(node.epoch(), epoch);
     assert!(!node.kind_exists("notes"));
@@ -304,18 +331,11 @@ async fn revoked_resend_queued_behind_drain_releases_its_reservation() {
     let drain = node.drain(Duration::from_secs(5)).await.unwrap();
     let before = node.applied_lsn();
     let authority = common::Revocable::new();
-    let mut request = Box::pin(node.resend(dead, audit(), false, authority.lease()));
-    std::future::poll_fn(|cx| {
-        assert!(request.as_mut().poll(cx).is_pending());
-        std::task::Poll::Ready(())
-    })
+    revoked_while_pending(
+        node.resend(dead, audit(), false, authority.lease()),
+        &authority,
+    )
     .await;
-    authority.revoke();
-    let error = tokio::time::timeout(Duration::from_secs(5), request)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(error.code, kronik_core::error::ErrorCode::Unauthenticated);
     assert_eq!(node.applied_lsn(), before);
     assert_eq!(
         node.store()
@@ -426,18 +446,11 @@ async fn revoked_connection_resend_queued_behind_drain_releases_its_reservation(
     let drain = node.drain(Duration::from_secs(5)).await.unwrap();
     let before = node.applied_lsn();
     let authority = common::Revocable::new();
-    let mut request = Box::pin(node.resend(dead, audit(), false, authority.lease()));
-    std::future::poll_fn(|cx| {
-        assert!(request.as_mut().poll(cx).is_pending());
-        std::task::Poll::Ready(())
-    })
+    let error = revoked_while_pending(
+        node.resend(dead, audit(), false, authority.lease()),
+        &authority,
+    )
     .await;
-    authority.revoke();
-    let error = tokio::time::timeout(Duration::from_secs(5), request)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(error.code, kronik_core::error::ErrorCode::Unauthenticated);
     assert_eq!(error.message, "queued request revoked");
     assert_eq!(node.applied_lsn(), before);
     assert_eq!(
@@ -472,20 +485,6 @@ async fn revoked_connection_resend_queued_behind_drain_releases_its_reservation(
 /// refuses that append; this is the later window.
 #[tokio::test(flavor = "current_thread")]
 async fn a_started_connection_resend_completes_after_revoke() {
-    struct RevokeAfterAdmit(Arc<common::Revocable>);
-    impl kronik_core::authority::Authority for RevokeAfterAdmit {
-        fn check(&self) -> Result<(), ApiError> {
-            kronik_core::authority::Authority::check(self.0.as_ref())
-        }
-        fn cancelled(&self) -> kronik_core::env::BoxFuture<'static, ()> {
-            kronik_core::authority::Authority::cancelled(self.0.as_ref())
-        }
-        fn admit(&self, effect: &mut dyn FnMut() -> Result<(), ApiError>) -> Result<(), ApiError> {
-            kronik_core::authority::Authority::admit(self.0.as_ref(), effect)?;
-            self.0.revoke();
-            Ok(())
-        }
-    }
     let dir = tempfile::tempdir().unwrap();
     let (node, _) = node(dir.path()).await;
     let dead = connection_dead_letter(&node).await;
@@ -577,27 +576,20 @@ async fn revoked_remaining_admin_lock_waiter_cannot_publish_configuration() {
     let before = node.applied_lsn();
     let epoch = node.epoch();
     let authority = common::Revocable::new();
-    let mut request = Box::pin(node.grant(
-        "counter",
-        "http:revoked.test",
-        None,
-        None,
-        kronik_effects::InForks::Recorded,
-        audit(),
-        false,
-        authority.lease(),
-    ));
-    std::future::poll_fn(|cx| {
-        assert!(request.as_mut().poll(cx).is_pending());
-        std::task::Poll::Ready(())
-    })
+    revoked_while_pending(
+        node.grant(
+            "counter",
+            "http:revoked.test",
+            None,
+            None,
+            kronik_effects::InForks::Recorded,
+            audit(),
+            false,
+            authority.lease(),
+        ),
+        &authority,
+    )
     .await;
-    authority.revoke();
-    let error = tokio::time::timeout(Duration::from_secs(5), request)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(error.code, kronik_core::error::ErrorCode::Unauthenticated);
     assert_eq!(node.applied_lsn(), before);
     assert_eq!(node.epoch(), epoch);
     assert!(
@@ -632,19 +624,11 @@ async fn revoked_privacy_mode_waiter_cannot_toggle_the_sealer() {
     let mode = node.privacy_mode();
     let sealing = node.sealer().is_on();
     let authority = common::Revocable::new();
-    let mut request =
-        Box::pin(node.set_privacy_mode(pb::PrivacyState::On, audit(), false, authority.lease()));
-    std::future::poll_fn(|cx| {
-        assert!(request.as_mut().poll(cx).is_pending());
-        std::task::Poll::Ready(())
-    })
+    revoked_while_pending(
+        node.set_privacy_mode(pb::PrivacyState::On, audit(), false, authority.lease()),
+        &authority,
+    )
     .await;
-    authority.revoke();
-    let error = tokio::time::timeout(Duration::from_secs(5), request)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(error.code, kronik_core::error::ErrorCode::Unauthenticated);
     assert_eq!(node.applied_lsn(), before);
     assert_eq!(node.privacy_mode(), mode);
     assert_eq!(node.sealer().is_on(), sealing);
@@ -659,18 +643,7 @@ async fn revoked_snapshot_waiter_creates_neither_files_nor_marker() {
     let before = node.applied_lsn();
     let snapshots = node.snapshots().unwrap().len();
     let authority = common::Revocable::new();
-    let mut request = Box::pin(node.snapshot("manual", authority.lease()));
-    std::future::poll_fn(|cx| {
-        assert!(request.as_mut().poll(cx).is_pending());
-        std::task::Poll::Ready(())
-    })
-    .await;
-    authority.revoke();
-    let error = tokio::time::timeout(Duration::from_secs(5), request)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(error.code, kronik_core::error::ErrorCode::Unauthenticated);
+    revoked_while_pending(node.snapshot("manual", authority.lease()), &authority).await;
     assert_eq!(node.applied_lsn(), before);
     assert_eq!(node.snapshots().unwrap().len(), snapshots);
     drop(held);
@@ -684,19 +657,11 @@ async fn revoked_erasure_lock_waiter_deletes_no_keys_or_state() {
     let before = node.applied_lsn();
     let keys = node.keystore_stats().unwrap();
     let authority = common::Revocable::new();
-    let mut request =
-        Box::pin(node.erase_subject("revoked-subject", audit(), false, authority.lease()));
-    std::future::poll_fn(|cx| {
-        assert!(request.as_mut().poll(cx).is_pending());
-        std::task::Poll::Ready(())
-    })
+    revoked_while_pending(
+        node.erase_subject("revoked-subject", audit(), false, authority.lease()),
+        &authority,
+    )
     .await;
-    authority.revoke();
-    let error = tokio::time::timeout(Duration::from_secs(5), request)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(error.code, kronik_core::error::ErrorCode::Unauthenticated);
     assert_eq!(node.applied_lsn(), before);
     assert_eq!(node.keystore_stats().unwrap(), keys);
     assert!(
@@ -713,23 +678,9 @@ async fn revoked_erasure_lock_waiter_deletes_no_keys_or_state() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn admitted_irreversible_erasure_finishes_after_revoke() {
-    struct RevokeAfterAdmission(Arc<common::Revocable>);
-    impl kronik_core::authority::Authority for RevokeAfterAdmission {
-        fn check(&self) -> Result<(), ApiError> {
-            kronik_core::authority::Authority::check(self.0.as_ref())
-        }
-        fn cancelled(&self) -> kronik_core::env::BoxFuture<'static, ()> {
-            kronik_core::authority::Authority::cancelled(self.0.as_ref())
-        }
-        fn admit(&self, effect: &mut dyn FnMut() -> Result<(), ApiError>) -> Result<(), ApiError> {
-            kronik_core::authority::Authority::admit(self.0.as_ref(), effect)?;
-            self.0.revoke();
-            Ok(())
-        }
-    }
     let dir = tempfile::tempdir().unwrap();
     let (node, _) = node(dir.path()).await;
-    let authority = Arc::new(RevokeAfterAdmission(common::Revocable::new()));
+    let authority = Arc::new(RevokeAfterAdmit(common::Revocable::new()));
     let done = node
         .erase_subject("accepted-subject", audit(), false, authority.clone())
         .await
@@ -754,19 +705,11 @@ async fn revoked_rebase_pause_releases_its_configuration_lock_waiter() {
     let held = node.deploy_lock.clone().lock_owned().await;
     let before = node.applied_lsn();
     let authority = common::Revocable::new();
-    let mut request = Box::pin(node.rebase_pause(Duration::from_secs(5), authority.lease()));
-    std::future::poll_fn(|cx| {
-        assert!(request.as_mut().poll(cx).is_pending());
-        std::task::Poll::Ready(())
-    })
+    revoked_while_pending(
+        node.rebase_pause(Duration::from_secs(5), authority.lease()),
+        &authority,
+    )
     .await;
-    authority.revoke();
-    let result = tokio::time::timeout(Duration::from_secs(5), request)
-        .await
-        .unwrap();
-    assert!(
-        matches!(result, Err(error) if error.code == kronik_core::error::ErrorCode::Unauthenticated)
-    );
     assert_eq!(node.applied_lsn(), before);
     drop(held);
     let pause = node
@@ -811,6 +754,52 @@ async fn admitted_code_switch_retains_live_config_after_request_revoke() {
     assert!(node.applied_lsn() >= lsn);
 }
 
+/// A promote of `version`, verified through `verified`.
+fn promote(version: pb::KindVersion, verified: u64, proposal_id: &str) -> crate::CodeSwitch {
+    crate::CodeSwitch {
+        kinds: vec![version],
+        pinned: Vec::new(),
+        cause: pb::DeploymentCause::Promote,
+        verified_through_lsn: verified,
+        proposal_id: proposal_id.into(),
+        rollback_of_epoch: 0,
+    }
+}
+
+/// The root inputs in `(from, to]` that the log records.
+async fn root_inputs(node: &Node, from: u64, to: u64) -> u64 {
+    let mut roots = 0u64;
+    node.reader()
+        .read(from + 1, to, |c| {
+            if let kronik_proto::Record::TurnRecord(t) = &c.record
+                && kronik_core::causal::is_root_input(t)
+            {
+                roots += 1;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    roots
+}
+
+/// One operator `increment` of `counter/<key>`.
+async fn increment(node: &Node, key: &str) {
+    node.send(
+        ActorRef::parse(&format!("counter/{key}")).unwrap(),
+        pb::Message {
+            name: "increment".into(),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        common::lease(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+}
+
 /// Issue #85: a promote's `unverified_inputs` is the root inputs of
 /// `(verified_through_lsn, lsn]`, so it must be counted after the switch
 /// waited for the deploy lock, not before. Two sends commit while the
@@ -826,14 +815,7 @@ async fn a_promote_counts_the_root_inputs_that_committed_while_it_waited() {
         let node = node.clone();
         tokio::spawn(async move {
             node.switch_code(
-                crate::CodeSwitch {
-                    kinds: vec![version],
-                    pinned: Vec::new(),
-                    cause: pb::DeploymentCause::Promote,
-                    verified_through_lsn: verified,
-                    proposal_id: "p-issue-85".into(),
-                    rollback_of_epoch: 0,
-                },
+                promote(version, verified, "p-issue-85"),
                 audit(),
                 false,
                 common::lease(),
@@ -842,19 +824,7 @@ async fn a_promote_counts_the_root_inputs_that_committed_while_it_waited() {
         })
     };
     for key in ["a", "b"] {
-        node.send(
-            ActorRef::parse(&format!("counter/{key}")).unwrap(),
-            pb::Message {
-                name: "increment".into(),
-                ..Default::default()
-            },
-            audit(),
-            false,
-            common::lease(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        increment(&node, key).await;
     }
     drop(held);
     hold.release.add_permits(1);
@@ -865,19 +835,7 @@ async fn a_promote_counts_the_root_inputs_that_committed_while_it_waited() {
     assert_eq!(deployment.unverified_inputs, unverified);
     assert_eq!(unverified, 2, "the sends committed while the switch waited");
     // The number is the log's: every root input in the gap, no other turn.
-    let mut roots = 0u64;
-    node.reader()
-        .read(verified + 1, lsn, |c| {
-            if let kronik_proto::Record::TurnRecord(t) = &c.record
-                && kronik_core::causal::is_root_input(t)
-            {
-                roots += 1;
-            }
-            Ok(())
-        })
-        .await
-        .unwrap();
-    assert_eq!(roots, unverified);
+    assert_eq!(root_inputs(&node, verified, lsn).await, unverified);
 }
 
 /// Issue #126: a turn that started before the switch and is still running
@@ -922,14 +880,7 @@ async fn a_promote_waits_for_a_running_turn_and_counts_it() {
         let node = node.clone();
         tokio::spawn(async move {
             node.switch_code(
-                crate::CodeSwitch {
-                    kinds: vec![version],
-                    pinned: Vec::new(),
-                    cause: pb::DeploymentCause::Promote,
-                    verified_through_lsn: verified,
-                    proposal_id: "p-issue-126".into(),
-                    rollback_of_epoch: 0,
-                },
+                promote(version, verified, "p-issue-126"),
                 audit(),
                 false,
                 common::lease(),
@@ -962,19 +913,7 @@ async fn a_promote_waits_for_a_running_turn_and_counts_it() {
     assert_eq!(deployed, lsn);
     assert_eq!(deployment.unverified_inputs, unverified);
     // The number is the log's: every root input in the gap, no other turn.
-    let mut roots = 0u64;
-    node.reader()
-        .read(verified + 1, lsn, |c| {
-            if let kronik_proto::Record::TurnRecord(t) = &c.record
-                && kronik_core::causal::is_root_input(t)
-            {
-                roots += 1;
-            }
-            Ok(())
-        })
-        .await
-        .unwrap();
-    assert_eq!(roots, unverified);
+    assert_eq!(root_inputs(&node, verified, lsn).await, unverified);
 }
 
 /// Issue #126: the dry-run projection is taken under the same pause and gate
@@ -984,30 +923,11 @@ async fn a_promote_dry_run_projects_the_recorded_count() {
     let dir = tempfile::tempdir().unwrap();
     let (node, hold) = node(dir.path()).await;
     let verified = node.applied_lsn();
-    let version = node.deployed("counter").unwrap().clone();
+    let version = node.deployed("counter").unwrap();
     for key in ["a", "b"] {
-        node.send(
-            ActorRef::parse(&format!("counter/{key}")).unwrap(),
-            pb::Message {
-                name: "increment".into(),
-                ..Default::default()
-            },
-            audit(),
-            false,
-            common::lease(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        increment(&node, key).await;
     }
-    let switch = crate::CodeSwitch {
-        kinds: vec![version],
-        pinned: Vec::new(),
-        cause: pb::DeploymentCause::Promote,
-        verified_through_lsn: verified,
-        proposal_id: "p-issue-126".into(),
-        rollback_of_epoch: 0,
-    };
+    let switch = promote(version, verified, "p-issue-126");
     let (_, dry_lsn, projected) = node
         .switch_code(switch.clone(), audit(), true, common::lease())
         .await
