@@ -1116,6 +1116,7 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::resolver;
 
     #[test]
     fn the_actor_directory_is_private_and_its_data_directory_traversable() {
@@ -1161,41 +1162,6 @@ mod tests {
         assert!(secret_binding("1X=stripe-key").is_err());
         assert!(secret_binding("A-B=stripe-key").is_err());
         assert!(secret_binding("X=Bad Name").is_err());
-    }
-
-    /// A resolver that counts what a start asks of it: `stripe` is linked
-    /// and served from the cache (or the backend), `plain` from the built-in
-    /// store, `down` is linked to a backend that does not answer.
-    struct Resolver {
-        asked: Mutex<Vec<String>>,
-    }
-
-    impl ForeignSecrets for Resolver {
-        fn current(
-            &self,
-            name: &str,
-        ) -> kronik_core::env::BoxFuture<
-            'static,
-            Result<Option<zeroize::Zeroizing<Vec<u8>>>, kronik_core::error::ApiError>,
-        > {
-            lock(&self.asked).push(name.to_owned());
-            let answer = match name {
-                "stripe" => Ok(Some(zeroize::Zeroizing::new(b"backend-value".to_vec()))),
-                "plain" => Ok(Some(zeroize::Zeroizing::new(b"plain-value".to_vec()))),
-                "down" => Err(kronik_core::error::ApiError::new(
-                    kronik_core::error::ErrorCode::SecretUnavailable,
-                    "The retained secret identity or value is unavailable",
-                )),
-                _ => Ok(None),
-            };
-            Box::pin(async move { answer })
-        }
-    }
-
-    fn resolver() -> Resolver {
-        Resolver {
-            asked: Mutex::new(Vec::new()),
-        }
     }
 
     fn entries(names: &[&str]) -> Vec<String> {

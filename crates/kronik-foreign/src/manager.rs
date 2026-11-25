@@ -1621,12 +1621,7 @@ mod tests {
     }
 
     fn blobs(f: &Foreign) -> Vec<String> {
-        std::fs::read_dir(f.ctx.blobs.dir())
-            .map(|d| {
-                d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default()
+        crate::test_support::names(&f.ctx.blobs.dir())
     }
 
     /// R1: an image whose new layers do not fit in the free space above the
@@ -1662,28 +1657,13 @@ mod tests {
     /// resolver's SECRET_UNAVAILABLE, both before the image is fetched.
     #[tokio::test]
     async fn an_add_checks_its_secrets_through_the_resolver() {
-        struct Resolver;
-        impl kronik_effects::foreign::ForeignSecrets for Resolver {
-            fn current(
-                &self,
-                name: &str,
-            ) -> BoxFuture<'static, Result<Option<zeroize::Zeroizing<Vec<u8>>>, ApiError>>
-            {
-                let answer = match name {
-                    "stripe" => Ok(Some(zeroize::Zeroizing::new(b"linked".to_vec()))),
-                    "down" => Err(ApiError::new(ErrorCode::SecretUnavailable, "unavailable")),
-                    _ => Ok(None),
-                };
-                Box::pin(async move { answer })
-            }
-        }
         let tmp = tempfile::tempdir().unwrap();
         let (f, image) = manager_and_image(tmp.path(), 4096).await;
         let binding = |entry: &str| AddRequest {
             secrets: vec![entry.to_owned()],
             ..add(&image, None)
         };
-        let source: SecretSource = Arc::new(Resolver);
+        let source: SecretSource = Arc::new(crate::test_support::resolver());
         for (entry, code) in [
             ("TOKEN=missing", ErrorCode::SecretNotFound),
             ("TOKEN=down", ErrorCode::SecretUnavailable),

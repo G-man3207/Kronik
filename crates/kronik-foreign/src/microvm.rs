@@ -1104,6 +1104,8 @@ fn cpio_entry(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::child_text;
+
     #[test]
     fn the_root_service_needs_the_drop_in_for_microvms_and_the_nonroot_one_has_its_leaf() {
         use crate::manager::Privilege;
@@ -1695,11 +1697,7 @@ mod tests {
             .env(SWEEP_CHILD, "1")
             .output()
             .unwrap();
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let text = child_text(&out);
         assert!(
             out.status.success() && text.contains("launcher sweep ok"),
             "{text}"
