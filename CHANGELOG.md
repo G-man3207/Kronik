@@ -5,6 +5,10 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- An approval now covers a forked grounding row only if that row was already
+  changed when the approval was given. A diff after catch-up whose only new
+  change is an answer from a foreign actor's copy needs a new approval; before,
+  `approve` recorded the row but `promote` did not require it (#406).
 - `kronik build` builds again when the component in `dist/` is damaged
   before its `kronik-build-input` section, instead of stopping with
   `BAD_REQUEST` on every build until the file is removed; a section

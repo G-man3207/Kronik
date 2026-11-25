@@ -74,8 +74,8 @@ pub struct Approved {
     pub lsn: Lsn,
     pub diff_hash: String,
     pub outcome: String,
-    /// Targets with approximate or synthetic effects, or changed effects,
-    /// when approved.
+    /// Targets with approximate, forked or synthetic effects, or changed
+    /// effects, when approved.
     pub targets: Vec<String>,
     /// Root inputs the approved diff replayed in isolation (§6), sorted.
     /// A later catch-up diff may use this approval only if it replays all of
@@ -391,7 +391,7 @@ fn changed_targets(d: &diff::Diff) -> BTreeSet<String> {
     let mut out: BTreeSet<String> = d
         .grounding
         .iter()
-        .filter(|g| g.approximate + g.synthetic > 0)
+        .filter(|g| g.approximate + g.synthetic + g.forked > 0)
         .map(|g| format!("{} {} {}{}", g.kind, g.method, g.host, g.route))
         .collect();
     out.extend(
@@ -1669,14 +1669,14 @@ impl Proposals {
                 .rev()
                 .find(|(_, a)| !a.request && a.diff_hash == hash);
             if let Some((lsn, _)) = approval {
-                let d: Value = serde_json::from_slice(&bytes).map_err(internal)?;
+                let d: diff::Diff = serde_json::from_slice(&bytes).map_err(internal)?;
                 // As `approve` would have: under the policy in force.
                 let policy = self.evaluate(&bytes)?;
                 meta.approved = Some(Approved {
                     lsn,
                     diff_hash: meta.diff_hash.clone(),
                     outcome: policy["outcome"].as_str().unwrap_or("deny").to_owned(),
-                    targets: targets_of_value(&d),
+                    targets: changed_targets(&d).into_iter().collect(),
                     // The approval's record in the log names the diff, and
                     // diff.json is the diff this metadata describes.
                     sampled: meta.sampled.clone(),
@@ -1797,8 +1797,8 @@ impl Proposals {
             ));
         }
         let bytes = std::fs::read(self.dir(id).join("diff.json")).map_err(internal)?;
-        let d: Value = serde_json::from_slice(&bytes).map_err(internal)?;
-        let targets = targets_of_value(&d);
+        let d: diff::Diff = serde_json::from_slice(&bytes).map_err(internal)?;
+        let targets = changed_targets(&d).into_iter().collect();
         let hash_bytes = blake3::hash(&bytes).as_bytes().to_vec();
         // The bar this approval answers is the policy in force now, not the
         // one the proposal was evaluated under: a policy set since then
@@ -2882,35 +2882,6 @@ fn fired_names(policy: &Value) -> String {
     }
 }
 
-fn targets_of_value(d: &Value) -> Vec<String> {
-    let mut out = BTreeSet::new();
-    for g in d["grounding"].as_array().into_iter().flatten() {
-        let below_exact = ["approximate", "synthetic", "forked"]
-            .iter()
-            .map(|k| g[*k].as_u64().unwrap_or(0))
-            .sum::<u64>();
-        if below_exact > 0 {
-            out.insert(format!(
-                "{} {} {}{}",
-                g["kind"].as_str().unwrap_or(""),
-                g["method"].as_str().unwrap_or(""),
-                g["host"].as_str().unwrap_or(""),
-                g["route"].as_str().unwrap_or("")
-            ));
-        }
-    }
-    for e in d["effects"]["items"].as_array().into_iter().flatten() {
-        out.insert(format!(
-            "{} {} {}{}",
-            e["kind"].as_str().unwrap_or(""),
-            e["method"].as_str().unwrap_or(""),
-            e["host"].as_str().unwrap_or(""),
-            e["route"].as_str().unwrap_or("")
-        ));
-    }
-    out.into_iter().collect()
-}
-
 pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), ApiError> {
     crate::write_atomic(path, bytes).map_err(internal)
 }
@@ -2974,6 +2945,22 @@ mod tests {
             &BTreeSet::from(["other".into()])
         ));
         assert!(!approval_holds(&a, "deny", "b3:new", &covered, &changed));
+    }
+
+    /// An answer from a foreign actor's copy is below exact (ADR 0020), so
+    /// an approval must cover the target once catch-up adds one.
+    #[test]
+    fn a_forked_grounding_row_is_a_changed_target() {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/design/fixtures/diff-forked-postgres.json"
+        ))
+        .unwrap();
+        let d: diff::Diff = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            changed_targets(&d),
+            BTreeSet::from(["foreign.http POST pg/sql".to_owned()])
+        );
     }
 
     /// A replay that found the instance pool full could not run: the
