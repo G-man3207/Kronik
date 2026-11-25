@@ -1671,8 +1671,12 @@ fn identical_turns_on_pseudonyms_of_changed_code_need_an_approval() {
 /// M10 criterion 3: `diff show --summary` (`format=summary`) has no bodies,
 /// no state values and no actor keys, for a diff with personal data under
 /// privacy mode `on` (sealed values with subjects) and with plain values.
+/// Review H1: an e-mail address in an effect's URL path never reaches the
+/// summary, through the API or `kronik diff show --summary`; grounding shows
+/// the kind, method and granted host only.
 #[test]
-fn the_diff_summary_shows_no_bodies_or_values() {
+fn the_diff_summary_shows_no_bodies_values_or_url_paths() {
+    const EMAIL: &str = "alice.smith@example.com";
     let tmp = tempfile::Builder::new()
         .prefix("kronik-m10-")
         .tempdir_in("/var/tmp")
@@ -1707,6 +1711,20 @@ fn the_diff_summary_shows_no_bodies_or_values() {
     );
     d.send("counter/alice-key", "note", "plain-state-5d1e", None);
     d.send("counter/bob-key", "subject", "", None);
+    d.send(
+        "counter/alice",
+        "fetch-ok",
+        &format!("POST http://{target}/v1/customers/{EMAIL}/notify\n\nhello"),
+        Some("user:alice"),
+    );
+    let reader = d.api(
+        "POST",
+        "/v1/tokens",
+        json!({"name": "reader", "scopes": ["read"], "reason": "privacy test"}),
+    )["secret"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     let wasm = base64::engine::general_purpose::STANDARD
         .encode(std::fs::read(Path::new(GUESTS).join("counter-body-v2.wasm")).unwrap());
@@ -1740,56 +1758,8 @@ fn the_diff_summary_shows_no_bodies_or_values() {
         "{summary}"
     );
     assert!(summary.contains("| Effects | "), "{summary}");
-}
-
-/// M10 criterion 3 (review H1): an e-mail address in an effect's URL path
-/// never reaches the summary, through the API or `kronik diff show
-/// --summary`; grounding shows the kind, method and granted host only.
-#[test]
-fn the_diff_summary_shows_no_url_paths() {
-    const EMAIL: &str = "alice.smith@example.com";
-    let tmp = tempfile::Builder::new()
-        .prefix("kronik-m10-")
-        .tempdir_in("/var/tmp")
-        .unwrap();
-    let d = Daemon::start(tmp.path());
-    deploy(&d, "counter.wasm");
-    d.api(
-        "POST",
-        "/v1/grants",
-        json!({"kind": "counter", "capability": "http:127.0.0.1", "reason": "privacy test"}),
-    );
-    d.api(
-        "POST",
-        "/v1/privacy/mode",
-        json!({"mode": "on", "reason": "privacy test"}),
-    );
-    let target = common::http_target("127.0.0.1", "pong").0;
-    d.send(
-        "counter/alice",
-        "fetch-ok",
-        &format!("POST http://{target}/v1/customers/{EMAIL}/notify\n\nhello"),
-        Some("user:alice"),
-    );
-    let reader = d.api(
-        "POST",
-        "/v1/tokens",
-        json!({"name": "reader", "scopes": ["read"], "reason": "privacy test"}),
-    )["secret"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let wasm = base64::engine::general_purpose::STANDARD
-        .encode(std::fs::read(Path::new(GUESTS).join("counter-body-v2.wasm")).unwrap());
-    let v = d.api(
-        "POST",
-        "/v1/proposals",
-        json!({"wasm_base64": [wasm], "reason": "privacy test"}),
-    );
-    let id = v["proposal"]["id"].as_str().unwrap().to_owned();
-    let api = api_text(&d, &format!("/v1/proposals/{id}/diff?format=summary"), None);
     let cli = cli_as(&d, &reader, &["diff", "show", &id, "--summary"]);
-    for (from, summary) in [("API", &api), ("CLI", &cli)] {
+    for (from, summary) in [("API", &summary), ("CLI", &cli)] {
         // The grounding table is there, without the path.
         assert!(
             summary.contains("| `http.fetch` | `POST` | `127.0.0.1` |"),
