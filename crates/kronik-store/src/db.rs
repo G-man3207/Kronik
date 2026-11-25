@@ -4615,101 +4615,33 @@ pub fn note_sealed(keys: &mut SubjectKeys) -> impl FnMut(&mut pb::Sealable) + '_
     }
 }
 
-/// Every subject that still has a plain value in this state database:
-/// written in `off` mode and not resealed since (docs/design/m8-privacy.md
-/// §6.5, §8). The user data a reseal fixes, and an erasure deletes or
-/// tombstones: kv values, queued timer and message bodies, saved call and
-/// ingress responses, dead-letter inputs, and the recorded effects of turns
-/// still open. `privacy status` counts an erasure as pending while its
-/// subject has one here, as it does for one in the log (issue #31).
-pub fn plain_subjects(conn: &Connection) -> Result<std::collections::BTreeSet<String>, StoreError> {
-    use kronik_proto::sealables;
-    let mut out = std::collections::BTreeSet::new();
-    let mut st =
-        conn.prepare("SELECT DISTINCT subject FROM kv WHERE NOT sealed AND subject IS NOT NULL")?;
-    for s in st.query_map([], |r| r.get::<_, String>(0))? {
-        out.insert(s?);
-    }
-    let mut note = |s: &mut pb::Sealable| {
-        if let (Some(subject), Some(pb::sealable::Value::Plain(_))) = (&s.subject, &s.value) {
-            out.insert(subject.clone());
-        }
-    };
-    for (sql, what) in [
-        (
-            "SELECT outcome FROM deliveries WHERE outcome IS NOT NULL",
-            "outcome",
-        ),
-        ("SELECT outcome FROM ingress_keys", "outcome"),
-        ("SELECT input FROM mailbox", "input"),
-        ("SELECT input FROM dead_letters", "input"),
-        ("SELECT msg FROM timers", "message"),
-        ("SELECT record FROM open_effects", "effect"),
-    ] {
-        let mut st = conn.prepare(sql)?;
-        let mut q = st.query([])?;
-        while let Some(r) = q.next()? {
-            let b: Vec<u8> = r.get(0)?;
-            let bad = |e: prost::DecodeError| corrupt(format!("a stored {what}: {e}"));
-            match what {
-                "outcome" => sealables::outcome_mut(
-                    Some(&mut pb::Outcome::decode(b.as_slice()).map_err(bad)?),
-                    &mut note,
-                ),
-                "input" => sealables::input_mut(
-                    Some(&mut pb::Input::decode(b.as_slice()).map_err(bad)?),
-                    &mut note,
-                ),
-                "message" => sealables::message_mut(
-                    Some(&mut pb::Message::decode(b.as_slice()).map_err(bad)?),
-                    &mut note,
-                ),
-                _ => sealables::effect_mut(
-                    &mut pb::EffectRecord::decode(b.as_slice()).map_err(bad)?,
-                    &mut note,
-                ),
-            }
-        }
-    }
-    Ok(out)
-}
+/// The state tables whose rows hold a `pb::Sealable`, and the name a
+/// decode error reports for each.
+const STORED_SEALABLES: [(&str, &str); 6] = [
+    (
+        "SELECT outcome FROM deliveries WHERE outcome IS NOT NULL",
+        "outcome",
+    ),
+    ("SELECT outcome FROM ingress_keys", "outcome"),
+    ("SELECT input FROM mailbox", "input"),
+    ("SELECT input FROM dead_letters", "input"),
+    ("SELECT msg FROM timers", "message"),
+    ("SELECT record FROM open_effects", "effect"),
+];
 
-/// Every subject key that a sealed value in this state database needs: kv
-/// values, call outcomes, saved responses, mailbox and dead-letter inputs,
-/// timer messages, open effects and protected approval identities. A restore checks them against the
-/// keystore it installs, and `kronik integrity` against the live one
-/// (m8-privacy §10).
-pub fn sealed_keys(conn: &Connection) -> Result<SubjectKeys, StoreError> {
+/// Visits every `pb::Sealable` stored in the rows of `tables`.
+fn each_stored_sealable(
+    conn: &Connection,
+    tables: &[(&str, &str)],
+    f: kronik_proto::sealables::Visit<'_>,
+) -> Result<(), StoreError> {
     use kronik_proto::sealables;
-    let mut keys = SubjectKeys::new();
-    let mut st =
-        conn.prepare("SELECT subject, value FROM kv WHERE sealed AND subject IS NOT NULL")?;
-    let mut q = st.query([])?;
-    while let Some(r) = q.next()? {
-        let subject: String = r.get(0)?;
-        let bytes: Vec<u8> = r.get(1)?;
-        let s = pb::Sealed::decode(bytes.as_slice())
-            .map_err(|e| corrupt(format!("a sealed state value: {e}")))?;
-        note_key(&mut keys, &subject, &s);
-    }
-    for (sql, what) in [
-        (
-            "SELECT outcome FROM deliveries WHERE outcome IS NOT NULL",
-            "outcome",
-        ),
-        ("SELECT outcome FROM ingress_keys", "outcome"),
-        ("SELECT input FROM mailbox", "input"),
-        ("SELECT input FROM dead_letters", "input"),
-        ("SELECT msg FROM timers", "message"),
-        ("SELECT record FROM open_effects", "effect"),
-        ("SELECT record FROM approvals", "approval"),
-    ] {
+    for &(sql, what) in tables {
         let mut st = conn.prepare(sql)?;
         let mut q = st.query([])?;
         while let Some(r) = q.next()? {
             let b: Vec<u8> = r.get(0)?;
             let bad = |e: prost::DecodeError| corrupt(format!("a stored {what}: {e}"));
-            let f = &mut note_sealed(&mut keys);
             match what {
                 "outcome" => sealables::outcome_mut(
                     Some(&mut pb::Outcome::decode(b.as_slice()).map_err(bad)?),
@@ -4733,6 +4665,58 @@ pub fn sealed_keys(conn: &Connection) -> Result<SubjectKeys, StoreError> {
                 ),
             }
         }
+    }
+    Ok(())
+}
+
+/// Every subject that still has a plain value in this state database:
+/// written in `off` mode and not resealed since (docs/design/m8-privacy.md
+/// §6.5, §8). The user data a reseal fixes, and an erasure deletes or
+/// tombstones: kv values, queued timer and message bodies, saved call and
+/// ingress responses, dead-letter inputs, and the recorded effects of turns
+/// still open. `privacy status` counts an erasure as pending while its
+/// subject has one here, as it does for one in the log (issue #31).
+pub fn plain_subjects(conn: &Connection) -> Result<std::collections::BTreeSet<String>, StoreError> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut st =
+        conn.prepare("SELECT DISTINCT subject FROM kv WHERE NOT sealed AND subject IS NOT NULL")?;
+    for s in st.query_map([], |r| r.get::<_, String>(0))? {
+        out.insert(s?);
+    }
+    let mut note = |s: &mut pb::Sealable| {
+        if let (Some(subject), Some(pb::sealable::Value::Plain(_))) = (&s.subject, &s.value) {
+            out.insert(subject.clone());
+        }
+    };
+    each_stored_sealable(conn, &STORED_SEALABLES, &mut note)?;
+    Ok(out)
+}
+
+/// Every subject key that a sealed value in this state database needs: kv
+/// values, call outcomes, saved responses, mailbox and dead-letter inputs,
+/// timer messages, open effects and protected approval identities. A restore checks them against the
+/// keystore it installs, and `kronik integrity` against the live one
+/// (m8-privacy §10).
+pub fn sealed_keys(conn: &Connection) -> Result<SubjectKeys, StoreError> {
+    let mut keys = SubjectKeys::new();
+    let mut st =
+        conn.prepare("SELECT subject, value FROM kv WHERE sealed AND subject IS NOT NULL")?;
+    let mut q = st.query([])?;
+    while let Some(r) = q.next()? {
+        let subject: String = r.get(0)?;
+        let bytes: Vec<u8> = r.get(1)?;
+        let s = pb::Sealed::decode(bytes.as_slice())
+            .map_err(|e| corrupt(format!("a sealed state value: {e}")))?;
+        note_key(&mut keys, &subject, &s);
+    }
+    {
+        let mut f = note_sealed(&mut keys);
+        each_stored_sealable(conn, &STORED_SEALABLES, &mut f)?;
+        each_stored_sealable(
+            conn,
+            &[("SELECT record FROM approvals", "approval")],
+            &mut f,
+        )?;
     }
     Ok(keys)
 }
