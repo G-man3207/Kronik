@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use common::audit;
+use common::{audit, open_request, text_frame};
 use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
@@ -382,39 +382,6 @@ async fn a_held_resend_of_a_dead_letter_gone_by_the_switch_is_dropped() {
         "the resend ran"
     );
     assert!(node.store().db().dead_letters(0, 100).unwrap().is_empty());
-}
-
-fn text_frame(text: &str) -> pb::Frame {
-    pb::Frame {
-        kind: pb::frame::Kind::Text as i32,
-        data: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(text.as_bytes().to_vec())),
-        }),
-        ..Default::default()
-    }
-}
-
-fn open_request(key: &str, query: &str) -> pb::HttpInput {
-    pb::HttpInput {
-        method: "GET".into(),
-        path: format!("/room/{key}/ws"),
-        query: query.into(),
-        params: vec![pb::Param {
-            name: "key".into(),
-            value: key.into(),
-            sealed_value: None,
-        }],
-        headers: vec![pb::Header {
-            name: "sec-websocket-protocol".into(),
-            value: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(b"room.v1".to_vec())),
-            }),
-        }],
-        route: "/room/{key}/ws".into(),
-        ..Default::default()
-    }
 }
 
 /// Room deployed (epoch 1). Code switches park on `hold`; deploys do not.
