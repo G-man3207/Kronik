@@ -230,21 +230,7 @@ impl Fs for StalledFs {
 fn pkcs11() -> Keys {
     Keys {
         source: Source::Pkcs11,
-        pkcs11: Some(config::Pkcs11 {
-            helper_path: "/opt/kronik/bin/kronik-keyhelper".into(),
-            module: "/opt/hsm/module.so".into(),
-            module_sha256: "a1".repeat(32),
-            pin_file: "/opt/kronik/private/pin".into(),
-            manufacturer: "Example HSM".into(),
-            model: "AES model".into(),
-            serial: "123456789".into(),
-            key_id: "0001".into(),
-            key_version: "v1".into(),
-            probe: Some(config::Probe {
-                nonce: "ab".repeat(12),
-                ciphertext: "cd".repeat(48),
-            }),
-        }),
+        pkcs11: Some(pkcs11::tests::config()),
         ..Keys::default()
     }
 }
