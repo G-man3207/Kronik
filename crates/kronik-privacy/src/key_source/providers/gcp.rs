@@ -111,9 +111,7 @@ async fn auth(env: &Env, c: &Gcp) -> Result<Zeroizing<String>, String> {
     )
     .await
     .map_err(|error| error.to_string())?;
-    let token = Zeroizing::new(field(&response, "access_token")?.to_owned());
-    header_secret(&token)?;
-    Ok(token)
+    access_token(&response)
 }
 async fn kms(env: &Env, c: &Gcp, operation: &str, body: SecretJson) -> Result<SecretJson, String> {
     let net = tls_env(env, c.ca_file.as_deref(), None, Dispatch::StartupBootstrap).await?;
