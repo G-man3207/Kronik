@@ -11,7 +11,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::{audit, guest, message, rt, tempdir};
+use common::{audit, guest, message, restore_main, restore_two_phases, rt, tempdir};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_privacy::key_source::{Keys, lock_data};
@@ -220,45 +220,18 @@ fn missing_key() -> Keys {
 fn the_two_phases_restore_what_one_call_restores() {
     let shipped = shipped(true);
     let rt = rt();
-    let env = Env::real(rt.handle().clone());
     let whole = shipped.destination();
-    let one = rt
-        .block_on(restore(
-            &shipped.remote,
-            whole.path(),
-            "main",
-            false,
-            &env,
-            &Keys::default(),
-            KeystoreMode::Require,
-            false,
-            &|_| Ok(()),
-        ))
-        .unwrap();
+    let one = restore_main(&shipped.remote, whole.path()).unwrap();
     let split = shipped.destination();
-    let ownership = lock_data(split.path()).unwrap();
-    let two = rt
-        .block_on(async {
-            let phase = root_phase(
-                &shipped.remote,
-                split.path(),
-                &env,
-                &Keys::default(),
-                KeystoreMode::Require,
-            )
-            .await?;
-            restore_as_owner(
-                &shipped.remote,
-                split.path(),
-                "main",
-                false,
-                &env,
-                phase,
-                &ownership,
-            )
-            .await
-        })
-        .unwrap();
+    let two = restore_two_phases(
+        &rt,
+        &shipped.remote,
+        split.path(),
+        false,
+        &Keys::default(),
+        KeystoreMode::Require,
+    )
+    .unwrap();
     assert_eq!(one.keystore, "installed");
     same(&one, &two);
     assert_eq!(listing(whole.path()), listing(split.path()));
@@ -341,29 +314,15 @@ fn a_restore_needs_a_key_for_a_backup_at_once_and_for_a_secret_store_only_when_i
     let plain = shipped(false);
     plain.set_secret_store(None);
     let dst = plain.destination();
-    let ownership = lock_data(dst.path()).unwrap();
-    let report = rt
-        .block_on(async {
-            let phase = root_phase(
-                &plain.remote,
-                dst.path(),
-                &env,
-                &missing_key(),
-                KeystoreMode::Require,
-            )
-            .await?;
-            restore_as_owner(
-                &plain.remote,
-                dst.path(),
-                "main",
-                false,
-                &env,
-                phase,
-                &ownership,
-            )
-            .await
-        })
-        .unwrap();
+    let report = restore_two_phases(
+        &rt,
+        &plain.remote,
+        dst.path(),
+        false,
+        &missing_key(),
+        KeystoreMode::Require,
+    )
+    .unwrap();
     assert_eq!(report.keystore, "none_in_bucket");
 
     // No backup, but a secret store in the snapshot: the key is needed after
@@ -372,29 +331,15 @@ fn a_restore_needs_a_key_for_a_backup_at_once_and_for_a_secret_store_only_when_i
     plain.set_secret_store(Some(b"a secret store of some key"));
     let dst = plain.destination();
     let before = listing(dst.path());
-    let ownership = lock_data(dst.path()).unwrap();
-    let error = rt
-        .block_on(async {
-            let phase = root_phase(
-                &plain.remote,
-                dst.path(),
-                &env,
-                &missing_key(),
-                KeystoreMode::Require,
-            )
-            .await?;
-            restore_as_owner(
-                &plain.remote,
-                dst.path(),
-                "main",
-                false,
-                &env,
-                phase,
-                &ownership,
-            )
-            .await
-        })
-        .unwrap_err();
+    let error = restore_two_phases(
+        &rt,
+        &plain.remote,
+        dst.path(),
+        false,
+        &missing_key(),
+        KeystoreMode::Require,
+    )
+    .unwrap_err();
     assert!(matches!(error, ShipError::KeySource(_)), "{error:?}");
     assert!(error.to_string().contains("master key"), "{error}");
     assert_eq!(listing(dst.path()), before);
@@ -404,31 +349,16 @@ fn a_restore_needs_a_key_for_a_backup_at_once_and_for_a_secret_store_only_when_i
 fn without_the_keystore_no_key_is_read_at_all() {
     let shipped = shipped(true);
     let rt = rt();
-    let env = Env::real(rt.handle().clone());
     let dst = shipped.destination();
-    let ownership = lock_data(dst.path()).unwrap();
-    let report = rt
-        .block_on(async {
-            let phase = root_phase(
-                &shipped.remote,
-                dst.path(),
-                &env,
-                &missing_key(),
-                KeystoreMode::Without,
-            )
-            .await?;
-            restore_as_owner(
-                &shipped.remote,
-                dst.path(),
-                "main",
-                false,
-                &env,
-                phase,
-                &ownership,
-            )
-            .await
-        })
-        .unwrap();
+    let report = restore_two_phases(
+        &rt,
+        &shipped.remote,
+        dst.path(),
+        false,
+        &missing_key(),
+        KeystoreMode::Without,
+    )
+    .unwrap();
     assert_eq!(report.keystore, "skipped");
 }
 
@@ -475,7 +405,6 @@ fn a_directory_that_was_replaced_after_it_was_locked_is_not_restored_into() {
 fn a_stage_left_by_a_restore_that_was_killed_is_removed_by_the_next_and_is_not_data() {
     let shipped = shipped(false);
     let rt = rt();
-    let env = Env::real(rt.handle().clone());
     let dst = shipped.destination();
     // What a kill in the middle leaves: a stage with part of a download in it.
     let stage = dst.path().join(".restore");
@@ -505,29 +434,15 @@ fn a_stage_left_by_a_restore_that_was_killed_is_removed_by_the_next_and_is_not_d
     );
     // The next restore starts from nothing and leaves no stage.
     std::fs::remove_dir_all(dst.path().join("branches")).ok();
-    let ownership = lock_data(dst.path()).unwrap();
-    let report = rt
-        .block_on(async {
-            let phase = root_phase(
-                &shipped.remote,
-                dst.path(),
-                &env,
-                &Keys::default(),
-                KeystoreMode::Require,
-            )
-            .await?;
-            restore_as_owner(
-                &shipped.remote,
-                dst.path(),
-                "main",
-                true,
-                &env,
-                phase,
-                &ownership,
-            )
-            .await
-        })
-        .unwrap();
+    let report = restore_two_phases(
+        &rt,
+        &shipped.remote,
+        dst.path(),
+        true,
+        &Keys::default(),
+        KeystoreMode::Require,
+    )
+    .unwrap();
     assert!(report.snapshot_lsn > 0);
     assert!(!stage.exists(), "the stage was left behind");
 }
@@ -558,20 +473,14 @@ fn both_flows(
     ));
     let split = shipped.destination();
     let before = listing(split.path());
-    let ownership = lock_data(split.path()).unwrap();
-    let two = rt.block_on(async {
-        let phase = root_phase(&shipped.remote, split.path(), &env, &Keys::default(), mode).await?;
-        restore_as_owner(
-            &shipped.remote,
-            split.path(),
-            "main",
-            false,
-            &env,
-            phase,
-            &ownership,
-        )
-        .await
-    });
+    let two = restore_two_phases(
+        &rt,
+        &shipped.remote,
+        split.path(),
+        false,
+        &Keys::default(),
+        mode,
+    );
     // What a refused restore leaves must be what it found, in both flows.
     if two.is_err() {
         assert_eq!(listing(split.path()), before);

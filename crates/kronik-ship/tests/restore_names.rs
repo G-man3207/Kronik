@@ -12,16 +12,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use common::{audit, guest, message, rt, tempdir};
+use common::{audit, guest, message, restore_two_phases, rt, tempdir};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
-use kronik_privacy::key_source::lock_data;
 use kronik_sched::snapshots::{Manifest, SnapshotFile, StorageConfig};
 use kronik_sched::{Node, NodeConfig, start_local};
-use kronik_ship::{
-    KeystoreMode, Remote, RestoreReport, ShipError, ShipState, restore, restore_as_owner,
-    root_phase, ship_once,
-};
+use kronik_ship::{KeystoreMode, Remote, RestoreReport, ShipError, ShipState, restore, ship_once};
 use tokio::runtime::Runtime;
 
 /// A node running on `dir`, with the runtime it runs on.
@@ -306,18 +302,14 @@ fn restore_in(
             false,
             &|_| Ok(()),
         )),
-        Flow::Split => rt.block_on(async {
-            let ownership = lock_data(data)?;
-            let phase = root_phase(
-                remote,
-                data,
-                &env,
-                &Default::default(),
-                KeystoreMode::Require,
-            )
-            .await?;
-            restore_as_owner(remote, data, "main", force, &env, phase, &ownership).await
-        }),
+        Flow::Split => restore_two_phases(
+            rt,
+            remote,
+            data,
+            force,
+            &Default::default(),
+            KeystoreMode::Require,
+        ),
     }
 }
 
