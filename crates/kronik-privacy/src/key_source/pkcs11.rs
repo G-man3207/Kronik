@@ -392,4 +392,4 @@ pub(crate) async fn decrypt(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

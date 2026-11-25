@@ -1,6 +1,6 @@
 use super::*;
 
-fn config() -> Pkcs11 {
+pub(crate) fn config() -> Pkcs11 {
     Pkcs11 {
         helper_path: "/opt/kronik/bin/kronik-keyhelper".into(),
         module: "/opt/hsm/module.so".into(),

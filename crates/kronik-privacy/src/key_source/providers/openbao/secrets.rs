@@ -378,28 +378,37 @@ mod tests {
         ));
     }
 
-    struct ReadDenied;
-    impl kronik_core::env::Net for ReadDenied {
+    /// Answers every request with `status` and `body`; `expected` checks the request.
+    struct Canned {
+        status: u16,
+        body: &'static [u8],
+        expected: fn(&HttpRequest) -> bool,
+    }
+    impl Canned {
+        fn response(&self) -> kronik_core::env::HttpResponse {
+            kronik_core::env::HttpResponse {
+                status: self.status,
+                headers: vec![],
+                body: Bytes::from_static(self.body),
+            }
+        }
+    }
+    impl kronik_core::env::Net for Canned {
         fn http_authorized(
             &self,
             request: HttpRequest,
             original: kronik_core::authority::AuthLease,
         ) -> BoxFuture<'static, Result<kronik_core::env::HttpResponse, kronik_core::env::NetError>>
         {
-            assert_eq!(request.method, "GET");
-            assert!(request.url.contains("/data/") || request.url.contains("/metadata/"));
+            assert!((self.expected)(&request), "{}", request.url);
             let mut response = None;
             let admitted = original.admit(&mut || {
-                response = Some(kronik_core::env::HttpResponse {
-                    status: 403,
-                    headers: vec![],
-                    body: Bytes::from_static(b"private-denial-body"),
-                });
+                response = Some(self.response());
                 Ok(())
             });
             Box::pin(std::future::ready(
                 admitted
-                    .map(|()| response.expect("denial response was not admitted"))
+                    .map(|()| response.expect("canned response was not admitted"))
                     .map_err(|_| {
                         kronik_core::env::NetError::Connect("test provider authority ended".into())
                     }),
@@ -410,15 +419,9 @@ mod tests {
             request: HttpRequest,
         ) -> BoxFuture<'static, Result<kronik_core::env::HttpResponse, kronik_core::env::NetError>>
         {
-            assert_eq!(request.method, "GET");
-            assert!(request.url.contains("/data/") || request.url.contains("/metadata/"));
-            Box::pin(async {
-                Ok(kronik_core::env::HttpResponse {
-                    status: 403,
-                    headers: vec![],
-                    body: Bytes::from_static(b"private-denial-body"),
-                })
-            })
+            assert!((self.expected)(&request), "{}", request.url);
+            let response = self.response();
+            Box::pin(async move { Ok(response) })
         }
     }
 
@@ -426,7 +429,13 @@ mod tests {
     async fn read_denial_clears_only_the_session_that_authorized_the_request() {
         for metadata in [false, true] {
             let mut env = Env::real(tokio::runtime::Handle::current());
-            env.net = std::sync::Arc::new(ReadDenied);
+            env.net = std::sync::Arc::new(Canned {
+                status: 403,
+                body: b"private-denial-body",
+                expected: |r| {
+                    r.method == "GET" && (r.url.contains("/data/") || r.url.contains("/metadata/"))
+                },
+            });
             let session = |token: &str| Session {
                 env: env.clone(),
                 token: Zeroizing::new(token.to_owned()),
@@ -473,49 +482,6 @@ mod tests {
         }
     }
 
-    struct RenewalFailure(u16);
-    impl kronik_core::env::Net for RenewalFailure {
-        fn http_authorized(
-            &self,
-            request: HttpRequest,
-            original: kronik_core::authority::AuthLease,
-        ) -> BoxFuture<'static, Result<kronik_core::env::HttpResponse, kronik_core::env::NetError>>
-        {
-            assert!(request.url.ends_with("/v1/auth/token/renew-self"));
-            let mut response = None;
-            let admitted = original.admit(&mut || {
-                response = Some(kronik_core::env::HttpResponse {
-                    status: self.0,
-                    headers: vec![],
-                    body: Bytes::from_static(b"private-auth-body"),
-                });
-                Ok(())
-            });
-            Box::pin(std::future::ready(
-                admitted
-                    .map(|()| response.expect("renewal response was not admitted"))
-                    .map_err(|_| {
-                        kronik_core::env::NetError::Connect("test provider authority ended".into())
-                    }),
-            ))
-        }
-        fn http(
-            &self,
-            request: HttpRequest,
-        ) -> BoxFuture<'static, Result<kronik_core::env::HttpResponse, kronik_core::env::NetError>>
-        {
-            assert!(request.url.ends_with("/v1/auth/token/renew-self"));
-            let status = self.0;
-            Box::pin(async move {
-                Ok(kronik_core::env::HttpResponse {
-                    status,
-                    headers: vec![],
-                    body: Bytes::from_static(b"private-auth-body"),
-                })
-            })
-        }
-    }
-
     #[tokio::test]
     async fn token_renewal_denial_is_not_an_availability_failure() {
         for (status, expected) in [
@@ -523,7 +489,11 @@ mod tests {
             (503, BackendError::Unavailable),
         ] {
             let mut env = Env::real(tokio::runtime::Handle::current());
-            env.net = std::sync::Arc::new(RenewalFailure(status));
+            env.net = std::sync::Arc::new(Canned {
+                status,
+                body: b"private-auth-body",
+                expected: |r| r.url.ends_with("/v1/auth/token/renew-self"),
+            });
             let backend = Secrets {
                 env: env.clone(),
                 config: OpenBao {
