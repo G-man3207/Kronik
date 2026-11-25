@@ -1877,7 +1877,6 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "boon",
- "bytes",
  "clap",
  "http-body-util",
  "hyper",
@@ -2203,7 +2202,6 @@ dependencies = [
 name = "kronik-mcp"
 version = "0.6.0-dev"
 dependencies = [
- "bytes",
  "http",
  "kronik-api",
  "kronik-core",
@@ -2265,7 +2263,6 @@ dependencies = [
  "blake3",
  "bytes",
  "chacha20poly1305",
- "http",
  "kronik-blob",
  "kronik-core",
  "kronik-proto",

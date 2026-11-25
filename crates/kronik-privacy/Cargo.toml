@@ -10,7 +10,6 @@ publish.workspace = true
 blake3 = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-http = { workspace = true }
 kronik-blob = { workspace = true }
 kronik-core = { workspace = true }
 ring = { workspace = true }
