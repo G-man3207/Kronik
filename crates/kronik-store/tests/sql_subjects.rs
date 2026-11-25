@@ -41,40 +41,6 @@ fn turn_opts(seed: u8, subject: Option<&str>, migrate: bool) -> TurnOpts {
     }
 }
 
-/// What the actor's turns record.
-struct Recorded {
-    /// The schema turn's DDL.
-    ddl: Vec<String>,
-    /// The changesets, by subject, of one turn on behalf of `user:1` that
-    /// writes its own row and one that names `user:2`.
-    changesets: Vec<(Option<String>, Vec<u8>)>,
-}
-
-fn recorded_sql() -> Recorded {
-    let mut actor = SqlActor::open(&MemOpener, "notes/n", Limits::default()).unwrap();
-    actor.begin_turn(&turn_opts(1, None, true)).unwrap();
-    actor.query(SCHEMA, &[]).unwrap();
-    let schema = actor.end_turn(true).unwrap();
-    actor.apply(&schema, 1, &BTreeSet::new()).unwrap();
-    actor
-        .begin_turn(&turn_opts(2, Some("user:1"), false))
-        .unwrap();
-    actor
-        .query(&format!("INSERT INTO notes(body) VALUES ('{MINE}')"), &[])
-        .unwrap();
-    actor
-        .query(
-            &format!("INSERT INTO notes(body, _subject) VALUES ('{THEIRS}', 'user:2')"),
-            &[],
-        )
-        .unwrap();
-    let dml = actor.end_turn(true).unwrap();
-    Recorded {
-        ddl: schema.ddl,
-        changesets: dml.changesets,
-    }
-}
-
 fn committed(lsn: u64, record: Record) -> Committed {
     Committed {
         lsn,
@@ -144,19 +110,35 @@ fn store_after(sealer: &Arc<Sealer>, records: &[Committed]) -> Arc<Store> {
     store
 }
 
-/// The actor's rows: (body, `_subject`).
-fn rows(store: &Store) -> Vec<(String, String)> {
+/// A sealer that seals with the keys of an in-memory keystore, as the node's
+/// does. `seed` selects the master key.
+fn sealer_on(seed: u8) -> Arc<Sealer> {
+    let master = MasterKey::from_bytes([seed; 32]).unwrap();
+    let sealer = Arc::new(Sealer::new(Arc::new(
+        Keystore::open_memory(&master).unwrap(),
+    )));
+    sealer.set_on(true);
+    sealer
+}
+
+/// The two columns of `sql`, read from the actor's database as its host.
+fn select<A: rusqlite::types::FromSql, B: rusqlite::types::FromSql>(
+    store: &Store,
+    sql: &str,
+) -> Vec<(A, B)> {
     let db = store.sql.get("notes/n").unwrap();
     let actor = db.lock().unwrap();
     actor.set_host();
-    let mut st = actor
-        .conn
-        .prepare("SELECT body, _subject FROM notes ORDER BY id")
-        .unwrap();
+    let mut st = actor.conn.prepare(sql).unwrap();
     st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
         .map(Result::unwrap)
         .collect()
+}
+
+/// The actor's rows: (body, `_subject`).
+fn rows(store: &Store) -> Vec<(String, String)> {
+    select(store, "SELECT body, _subject FROM notes ORDER BY id")
 }
 
 fn row(body: &str, subject: &str) -> (String, String) {
@@ -169,34 +151,23 @@ fn holds(bytes: &[u8], needle: &str) -> bool {
 
 #[test]
 fn erasing_one_subject_of_a_turn_keeps_the_other_subjects_rows_live_and_rebuilt() {
-    let master = MasterKey::from_bytes([5; 32]).unwrap();
-    let sealer = Arc::new(Sealer::new(Arc::new(
-        Keystore::open_memory(&master).unwrap(),
-    )));
-    sealer.set_on(true);
-    let Recorded { ddl, changesets } = recorded_sql();
+    let sealer = sealer_on(5);
+    let insert_mine = format!("INSERT INTO notes(body) VALUES ('{MINE}')");
+    let insert_theirs = format!("INSERT INTO notes(body, _subject) VALUES ('{THEIRS}', 'user:2')");
+    let schema: &[&str] = &[SCHEMA];
+    let writes: &[&str] = &[insert_mine.as_str(), insert_theirs.as_str()];
+    let turns = guest_turns(&[schema, writes]);
     // The node seals each changeset of the turn record under its subject.
-    let sealed: Vec<pb::SqlChangeset> = changesets
-        .into_iter()
-        .map(|(subject, cs)| {
-            let mut value = pb::Sealable {
-                subject,
-                value: Some(pb::sealable::Value::Plain(cs)),
-            };
-            sealer
-                .seal_value(&mut value, &|b: &mut [u8]| b.fill(3), 2)
-                .unwrap();
-            pb::SqlChangeset {
-                changeset: Some(value),
-            }
-        })
-        .collect();
+    let sealed = seal_changes(&sealer, &turns[1].changesets, 2);
     let subjects: Vec<Option<&str>> = sealed
         .iter()
         .map(|c| c.changeset.as_ref().and_then(|v| v.subject.as_deref()))
         .collect();
     assert_eq!(subjects, [Some("user:1"), Some("user:2")]);
-    let mut log = vec![turn(1, &ddl, Vec::new()), turn(2, &[], sealed.clone())];
+    let mut log = vec![
+        turn(1, &turns[0].ddl, Vec::new()),
+        turn(2, &[], sealed.clone()),
+    ];
 
     let live = store_after(&sealer, &log);
     assert_eq!(
@@ -274,11 +245,7 @@ fn erasing_one_subject_of_a_turn_keeps_the_other_subjects_rows_live_and_rebuilt(
 /// rebuild from the log must still answer a query.
 #[test]
 fn a_quoted_table_name_erases_and_a_rebuild_still_serves() {
-    let master = MasterKey::from_bytes([7; 32]).unwrap();
-    let sealer = Arc::new(Sealer::new(Arc::new(
-        Keystore::open_memory(&master).unwrap(),
-    )));
-    sealer.set_on(true);
+    let sealer = sealer_on(7);
 
     let ddl = "CREATE TABLE \"a\"\"b\" (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
          _subject TEXT DEFAULT (kronik_subject()))";
@@ -319,27 +286,10 @@ fn a_quoted_table_name_erases_and_a_rebuild_still_serves() {
     );
     actor.canonical_hash().unwrap();
 
-    let seal = |changesets: Vec<(Option<String>, Vec<u8>)>, lsn: u64| {
-        changesets
-            .into_iter()
-            .map(|(subject, cs)| {
-                let mut value = pb::Sealable {
-                    subject,
-                    value: Some(pb::sealable::Value::Plain(cs)),
-                };
-                sealer
-                    .seal_value(&mut value, &|b: &mut [u8]| b.fill(3), lsn)
-                    .unwrap();
-                pb::SqlChangeset {
-                    changeset: Some(value),
-                }
-            })
-            .collect()
-    };
     let mut log = vec![
         turn(1, &schema.ddl, Vec::new()),
-        turn(2, &[], seal(inserted.changesets, 2)),
-        turn(3, &[], seal(updated.changesets, 3)),
+        turn(2, &[], seal_changes(&sealer, &inserted.changesets, 2)),
+        turn(3, &[], seal_changes(&sealer, &updated.changesets, 3)),
     ];
     let live = store_after(&sealer, &log);
     assert_eq!(
@@ -386,17 +336,7 @@ fn a_quoted_table_name_erases_and_a_rebuild_still_serves() {
 }
 
 fn quoted_rows(store: &Store) -> Vec<(String, String)> {
-    let db = store.sql.get("notes/n").unwrap();
-    let actor = db.lock().unwrap();
-    actor.set_host();
-    let mut st = actor
-        .conn
-        .prepare("SELECT body, _subject FROM \"a\"\"b\" ORDER BY id")
-        .unwrap();
-    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect()
+    select(store, "SELECT body, _subject FROM \"a\"\"b\" ORDER BY id")
 }
 
 fn actor_applied(store: &Store) -> u64 {
@@ -405,24 +345,6 @@ fn actor_applied(store: &Store) -> u64 {
 }
 
 type SubjectChanges = Vec<(Option<String>, Vec<u8>)>;
-
-fn fk_changesets(schema: &[&str], inserts: &[&str]) -> (Vec<String>, SubjectChanges) {
-    let mut actor = SqlActor::open(&MemOpener, "notes/n", Limits::default()).unwrap();
-    actor.begin_turn(&turn_opts(1, None, true)).unwrap();
-    for statement in schema {
-        actor.query(statement, &[]).unwrap();
-    }
-    let schema_turn = actor.end_turn(true).unwrap();
-    actor.apply(&schema_turn, 1, &BTreeSet::new()).unwrap();
-    actor
-        .begin_turn(&turn_opts(2, Some("user:1"), false))
-        .unwrap();
-    for statement in inserts {
-        actor.query(statement, &[]).unwrap();
-    }
-    let dml = actor.end_turn(true).unwrap();
-    (schema_turn.ddl, dml.changesets)
-}
 
 fn sealable_changes(changes: SubjectChanges) -> Vec<pb::SqlChangeset> {
     changes
@@ -437,40 +359,31 @@ fn sealable_changes(changes: SubjectChanges) -> Vec<pb::SqlChangeset> {
 }
 
 fn account_line(store: &Store) -> Vec<(i64, String)> {
-    let db = store.sql.get("notes/n").unwrap();
-    let actor = db.lock().unwrap();
-    actor.set_host();
-    let mut st = actor
-        .conn
-        .prepare("SELECT id, _subject FROM account ORDER BY id")
-        .unwrap();
-    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect()
+    select(store, "SELECT id, _subject FROM account ORDER BY id")
 }
+
+const FK_SCHEMA: &[&str] = &[
+    "CREATE TABLE account (id INTEGER PRIMARY KEY, _subject TEXT)",
+    "CREATE TABLE line (id INTEGER PRIMARY KEY, \
+     account_id INTEGER NOT NULL REFERENCES account(id), _subject TEXT)",
+];
 
 /// Issue #241: applying the `Erasure` record deletes a parent and its child
 /// of the same subject, leaves the other subject, and a rebuild (what a
 /// restart applies) does not report the record corrupt.
 #[test]
 fn a_parent_child_erasure_applies_and_a_rebuild_stays_up() {
-    let schema = [
-        "CREATE TABLE account (id INTEGER PRIMARY KEY, _subject TEXT)",
-        "CREATE TABLE line (id INTEGER PRIMARY KEY, \
-         account_id INTEGER NOT NULL REFERENCES account(id), _subject TEXT)",
-    ];
     let inserts = [
         "INSERT INTO account(id, _subject) VALUES (1, 'user:1')",
         "INSERT INTO line(id, account_id, _subject) VALUES (1, 1, 'user:1')",
         "INSERT INTO account(id, _subject) VALUES (2, 'user:2')",
         "INSERT INTO line(id, account_id, _subject) VALUES (2, 2, 'user:2')",
     ];
-    let (ddl, changes) = fk_changesets(&schema, &inserts);
+    let turns = guest_turns(&[FK_SCHEMA, &inserts]);
     let sealer = Arc::new(Sealer::plain());
     let log = [
-        turn(1, &ddl, Vec::new()),
-        turn(2, &[], sealable_changes(changes)),
+        turn(1, &turns[0].ddl, Vec::new()),
+        turn(2, &[], sealable_changes(turns[1].changesets.clone())),
         committed(
             3,
             Record::Erasure(pb::Erasure {
@@ -495,20 +408,15 @@ fn a_parent_child_erasure_applies_and_a_rebuild_stays_up() {
 /// leaves the rows, and a second apply (a restart of that record) does too.
 #[test]
 fn a_cross_subject_reference_is_not_a_corrupt_erasure() {
-    let schema = [
-        "CREATE TABLE account (id INTEGER PRIMARY KEY, _subject TEXT)",
-        "CREATE TABLE line (id INTEGER PRIMARY KEY, \
-         account_id INTEGER NOT NULL REFERENCES account(id), _subject TEXT)",
-    ];
     let inserts = [
         "INSERT INTO account(id, _subject) VALUES (1, 'user:1')",
         "INSERT INTO line(id, account_id, _subject) VALUES (1, 1, 'user:2')",
     ];
-    let (ddl, changes) = fk_changesets(&schema, &inserts);
+    let turns = guest_turns(&[FK_SCHEMA, &inserts]);
     let sealer = Arc::new(Sealer::plain());
     let log = [
-        turn(1, &ddl, Vec::new()),
-        turn(2, &[], sealable_changes(changes)),
+        turn(1, &turns[0].ddl, Vec::new()),
+        turn(2, &[], sealable_changes(turns[1].changesets.clone())),
         committed(
             3,
             Record::Erasure(pb::Erasure {
@@ -536,12 +444,6 @@ fn a_cross_subject_reference_is_not_a_corrupt_erasure() {
     );
     assert_eq!(actor_applied(&live), 2);
 }
-
-const FK_SCHEMA: &[&str] = &[
-    "CREATE TABLE account (id INTEGER PRIMARY KEY, _subject TEXT)",
-    "CREATE TABLE line (id INTEGER PRIMARY KEY, \
-     account_id INTEGER NOT NULL REFERENCES account(id), _subject TEXT)",
-];
 
 type FkRows = (Vec<(i64, String)>, Vec<(i64, i64, String)>);
 
@@ -613,7 +515,11 @@ fn direct_fk(statements: &[&str]) -> FkRows {
     read_fk(&conn)
 }
 
-fn seal_changes(sealer: &Sealer, changes: &[(Option<String>, Vec<u8>)]) -> Vec<pb::SqlChangeset> {
+fn seal_changes(
+    sealer: &Sealer,
+    changes: &[(Option<String>, Vec<u8>)],
+    lsn: u64,
+) -> Vec<pb::SqlChangeset> {
     changes
         .iter()
         .map(|(subject, cs)| {
@@ -622,7 +528,7 @@ fn seal_changes(sealer: &Sealer, changes: &[(Option<String>, Vec<u8>)]) -> Vec<p
                 value: Some(pb::sealable::Value::Plain(cs.clone())),
             };
             sealer
-                .seal_value(&mut value, &|b: &mut [u8]| b.fill(9), 2)
+                .seal_value(&mut value, &|b: &mut [u8]| b.fill(9), lsn)
                 .unwrap();
             assert!(
                 matches!(value.value, Some(pb::sealable::Value::Sealed(_))),
@@ -661,12 +567,8 @@ fn a_cross_subject_parent_insert_commits_and_survives_restart() {
             }
         );
     }
-    let master = MasterKey::from_bytes([9; 32]).unwrap();
-    let sealer = Arc::new(Sealer::new(Arc::new(
-        Keystore::open_memory(&master).unwrap(),
-    )));
-    sealer.set_on(true);
-    let sealed = seal_changes(&sealer, changes);
+    let sealer = sealer_on(9);
+    let sealed = seal_changes(&sealer, changes, 2);
     assert_eq!(
         sealed
             .iter()
