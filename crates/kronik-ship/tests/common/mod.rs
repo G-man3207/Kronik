@@ -5,8 +5,11 @@
 use std::path::Path;
 
 use kronik_core::env::Env;
+use kronik_privacy::key_source::{Keys, lock_data};
 use kronik_proto::log::v1 as pb;
-use kronik_ship::{KeystoreMode, Remote, RestoreReport, ShipError, restore};
+use kronik_ship::{
+    KeystoreMode, Remote, RestoreReport, ShipError, restore, restore_as_owner, root_phase,
+};
 use tokio::runtime::Runtime;
 
 pub fn rt() -> Runtime {
@@ -56,6 +59,25 @@ pub fn restore_main(remote: &Remote, data: &Path) -> Result<RestoreReport, ShipE
         false,
         &|_| Ok(()),
     ))
+}
+
+/// Restores branch `main` from `remote` into `data` in the two phases
+/// `kronik restore` runs on either side of a drop of privileges: lock the
+/// directory, run the root phase, then the owner's phase under the lock.
+pub fn restore_two_phases(
+    rt: &Runtime,
+    remote: &Remote,
+    data: &Path,
+    force: bool,
+    keys: &Keys,
+    mode: KeystoreMode,
+) -> Result<RestoreReport, ShipError> {
+    let env = Env::real(rt.handle().clone());
+    rt.block_on(async {
+        let ownership = lock_data(data)?;
+        let phase = root_phase(remote, data, &env, keys, mode).await?;
+        restore_as_owner(remote, data, "main", force, &env, phase, &ownership).await
+    })
 }
 
 pub fn guest(name: &str) -> Vec<u8> {

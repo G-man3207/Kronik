@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use common::{restore_main, rt};
+use common::{restore_main, restore_two_phases, rt};
 use kronik_core::env::Env;
 use kronik_privacy::MasterKey;
 use kronik_privacy::keystore::{KeyLookup, Keystore};
@@ -477,19 +477,14 @@ fn a_failed_restore_in_two_phases_leaves_an_empty_destination_empty() {
     let dst = tempfile::tempdir().unwrap();
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     let runtime = rt();
-    let env = Env::real(runtime.handle().clone());
-    let held = kronik_privacy::key_source::lock_data(dst.path()).unwrap();
-    let result = runtime.block_on(async {
-        let phase = kronik_ship::root_phase(
-            &remote,
-            dst.path(),
-            &env,
-            &Default::default(),
-            KeystoreMode::Require,
-        )
-        .await?;
-        kronik_ship::restore_as_owner(&remote, dst.path(), "main", false, &env, phase, &held).await
-    });
+    let result = restore_two_phases(
+        &runtime,
+        &remote,
+        dst.path(),
+        false,
+        &Default::default(),
+        KeystoreMode::Require,
+    );
     assert!(result.is_err());
     assert_eq!(std::fs::read_dir(dst.path()).unwrap().count(), 0);
 }
