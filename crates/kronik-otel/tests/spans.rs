@@ -6,7 +6,7 @@
 #![allow(clippy::unwrap_used)]
 
 use kronik_core::causal;
-use kronik_core::ids::{ActorRef, hex};
+use kronik_core::ids::{ActorRef, hex, unhex};
 use kronik_otel::otlp::common::v1::any_value::Value;
 use kronik_otel::otlp::trace::v1::{Span, span, status};
 use kronik_otel::spans::{
@@ -958,10 +958,7 @@ fn clamp_puts_children_inside_their_parents() {
 #[test]
 fn effect_records_from_before_offset_us_start_at_the_turn() {
     let fixture = include_str!("../../kronik-proto/tests/fixtures/effect-record-v1.hex").trim();
-    let bytes: Vec<u8> = (0..fixture.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&fixture[i..i + 2], 16).unwrap())
-        .collect();
+    let bytes = unhex(fixture).unwrap();
     let e = pb::EffectRecord::decode(bytes.as_slice()).unwrap();
     assert_eq!(
         (e.kind.as_str(), e.duration_us, e.offset_us),

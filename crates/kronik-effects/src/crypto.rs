@@ -43,7 +43,7 @@ mod tests {
     #[test]
     fn hmac_rfc4231_case_2() {
         let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
-        let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = kronik_core::ids::hex(&mac);
         assert_eq!(
             hex,
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
@@ -54,7 +54,7 @@ mod tests {
     fn ed25519_rfc8032_test_1() {
         let seed = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
         let sig = sign_ed25519(seed.as_bytes(), b"").unwrap();
-        let hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = kronik_core::ids::hex(&sig);
         assert!(
             hex.starts_with("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155")
         );

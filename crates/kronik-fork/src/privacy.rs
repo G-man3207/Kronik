@@ -607,7 +607,7 @@ mod tests {
         live.query(SCHEMA, &[]).unwrap();
         let schema_turn = live.end_turn(true).unwrap();
         live.apply(&schema_turn, 1, &BTreeSet::new()).unwrap();
-        let blob = BLOB.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let blob = kronik_core::ids::hex(BLOB);
         live.begin_turn(&opts(2, false)).unwrap();
         live.query(
             &format!("INSERT INTO notes(body, payload) VALUES ('{ROW}', x'{blob}')"),
