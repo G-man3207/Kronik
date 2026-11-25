@@ -26,7 +26,7 @@ use kronik_effects::http::{
 use kronik_effects::simulator::{ContractFake, NeighborSource, RecordedNeighbor};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::scrub::original_secret_prefix;
+use kronik_sched::scrub::{BoundedWriter, original_secret_prefix};
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -693,52 +693,10 @@ impl<W: std::io::Write> std::io::Write for CacheWrite<'_, W> {
     }
 }
 
-/// The existing record bound applies before serialization grows a buffer,
-/// not after an unbounded serde_json::to_vec has already allocated it.
-struct JsonWriter {
-    bytes: Vec<u8>,
-    limit: usize,
-}
-
-impl Drop for JsonWriter {
-    fn drop(&mut self) {
-        self.bytes.zeroize();
-    }
-}
-
-impl std::io::Write for JsonWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let needed = self
-            .bytes
-            .len()
-            .checked_add(bytes.len())
-            .filter(|&n| n <= self.limit)
-            .ok_or_else(|| std::io::Error::other("model JSON output limit"))?;
-        if needed > self.bytes.capacity() {
-            let capacity = needed
-                .max(self.bytes.capacity().saturating_mul(2))
-                .max(64)
-                .min(self.limit);
-            self.bytes
-                .try_reserve_exact(capacity - self.bytes.len())
-                .map_err(|_| std::io::Error::other("model JSON output limit"))?;
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>, ScrubError> {
-    let mut writer = JsonWriter {
-        bytes: Vec::new(),
-        limit: kronik_sched::scrub::MAX_JSON_OUTPUT_BYTES,
-    };
+    let mut writer = BoundedWriter::new(kronik_sched::scrub::MAX_JSON_OUTPUT_BYTES);
     serde_json::to_writer(&mut writer, value).map_err(|_| ScrubError::OutputLimit)?;
-    Ok(std::mem::take(&mut writer.bytes))
+    Ok(writer.into_bytes())
 }
 
 fn unavailable(message: &'static str) -> ApiError {
@@ -2016,17 +1974,6 @@ mod tests {
         assert!(access.has_cached_answer("http:h", &[1]).is_err());
         assert_eq!(cache.len(), 1);
         assert_eq!(lock(&cache.slots)[key].answer.get(), Some(&Ok(None)));
-    }
-
-    #[test]
-    fn json_writer_refuses_growth_before_allocation_and_does_not_lose_accepted_bytes() {
-        let mut writer = JsonWriter {
-            bytes: Vec::new(),
-            limit: 4,
-        };
-        writer.write_all(b"1234").unwrap();
-        assert!(writer.write_all(b"5").is_err());
-        assert_eq!(writer.bytes, b"1234");
     }
 
     #[test]

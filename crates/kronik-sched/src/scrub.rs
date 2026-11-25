@@ -21,6 +21,94 @@ pub const MAX_JSON_OUTPUT_BYTES: usize = kronik_log::MAX_RECORD as usize;
 /// Bound for the shared matcher's secret values and names.
 pub const MAX_SECRET_PATTERN_BYTES: usize = crate::secrets::MAX_INVENTORY_BYTES;
 
+/// A `Write` that refuses a write past its limit before it allocates, and
+/// zeroizes the bytes it holds when dropped (serialized output may hold
+/// secret values).
+pub struct BoundedWriter {
+    bytes: Vec<u8>,
+    remaining: usize,
+    count: usize,
+    collect: bool,
+    exceeded: bool,
+}
+
+impl BoundedWriter {
+    /// Keeps up to `limit` bytes.
+    pub fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            remaining: limit,
+            count: 0,
+            collect: true,
+            exceeded: false,
+        }
+    }
+
+    /// Counts up to `limit` bytes without keeping them.
+    pub fn counting(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            remaining: limit,
+            count: 0,
+            collect: false,
+            exceeded: false,
+        }
+    }
+
+    /// The bytes written so far.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Whether a write was refused for the limit.
+    pub fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+
+    /// The bytes kept (empty for `counting`).
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Drop for BoundedWriter {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+impl std::io::Write for BoundedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.remaining {
+            self.exceeded = true;
+            return Err(std::io::Error::other("JSON output limit"));
+        }
+        if self.collect {
+            let required = self.count + bytes.len();
+            if required > self.bytes.capacity() {
+                let limit = self.count + self.remaining;
+                let capacity = self
+                    .bytes
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(required)
+                    .min(limit);
+                self.bytes
+                    .try_reserve_exact(capacity - self.bytes.len())
+                    .map_err(|_| std::io::Error::other("JSON output allocation unavailable"))?;
+            }
+            self.bytes.extend_from_slice(bytes);
+        }
+        self.remaining -= bytes.len();
+        self.count += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Public log positions of the two audit actions whose semantics use them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditPositions {
