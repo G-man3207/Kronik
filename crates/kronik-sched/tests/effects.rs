@@ -6,6 +6,8 @@
 // uses plain std threads.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -13,14 +15,14 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use common::{Proc, audit, start_proc};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_effects::{Delivery, Rate};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{Node, NodeConfig, TurnResult, start_local};
+use kronik_sched::{NodeConfig, TurnResult, start_local};
 use prost::Message as _;
-use tokio::runtime::Runtime;
 
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -182,22 +184,8 @@ fn serve(stream: TcpStream, st: Arc<(Mutex<ServerState>, Condvar)>) {
 
 // ---------------------------------------------------------------- daemon
 
-struct Proc {
-    rt: Runtime,
-    node: Arc<Node>,
-}
-
 fn start_with(dir: &Path, config: NodeConfig) -> Proc {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        start_local(env, dir, config).await.unwrap()
-    });
-    Proc { rt, node }
+    start_proc(dir, config)
 }
 
 fn start(dir: &Path) -> Proc {
@@ -208,14 +196,6 @@ fn start(dir: &Path) -> Proc {
             ..NodeConfig::default()
         },
     )
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
 }
 
 fn msg(name: &str, body: &str) -> pb::Message {
@@ -243,15 +223,8 @@ fn reply(r: &TurnResult) -> String {
 }
 
 impl Proc {
-    fn owner(&self) -> kronik_core::authority::AuthLease {
-        self.node.local_operator_authority().unwrap()
-    }
-
     fn deploy(&self) {
-        let bytes = std::fs::read(COUNTER).unwrap();
-        self.rt
-            .block_on(self.node.deploy(&bytes, audit(), false, self.owner()))
-            .unwrap();
+        self.deploy_file(COUNTER);
     }
 
     fn grant(&self, cap: &str, delivery: Option<Delivery>, rate: Option<Rate>) {

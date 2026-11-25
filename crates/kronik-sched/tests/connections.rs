@@ -8,18 +8,20 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::{Proc, audit, start_proc, wait_turn};
 use kronik_core::env::Env;
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::connections::{Recording, RecordingTransport};
-use kronik_sched::{Ingress, Node, NodeConfig, TurnResult, start_local};
-use tokio::runtime::Runtime;
+use kronik_sched::{NodeConfig, TurnResult, start_local};
 
 const ROOM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/room.wasm");
 const ROOM_BARE: &str = concat!(
@@ -31,39 +33,19 @@ const ROOM_FRAME_V2: &str = concat!(
     "/../../tests/guests/room-frame-v2.wasm"
 );
 
-struct Proc {
-    rt: Runtime,
-    node: Arc<Node>,
-}
-
 fn start(dir: &Path) -> Proc {
     start_with(dir, kronik_sched::connections::ConnectionsConfig::default())
 }
 
 fn start_with(dir: &Path, connections: kronik_sched::connections::ConnectionsConfig) -> Proc {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let config = NodeConfig {
+    start_proc(
+        dir,
+        NodeConfig {
             concurrency: 8,
             connections,
             ..NodeConfig::default()
-        };
-        start_local(env, dir, config).await.unwrap()
-    });
-    Proc { rt, node }
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
+        },
+    )
 }
 
 impl Proc {
@@ -652,35 +634,34 @@ fn a_restart_closes_every_connection_the_last_process_held() {
     p.until("the new welcome", || tn.recording().frames.len() == 1);
     // The HTTP ingress path is unaffected by connections.
     let r = p.rt.block_on(async {
-        match p
-            .node
-            .ingress(
-                ActorRef::parse("room/lobby").unwrap(),
-                pb::HttpInput {
-                    method: "GET".into(),
-                    path: "/room/lobby/seq".into(),
-                    params: vec![
-                        pb::Param {
-                            name: "key".into(),
-                            value: "lobby".into(),
-                            sealed_value: None,
-                        },
-                        pb::Param {
-                            name: "op".into(),
-                            value: "seq".into(),
-                            sealed_value: None,
-                        },
-                    ],
-                    route: "/room/{key}/{op}".into(),
-                    ..Default::default()
-                },
-                None,
-            )
-            .unwrap()
-        {
-            Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
-            Ingress::Done(r) => *r,
-        }
+        wait_turn(
+            p.node
+                .ingress(
+                    ActorRef::parse("room/lobby").unwrap(),
+                    pb::HttpInput {
+                        method: "GET".into(),
+                        path: "/room/lobby/seq".into(),
+                        params: vec![
+                            pb::Param {
+                                name: "key".into(),
+                                value: "lobby".into(),
+                                sealed_value: None,
+                            },
+                            pb::Param {
+                                name: "op".into(),
+                                value: "seq".into(),
+                                sealed_value: None,
+                            },
+                        ],
+                        route: "/room/{key}/{op}".into(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap()
     });
     assert_eq!(reply(&r), "1");
 }

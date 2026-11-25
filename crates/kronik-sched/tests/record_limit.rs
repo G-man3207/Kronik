@@ -8,19 +8,21 @@
 // uses plain std threads.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::{Proc, audit, start_proc};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::snapshots::StorageConfig;
-use kronik_sched::{HoldPoint, Node, NodeConfig, TestHold, TurnResult, start_local};
-use tokio::runtime::Runtime;
+use kronik_sched::{HoldPoint, NodeConfig, TestHold, TurnResult};
 
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -109,11 +111,6 @@ fn serve(stream: TcpStream, seen: Arc<Mutex<Vec<String>>>) {
     }
 }
 
-struct Proc {
-    rt: Runtime,
-    node: Arc<Node>,
-}
-
 fn start(dir: &Path) -> Proc {
     start_limit(dir, LIMIT)
 }
@@ -131,37 +128,17 @@ fn start_with(
     storage: Option<StorageConfig>,
     segment_max_bytes: Option<u64>,
 ) -> Proc {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        start_local(
-            env,
-            dir,
-            NodeConfig {
-                concurrency: 4,
-                test_max_record_bytes: Some(limit),
-                test_hold: hold,
-                storage,
-                segment_max_bytes,
-                ..NodeConfig::default()
-            },
-        )
-        .await
-        .unwrap()
-    });
-    Proc { rt, node }
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
+    start_proc(
+        dir,
+        NodeConfig {
+            concurrency: 4,
+            test_max_record_bytes: Some(limit),
+            test_hold: hold,
+            storage,
+            segment_max_bytes,
+            ..NodeConfig::default()
+        },
+    )
 }
 
 fn msg(name: &str, body: &[u8]) -> pb::Message {
@@ -178,15 +155,8 @@ fn msg(name: &str, body: &[u8]) -> pb::Message {
 }
 
 impl Proc {
-    fn owner(&self) -> kronik_core::authority::AuthLease {
-        self.node.local_operator_authority().unwrap()
-    }
-
     fn deploy(&self) {
-        let bytes = std::fs::read(COUNTER).unwrap();
-        self.rt
-            .block_on(self.node.deploy(&bytes, audit(), false, self.owner()))
-            .unwrap();
+        self.deploy_file(COUNTER);
     }
 
     fn grant(&self, cap: &str) {

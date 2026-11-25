@@ -4,11 +4,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use common::{Proc, audit, wait_turn};
 use kronik_core::env::{BoxFuture, Env};
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
@@ -27,14 +30,6 @@ fn guest(name: &str) -> Vec<u8> {
     .unwrap()
 }
 
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
-
 fn msg(name: &str, body: &str) -> pb::Message {
     pb::Message {
         name: name.into(),
@@ -46,11 +41,6 @@ fn msg(name: &str, body: &str) -> pb::Message {
         blobs: vec![],
         retained_compensation_source: None,
     }
-}
-
-struct Proc {
-    rt: Runtime,
-    node: Arc<Node>,
 }
 
 fn start(dir: &Path, kept: usize) -> Proc {
@@ -109,10 +99,6 @@ fn try_start_with(
 }
 
 impl Proc {
-    fn owner(&self) -> kronik_core::authority::AuthLease {
-        self.node.local_operator_authority().unwrap()
-    }
-
     fn send(&self, actor: &str, name: &str, body: &str) {
         let r = self
             .rt
@@ -1282,13 +1268,11 @@ fn keyed_increment(
         ..Default::default()
     };
     p.rt.block_on(async {
-        match p
-            .node
-            .ingress(ActorRef::parse("counter/a").unwrap(), http, None)?
-        {
-            Ingress::Started(w) | Ingress::Joined(w) => w.wait().await,
-            Ingress::Done(r) => Ok(*r),
-        }
+        wait_turn(
+            p.node
+                .ingress(ActorRef::parse("counter/a").unwrap(), http, None)?,
+        )
+        .await
     })
 }
 

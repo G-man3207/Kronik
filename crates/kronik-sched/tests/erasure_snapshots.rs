@@ -4,48 +4,21 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::Path;
-use std::sync::Arc;
+mod common;
 
-use kronik_core::env::Env;
+use std::path::Path;
+
+use common::{Proc, audit, start_proc};
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{Node, NodeConfig, start_local};
-use tokio::runtime::Runtime;
+use kronik_sched::NodeConfig;
 
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/guests/counter.wasm"
 );
 
-struct Proc {
-    rt: Runtime,
-    node: Arc<Node>,
-}
-
 fn start(dir: &Path) -> Proc {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        start_local(
-            Env::real(tokio::runtime::Handle::current()),
-            dir,
-            NodeConfig::default(),
-        )
-        .await
-        .unwrap()
-    });
-    Proc { rt, node }
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
+    start_proc(dir, NodeConfig::default())
 }
 
 fn msg(name: &str) -> pb::Message {

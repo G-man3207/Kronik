@@ -1,4 +1,4 @@
-#[path = "../../tests/common/mod.rs"]
+#[path = "../../tests/common/revocable.rs"]
 mod common;
 use std::sync::atomic::Ordering;
 

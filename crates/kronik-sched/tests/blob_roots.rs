@@ -10,47 +10,29 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
+use common::{Proc, start_proc, wait_turn};
 use kronik_blob::SweepOptions;
-use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::snapshots::StorageConfig;
-use kronik_sched::{BlobsConfig, Ingress, Node, NodeConfig, TurnResult, start_local};
-use tokio::runtime::Runtime;
+use kronik_sched::{BlobsConfig, NodeConfig, TurnResult};
 
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
-
-struct Proc {
-    rt: Runtime,
-    node: Arc<Node>,
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
 
 /// A node with blobs, no history window and no collector loop of its own;
 /// `media` deployed unless `deploy` is false (a restart).
 fn start(dir: &Path, deploy: bool) -> Proc {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let mut storage = StorageConfig::new(dir.to_path_buf());
-        storage.history = Duration::ZERO;
-        storage.snapshot_interval = Duration::from_secs(3600);
-        let config = NodeConfig {
+    let mut storage = StorageConfig::new(dir.to_path_buf());
+    storage.history = Duration::ZERO;
+    storage.snapshot_interval = Duration::from_secs(3600);
+    let p = start_proc(
+        dir,
+        NodeConfig {
             concurrency: 8,
             storage: Some(storage),
             segment_max_bytes: Some(4096),
@@ -60,15 +42,10 @@ fn start(dir: &Path, deploy: bool) -> Proc {
                 ..BlobsConfig::default()
             }),
             ..NodeConfig::default()
-        };
-        start_local(env, dir, config).await.unwrap()
-    });
-    let p = Proc { rt, node };
+        },
+    );
     if deploy {
-        let bytes = std::fs::read(MEDIA).unwrap();
-        let owner = p.node.local_operator_authority().unwrap();
-        p.rt.block_on(p.node.deploy(&bytes, audit(), false, owner))
-            .unwrap();
+        p.deploy_file(MEDIA);
     }
     p
 }
@@ -101,10 +78,9 @@ impl Proc {
         };
         self.rt.block_on(async {
             let actor = ActorRef::parse(&format!("media/{key}")).unwrap();
-            match self.node.ingress(actor, input, None).unwrap() {
-                Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
-                Ingress::Done(r) => *r,
-            }
+            wait_turn(self.node.ingress(actor, input, None).unwrap())
+                .await
+                .unwrap()
         })
     }
 
