@@ -4,17 +4,19 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::{Proc, audit, start_proc, wait_turn};
 use kronik_core::env::Env;
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{Ingress, Node, NodeConfig, TurnResult, start_local};
-use tokio::runtime::Runtime;
+use kronik_sched::{NodeConfig, TurnResult, start_local};
 
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -26,34 +28,14 @@ const FS_PROBE: &str = concat!(
     "/../../tests/guests/fs-probe.wasm"
 );
 
-struct Proc {
-    rt: Runtime,
-    node: Arc<Node>,
-}
-
 fn start(dir: &Path) -> Proc {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let config = NodeConfig {
+    start_proc(
+        dir,
+        NodeConfig {
             concurrency: 8,
             ..NodeConfig::default()
-        };
-        start_local(env, dir, config).await.unwrap()
-    });
-    Proc { rt, node }
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
+        },
+    )
 }
 
 fn plain(b: &[u8]) -> Option<pb::Sealable> {
@@ -119,29 +101,14 @@ fn reply_text(r: &TurnResult) -> String {
 }
 
 impl Proc {
-    fn owner(&self) -> kronik_core::authority::AuthLease {
-        self.node.local_operator_authority().unwrap()
-    }
-
-    fn deploy(&self, path: &str) -> kronik_sched::DeployResult {
-        let bytes = std::fs::read(path).unwrap();
-        self.rt
-            .block_on(self.node.deploy(&bytes, audit(), false, self.owner()))
-            .unwrap()
-    }
-
     fn ingress(
         &self,
         actor: &str,
         h: pb::HttpInput,
     ) -> Result<TurnResult, kronik_core::error::ApiError> {
         let actor = ActorRef::parse(actor).unwrap();
-        self.rt.block_on(async {
-            match self.node.ingress(actor, h, None)? {
-                Ingress::Started(w) | Ingress::Joined(w) => w.wait().await,
-                Ingress::Done(r) => Ok(*r),
-            }
-        })
+        self.rt
+            .block_on(async { wait_turn(self.node.ingress(actor, h, None)?).await })
     }
 
     fn inc(&self, key: &str) -> String {
@@ -216,7 +183,7 @@ fn counter_survives_restart_and_rebuild() {
     let dir = tempfile::tempdir().unwrap();
     {
         let p = start(dir.path());
-        let d = p.deploy(COUNTER);
+        let d = p.deploy_file(COUNTER);
         assert_eq!(d.manifest.kind, "counter");
         for i in 1..=5 {
             assert_eq!(p.inc("a"), i.to_string());
@@ -241,7 +208,7 @@ fn counter_survives_restart_and_rebuild() {
 fn messages_failures_dead_letters_and_resend() {
     let dir = tempfile::tempdir().unwrap();
     let p = start(dir.path());
-    p.deploy(COUNTER);
+    p.deploy_file(COUNTER);
     let r = p.send("counter/a", msg("forward", b"b"));
     assert!(r.committed());
     p.wait_kv("counter/b", "n", "1");
@@ -314,7 +281,7 @@ fn ingress_idempotency_key() {
     };
     let first = {
         let p = start(dir.path());
-        p.deploy(COUNTER);
+        p.deploy_file(COUNTER);
         let first = p.ingress("counter/a", keyed(b"x")).unwrap();
         let second = p.ingress("counter/a", keyed(b"x")).unwrap();
         assert_eq!(first, second);
@@ -382,7 +349,7 @@ fn notes_sql_state_migrates_and_rebuilds() {
     };
     {
         let p = start(dir.path());
-        let d = p.deploy(NOTES);
+        let d = p.deploy_file(NOTES);
         assert_eq!(d.manifest.schema_version, 1);
         assert_eq!(add(&p, "first"), "1");
         assert_eq!(add(&p, "second"), "2");
@@ -436,9 +403,9 @@ fn deploy_checks() {
             .unwrap();
     assert!(dry.dry_run);
     assert!(!p.node.kind_exists("counter"));
-    p.deploy(COUNTER);
+    p.deploy_file(COUNTER);
     assert!(p.node.kind_exists("counter"));
-    let again = p.deploy(COUNTER);
+    let again = p.deploy_file(COUNTER);
     assert!(again.unchanged);
     let err =
         p.rt.block_on(p.node.send(
@@ -456,7 +423,7 @@ fn deploy_checks() {
 fn turns_are_deterministic_and_hide_the_execution_id() {
     let dir = tempfile::tempdir().unwrap();
     let p = start(dir.path());
-    p.deploy(COUNTER);
+    p.deploy_file(COUNTER);
     let r = p.send("counter/a", msg("probe", b""));
     let text = reply_text(&r);
     let rec = p.record(&r);
@@ -530,7 +497,7 @@ fn an_erasure_without_its_record_is_recovered_at_start() {
     };
     {
         let p = start(dir.path());
-        p.deploy(COUNTER);
+        p.deploy_file(COUNTER);
         p.rt.block_on(
             p.node
                 .set_privacy_mode(pb::PrivacyState::On, audit(), false, p.owner()),

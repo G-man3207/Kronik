@@ -7,61 +7,35 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+mod common;
 
+use std::path::{Path, PathBuf};
+
+use common::{Proc, audit, start_proc, wait_turn};
 use kronik_blob::{BlobId, BlobStore, Space, StoreConfig};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{BlobsConfig, Ingress, Node, NodeConfig, TurnResult, start_local};
-use tokio::runtime::Runtime;
+use kronik_sched::{BlobsConfig, NodeConfig, TurnResult, start_local};
 
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
-
-struct Proc {
-    rt: Runtime,
-    node: Arc<Node>,
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
 
 fn start(dir: &Path) -> Proc {
     start_in(dir, pb::PrivacyState::On)
 }
 
 fn start_in(dir: &Path, mode: pb::PrivacyState) -> Proc {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let config = NodeConfig {
+    let p = start_proc(
+        dir,
+        NodeConfig {
             concurrency: 8,
             blobs: Some(BlobsConfig::default()),
             ..NodeConfig::default()
-        };
-        start_local(env, dir, config).await.unwrap()
-    });
-    let p = Proc { rt, node };
-    let owner = p.node.local_operator_authority().unwrap();
-    p.rt.block_on(p.node.deploy(
-        &std::fs::read(MEDIA).unwrap(),
-        audit(),
-        false,
-        owner.clone(),
-    ))
-    .unwrap();
+        },
+    );
+    p.deploy_file(MEDIA);
     if mode == pb::PrivacyState::On {
-        p.rt.block_on(p.node.set_privacy_mode(mode, audit(), false, owner))
+        p.rt.block_on(p.node.set_privacy_mode(mode, audit(), false, p.owner()))
             .unwrap();
     }
     p
@@ -91,18 +65,17 @@ impl Proc {
             ..Default::default()
         };
         self.rt.block_on(async {
-            match self
-                .node
-                .ingress(
-                    ActorRef::parse("media/a").unwrap(),
-                    input,
-                    Some(subject.into()),
-                )
-                .unwrap()
-            {
-                Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
-                Ingress::Done(r) => *r,
-            }
+            wait_turn(
+                self.node
+                    .ingress(
+                        ActorRef::parse("media/a").unwrap(),
+                        input,
+                        Some(subject.into()),
+                    )
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
         })
     }
 
@@ -122,18 +95,17 @@ impl Proc {
             ..Default::default()
         };
         let r: TurnResult = self.rt.block_on(async {
-            match self
-                .node
-                .ingress(
-                    ActorRef::parse("media/a").unwrap(),
-                    input,
-                    Some(subject.into()),
-                )
-                .unwrap()
-            {
-                Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
-                Ingress::Done(r) => *r,
-            }
+            wait_turn(
+                self.node
+                    .ingress(
+                        ActorRef::parse("media/a").unwrap(),
+                        input,
+                        Some(subject.into()),
+                    )
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
         });
         assert!(r.committed(), "{r:?}");
         match &r.outcome.output {
@@ -338,17 +310,16 @@ fn a_turn_across_its_subjects_erasure_writes_no_blob_of_it() {
     };
     let node = p.node.clone();
     let pending = p.rt.spawn(async move {
-        match node
-            .ingress(
+        wait_turn(
+            node.ingress(
                 ActorRef::parse("media/a").unwrap(),
                 input,
                 Some("user:1".into()),
             )
-            .unwrap()
-        {
-            Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
-            Ingress::Done(r) => *r,
-        }
+            .unwrap(),
+        )
+        .await
+        .unwrap()
     });
     arrived
         .recv_timeout(std::time::Duration::from_secs(10))
@@ -420,22 +391,21 @@ fn a_blob_first_referenced_after_its_erasure_is_deleted_when_the_record_applies(
         ..Default::default()
     };
     let r = p.rt.block_on(async {
-        match p
-            .node
-            .ingress_with(
-                ActorRef::parse("media/a").unwrap(),
-                input,
-                Some("user:1".into()),
-                kronik_sched::IngressExtras {
-                    upload: Some(lease),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-        {
-            Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
-            Ingress::Done(r) => *r,
-        }
+        wait_turn(
+            p.node
+                .ingress_with(
+                    ActorRef::parse("media/a").unwrap(),
+                    input,
+                    Some("user:1".into()),
+                    kronik_sched::IngressExtras {
+                        upload: Some(lease),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap()
     });
     assert!(r.committed(), "{r:?}");
     let row = p.node.store().db().blob(&blob.hash).unwrap().unwrap();

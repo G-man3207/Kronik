@@ -20,19 +20,20 @@
 // uses plain std threads.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use kronik_core::env::Env;
+use common::{Proc, audit, start_proc};
 use kronik_core::error::ApiError;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{Node, NodeConfig, TurnResult, start_local};
-use tokio::runtime::Runtime;
+use kronik_sched::{NodeConfig, TurnResult};
 
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -164,44 +165,19 @@ fn serve(stream: TcpStream, st: Arc<(Mutex<Gates>, Condvar)>) {
 
 // ---------------------------------------------------------------- daemon
 
-struct Proc {
-    rt: Runtime,
-    node: Arc<Node>,
-}
-
 /// Two worker permits: two turns that wait take them all, and the next turn
 /// waits for one after it took its provenance. With `hold_after_call`, a
 /// caller's turn stops for good after its call had its answer, before it
 /// records it (a crash there).
 fn start(dir: &Path, hold_after_call: bool) -> Proc {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        start_local(
-            env,
-            dir,
-            NodeConfig {
-                concurrency: 2,
-                test_hold_after_call: hold_after_call,
-                ..NodeConfig::default()
-            },
-        )
-        .await
-        .unwrap()
-    });
-    Proc { rt, node }
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
+    start_proc(
+        dir,
+        NodeConfig {
+            concurrency: 2,
+            test_hold_after_call: hold_after_call,
+            ..NodeConfig::default()
+        },
+    )
 }
 
 fn msg(name: &str, body: &str) -> pb::Message {
@@ -243,10 +219,6 @@ fn assert_erased_reply(text: &str) {
 type Pending = tokio::task::JoinHandle<Result<Option<TurnResult>, ApiError>>;
 
 impl Proc {
-    fn owner(&self) -> kronik_core::authority::AuthLease {
-        self.node.local_operator_authority().unwrap()
-    }
-
     /// Deploys `wasm` (a counter build), grants it the test server and sets
     /// the privacy mode.
     fn setup(&self, wasm: &str, mode: pb::PrivacyState) {

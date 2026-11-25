@@ -5,10 +5,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use common::audit;
 use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
@@ -22,14 +25,6 @@ fn guest(name: &str) -> Vec<u8> {
         env!("CARGO_MANIFEST_DIR")
     ))
     .unwrap()
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
 }
 
 /// A fresh live operator lease for the fixture's own operations.

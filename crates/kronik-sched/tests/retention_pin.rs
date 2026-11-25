@@ -8,12 +8,15 @@
 // Test helpers may unwrap; the test server uses plain std threads.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use common::audit;
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
@@ -59,14 +62,6 @@ fn hanging_server() -> (String, Arc<AtomicUsize>) {
         }
     });
     (addr, seen)
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
 }
 
 fn msg(name: &str, body: &str) -> pb::Message {

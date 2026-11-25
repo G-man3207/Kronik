@@ -9,54 +9,36 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use common::{Proc, audit, start_proc};
 use kronik_blob::{BlobMeta, BlobStore, NoKeys, Space, StoreConfig};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{BlobsConfig, Node, NodeConfig, TurnResult, start_local};
-use tokio::runtime::Runtime;
+use kronik_sched::{BlobsConfig, NodeConfig, TurnResult};
 
 const GUEST: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/guests/counter-wasi-http-blobs.wasm"
 );
 
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
-
-struct Proc {
-    rt: Runtime,
-    node: Arc<Node>,
-}
-
 /// A node with a blob store, the guest deployed as kind `counter` with a
 /// 64 KiB threshold, and `http:127.0.0.1` granted.
 fn start(dir: &Path) -> Proc {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let config = NodeConfig {
+    let p = start_proc(
+        dir,
+        NodeConfig {
             concurrency: 8,
             blobs: Some(BlobsConfig::default()),
             ..NodeConfig::default()
-        };
-        start_local(env, dir, config).await.unwrap()
-    });
-    let p = Proc { rt, node };
+        },
+    );
     let owner = p.node.local_operator_authority().unwrap();
     let code = std::fs::read(GUEST).unwrap();
     p.rt.block_on(async {

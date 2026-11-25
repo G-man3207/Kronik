@@ -5,54 +5,33 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 
+use common::{Proc, audit, start_proc, wait_turn};
 use kronik_blob::{BlobMeta, BlobStore, NoKeys, Space, StoreConfig};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{
-    BlobsConfig, BodyPolicy, Ingress, IngressExtras, Node, NodeConfig, TurnResult, start_local,
+    BlobsConfig, BodyPolicy, Ingress, IngressExtras, NodeConfig, TurnResult, start_local,
 };
-use tokio::runtime::Runtime;
 
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
 
-struct Proc {
-    rt: Runtime,
-    node: Arc<Node>,
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
-
 fn start(dir: &Path, blobs: Option<BlobsConfig>) -> Proc {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let config = NodeConfig {
+    let p = start_proc(
+        dir,
+        NodeConfig {
             concurrency: 8,
             blobs,
             ..NodeConfig::default()
-        };
-        start_local(env, dir, config).await.unwrap()
-    });
-    let p = Proc { rt, node };
-    let bytes = std::fs::read(MEDIA).unwrap();
-    let owner = p.node.local_operator_authority().unwrap();
-    p.rt.block_on(p.node.deploy(&bytes, audit(), false, owner))
-        .unwrap();
+        },
+    );
+    p.deploy_file(MEDIA);
     p
 }
 
@@ -80,14 +59,13 @@ fn inline(bytes: &[u8]) -> pb::body::Value {
 impl Proc {
     fn ingress(&self, input: pb::HttpInput) -> TurnResult {
         self.rt.block_on(async {
-            match self
-                .node
-                .ingress(ActorRef::parse("media/a").unwrap(), input, None)
-                .unwrap()
-            {
-                Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
-                Ingress::Done(r) => *r,
-            }
+            wait_turn(
+                self.node
+                    .ingress(ActorRef::parse("media/a").unwrap(), input, None)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
         })
     }
 
@@ -332,13 +310,12 @@ fn a_turn_that_meets_a_full_store_runs_again_when_there_is_room() {
         let node = p.node.clone();
         let input = http(op, query, inline(body.as_bytes()));
         let pending = p.rt.spawn(async move {
-            match node
-                .ingress(ActorRef::parse("media/a").unwrap(), input, None)
-                .unwrap()
-            {
-                Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
-                Ingress::Done(r) => *r,
-            }
+            wait_turn(
+                node.ingress(ActorRef::parse("media/a").unwrap(), input, None)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
         });
         std::thread::sleep(std::time::Duration::from_millis(800));
         assert!(!pending.is_finished(), "{op} did not wait for room");
@@ -662,18 +639,16 @@ fn a_turn_that_fills_the_store_itself_stops_waiting() {
     };
     let started = std::time::Instant::now();
     let result = p.rt.block_on(async {
-        match p
-            .node
-            .ingress(
-                ActorRef::parse("media/a").unwrap(),
-                http("write", "size=1000000", inline(b"")),
-                None,
-            )
-            .unwrap()
-        {
-            Ingress::Started(w) | Ingress::Joined(w) => w.wait().await,
-            Ingress::Done(r) => Ok(*r),
-        }
+        wait_turn(
+            p.node
+                .ingress(
+                    ActorRef::parse("media/a").unwrap(),
+                    http("write", "size=1000000", inline(b"")),
+                    None,
+                )
+                .unwrap(),
+        )
+        .await
     });
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     reading.join().unwrap();
@@ -870,15 +845,13 @@ impl Proc {
         extras: IngressExtras,
     ) -> Result<TurnResult, kronik_core::error::ApiError> {
         self.rt.block_on(async {
-            match self.node.ingress_with(
+            wait_turn(self.node.ingress_with(
                 ActorRef::parse("media/a").unwrap(),
                 input,
                 None,
                 extras,
-            )? {
-                Ingress::Started(w) | Ingress::Joined(w) => w.wait().await,
-                Ingress::Done(r) => Ok(*r),
-            }
+            )?)
+            .await
         })
     }
 }
@@ -1279,13 +1252,12 @@ fn a_running_turn_leases_its_input() {
         pb::body::Value::Blob(blob),
     );
     let turn = p.rt.spawn(async move {
-        match node
-            .ingress(ActorRef::parse("media/a").unwrap(), input, None)
-            .unwrap()
-        {
-            Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
-            Ingress::Done(r) => *r,
-        }
+        wait_turn(
+            node.ingress(ActorRef::parse("media/a").unwrap(), input, None)
+                .unwrap(),
+        )
+        .await
+        .unwrap()
     });
     std::thread::sleep(std::time::Duration::from_millis(900));
     assert!(
