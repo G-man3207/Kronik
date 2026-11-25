@@ -22,6 +22,13 @@ fn fixture(name: &str, record: &Record) -> Vec<u8> {
         .collect()
 }
 
+/// The fixture `name`, decoded as `record`'s kind; it must decode to `record`.
+fn decoded(name: &str, record: &Record) -> Record {
+    let decoded = Record::decode(record.kind(), &fixture(name, record)).unwrap();
+    assert_eq!(&decoded, record, "{name}");
+    decoded
+}
+
 /// `SimulatorConfig`, kind 15 (M12, ADR 0014).
 #[test]
 fn simulator_config_v1() {
@@ -48,11 +55,7 @@ fn simulator_config_v1() {
             wall_time_ms: 1_793_000_000_000,
         }),
     });
-    let bytes = fixture("simulator-config-v1", &record);
-    assert_eq!(
-        Record::decode(kronik_proto::kind::SIMULATOR_CONFIG, &bytes).unwrap(),
-        record
-    );
+    decoded("simulator-config-v1", &record);
 }
 
 /// `EffectRecord.simulator` (field 13, M12) inside a `TurnRecord`; a record
@@ -95,11 +98,7 @@ fn effect_record_simulator_v1() {
         }),
         ..Default::default()
     });
-    let bytes = fixture("effect-record-simulator-v1", &record);
-    assert_eq!(
-        Record::decode(kronik_proto::kind::TURN_RECORD, &bytes).unwrap(),
-        record
-    );
+    decoded("effect-record-simulator-v1", &record);
 }
 
 /// A small committed turn record, as a rebase fork records one.
@@ -154,9 +153,7 @@ fn state_rebase_turn_v1() {
             record: Some(turn()),
         })),
     });
-    let bytes = fixture("state-rebase-turn-v1", &record);
-    let decoded = Record::decode(kronik_proto::kind::STATE_REBASE, &bytes).unwrap();
-    assert_eq!(decoded, record);
+    let decoded = decoded("state-rebase-turn-v1", &record);
     assert_eq!(decoded.turn(), Some(&turn()));
 }
 
@@ -198,9 +195,7 @@ fn state_rebase_switch_v1() {
             }),
         })),
     });
-    let bytes = fixture("state-rebase-switch-v1", &record);
-    let decoded = Record::decode(kronik_proto::kind::STATE_REBASE, &bytes).unwrap();
-    assert_eq!(decoded, record);
+    let decoded = decoded("state-rebase-switch-v1", &record);
     assert!(decoded.turn().is_none());
     assert_eq!(
         decoded.rebase_switch().map(|(id, s)| (id, s.turns)),
@@ -226,11 +221,7 @@ fn grant_in_forks_v1() {
         }),
         ..Default::default()
     });
-    let bytes = fixture("grant-in-forks-v1", &record);
-    assert_eq!(
-        Record::decode(kronik_proto::kind::GRANT, &bytes).unwrap(),
-        record
-    );
+    decoded("grant-in-forks-v1", &record);
 }
 
 /// Bytes of a grant written before field 8. Decoding leaves `in_forks`
@@ -276,11 +267,7 @@ fn foreign_actor_fork_mode_v1() {
         fork_mode: "sandbox".into(),
         ..Default::default()
     });
-    let bytes = fixture("foreign-actor-fork-mode-v1", &record);
-    assert_eq!(
-        Record::decode(kronik_proto::kind::FOREIGN_ACTOR, &bytes).unwrap(),
-        record
-    );
+    decoded("foreign-actor-fork-mode-v1", &record);
 }
 
 /// `ForeignActor` with `isolation = MICROVM` (M20, ADR 0095). The value has
@@ -304,9 +291,7 @@ fn foreign_actor_microvm_v1() {
         fork_mode: "sandbox".into(),
         ..Default::default()
     });
-    let bytes = fixture("foreign-actor-microvm-v1", &record);
-    let decoded = Record::decode(kronik_proto::kind::FOREIGN_ACTOR, &bytes).unwrap();
-    assert_eq!(decoded, record);
+    let decoded = decoded("foreign-actor-microvm-v1", &record);
     let Record::ForeignActor(actor) = decoded else {
         panic!("not a ForeignActor record");
     };
@@ -327,11 +312,7 @@ fn effect_record_forked_v1() {
         ..Default::default()
     });
     let record = Record::TurnRecord(t);
-    let bytes = fixture("effect-record-forked-v1", &record);
-    assert_eq!(
-        Record::decode(kronik_proto::kind::TURN_RECORD, &bytes).unwrap(),
-        record
-    );
+    decoded("effect-record-forked-v1", &record);
 }
 
 fn secret_audit() -> Option<pb::Audit> {
@@ -847,9 +828,7 @@ fn limits_fingerprint_rules_v1() {
         }),
         ..Default::default()
     });
-    let bytes = fixture("limits-fingerprint-v1", &record);
-    let decoded = Record::decode(kronik_proto::kind::LIMITS, &bytes).unwrap();
-    assert_eq!(decoded, record);
+    let decoded = decoded("limits-fingerprint-v1", &record);
     // An empty list is a list (it clears), not an unset field.
     let Record::Limits(limits) = decoded else {
         unreachable!("a Limits record")
@@ -904,9 +883,7 @@ fn effect_record_http_v3_v1() {
         ..Default::default()
     }];
     let record = Record::TurnRecord(turn);
-    let bytes = fixture("effect-record-http-v3-v1", &record);
-    let decoded = Record::decode(kronik_proto::kind::TURN_RECORD, &bytes).unwrap();
-    assert_eq!(decoded, record);
+    let decoded = decoded("effect-record-http-v3-v1", &record);
     let Record::TurnRecord(turn) = decoded else {
         unreachable!("a TurnRecord")
     };
@@ -1034,11 +1011,7 @@ fn connection_open_v1() {
         },
     ];
     let record = Record::TurnRecord(t);
-    let bytes = fixture("connection-open-v1", &record);
-    assert_eq!(
-        Record::decode(kronik_proto::kind::TURN_RECORD, &bytes).unwrap(),
-        record
-    );
+    decoded("connection-open-v1", &record);
 }
 
 /// M24: a frame turn (`ConnectionFrame`) with a `connection.send-now`
@@ -1098,9 +1071,7 @@ fn connection_frame_v1() {
         dropped: vec!["c-00000000000000000000000000000001".into()],
     }];
     let record = Record::TurnRecord(t);
-    let bytes = fixture("connection-frame-v1", &record);
-    let decoded = Record::decode(kronik_proto::kind::TURN_RECORD, &bytes).unwrap();
-    assert_eq!(decoded, record);
+    let decoded = decoded("connection-frame-v1", &record);
     let Some(turn) = decoded.turn() else {
         panic!("not a turn")
     };
@@ -1143,12 +1114,7 @@ fn connection_close_v1() {
         ("connection-close-client-v1", client),
     ] {
         let record = Record::TurnRecord(t);
-        let bytes = fixture(name, &record);
-        assert_eq!(
-            Record::decode(kronik_proto::kind::TURN_RECORD, &bytes).unwrap(),
-            record,
-            "{name}"
-        );
+        decoded(name, &record);
     }
 }
 
@@ -1223,9 +1189,7 @@ fn blob_bodies_v1() {
         ..Default::default()
     });
     let record = Record::TurnRecord(t);
-    let bytes = fixture("blob-bodies-v1", &record);
-    let decoded = Record::decode(kronik_proto::kind::TURN_RECORD, &bytes).unwrap();
-    assert_eq!(decoded, record);
+    let decoded = decoded("blob-bodies-v1", &record);
     assert_eq!(
         kronik_proto::blobs::refs(&decoded),
         [&upload, &fetched, &fetched]
@@ -1290,9 +1254,7 @@ fn subject_blob_effect_result_v1() {
             ..Default::default()
         }),
     });
-    let bytes = fixture("subject-blob-effect-result-v1", &record);
-    let decoded = Record::decode(kronik_proto::kind::EFFECT_RESULT, &bytes).unwrap();
-    assert_eq!(decoded, record);
+    let decoded = decoded("subject-blob-effect-result-v1", &record);
     assert_eq!(kronik_proto::blobs::refs(&decoded), [&sent, &received]);
 }
 
@@ -1313,11 +1275,7 @@ fn blob_limits_v1() {
         blob_bytes_per_actor: Some(4 << 30),
         ..Default::default()
     });
-    let bytes = fixture("blob-limits-v1", &record);
-    assert_eq!(
-        Record::decode(kronik_proto::kind::LIMITS, &bytes).unwrap(),
-        record
-    );
+    decoded("blob-limits-v1", &record);
 }
 
 /// References that break the rules of ADR 0118 do not decode.

@@ -1053,11 +1053,7 @@ mod tests {
     #[test]
     fn effect_record_fixture_with_offset_us_round_trips() {
         use prost::Message as _;
-        let hex = include_str!("../tests/fixtures/effect-record-v2.hex").trim();
-        let bytes: Vec<u8> = (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-            .collect();
+        let bytes = unhex(include_str!("../tests/fixtures/effect-record-v2.hex"));
         let e = pb::EffectRecord::decode(bytes.as_slice()).unwrap();
         assert_eq!(
             (e.kind.as_str(), e.duration_us, e.offset_us),
@@ -1070,11 +1066,7 @@ mod tests {
     /// still writes exactly them (I16). Fixture: `tests/fixtures/audit-event-v1.hex`.
     #[test]
     fn audit_event_fixture_decodes_and_requires_action_and_audit() {
-        let hex = include_str!("../tests/fixtures/audit-event-v1.hex").trim();
-        let bytes: Vec<u8> = (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-            .collect();
+        let bytes = unhex(include_str!("../tests/fixtures/audit-event-v1.hex"));
         let record = Record::decode(kind::AUDIT_EVENT, &bytes).unwrap();
         let Record::AuditEvent(e) = &record else {
             panic!("{record:?}")
