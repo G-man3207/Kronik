@@ -12,12 +12,69 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
+
+/// The developer's settings that `kronik` reads from the environment.
+const SETTINGS_ENV: [&str; 7] = [
+    "KRONIK_CONFIG",
+    "KRONIK_DATA_DIR",
+    "KRONIK_HTTP_LISTEN",
+    "KRONIK_ADMIN_LISTEN",
+    "KRONIK_API_SOCKET",
+    "KRONIK_MASTER_KEY_FILE",
+    "KRONIK_TOKEN",
+];
+
+/// `kronik` without the developer's settings, with no disk reserve (the
+/// tests' file system may have less than the reserve) and stdin null.
+pub fn command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kronik"));
+    for var in SETTINGS_ENV {
+        command.env_remove(var);
+    }
+    command.env("KRONIK_DISK_RESERVE", "0B");
+    command.stdin(Stdio::null());
+    command
+}
+
+/// What a `kronik` run printed and how it exited.
+pub struct Out {
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl std::fmt::Debug for Out {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "exit {}\nstdout:\n{}\nstderr:\n{}",
+            self.code, self.stdout, self.stderr
+        )
+    }
+}
+
+impl Out {
+    /// stdout as JSON; panics with the whole output when it is not.
+    pub fn json(&self) -> Value {
+        serde_json::from_str(&self.stdout).unwrap_or_else(|e| panic!("{e}: {self:?}"))
+    }
+}
+
+impl From<Output> for Out {
+    fn from(out: Output) -> Out {
+        Out {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
+}
 
 /// Where every test process claims the ports it hands out, whatever its
 /// target directory.

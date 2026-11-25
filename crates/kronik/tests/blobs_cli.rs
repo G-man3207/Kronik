@@ -18,58 +18,14 @@ mod common;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use blob_fixtures::{hash, pattern};
-use common::free_port;
+use common::{Out, command, free_port};
 use serde_json::Value;
 
-const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
-
-const SETTINGS_ENV: [&str; 6] = [
-    "KRONIK_CONFIG",
-    "KRONIK_DATA_DIR",
-    "KRONIK_HTTP_LISTEN",
-    "KRONIK_ADMIN_LISTEN",
-    "KRONIK_API_SOCKET",
-    "KRONIK_MASTER_KEY_FILE",
-];
-
-struct Out {
-    code: i32,
-    stdout: String,
-    stderr: String,
-}
-
-impl std::fmt::Debug for Out {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "exit {}\nstdout:\n{}\nstderr:\n{}",
-            self.code, self.stdout, self.stderr
-        )
-    }
-}
-
-impl Out {
-    fn json(&self) -> Value {
-        serde_json::from_str(&self.stdout).unwrap_or_else(|e| panic!("{e}: {self:?}"))
-    }
-}
-
-fn command() -> Command {
-    let mut command = Command::new(KRONIK);
-    for var in SETTINGS_ENV {
-        command.env_remove(var);
-    }
-    command.env_remove("KRONIK_TOKEN");
-    // The tests' temporary file system may have less than the reserve.
-    command.env("KRONIK_DISK_RESERVE", "0B");
-    command.stdin(Stdio::null());
-    command
-}
 
 struct Serve {
     child: Child,
@@ -136,7 +92,7 @@ impl Serve {
         if let Some(bytes) = stdin {
             child.stdin.take().unwrap().write_all(bytes).unwrap();
         }
-        finish(child.wait_with_output().unwrap())
+        child.wait_with_output().unwrap().into()
     }
 
     /// `POST /media/a/<op>?<query>` to the gateway: the status line.
@@ -183,14 +139,6 @@ impl Drop for Serve {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-}
-
-fn finish(out: Output) -> Out {
-    Out {
-        code: out.status.code().unwrap_or(1),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
 }
 

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use common::free_port;
+use common::{Out, free_port};
 use kronik_runtime::{KRONIK_VERSION, WASMTIME_VERSION};
 use serde_json::{Value, json};
 
@@ -34,18 +34,7 @@ const STEP2: &str = concat!(
     "/../../tests/guests/counter-step2.wasm"
 );
 
-#[derive(Debug)]
-struct Out {
-    code: i32,
-    stdout: String,
-    stderr: String,
-}
-
 impl Out {
-    fn json(&self) -> Value {
-        serde_json::from_str(&self.stdout).unwrap_or_else(|e| panic!("{e}: {self:?}"))
-    }
-
     /// The second word of the first line, e.g. the turn id in
     /// "Turn main:5 committed on counter/a".
     fn second_word(&self) -> String {
@@ -82,12 +71,7 @@ fn kronik_with(socket: &Path, args: &[&str], http: Option<&str>, input: Option<&
     if let Some(input) = input {
         child.stdin.take().unwrap().write_all(input).unwrap();
     }
-    let out = child.wait_with_output().unwrap();
-    Out {
-        code: out.status.code().unwrap_or(-1),
-        stdout: String::from_utf8(out.stdout).unwrap(),
-        stderr: String::from_utf8(out.stderr).unwrap(),
-    }
+    child.wait_with_output().unwrap().into()
 }
 
 /// The value after `Reply` in a turn's human output.

@@ -43,7 +43,7 @@ use serde_json::{Value, json};
 
 mod common;
 
-use common::Daemon;
+use common::{Daemon, Out};
 
 const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 const GUESTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests");
@@ -409,13 +409,6 @@ impl Target {
 
 // -------------------------------------------------------------------- daemon
 
-#[derive(Debug)]
-struct Out {
-    code: i32,
-    stdout: String,
-    stderr: String,
-}
-
 impl Daemon {
     /// Starts `kronik serve` on `dir` with the master key of the tests, the
     /// `bao` backend of `bao` if there is one, and the given
@@ -504,7 +497,7 @@ impl Daemon {
     }
 
     fn cli(&self, args: &[&str]) -> Out {
-        let out = Command::new(KRONIK)
+        Command::new(KRONIK)
             .arg("--socket")
             .arg(self.socket())
             .args(args)
@@ -512,12 +505,8 @@ impl Daemon {
             .env_remove("KRONIK_TOKEN")
             .stdin(Stdio::null())
             .output()
-            .unwrap();
-        Out {
-            code: out.status.code().unwrap_or(-1),
-            stdout: String::from_utf8(out.stdout).unwrap(),
-            stderr: String::from_utf8(out.stderr).unwrap(),
-        }
+            .unwrap()
+            .into()
     }
 
     fn deploy(&self, guest: &str) {
