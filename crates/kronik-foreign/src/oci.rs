@@ -1017,17 +1017,6 @@ fn resolve_user(rootfs: &Path, user: &str) -> Result<(u32, u32), ImageError> {
     Ok((uid, gid))
 }
 
-/// A bind mount into the sandbox.
-#[derive(Clone, Debug)]
-pub struct Bind {
-    /// Host path.
-    pub source: PathBuf,
-    /// Absolute path inside the sandbox.
-    pub destination: String,
-    /// Mount read-only.
-    pub read_only: bool,
-}
-
 /// What the record and the daemon add to the image config.
 #[derive(Clone, Debug, Default)]
 pub struct Overrides {
@@ -1040,8 +1029,8 @@ pub struct Overrides {
     pub pids: i64,
     /// Variables that replace image variables with the same name.
     pub env: Vec<(String, String)>,
-    /// Extra bind mounts (the data directory).
-    pub binds: Vec<Bind>,
+    /// The actor's data directory, bind-mounted read-write at `/data`.
+    pub data_dir: Option<PathBuf>,
     /// `linux.cgroupsPath`.
     pub cgroups_path: Option<String>,
     /// Path of an existing network namespace to join (`<run>/netns/<name>`);
@@ -1218,12 +1207,12 @@ pub fn runtime_spec(
         json!({"destination": "/sys", "type": "sysfs", "source": "sysfs",
                "options": ["nosuid", "noexec", "nodev", "ro"]}),
     ];
-    for bind in &o.binds {
+    if let Some(dir) = &o.data_dir {
         mounts.push(json!({
-            "destination": bind.destination,
+            "destination": "/data",
             "type": "bind",
-            "source": utf8_path(&bind.source, "bind source")?,
-            "options": ["rbind", if bind.read_only { "ro" } else { "rw" }, "nosuid", "nodev"],
+            "source": utf8_path(dir, "bind source")?,
+            "options": ["rbind", "rw", "nosuid", "nodev"],
         }));
     }
 
@@ -2297,11 +2286,7 @@ mod tests {
             memory_bytes: 64 << 20,
             pids: 1024,
             env: vec![("A".into(), "2".into()), ("SECRET".into(), "s".into())],
-            binds: vec![Bind {
-                source: "/var/lib/kronik/foreign/echo/data".into(),
-                destination: "/data".into(),
-                read_only: false,
-            }],
+            data_dir: Some("/var/lib/kronik/foreign/echo/data".into()),
             cgroups_path: Some("/kronik/0123abcd/echo".into()),
             netns: Some("/run/kronik/netns/echo".into()),
             hostname: "echo".into(),
