@@ -172,17 +172,6 @@ fn message(body: &str) -> pb::Message {
     }
 }
 
-fn reply(t: &kronik_fork::ForkTurn) -> String {
-    match t.record.outcome.as_ref().and_then(|o| o.output.as_ref()) {
-        Some(pb::outcome::Output::Reply(m)) => match m.body.as_ref().and_then(|b| b.value.as_ref())
-        {
-            Some(pb::sealable::Value::Plain(b)) => String::from_utf8_lossy(b).into_owned(),
-            _ => String::new(),
-        },
-        _ => String::new(),
-    }
-}
-
 #[test]
 fn a_continuous_fork_talks_to_a_copy_from_the_nearest_checkpoint() {
     let dir = tempdir();
@@ -273,7 +262,7 @@ fn a_continuous_fork_talks_to_a_copy_from_the_nearest_checkpoint() {
             p.owner(),
         ))
         .unwrap();
-    assert_eq!(reply(&t), "200 4:d v2");
+    assert_eq!(fork_reply(&t), "200 4:d v2");
     assert_eq!(t.record.effects[0].grounding, pb::Grounding::Forked as i32);
     assert_eq!(*host.prod.0.lock().unwrap(), ["a", "b", "c"]);
     // The copy goes with the fork.

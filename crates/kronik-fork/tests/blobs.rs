@@ -920,25 +920,6 @@ fn a_preview_takes_uploads_as_blobs_after_a_restart() {
     }
 }
 
-/// Every file under `dir` that contains `needle`.
-fn files_with(dir: &std::path::Path, needle: &[u8]) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            let path = e.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if std::fs::read(&path)
-                .is_ok_and(|bytes| bytes.windows(needle.len()).any(|w| w == needle))
-            {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
-
 /// Review P-1 (erasure): with privacy on, a preview's upload of a subject
 /// without a key, and a preview turn's own blob of one, were stored plain
 /// (a fork-local test key) although the preview's record sealing created
