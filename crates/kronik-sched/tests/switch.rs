@@ -123,6 +123,45 @@ async fn prepare_rebase(
     (sw, before, node.applied_lsn())
 }
 
+/// Prepares and pauses the rebase `id` of `epoch`, starts a resend of
+/// `dead` that parks after its dead-letter check, and runs the whole
+/// rebase switch while it is parked. Returns the parked resend, which
+/// goes on at `hold.resend_release`, and `hold.arrived` as it was before
+/// the resend started.
+async fn resend_parked_across_rebase(
+    node: &Arc<Node>,
+    hold: &SwitchHold,
+    id: &str,
+    epoch: u64,
+    dead: Lsn,
+) -> (
+    tokio::task::JoinHandle<Result<Option<kronik_sched::TurnResult>, ApiError>>,
+    usize,
+) {
+    let (sw, kinds, not_after) = prepare_rebase(node, id, epoch).await;
+    let pause = node
+        .rebase_pause(Duration::from_secs(5), owner(node))
+        .await
+        .unwrap();
+    let started = hold.arrived.load(Ordering::SeqCst);
+    hold.park_resend.store(true, Ordering::SeqCst);
+    let resend = {
+        let node = node.clone();
+        tokio::spawn(async move { node.resend(dead, audit(), false, owner(&node)).await })
+    };
+    wait_until("the resend parks after its check", || {
+        hold.resend_parked.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    // The whole switch happens while it is parked: when it goes on, the
+    // pause is over and the state is the rebased one.
+    hold.release.add_permits(1);
+    node.rebase_switch(pause, id, sw, kinds, not_after, audit(), owner(node))
+        .await
+        .unwrap();
+    (resend, started)
+}
+
 /// A set switch whose caller goes away after its record is committed
 /// still installs its code: the switch runs on a task of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -289,27 +328,7 @@ async fn a_resend_queued_after_the_switch_for_a_dead_letter_it_removed_does_not_
         .unwrap()
         .unwrap();
     let dead = failed.turn_id.lsn;
-    let (sw, kinds, not_after) = prepare_rebase(&node, "r-late", epoch).await;
-    let pause = node
-        .rebase_pause(Duration::from_secs(5), owner(&node))
-        .await
-        .unwrap();
-    let started = hold.arrived.load(Ordering::SeqCst);
-    hold.park_resend.store(true, Ordering::SeqCst);
-    let resend = {
-        let node = node.clone();
-        tokio::spawn(async move { node.resend(dead, audit(), false, owner(&node)).await })
-    };
-    wait_until("the resend parks after its check", || {
-        hold.resend_parked.load(Ordering::SeqCst) == 1
-    })
-    .await;
-    // The whole switch happens while it is parked: when it goes on, the
-    // pause is over and the state has no such dead letter.
-    hold.release.add_permits(1);
-    node.rebase_switch(pause, "r-late", sw, kinds, not_after, audit(), owner(&node))
-        .await
-        .unwrap();
+    let (resend, started) = resend_parked_across_rebase(&node, &hold, "r-late", epoch, dead).await;
     assert!(node.store().db().dead_letter(dead).unwrap().is_none());
     hold.resend_release.add_permits(1);
     let r: Result<_, ApiError> = resend.await.unwrap();
@@ -456,25 +475,7 @@ async fn a_connection_resend_queued_after_the_switch_does_not_run_when_the_lette
     let (node, hold) = room_node(dir.path()).await;
     let epoch = promote_now(&node, &hold, "room-fmt2").await;
     let dead = fail_frame(&node).await;
-    let (sw, kinds, not_after) = prepare_rebase(&node, "r-conn", epoch).await;
-    let pause = node
-        .rebase_pause(Duration::from_secs(5), owner(&node))
-        .await
-        .unwrap();
-    let started = hold.arrived.load(Ordering::SeqCst);
-    hold.park_resend.store(true, Ordering::SeqCst);
-    let resend = {
-        let node = node.clone();
-        tokio::spawn(async move { node.resend(dead, audit(), false, owner(&node)).await })
-    };
-    wait_until("the resend parks after its check", || {
-        hold.resend_parked.load(Ordering::SeqCst) == 1
-    })
-    .await;
-    hold.release.add_permits(1);
-    node.rebase_switch(pause, "r-conn", sw, kinds, not_after, audit(), owner(&node))
-        .await
-        .unwrap();
+    let (resend, started) = resend_parked_across_rebase(&node, &hold, "r-conn", epoch, dead).await;
     assert!(node.store().db().dead_letter(dead).unwrap().is_none());
     hold.resend_release.add_permits(1);
     let r: Result<_, ApiError> = resend.await.unwrap();
@@ -497,24 +498,7 @@ async fn a_connection_resend_queued_after_the_switch_runs_once_when_the_letter_r
     let (node, hold) = room_node(dir.path()).await;
     let dead = fail_frame(&node).await;
     let epoch = promote_now(&node, &hold, "room-fmt2").await;
-    let (sw, kinds, not_after) = prepare_rebase(&node, "r-kept", epoch).await;
-    let pause = node
-        .rebase_pause(Duration::from_secs(5), owner(&node))
-        .await
-        .unwrap();
-    hold.park_resend.store(true, Ordering::SeqCst);
-    let resend = {
-        let node = node.clone();
-        tokio::spawn(async move { node.resend(dead, audit(), false, owner(&node)).await })
-    };
-    wait_until("the resend parks after its check", || {
-        hold.resend_parked.load(Ordering::SeqCst) == 1
-    })
-    .await;
-    hold.release.add_permits(1);
-    node.rebase_switch(pause, "r-kept", sw, kinds, not_after, audit(), owner(&node))
-        .await
-        .unwrap();
+    let (resend, _started) = resend_parked_across_rebase(&node, &hold, "r-kept", epoch, dead).await;
     assert!(
         node.store().db().dead_letter(dead).unwrap().is_some(),
         "the rebased state still has the letter"
