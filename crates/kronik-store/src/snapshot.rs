@@ -1506,23 +1506,13 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
-    use crate::sql::{FileOpener, Limits, SqlPool, TurnOpts};
+    use crate::sql::TurnOpts;
 
     /// A store over files in `dir` (`state.db`, `sql/`), as the daemon opens
     /// one, with `actors` registered as SQL actors whose databases have the
     /// given applied LSNs, and the store itself applied through `applied`.
     fn store_with(dir: &Path, applied: Lsn, actors: &[(&str, u64)]) -> Arc<Store> {
-        let store = Store::open(
-            Connection::open(dir.join("state.db")).unwrap(),
-            SqlPool::new(
-                Arc::new(FileOpener {
-                    root: dir.join("sql"),
-                }),
-                Limits::default(),
-                8,
-            ),
-        )
-        .unwrap();
+        let store = crate::file_store(dir, 8);
         for (name, marker) in actors {
             let (kind, key) = name.split_once('/').unwrap();
             store
@@ -1644,17 +1634,7 @@ mod tests {
         drop(store);
         let file = actor_file(&dir.path().join("sql"), "a/idle");
         std::fs::remove_file(&file).unwrap();
-        let store = Store::open(
-            Connection::open(dir.path().join("state.db")).unwrap(),
-            SqlPool::new(
-                Arc::new(FileOpener {
-                    root: dir.path().join("sql"),
-                }),
-                Limits::default(),
-                8,
-            ),
-        )
-        .unwrap();
+        let store = crate::file_store(dir.path(), 8);
         let out = store.raise_idle_sql(50, 64).unwrap();
         assert_eq!(out.blocked, ["a/idle"], "{out:?}");
         assert!(!file.exists(), "stamping must not invent an empty database");

@@ -4733,6 +4733,8 @@ pub fn sealed_keys(conn: &Connection) -> Result<SubjectKeys, StoreError> {
 mod tests {
     use super::*;
 
+    use crate::committed;
+
     #[test]
     fn read_only_state_copy_reads_committed_wal_without_mutating_source() {
         let original = tempfile::tempdir().unwrap();
@@ -4918,17 +4920,6 @@ mod tests {
                 ..Default::default()
             })),
         })
-    }
-
-    fn committed(lsn: u64, record: Record) -> Committed {
-        Committed {
-            lsn,
-            pos: Position {
-                segment: 0,
-                offset: 0,
-            },
-            record,
-        }
     }
 
     fn begin(exec: &str, root: &str, input: Option<pb::Input>) -> Record {

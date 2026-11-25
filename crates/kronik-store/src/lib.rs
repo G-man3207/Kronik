@@ -77,6 +77,62 @@ pub(crate) fn take_apply_lock_hold() -> std::time::Duration {
     std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
 }
 
+/// A [`Committed`] record at `lsn` in a test log segment.
+#[cfg(test)]
+pub(crate) fn committed(lsn: Lsn, record: Record) -> Committed {
+    Committed {
+        lsn,
+        pos: kronik_log::Position {
+            segment: 0,
+            offset: 0,
+        },
+        record,
+    }
+}
+
+/// A committed `notes` SQL turn that runs `statement`.
+#[cfg(test)]
+pub(crate) fn sql_turn(lsn: Lsn, key: &str, statement: &str) -> Committed {
+    committed(
+        lsn,
+        Record::TurnRecord(pb::TurnRecord {
+            actor: Some(pb::ActorRef {
+                kind: "notes".into(),
+                key: key.into(),
+            }),
+            causal_key: Some(kronik_core::causal::root(format!("r{lsn}"))),
+            input: Some(pb::Input {
+                kind: Some(pb::input::Kind::Http(pb::HttpInput::default())),
+            }),
+            outcome: Some(pb::Outcome {
+                kind: pb::OutcomeKind::Committed as i32,
+                ..Default::default()
+            }),
+            sql_schema: vec![pb::SqlSchemaChange {
+                statement: statement.into(),
+            }],
+            ..Default::default()
+        }),
+    )
+}
+
+/// A [`Store`] over files in `dir` (`state.db`, `sql/`), as the daemon opens
+/// one, with room for `capacity` actor databases.
+#[cfg(test)]
+pub(crate) fn file_store(dir: &std::path::Path, capacity: usize) -> Arc<Store> {
+    Store::open(
+        rusqlite::Connection::open(dir.join("state.db")).unwrap(),
+        crate::sql::SqlPool::new(
+            Arc::new(crate::sql::FileOpener {
+                root: dir.join("sql"),
+            }),
+            crate::sql::Limits::default(),
+            capacity,
+        ),
+    )
+    .unwrap()
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 fn mark_lock_enter() {
@@ -933,29 +989,20 @@ fn turn_committed(t: &pb::TurnRecord) -> bool {
 
 #[cfg(test)]
 mod erasure_lock_tests {
-    use std::sync::Arc;
-
-    use rusqlite::Connection;
-
     use super::*;
-    use crate::sql::{FileOpener, Limits, SqlPool};
+
+    use crate::sql::Limits;
+
+    /// The schema of the SQL actor the erasure tests erase.
+    const CREATE_NOTES: &str =
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, _subject TEXT)";
 
     /// Issue #161: an erasure's actor-database WAL checkpoint does not run
     /// while the apply lock is held.
     #[test]
     fn erasure_checkpoints_actor_databases_outside_the_apply_lock() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(
-            Connection::open(dir.path().join("state.db")).unwrap(),
-            SqlPool::new(
-                Arc::new(FileOpener {
-                    root: dir.path().join("sql"),
-                }),
-                Limits::default(),
-                8,
-            ),
-        )
-        .unwrap();
+        let store = file_store(dir.path(), 8);
         store
             .db()
             .conn()
@@ -989,60 +1036,19 @@ mod erasure_lock_tests {
             .unwrap();
         ACTOR_ERASURE_CHECKPOINTS.with(|c| c.set(0));
         store
-            .apply(&[Committed {
-                lsn: 2,
-                pos: kronik_log::Position {
-                    segment: 0,
-                    offset: 0,
-                },
-                record: Record::Erasure(pb::Erasure {
+            .apply(&[committed(
+                2,
+                Record::Erasure(pb::Erasure {
                     subject: "user:1".into(),
                     key_version: 1,
                     ..Default::default()
                 }),
-            }])
+            )])
             .unwrap();
         ACTOR_ERASURE_CHECKPOINTS.with(|c| {
             assert_eq!(c.get(), 1, "the actor database was not checkpointed");
         });
         assert!(!apply_lock_held());
-    }
-
-    fn committed(lsn: u64, record: Record) -> Committed {
-        Committed {
-            lsn,
-            pos: kronik_log::Position {
-                segment: 0,
-                offset: 0,
-            },
-            record,
-        }
-    }
-
-    fn ddl(lsn: u64, key: &str) -> Committed {
-        committed(
-            lsn,
-            Record::TurnRecord(pb::TurnRecord {
-                actor: Some(pb::ActorRef {
-                    kind: "notes".into(),
-                    key: key.into(),
-                }),
-                causal_key: Some(kronik_core::causal::root(format!("r{lsn}"))),
-                input: Some(pb::Input {
-                    kind: Some(pb::input::Kind::Http(pb::HttpInput::default())),
-                }),
-                outcome: Some(pb::Outcome {
-                    kind: pb::OutcomeKind::Committed as i32,
-                    ..Default::default()
-                }),
-                sql_schema: vec![pb::SqlSchemaChange {
-                    statement: "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, \
-                         _subject TEXT)"
-                        .into(),
-                }],
-                ..Default::default()
-            }),
-        )
     }
 
     /// Issue #196: one subject's erasure does not open every SQL actor or
@@ -1054,20 +1060,12 @@ mod erasure_lock_tests {
         use prost::Message;
 
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(
-            Connection::open(dir.path().join("state.db")).unwrap(),
-            SqlPool::new(
-                Arc::new(FileOpener {
-                    root: dir.path().join("sql"),
-                }),
-                Limits::default(),
-                64,
-            ),
-        )
-        .unwrap();
+        let store = file_store(dir.path(), 64);
         const N: u64 = 32;
         for i in 1..=N {
-            store.apply(&[ddl(i, &format!("a{i}"))]).unwrap();
+            store
+                .apply(&[sql_turn(i, &format!("a{i}"), CREATE_NOTES)])
+                .unwrap();
         }
         let bytes = {
             let mut side =
@@ -1217,18 +1215,8 @@ mod erasure_lock_tests {
     #[test]
     fn erasure_defers_on_an_open_sql_session() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(
-            Connection::open(dir.path().join("state.db")).unwrap(),
-            SqlPool::new(
-                Arc::new(FileOpener {
-                    root: dir.path().join("sql"),
-                }),
-                Limits::default(),
-                8,
-            ),
-        )
-        .unwrap();
-        store.apply(&[ddl(1, "n")]).unwrap();
+        let store = file_store(dir.path(), 8);
+        store.apply(&[sql_turn(1, "n", CREATE_NOTES)]).unwrap();
         {
             let db = store.sql.get("notes/n").unwrap();
             let mut actor = db.lock().unwrap();
@@ -1335,34 +1323,6 @@ mod sql_pool_apply_tests {
             Store::open(Connection::open_in_memory().unwrap(), pool).unwrap(),
             counting,
         )
-    }
-
-    fn sql_turn(lsn: u64, key: &str, statement: &str) -> Committed {
-        Committed {
-            lsn,
-            pos: kronik_log::Position {
-                segment: 0,
-                offset: 0,
-            },
-            record: Record::TurnRecord(pb::TurnRecord {
-                actor: Some(pb::ActorRef {
-                    kind: "notes".into(),
-                    key: key.into(),
-                }),
-                causal_key: Some(kronik_core::causal::root(format!("r{lsn}"))),
-                input: Some(pb::Input {
-                    kind: Some(pb::input::Kind::Http(pb::HttpInput::default())),
-                }),
-                outcome: Some(pb::Outcome {
-                    kind: pb::OutcomeKind::Committed as i32,
-                    ..Default::default()
-                }),
-                sql_schema: vec![pb::SqlSchemaChange {
-                    statement: statement.into(),
-                }],
-                ..Default::default()
-            }),
-        }
     }
 
     fn apply_round(store: &Store, start: u64, n: usize, statement: &str) {

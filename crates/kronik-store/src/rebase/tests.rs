@@ -1,16 +1,5 @@
 use super::*;
-use kronik_log::Position;
-
-fn at(lsn: Lsn, record: Record) -> Committed {
-    Committed {
-        lsn,
-        pos: Position {
-            segment: 0,
-            offset: lsn * 100,
-        },
-        record,
-    }
-}
+use crate::committed as at;
 
 fn set(kind: &str, key: &str, root: &str, k: &str, v: &str) -> pb::TurnRecord {
     pb::TurnRecord {
