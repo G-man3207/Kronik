@@ -323,13 +323,7 @@ fn fork_commands_refuse_a_preview() {
     let proposal = propose_step2(&p, &props);
     let id = create(&p, &props, &proposal);
     let wasm = std::fs::read(guest("counter")).unwrap();
-    let msg = pb::Message {
-        name: "increment".into(),
-        content_type: "text/plain".into(),
-        body: plain(""),
-        blobs: vec![],
-        retained_compensation_source: None,
-    };
+    let message = msg("increment", "");
     let errors = [
         p.rt.block_on(props.fork_deploy(&id, &wasm, false, p.owner()))
             .map(|_| ())
@@ -337,9 +331,14 @@ fn fork_commands_refuse_a_preview() {
         p.rt.block_on(props.fork_replay(&id, None, DiffOptions::default(), None, p.owner()))
             .map(|_| ())
             .unwrap_err(),
-        p.rt.block_on(props.fork_send(&id, ActorRef::parse("counter/x").unwrap(), msg, p.owner()))
-            .map(|_| ())
-            .unwrap_err(),
+        p.rt.block_on(props.fork_send(
+            &id,
+            ActorRef::parse("counter/x").unwrap(),
+            message,
+            p.owner(),
+        ))
+        .map(|_| ())
+        .unwrap_err(),
         p.rt.block_on(props.delete_fork(&id, false, p.owner()))
             .unwrap_err(),
     ];

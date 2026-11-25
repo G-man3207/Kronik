@@ -975,13 +975,7 @@ fn replay_from_a_snapshot_equals_replay_from_the_start() {
     p.rt.block_on(p.node.deploy(&notes, audit(), false, p.owner()))
         .unwrap();
     let note = |key: &str, text: &str| {
-        let m = kronik_proto::log::v1::Message {
-            name: "add".into(),
-            content_type: "text/plain".into(),
-            body: plain(text),
-            blobs: vec![],
-            retained_compensation_source: None,
-        };
+        let m = msg("add", text);
         let actor = kronik_core::ids::ActorRef::parse(&format!("notes/{key}")).unwrap();
         p.rt.block_on(p.node.send(actor, m, audit(), false, p.owner()))
             .unwrap()
@@ -1053,13 +1047,7 @@ fn identity_replay_over_outcome_unknown_turns_is_empty() {
     let spec = format!("POST http://{addr}/charge\n\nx");
     let authority = p.node.local_operator_authority().unwrap();
     p.rt.spawn(async move {
-        let m = kronik_proto::log::v1::Message {
-            name: "fetch".into(),
-            content_type: "text/plain".into(),
-            body: plain(&spec),
-            blobs: vec![],
-            retained_compensation_source: None,
-        };
+        let m = msg("fetch", &spec);
         let _ = node
             .send(
                 kronik_core::ids::ActorRef::parse("counter/u").unwrap(),

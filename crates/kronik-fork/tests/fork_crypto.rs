@@ -86,13 +86,7 @@ fn grant(p: &Proc, mode: InForks) {
 }
 
 fn fork_hmac(p: &Proc, props: &Arc<Proposals>, fork: &str, data: &str) -> kronik_fork::ForkTurn {
-    let message = pb::Message {
-        name: "hmac".into(),
-        content_type: "text/plain".into(),
-        body: plain(&format!("signing\n{data}")),
-        blobs: vec![],
-        retained_compensation_source: None,
-    };
+    let message = msg("hmac", &format!("signing\n{data}"));
     p.rt.block_on(props.fork_send(
         fork,
         ActorRef::parse("counter/a").unwrap(),
