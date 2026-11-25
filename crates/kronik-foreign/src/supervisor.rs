@@ -27,37 +27,21 @@ const BUNDLE_FORMAT: u32 = 1;
 pub(crate) const PIDS_LIMIT: i64 = 1024;
 /// Short runtime commands (kill, delete, list).
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Timings of supervision; the defaults are the design's.
-#[derive(Debug, Clone)]
-pub(crate) struct Timings {
-    pub start_timeout: Duration,
-    pub ready_poll: Duration,
-    pub backoff_base: Duration,
-    pub backoff_max: Duration,
-    pub healthy_after: Duration,
-    pub stop_grace: Duration,
-}
-
-impl Default for Timings {
-    fn default() -> Self {
-        Timings {
-            start_timeout: Duration::from_secs(30),
-            ready_poll: Duration::from_millis(50),
-            backoff_base: Duration::from_millis(500),
-            backoff_max: Duration::from_secs(60),
-            healthy_after: Duration::from_secs(60),
-            stop_grace: Duration::from_secs(10),
-        }
-    }
-}
+/// How often a starting actor's bridge is dialled.
+const READY_POLL: Duration = Duration::from_millis(50);
+/// The delay before the first restart after a failed start.
+const BACKOFF_BASE: Duration = Duration::from_millis(500);
+/// The longest delay between restarts.
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// A run at least this long is healthy: its exit restarts at once.
+const HEALTHY_AFTER: Duration = Duration::from_secs(60);
+/// How long a stop waits for the sandbox before it is killed.
+const STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// The delay before start number `failures + 1`.
-pub(crate) fn backoff(t: &Timings, failures: u32) -> Duration {
+pub(crate) fn backoff(failures: u32) -> Duration {
     let exp = failures.saturating_sub(1).min(20);
-    t.backoff_base
-        .saturating_mul(1u32 << exp)
-        .min(t.backoff_max)
+    BACKOFF_BASE.saturating_mul(1u32 << exp).min(BACKOFF_MAX)
 }
 
 /// Where an actor's files are (docs/design/m7-foreign.md §3).
@@ -114,7 +98,8 @@ pub(crate) struct Ctx {
     pub disk_reserve: u64,
     /// `[foreign] pull_timeout`.
     pub pull_timeout: Duration,
-    pub timings: Timings,
+    /// `[foreign] start_timeout`.
+    pub start_timeout: Duration,
     /// `/kronik/<instance>`: the cgroup parent of this daemon's sandboxes.
     pub cgroup_parent: String,
     /// Secret values injected per actor name since the daemon started, for
@@ -526,7 +511,7 @@ pub(crate) async fn supervise(ctx: Arc<Ctx>, a: Arc<Actor>) {
                             s.error = oom.then(|| "out of memory".to_owned());
                         });
                         let ran = env.clock.monotonic().saturating_sub(started);
-                        failures = if ran >= ctx.timings.healthy_after {
+                        failures = if ran >= HEALTHY_AFTER {
                             1
                         } else {
                             failures + 1
@@ -538,7 +523,7 @@ pub(crate) async fn supervise(ctx: Arc<Ctx>, a: Arc<Actor>) {
         if a.stopping() {
             break;
         }
-        let delay = backoff(&ctx.timings, failures);
+        let delay = backoff(failures);
         a.update(&env, |s| {
             s.state = State::Backoff;
             s.next_start_ms = Some(env.clock.wall_ms() + delay.as_millis() as u64);
@@ -594,11 +579,7 @@ async fn stop_running(ctx: &Ctx, a: &Actor, child: Arc<dyn Process>) {
             None
         }
     };
-    let exited = ctx
-        .env
-        .timeout(ctx.timings.stop_grace, child.wait())
-        .await
-        .is_ok();
+    let exited = ctx.env.timeout(STOP_GRACE, child.wait()).await.is_ok();
     if !exited {
         if vm.is_some() {
             let _ = child.kill().await;
@@ -903,7 +884,7 @@ async fn start_microvm(ctx: &Arc<Ctx>, a: &Arc<Actor>) -> Result<Arc<dyn Process
 
 async fn ready(ctx: &Ctx, a: &Actor, child: &Arc<dyn Process>) -> Result<(), String> {
     let env = &ctx.env;
-    let deadline = env.clock.monotonic() + ctx.timings.start_timeout;
+    let deadline = env.clock.monotonic() + ctx.start_timeout;
     let mut last: String;
     loop {
         if a.stopping() {
@@ -931,7 +912,7 @@ async fn ready(ctx: &Ctx, a: &Actor, child: &Arc<dyn Process>) -> Result<(), Str
         if env.clock.monotonic() >= deadline {
             return Err(format!(
                 "not ready within {} s: {last}",
-                ctx.timings.start_timeout.as_secs()
+                ctx.start_timeout.as_secs()
             ));
         }
         tokio::select! {
@@ -943,7 +924,7 @@ async fn ready(ctx: &Ctx, a: &Actor, child: &Arc<dyn Process>) -> Result<(), Str
                     a.name()
                 ));
             }
-            () = env.clock.sleep(ctx.timings.ready_poll) => {}
+            () = env.clock.sleep(READY_POLL) => {}
         }
     }
 }
@@ -1024,11 +1005,7 @@ fn sandbox_overrides(
         memory_bytes: decl.memory_bytes,
         pids: PIDS_LIMIT,
         env: env_vars,
-        binds: vec![oci::Bind {
-            source: data_dir,
-            destination: "/data".into(),
-            read_only: false,
-        }],
+        data_dir: Some(data_dir),
         cgroups_path: Some(cgroup),
         netns,
         hostname: decl.name.clone(),
@@ -1158,8 +1135,7 @@ mod tests {
 
     #[test]
     fn backoff_doubles_up_to_the_cap() {
-        let t = Timings::default();
-        let ms = |n| backoff(&t, n).as_millis();
+        let ms = |n| backoff(n).as_millis();
         assert_eq!(
             [ms(0), ms(1), ms(2), ms(3), ms(4)],
             [500, 500, 1000, 2000, 4000]

@@ -18,7 +18,7 @@ use crate::blobs::BlobStore;
 use crate::fetch::{FetchOptions, Resolved};
 use crate::image::{ImageError, ImageRef};
 use crate::runtime::{Engine, Runtime, find_runc, is_executable, run_quick};
-use crate::supervisor::{Actor, Ctx, Paths, State, Status, Timings, secret_binding, supervise};
+use crate::supervisor::{Actor, Ctx, Paths, State, Status, secret_binding, supervise};
 
 /// The tested gVisor release (ADR 0003).
 pub const TESTED_RUNSC: &str = "release-20261019.0";
@@ -361,10 +361,7 @@ impl Foreign {
             microvm_dir: cfg.microvm_dir.clone(),
             disk_reserve: cfg.disk_reserve,
             pull_timeout: cfg.pull_timeout,
-            timings: Timings {
-                start_timeout: cfg.start_timeout,
-                ..Timings::default()
-            },
+            start_timeout: cfg.start_timeout,
             cgroup_parent: match &cfg.privilege {
                 Privilege::Userns { cgroup } => cgroup.trim_end_matches('/').to_owned(),
                 _ => crate::sys::own_cgroup()
