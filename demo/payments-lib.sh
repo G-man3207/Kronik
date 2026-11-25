@@ -4,6 +4,10 @@
 # dir, port, bin, billing, ledger and its variant wasm path, then calls
 # payments_preflight, payments_serve and payments_deploy in that order; the
 # scenario-specific fork, replay and proposal steps follow as before.
+#
+# `demo/billing.sh` sources this file for its helpers only (`step`, `fail`,
+# `api`, `field`, `b64`, `http`, `invoice`, `payments_cleanup`) and keeps its
+# own preflight and serve steps because of its external owned mode.
 
 layout=examples/dist/fake-payments.oci
 api_key="demo-key-$(date +%s%N | sha256sum | cut -c1-16)"
