@@ -52,6 +52,19 @@ impl Runtime {
         }
     }
 
+    /// gVisor's flags before the command: `run` and `restore` must agree (a
+    /// restore needs the overlay medium of the checkpointed sandbox). None for runc.
+    fn sandbox_flags(&self) -> Vec<String> {
+        match &self.engine {
+            Engine::Runsc { platform } => vec![
+                format!("--platform={platform}"),
+                "--network=sandbox".to_owned(),
+                "--overlay2=root:memory".to_owned(),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
     /// `run` in the foreground: the child's exit status is the container's.
     /// Its output goes through the daemon into `log`, capped (§12). Under
     /// gVisor the rootfs overlay lives in the sandbox's memory, so writes
@@ -59,12 +72,7 @@ impl Runtime {
     /// the host's disk (`runsc`'s default `root:self` keeps them in a file
     /// next to the rootfs).
     pub fn run(&self, bundle: &Path, id: &str, log: &Path) -> ProcessSpec {
-        let mut args = Vec::new();
-        if let Engine::Runsc { platform } = &self.engine {
-            args.push(format!("--platform={platform}"));
-            args.push("--network=sandbox".to_owned());
-            args.push("--overlay2=root:memory".to_owned());
-        }
+        let mut args = self.sandbox_flags();
         args.extend([
             "run".to_owned(),
             "--bundle".to_owned(),
@@ -144,12 +152,7 @@ impl Runtime {
     /// overlay medium of the checkpointed sandbox), never into production's
     /// rootfs directory.
     pub fn restore(&self, bundle: &Path, id: &str, image: &Path, log: &Path) -> ProcessSpec {
-        let mut args = Vec::new();
-        if let Engine::Runsc { platform } = &self.engine {
-            args.push(format!("--platform={platform}"));
-            args.push("--network=sandbox".to_owned());
-            args.push("--overlay2=root:memory".to_owned());
-        }
+        let mut args = self.sandbox_flags();
         args.extend([
             "restore".to_owned(),
             "--detach".to_owned(),
@@ -264,6 +267,28 @@ mod tests {
                 path: log.to_path_buf(),
                 max_bytes: crate::logs::ROTATE_BYTES
             }
+        );
+        assert_eq!(
+            rt.restore(
+                Path::new("/d/bundle"),
+                "kronik-foreign-echo",
+                Path::new("/d/image"),
+                log
+            )
+            .args,
+            [
+                "--root",
+                "/run/kronik/runsc",
+                "--platform=systrap",
+                "--network=sandbox",
+                "--overlay2=root:memory",
+                "restore",
+                "--detach",
+                "--image-path=/d/image",
+                "--bundle",
+                "/d/bundle",
+                "kronik-foreign-echo"
+            ]
         );
         assert_eq!(
             rt.port_forward(Path::new("/s/c1.sock"), "kronik-foreign-echo", 8080, log)

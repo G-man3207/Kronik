@@ -24,12 +24,9 @@ use tokio::io::{AsyncReadExt, AsyncWrite};
 use crate::blobs::{BlobStore, Descriptor, TempFile, check, io_error, sha256_digest};
 use crate::image::{ImageError, ImageRef, validate_digest};
 use crate::oci::{
-    DOCKER_LIST, DOCKER_MANIFEST, MAX_JSON_BYTES, MEDIA_INDEX, MEDIA_MANIFEST, Parsed,
-    parse_config, parse_manifest, select_platform,
+    DOCKER_LIST, DOCKER_MANIFEST, MAX_INDEX_DEPTH, MAX_JSON_BYTES, MEDIA_INDEX, MEDIA_MANIFEST,
+    Parsed, invalid, parse_config, parse_manifest, select_platform,
 };
-
-/// How deep indexes may nest before a manifest must appear.
-const MAX_INDEX_DEPTH: usize = 4;
 
 /// An image that is complete in the blob store.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,10 +36,6 @@ pub struct Resolved {
     pub manifest_digest: String,
     /// The canonical record string, see [`ImageRef::pinned`].
     pub pinned: String,
-}
-
-fn invalid(msg: impl Into<String>) -> ImageError {
-    ImageError::Invalid(msg.into())
 }
 
 /// Opens a file of a layout: never through a symbolic link (the daemon

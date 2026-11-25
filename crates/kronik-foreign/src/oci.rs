@@ -58,11 +58,11 @@ const WHITEOUT_PREFIX: &str = ".wh.";
 /// The largest index, manifest or image config Kronik reads.
 pub const MAX_JSON_BYTES: u64 = 8 << 20;
 /// How deep indexes may nest before a manifest must appear.
-const MAX_INDEX_DEPTH: usize = 4;
+pub(crate) const MAX_INDEX_DEPTH: usize = 4;
 /// The largest `/etc/passwd` or `/etc/group` read for user resolution.
 const MAX_ID_DB_BYTES: u64 = 4 << 20;
 
-fn invalid(msg: impl Into<String>) -> ImageError {
+pub(crate) fn invalid(msg: impl Into<String>) -> ImageError {
     ImageError::Invalid(msg.into())
 }
 
