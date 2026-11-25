@@ -17,38 +17,15 @@ mod common;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use blob_fixtures::{pattern, pattern_sum};
 use kronik_api::openapi::TURN_SCHEMA;
 use serde_json::{Value, json};
 
-const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
 const TURN_URL: &str = "file:///kronik/docs/reference/turn.schema.json";
-
-const SETTINGS_ENV: [&str; 7] = [
-    "KRONIK_CONFIG",
-    "KRONIK_DATA_DIR",
-    "KRONIK_HTTP_LISTEN",
-    "KRONIK_ADMIN_LISTEN",
-    "KRONIK_API_SOCKET",
-    "KRONIK_MASTER_KEY_FILE",
-    "KRONIK_TOKEN",
-];
-
-/// `kronik` with none of the developer's settings, and no disk reserve (the
-/// tests' file system may have less free space).
-fn kronik() -> Command {
-    let mut command = Command::new(KRONIK);
-    for var in SETTINGS_ENV {
-        command.env_remove(var);
-    }
-    command.env("KRONIK_DISK_RESERVE", "0B");
-    command.stdin(Stdio::null());
-    command
-}
 
 struct Daemon {
     dir: PathBuf,
@@ -90,7 +67,7 @@ impl Daemon {
         )
         .unwrap();
         let log = std::fs::File::create(dir.join("serve.log")).unwrap();
-        let child = kronik()
+        let child = common::command()
             .arg("serve")
             .arg("--config")
             .arg(&config)
@@ -195,7 +172,7 @@ impl Daemon {
         let socket = self.socket();
         let mut all = vec!["--socket", socket.to_str().unwrap()];
         all.extend_from_slice(args);
-        kronik()
+        common::command()
             .args(&all)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

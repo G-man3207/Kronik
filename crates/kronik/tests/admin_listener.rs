@@ -15,37 +15,16 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use blob_fixtures::pattern;
-use common::free_port;
+use common::{command, free_port};
 use serde_json::{Value, json};
 
-const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
-
-const SETTINGS_ENV: [&str; 7] = [
-    "KRONIK_CONFIG",
-    "KRONIK_DATA_DIR",
-    "KRONIK_HTTP_LISTEN",
-    "KRONIK_ADMIN_LISTEN",
-    "KRONIK_API_SOCKET",
-    "KRONIK_MASTER_KEY_FILE",
-    "KRONIK_TOKEN",
-];
-
-fn command() -> Command {
-    let mut command = Command::new(KRONIK);
-    for var in SETTINGS_ENV {
-        command.env_remove(var);
-    }
-    command.env("KRONIK_DISK_RESERVE", "0B");
-    command.stdin(Stdio::null());
-    command
-}
 
 /// One HTTP answer, parsed from an API socket or the admin listener.
 struct Answer {

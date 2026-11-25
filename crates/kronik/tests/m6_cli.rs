@@ -3,13 +3,15 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
+use common::{Out, command};
 use serde_json::Value;
 
-const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/guests/counter.wasm"
@@ -19,60 +21,8 @@ const COUNTER_STEP2: &str = concat!(
     "/../../tests/guests/counter-step2.wasm"
 );
 
-const SETTINGS_ENV: [&str; 6] = [
-    "KRONIK_CONFIG",
-    "KRONIK_DATA_DIR",
-    "KRONIK_HTTP_LISTEN",
-    "KRONIK_ADMIN_LISTEN",
-    "KRONIK_API_SOCKET",
-    "KRONIK_MASTER_KEY_FILE",
-];
-
-struct Out {
-    code: i32,
-    stdout: String,
-    stderr: String,
-}
-
-impl std::fmt::Debug for Out {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "exit {}\nstdout:\n{}\nstderr:\n{}",
-            self.code, self.stdout, self.stderr
-        )
-    }
-}
-
-impl Out {
-    fn json(&self) -> Value {
-        serde_json::from_str(&self.stdout).unwrap_or_else(|e| panic!("{e}: {self:?}"))
-    }
-}
-
-fn command() -> Command {
-    let mut command = Command::new(KRONIK);
-    for var in SETTINGS_ENV {
-        command.env_remove(var);
-    }
-    command.env_remove("KRONIK_TOKEN");
-    // The tests' temporary file system may have less than the reserve.
-    command.env("KRONIK_DISK_RESERVE", "0B");
-    command.stdin(Stdio::null());
-    command
-}
-
 fn kronik(args: &[&str]) -> Out {
-    let out = command().args(args).output().unwrap();
-    finish(out)
-}
-
-fn finish(out: Output) -> Out {
-    Out {
-        code: out.status.code().unwrap_or(1),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-    }
+    command().args(args).output().unwrap().into()
 }
 
 struct Serve {
