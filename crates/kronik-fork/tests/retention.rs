@@ -11,46 +11,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{Proc, audit, guest, tempdir};
-use kronik_core::env::Env;
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::Lsn;
 use kronik_fork::diff::DiffOptions;
 use kronik_fork::proposal::{Proposals, ProposeRequest};
+use kronik_sched::NodeConfig;
 use kronik_sched::snapshots::StorageConfig;
-use kronik_sched::{NodeConfig, start_local};
 
 fn start(dir: &Path, history: Option<Duration>, segment: Option<u64>) -> Proc {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let mut storage = StorageConfig::new(dir.to_path_buf());
-        if let Some(h) = history {
-            storage.history = h;
-        }
-        start_local(
-            env,
-            dir,
-            NodeConfig {
-                concurrency: 8,
-                storage: Some(storage),
-                segment_max_bytes: segment,
-                ..NodeConfig::default()
-            },
-        )
-        .await
-        .unwrap()
-    });
-    Proc { rt, node }
-}
-
-fn deploy(p: &Proc) {
-    let bytes = std::fs::read(guest("counter")).unwrap();
-    p.rt.block_on(p.node.deploy(&bytes, audit(), false, p.owner()))
-        .unwrap();
+    let mut storage = StorageConfig::new(dir.to_path_buf());
+    if let Some(h) = history {
+        storage.history = h;
+    }
+    Proc::open(
+        dir,
+        NodeConfig {
+            concurrency: 8,
+            storage: Some(storage),
+            segment_max_bytes: segment,
+            ..NodeConfig::default()
+        },
+    )
 }
 
 fn first_turn(p: &Proc) -> Lsn {
@@ -80,7 +61,7 @@ fn branch_names(dir: &Path) -> Vec<String> {
 /// second turn is strictly later even in the same wall millisecond.
 fn two_turns(dir: &Path, history: Option<Duration>) -> (Proc, Lsn) {
     let p = start(dir, history, None);
-    deploy(&p);
+    p.deploy("counter");
     p.send("counter/a", "increment", "");
     let early = first_turn(&p);
     drop(p);
@@ -330,7 +311,7 @@ fn fork_create_refuses_a_point_the_log_no_longer_covers() {
     let dir = tempdir();
     let log_dir = dir.path().join("branches/main/log");
     let p = start(dir.path(), Some(Duration::ZERO), Some(4096));
-    deploy(&p);
+    p.deploy("counter");
     for i in 0..80 {
         p.send(&format!("counter/k{}", i % 5), "increment", "");
     }
@@ -401,7 +382,7 @@ fn a_young_nodes_first_deployment_survives_its_first_restart() {
     let log_dir = dir.path().join("branches/main/log");
     // Every batch in a segment of its own, like the walk's segment 1.
     let p = start(dir.path(), None, Some(1));
-    deploy(&p);
+    p.deploy("counter");
     for i in 0..12 {
         p.send(&format!("counter/k{}", i % 3), "increment", "");
     }
@@ -436,7 +417,7 @@ fn a_window_cut_by_retention_is_reported() {
     // A 2 s history: the turns before the 3 s pause fall out of it, the
     // proposal's 1 h window still asks for them.
     let p = start(dir.path(), Some(Duration::from_secs(2)), Some(1));
-    deploy(&p);
+    p.deploy("counter");
     for i in 0..5 {
         p.send(&format!("counter/k{i}"), "increment", "");
     }
@@ -493,31 +474,19 @@ fn a_window_cut_by_retention_is_reported() {
 /// A node with a short window, frequent snapshots and few kept, so the
 /// window's base moves within seconds.
 fn start_moving(dir: &Path) -> Proc {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let mut storage = StorageConfig::new(dir.to_path_buf());
-        storage.history = Duration::from_secs(3);
-        storage.snapshot_interval = Duration::from_millis(400);
-        storage.snapshots_kept = 2;
-        start_local(
-            env,
-            dir,
-            NodeConfig {
-                concurrency: 8,
-                storage: Some(storage),
-                segment_max_bytes: Some(1),
-                ..NodeConfig::default()
-            },
-        )
-        .await
-        .unwrap()
-    });
-    Proc { rt, node }
+    let mut storage = StorageConfig::new(dir.to_path_buf());
+    storage.history = Duration::from_secs(3);
+    storage.snapshot_interval = Duration::from_millis(400);
+    storage.snapshots_kept = 2;
+    Proc::open(
+        dir,
+        NodeConfig {
+            concurrency: 8,
+            storage: Some(storage),
+            segment_max_bytes: Some(1),
+            ..NodeConfig::default()
+        },
+    )
 }
 
 /// The history window is how far back forks and replay can go (the brief):
@@ -532,7 +501,7 @@ fn a_fork_at_the_old_edge_of_the_window_works_after_the_base_moved() {
     let data = dir.path();
     let log_dir = data.join("branches/main/log");
     let p = start_moving(data);
-    deploy(&p);
+    p.deploy("counter");
     let mut first_snapshot = None;
     // About 9 s of turns, a snapshot every 400 ms: three windows.
     for i in 0..72 {
