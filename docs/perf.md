@@ -1028,18 +1028,16 @@ C allocator (`mimalloc` or `jemalloc`) through `#[global_allocator]` would be
 a new C dependency beyond SQLite and needs a maintainer decision with
 measurements before it ships.
 
-The other lever is Wasmtime’s `linear_memory_keep_resident` (default
-`LINEAR_MEMORY_KEEP_RESIDENT_BYTES`,
-2 MiB): less resident memory means less `memset` on the turn path but more
-page faults on replay (see [Memory cost of the resident Wasm
+The other lever is Wasmtime’s `linear_memory_keep_resident`
+(`LINEAR_MEMORY_KEEP_RESIDENT_BYTES`, 2 MiB): less resident memory means less
+`memset` on the turn path, but more page faults on replay (see [Memory cost of
+the resident Wasm
 memories](#memory-cost-of-the-resident-wasm-memories)). Any change must be
 re-measured against M24 criterion 1.
 
-`scripts/perf-linear-memory-keep-resident.sh` rebuilds the release musl binary
-for each allowed compile-time value
-(`KRONIK_PERF_LINEAR_MEMORY_KEEP_RESIDENT`, documented on the constant) and
-prints the 64-actor `perf-m1` row. Record numbers in this file before changing
-the default.
+To measure another value, change `LINEAR_MEMORY_KEEP_RESIDENT_BYTES` in
+`crates/kronik-runtime/src/engine.rs`, run the 64-actor `perf-m1` row, and
+record the numbers in this file before changing the default.
 
 ## The metrics registry (issue #273)
 
