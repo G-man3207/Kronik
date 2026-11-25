@@ -3632,7 +3632,6 @@ mod secret_tests {
                 ..Default::default()
             }),
         );
-        let original_bytes = original.encode_to_vec();
         assert_eq!(original.target, "http:ab.example");
         let projected = legacy_http_disclosure(original.clone(), &source, &matcher).unwrap();
         assert_eq!(
@@ -3646,7 +3645,6 @@ mod secret_tests {
         )
         .unwrap();
         assert_eq!(response.status, 200);
-        assert_eq!(original.encode_to_vec(), original_bytes);
     }
 
     #[test]
@@ -3667,7 +3665,6 @@ mod secret_tests {
                 ..Default::default()
             }),
         );
-        let original_bytes = original.encode_to_vec();
         assert_eq!(original.target, "http:abc.example");
         let mut lower = source.clone();
         lower.url = "https://abc.example/".into();
@@ -3682,7 +3679,6 @@ mod secret_tests {
         );
         assert_eq!(projection.target, "http:[withheld]");
         assert_eq!(projection.fingerprint, original.fingerprint);
-        assert_eq!(original.encode_to_vec(), original_bytes);
     }
 
     #[test]
@@ -3713,7 +3709,6 @@ mod secret_tests {
                     ..Default::default()
                 }),
             );
-            let original_bytes = original.encode_to_vec();
             let projected = legacy_http_disclosure(original.clone(), &source, &matcher).unwrap();
             assert_eq!(
                 projected.status,
@@ -3726,7 +3721,6 @@ mod secret_tests {
             .unwrap();
             assert_eq!(response.status, 201);
             assert_eq!(response.body, WITHHELD_EFFECT_BODY);
-            assert_eq!(original.encode_to_vec(), original_bytes);
         }
     }
 

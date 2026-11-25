@@ -187,63 +187,6 @@ async fn per_name_concurrent_sets_use_one_durable_allocator() {
     assert_eq!(current.meta.version, 12);
 }
 
-#[tokio::test]
-async fn failed_file_reservation_never_becomes_current_and_is_never_reused() {
-    let (_data, node) = node().await;
-    node.secret_set(
-        "token",
-        b"acknowledged-value".to_vec(),
-        &audit(),
-        false,
-        revocable::lease(),
-    )
-    .await
-    .unwrap();
-    let runtime = node.runtime().unwrap();
-    // An independent file write is deliberately unacknowledged by the log.
-    runtime
-        .file
-        .set_at(
-            "token",
-            2,
-            b"unacknowledged-orphan",
-            [2; 24],
-            20,
-            "system",
-            "crash boundary",
-        )
-        .unwrap();
-    // The design no longer fails the next write on the physical collision:
-    // it skips past the unacknowledged orphan, whose physical slot is never
-    // reused and whose bytes never become the operational current.
-    let next = node
-        .secret_set(
-            "token",
-            b"acknowledged-successor".to_vec(),
-            &audit(),
-            false,
-            revocable::lease(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(next.version, 2);
-    let identity = node
-        .secret_identity(node.branch(), "token", 2)
-        .await
-        .unwrap();
-    assert_eq!(identity.source_version, "3");
-    let history = node.secret_history("token").await.unwrap();
-    assert_eq!(history[1].phase, Phase::Active as i32);
-    let current = node
-        .resolve_secret("token", None, &node.config_now(), revocable::lease())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(current.meta.version, 2);
-    assert_eq!(current.value, b"acknowledged-successor");
-}
-
 /// The coverage watermark is written after a successful refresh, survives a
 /// restart of the same store, and is invalidated by a restored (replaced)
 /// store or a corrupt artifact — which fall back to the full scan and never
@@ -2051,6 +1994,10 @@ async fn failed_orphan_file_rows_are_scrub_only_and_never_operational_current() 
         .await
         .unwrap();
     assert_eq!(identity.source_version, "3");
+    assert_eq!(
+        node.secret_history("token").await.unwrap()[1].phase,
+        Phase::Active as i32
+    );
     node.refresh_secret_inventory(revocable::lease())
         .await
         .unwrap();
@@ -2061,15 +2008,13 @@ async fn failed_orphan_file_rows_are_scrub_only_and_never_operational_current() 
     assert!(node.secret_values().unwrap().iter().any(
         |(name, value)| name == "token" && value.as_slice() == b"unacknowledged-retained-value"
     ));
-    assert_eq!(
-        node.resolve_secret("token", None, &node.config_now(), revocable::lease())
-            .await
-            .unwrap()
-            .unwrap()
-            .meta
-            .version,
-        2
-    );
+    let current = node
+        .resolve_secret("token", None, &node.config_now(), revocable::lease())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.meta.version, 2);
+    assert_eq!(current.value, b"acknowledged-successor");
     assert!(
         node.secret_history("token")
             .await
