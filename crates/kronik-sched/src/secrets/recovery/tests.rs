@@ -6,7 +6,8 @@
 use super::super::Scope;
 use super::*;
 use crate::Ingress;
-use kronik_core::env::{BoxFuture, Env, HttpRequest, HttpResponse, Net, NetError, Spawner};
+use crate::secrets::certification_tests::{begin, config, env, install_file, plain, reveal, run};
+use kronik_core::env::{BoxFuture, HttpRequest, HttpResponse, Net, NetError, Spawner};
 use kronik_privacy::{SecretMeta, secret_backend::config::Definition};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,24 +17,8 @@ const COUNTER: &str = concat!(
     "/../../tests/guests/counter.wasm"
 );
 static TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-fn env() -> Env {
-    Env::real(tokio::runtime::Handle::current())
-}
 fn audit() -> pb::Audit {
     super::super::system_audit(&env(), "recorded secret recovery fixture")
-}
-fn config() -> crate::NodeConfig {
-    crate::NodeConfig {
-        concurrency: 1,
-        group_commit_window: Some(Duration::ZERO),
-        ..Default::default()
-    }
-}
-fn plain(bytes: Vec<u8>) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: None,
-        value: Some(pb::sealable::Value::Plain(bytes)),
-    })
 }
 fn message(name: &str) -> pb::Message {
     pb::Message {
@@ -42,31 +27,6 @@ fn message(name: &str) -> pb::Message {
         body: plain(b"canonical compensation body".to_vec()),
         blobs: Vec::new(),
         retained_compensation_source: None,
-    }
-}
-fn begin(node: &Node) -> pb::TurnBegin {
-    pb::TurnBegin {
-        execution_id: "0123456789abcdef0123456789abcdef".into(),
-        actor: Some(pb::ActorRef {
-            kind: "recover".into(),
-            key: "blocked".into(),
-        }),
-        code_hash: vec![9; 32],
-        engine_version: kronik_runtime::ENGINE_VERSION.into(),
-        causal_key: Some(causal::root("recorded-root".into())),
-        logical_time_ms: 29,
-        random_seed: vec![6; 32],
-        config_epoch: node.epoch(),
-        input: Some(pb::Input {
-            kind: Some(pb::input::Kind::Http(pb::HttpInput {
-                method: "GET".into(),
-                path: "/original-input".into(),
-                body: Some(pb::Body {
-                    value: Some(pb::body::Value::Inline(plain(Vec::new()).unwrap())),
-                }),
-                ..Default::default()
-            })),
-        }),
     }
 }
 fn message_begin(node: &Node) -> pb::TurnBegin {
@@ -81,29 +41,6 @@ fn message_begin(node: &Node) -> pb::TurnBegin {
         })),
     });
     begin
-}
-fn reveal(metadata: SecretMeta, ordinal: u32) -> pb::EffectRecord {
-    let mut reference = pb::SecretRef {
-        name: metadata.name.clone(),
-        version_hash: metadata.version_hash,
-        ..Default::default()
-    };
-    reference.set_resolved_version(metadata.version).unwrap();
-    pb::EffectRecord {
-        ordinal,
-        kind: "secret.reveal".into(),
-        status: pb::EffectStatus::Ok as i32,
-        target: format!("secret-reveal:{}", metadata.name),
-        fingerprint: vec![3; 32],
-        grounding: pb::Grounding::Live as i32,
-        request: plain(
-            pb::RevealEffectRequest {
-                secret: Some(reference),
-            }
-            .encode_to_vec(),
-        ),
-        ..Default::default()
-    }
 }
 fn call(begin: &pb::TurnBegin, ordinal: u32, with_compensation: bool) -> pb::EffectRecord {
     let key = begin.causal_key.as_ref().unwrap();
@@ -141,27 +78,6 @@ async fn node() -> (tempfile::TempDir, Arc<Node>) {
         .await
         .unwrap();
     (data, node)
-}
-async fn install_file(node: &Node, value: &[u8]) -> SecretMeta {
-    let runtime = node.runtime().unwrap();
-    let version = node.next_secret_version("token").await.unwrap();
-    let hash = runtime.file.version_hash("token", version, value).unwrap();
-    let mut row = node.secret_record(
-        &Scope::file("token", 0),
-        version,
-        version.to_string(),
-        hash,
-        false,
-        audit(),
-    );
-    node.secret_publish(row.clone()).await.unwrap();
-    let metadata = runtime
-        .file
-        .set_at("token", version, value, [5; 24], 29, "system", "fixture")
-        .unwrap();
-    row.phase = pb::secret_version::Phase::Active as i32;
-    node.secret_publish(row).await.unwrap();
-    metadata
 }
 async fn persist(node: &Node, begin: &pb::TurnBegin, effects: &[pb::EffectRecord]) -> Vec<u64> {
     node.commit(Record::TurnBegin(begin.clone())).await.unwrap();
@@ -1223,13 +1139,6 @@ async fn a_live_effect_whose_secret_comes_back_unusable_is_recorded_as_an_error_
     bao.invalid_body.store(true, Ordering::Release);
     counter_with_grants(&node).await;
     assert_live_effects_record_the_error(&node, &bao, "i").await;
-}
-
-fn run<T>(future: impl std::future::Future<Output = T>) -> T {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let output = runtime.block_on(future);
-    drop(runtime);
-    output
 }
 
 /// The delivery class of the grant for HTTP that a case needs so that a re-run
