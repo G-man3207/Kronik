@@ -4,8 +4,13 @@
 //! downloaded with a secret value scrubbed; a blob a turn wrote and did not
 //! keep is listed as loose and collected; a blob nobody knows is
 //! BLOB_NOT_FOUND.
+//! `kronik actors inspect`, `blobs list --actor`, `blobs inspect` and
+//! `blobs gc --dry-run --verify` show what an actor holds (M26 slice B16,
+//! §12).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod common;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -13,6 +18,7 @@ use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
+use common::free_port;
 use serde_json::Value;
 
 const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
@@ -59,14 +65,6 @@ fn command() -> Command {
     command.env("KRONIK_DISK_RESERVE", "0B");
     command.stdin(Stdio::null());
     command
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 struct Serve {
@@ -155,6 +153,25 @@ impl Serve {
             .position(|w| w == b"\r\n")
             .unwrap_or(response.len());
         String::from_utf8_lossy(&response[..end]).into_owned()
+    }
+
+    /// `POST /media/a/<op>?<query>` to the gateway, which must answer 200:
+    /// the response's body.
+    fn post_body(&self, op: &str, query: &str) -> String {
+        let mut s = TcpStream::connect(&self.http).unwrap();
+        write!(
+            s,
+            "POST /media/a/{op}?{query} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+             Content-Length: 0\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        s.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_owned())
+            .unwrap_or_default()
     }
 }
 
@@ -358,4 +375,73 @@ fn blobs_status_inspect_get_and_gc() {
     assert_eq!(inspect["state"], "live", "{inspect}");
     let audit = d.run(&["--json", "audit", "show"]);
     assert!(audit.stdout.contains("blobs.gc"), "{audit:?}");
+}
+
+#[test]
+fn holds_in_actors_inspect_blobs_list_inspect_and_the_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Serve::start(dir.path());
+    let o = d.run(&["deploy", MEDIA, "--reason", "what actors hold"]);
+    assert_eq!(o.code, 0, "{o:?}");
+    // media/a puts two blobs and holds both.
+    let first = d.post_body("put", "size=3000");
+    let second = d.post_body("put", "size=2000");
+    let hash = |answer: &str| answer.split(' ').nth(1).unwrap().to_owned();
+    let (first, second) = (hash(&first), hash(&second));
+
+    let actor = d.run(&["--json", "actors", "inspect", "media/a"]).json();
+    assert_eq!(actor["blobs"]["held"], 2, "{actor}");
+    assert_eq!(actor["blobs"]["bytes"], 5000, "{actor}");
+    let o = d.run(&["actors", "inspect", "media/a"]);
+    assert!(o.stdout.contains("2 blobs held"), "{o:?}");
+
+    // A page of one, then the rest.
+    let page = d
+        .run(&[
+            "--json", "blobs", "list", "--actor", "media/a", "--limit", "1",
+        ])
+        .json();
+    assert_eq!(page["blobs"].as_array().unwrap().len(), 1, "{page}");
+    let next = page["next"].as_str().unwrap().to_owned();
+    let rest = d
+        .run(&[
+            "--json", "blobs", "list", "--actor", "media/a", "--after", &next,
+        ])
+        .json();
+    assert_eq!(rest["blobs"].as_array().unwrap().len(), 1, "{rest}");
+    assert!(rest["next"].is_null(), "{rest}");
+    let mut listed = vec![
+        page["blobs"][0]["hash"].as_str().unwrap().to_owned(),
+        rest["blobs"][0]["hash"].as_str().unwrap().to_owned(),
+    ];
+    listed.sort();
+    let mut expected = vec![first.clone(), second.clone()];
+    expected.sort();
+    assert_eq!(listed, expected);
+    let o = d.run(&["blobs", "list", "--actor", "media/a"]);
+    assert!(o.stdout.contains(&first), "{o:?}");
+
+    // The hold is a root, named by its holder.
+    let inspect = d.run(&["--json", "blobs", "inspect", &first]).json();
+    let roots = inspect["roots"].as_array().unwrap();
+    assert!(
+        roots
+            .iter()
+            .any(|r| r["kind"] == "held" && r["actor"] == "media/a"),
+        "{inspect}"
+    );
+    let o = d.run(&["blobs", "inspect", &first]);
+    assert!(o.stdout.contains("held by media/a"), "{o:?}");
+
+    // The plan: nothing to collect, and the pins match their rows.
+    let o = d.run(&["--json", "blobs", "gc", "--dry-run", "--verify"]);
+    assert_eq!(o.code, 0, "{o:?}");
+    let plan = o.json();
+    assert_eq!(plan["count"], 0, "{plan}");
+    assert_eq!(plan["drift"], serde_json::json!([]), "{plan}");
+    let o = d.run(&["blobs", "gc", "--dry-run", "--verify"]);
+    assert!(o.stdout.contains("match the rows they mirror"), "{o:?}");
+    // --verify goes with the dry run only.
+    let o = d.run(&["blobs", "gc", "--verify", "--reason", "x"]);
+    assert_ne!(o.code, 0, "{o:?}");
 }
