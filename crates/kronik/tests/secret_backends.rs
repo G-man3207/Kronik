@@ -26,9 +26,8 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -41,6 +40,10 @@ use rmcp::service::{RoleClient, RunningService, ServiceExt as _};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, UnixSocketHttpClient};
 use serde_json::{Value, json};
+
+mod common;
+
+use common::Daemon;
 
 const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 const GUESTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests");
@@ -413,16 +416,7 @@ struct Out {
     stderr: String,
 }
 
-struct Daemon {
-    dir: PathBuf,
-    child: Option<Child>,
-}
-
 impl Daemon {
-    fn sock(&self) -> PathBuf {
-        self.dir.join("api.sock")
-    }
-
     /// Starts `kronik serve` on `dir` with the master key of the tests, the
     /// `bao` backend of `bao` if there is one, and the given
     /// `[secrets] fetch_timeout`. Waits until the API answers.
@@ -440,104 +434,16 @@ impl Daemon {
         let token = dir.join("bao.token");
         std::fs::write(&token, BAO_TOKEN).unwrap();
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let mut config = format!(
-            "[server]\ndata_dir = {:?}\n\n[secrets]\nrefresh = \"1h\"\nfetch_timeout = \"{fetch_timeout}\"\n\n",
-            dir.join("data")
-        );
+        let mut config =
+            format!("[secrets]\nrefresh = \"1h\"\nfetch_timeout = \"{fetch_timeout}\"\n\n");
         if let Some(bao) = bao {
             config.push_str(&bao.config(&token));
         }
         config.push_str(extra);
-        let config_file = dir.join("kronik.toml");
-        std::fs::write(&config_file, config).unwrap();
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("serve.log"))
-            .unwrap();
-        let child = Command::new(KRONIK)
-            .arg("serve")
-            .env("KRONIK_DISK_RESERVE", "0B")
-            .env("KRONIK_MASTER_KEY", MASTER_KEY)
-            .env_remove("KRONIK_MASTER_KEY_FILE")
-            .env_remove("KRONIK_TOKEN")
-            .arg("--config")
-            .arg(&config_file)
-            .args(["--http-listen", "127.0.0.1:0", "--api-socket"])
-            .arg(dir.join("api.sock"))
-            .env("KRONIK_LOG", "info")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        let d = Daemon {
-            dir: dir.to_path_buf(),
-            child: Some(child),
-        };
-        for _ in 0..4800 {
-            if d.try_api("GET", "/v1/health", Value::Null)
-                .is_some_and(|(status, _)| status == 200)
-            {
-                return d;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        panic!("daemon did not start: {}", d.serve_log());
-    }
-
-    fn serve_log(&self) -> String {
-        std::fs::read_to_string(self.dir.join("serve.log")).unwrap_or_default()
-    }
-
-    /// SIGKILL: no shutdown, no flush.
-    fn kill9(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            child.kill().unwrap();
-            child.wait().unwrap();
-        }
-    }
-
-    fn try_api(&self, method: &str, path: &str, body: Value) -> Option<(u16, Value)> {
-        let mut s = UnixStream::connect(self.sock()).ok()?;
-        let body = if body.is_null() {
-            String::new()
-        } else {
-            body.to_string()
-        };
-        write!(
-            s,
-            "{method} {path} HTTP/1.1\r\nhost: kronik\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .ok()?;
-        let mut r = BufReader::new(s);
-        let mut line = String::new();
-        r.read_line(&mut line).ok()?;
-        let status: u16 = line.split_whitespace().nth(1)?.parse().ok()?;
-        let mut length = 0;
-        loop {
-            let mut h = String::new();
-            r.read_line(&mut h).ok()?;
-            let h = h.trim_end();
-            if h.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = h.split_once(':')
-                && k.eq_ignore_ascii_case("content-length")
-            {
-                length = v.trim().parse().ok()?;
-            }
-        }
-        let mut buf = vec![0; length];
-        r.read_exact(&mut buf).ok()?;
-        Some((status, serde_json::from_slice(&buf).ok()?))
-    }
-
-    /// One request; any status.
-    fn api(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
-        self.try_api(method, path, body)
-            .unwrap_or_else(|| panic!("API {method} {path} failed: {}", self.serve_log()))
+        let mut c = Daemon::command(KRONIK, dir, Some(&config));
+        c.env("KRONIK_MASTER_KEY", MASTER_KEY)
+            .env_remove("KRONIK_MASTER_KEY_FILE");
+        Daemon::spawn(dir, c)
     }
 
     /// A read that waits out the fail-closed window of the secret coverage
@@ -545,7 +451,7 @@ impl Daemon {
     fn get(&self, path: &str) -> Value {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            let (status, v) = self.api("GET", path, Value::Null);
+            let (status, v) = self.call("GET", path, Value::Null);
             if status == 200 {
                 return v;
             }
@@ -556,7 +462,7 @@ impl Daemon {
             assert!(
                 Instant::now() < deadline,
                 "GET {path} stayed unavailable: {}",
-                self.serve_log()
+                self.log()
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -568,7 +474,7 @@ impl Daemon {
     fn mutate(&self, method: &str, path: &str, body: Value) -> Value {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            let (status, v) = self.api(method, path, body.clone());
+            let (status, v) = self.call(method, path, body.clone());
             if status == 200 {
                 return v;
             }
@@ -586,7 +492,7 @@ impl Daemon {
             assert!(
                 Instant::now() < deadline,
                 "{method} {path} stayed unavailable: {}",
-                self.serve_log()
+                self.log()
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -600,7 +506,7 @@ impl Daemon {
     fn cli(&self, args: &[&str]) -> Out {
         let out = Command::new(KRONIK)
             .arg("--socket")
-            .arg(self.sock())
+            .arg(self.socket())
             .args(args)
             .env_remove("KRONIK_API_SOCKET")
             .env_remove("KRONIK_TOKEN")
@@ -672,7 +578,7 @@ impl Daemon {
 
     /// A message to `actor` whose turn must be answered with 200; the answer.
     fn send(&self, actor: &str, name: &str, text: &str) -> Value {
-        let (status, v) = self.api(
+        let (status, v) = self.call(
             "POST",
             &format!("/v1/actors/{actor}/messages"),
             json!({"name": name, "text": text, "reason": "secret backends"}),
@@ -683,19 +589,11 @@ impl Daemon {
 
     /// Sends on a background thread: the daemon may die first.
     fn send_detached(&self, actor: &str, name: &str, text: &str) {
-        let socket = self.sock();
+        let socket = self.socket();
         let path = format!("/v1/actors/{actor}/messages");
-        let body = json!({"name": name, "text": text, "reason": "secret backends"}).to_string();
+        let body = json!({"name": name, "text": text, "reason": "secret backends"});
         std::thread::spawn(move || {
-            if let Ok(mut s) = UnixStream::connect(socket) {
-                let _ = write!(
-                    s,
-                    "POST {path} HTTP/1.1\r\nhost: kronik\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let mut sink = Vec::new();
-                let _ = s.read_to_end(&mut sink);
-            }
+            let _ = common::try_api(&socket, "POST", &path, &body, None);
         });
     }
 
@@ -708,17 +606,6 @@ impl Daemon {
 
     fn applied_lsn(&self) -> u64 {
         self.get("/v1/health")["applied_lsn"].as_u64().unwrap()
-    }
-
-    fn wait_until(&self, what: &str, f: impl Fn(&Daemon) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(90);
-        while Instant::now() < deadline {
-            if f(self) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        panic!("timed out waiting for {what}: {}", self.serve_log());
     }
 
     /// Waits until neither the log nor the backend has moved for 200 ms.
@@ -749,7 +636,7 @@ impl Daemon {
             "the daemon never went quiet: at lsn {} the backend had seen {} requests: {}",
             last.0,
             last.1,
-            self.serve_log()
+            self.log()
         );
     }
 
@@ -801,7 +688,7 @@ impl Daemon {
             .unwrap();
         runtime.block_on(async {
             const ENDPOINT: &str = "http://localhost/mcp";
-            let client = UnixSocketHttpClient::new(&self.sock().to_string_lossy(), ENDPOINT);
+            let client = UnixSocketHttpClient::new(&self.socket().to_string_lossy(), ENDPOINT);
             let config = StreamableHttpClientTransportConfig::with_uri(ENDPOINT);
             let transport = StreamableHttpClientTransport::with_client(client, config);
             let client: RunningService<RoleClient, ()> = ().serve(transport).await.unwrap();
@@ -831,12 +718,6 @@ impl Daemon {
             out.push(serde_json::to_string(&config).unwrap());
             out
         })
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        self.kill9();
     }
 }
 
@@ -1352,7 +1233,7 @@ fn a_crash_re_run_of_a_reveal_gets_the_recorded_version_and_waits_while_the_back
     bao.set_mode(Mode::Unavailable);
     d = Daemon::start(dir.path(), Some(&bao), "1s");
     let others = committed_messages(dir.path(), "counter/a", "increment");
-    let (status, answer) = d.api(
+    let (status, answer) = d.call(
         "POST",
         "/v1/actors/counter/a/messages",
         json!({"name": "increment", "reason": "a turn without a secret"}),
@@ -1535,7 +1416,7 @@ fn a_destroyed_version_is_scrubbed_from_its_copy_after_a_restart() {
     let scrubbed_after_restart = |d: &Daemon| {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let (status, v) = d.api("GET", "/v1/actors/counter/s", Value::Null);
+            let (status, v) = d.call("GET", "/v1/actors/counter/s", Value::Null);
             if status == 200 {
                 return v;
             }
@@ -1546,7 +1427,7 @@ fn a_destroyed_version_is_scrubbed_from_its_copy_after_a_restart() {
             assert!(
                 Instant::now() < deadline,
                 "the reads that scrub stayed unavailable after the restart: {}",
-                d.serve_log()
+                d.log()
             );
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -1575,7 +1456,7 @@ fn a_destroyed_version_is_scrubbed_from_its_copy_after_a_restart() {
     d = Daemon::start(dir.path(), Some(&bao), "1s");
     let down = scrubbed_after_restart(&d);
     assert_eq!(shown(&down), "[secret:stripe]", "{down}");
-    let (_, failed) = d.api(
+    let (_, failed) = d.call(
         "POST",
         "/v1/actors/counter/a/messages",
         json!({"name": "hmac", "text": "stripe\npayload", "reason": "no operational value"}),
@@ -1636,7 +1517,7 @@ fn the_scrubbing_of_a_revealed_value_survives_a_restart() {
         "/v1/actors/counter/sink".to_owned(),
         format!("/v1/turns/{turn_id}"),
     ] {
-        let (status, v) = d.api("GET", &path, Value::Null);
+        let (status, v) = d.call("GET", &path, Value::Null);
         assert_eq!(status, 503, "{path}: {v}");
         assert_eq!(v["error"]["code"], "SECRET_UNAVAILABLE", "{path}: {v}");
         assert!(!v.to_string().contains(VALUE_1), "{path}: {v}");
@@ -1681,7 +1562,7 @@ fn a_backend_that_hangs_stops_only_the_turns_that_need_its_secrets() {
     let before = committed_messages(dir.path(), "counter/a", "increment");
     for _ in 0..5 {
         let started = Instant::now();
-        let (status, answer) = d.api(
+        let (status, answer) = d.call(
             "POST",
             "/v1/actors/counter/a/messages",
             json!({"name": "increment", "reason": "a turn without a secret"}),
@@ -1699,7 +1580,7 @@ fn a_backend_that_hangs_stops_only_the_turns_that_need_its_secrets() {
     // with it (this guest does not handle it), so the turn is a failed turn, not
     // an open one (design m23 sections 6 and 9).
     let started = Instant::now();
-    let (status, answer) = d.api(
+    let (status, answer) = d.call(
         "POST",
         "/v1/actors/counter/h/messages",
         json!({"name": "hmac", "text": "stripe\npayload", "reason": "an uncached secret"}),
@@ -1712,12 +1593,12 @@ fn a_backend_that_hangs_stops_only_the_turns_that_need_its_secrets() {
     assert_eq!(open_turns(dir.path()), 0, "the aborted turn was left open");
     // The rebuild that cannot hold version 1 says which version it is.
     d.wait_until("the rebuild warning to name the version", |d| {
-        d.serve_log()
+        d.log()
             .contains("failed_version=stripe@v1 on bao: the secret backend is unavailable")
     });
 
     // Turns without a secret still commit.
-    let (status, _) = d.api(
+    let (status, _) = d.call(
         "POST",
         "/v1/actors/counter/a/messages",
         json!({"name": "increment", "reason": "after the failed secret"}),
@@ -1795,7 +1676,7 @@ fn assert_closed_when_quiet(d: &Daemon, what: &str) {
         assert!(
             Instant::now() < deadline,
             "{what}: the daemon never became quiet: {}",
-            d.serve_log()
+            d.log()
         );
         std::thread::sleep(Duration::from_millis(100));
         let now = d.applied_lsn();
@@ -1858,7 +1739,7 @@ fn a_turn_that_cannot_get_its_secret_leaves_no_open_turn() {
         body.chars().take(160).collect::<String>()
     );
     assert!(body.contains("SECRET_UNAVAILABLE"), "{status} {body}");
-    let (status, v) = l.d.api(
+    let (status, v) = l.d.call(
         "POST",
         "/v1/actors/counter/h/messages",
         json!({"name": "hmac", "text": "stripe\npayload", "reason": "uncached"}),
@@ -1922,7 +1803,7 @@ fn retrying_with_the_same_key_after_the_outage_sends_the_request_at_most_once() 
 #[test]
 fn a_timer_that_meets_the_outage_does_not_wait_for_a_restart() {
     let Linked { d, bao, dir } = after_a_restart_with_the_backend_down("idempotency-keyed").0;
-    let (status, v) = d.api(
+    let (status, v) = d.call(
         "POST",
         "/v1/actors/counter/h/messages",
         json!({"name": "schedule", "text": "300 hmac\nstripe\npayload", "reason": "timer"}),
@@ -2037,7 +1918,7 @@ fn a_fork_replays_the_secret_errors_that_production_recorded() {
         ),
     ];
     for (name, text, ..) in &cases {
-        let (status, answer) = d.api(
+        let (status, answer) = d.call(
             "POST",
             "/v1/actors/counter/h/messages",
             json!({"name": name, "text": text, "reason": "an outage"}),
@@ -2123,7 +2004,7 @@ fn http_turns(dir: &Path, actor: &str) -> Vec<pb::TurnRecord> {
 
 /// The lines of the daemon's log about secrets that could not be fetched.
 fn fetch_failures(d: &Daemon) -> Vec<String> {
-    d.serve_log()
+    d.log()
         .lines()
         .filter(|line| line.contains("secret fetch failed"))
         .map(str::to_owned)
@@ -2196,7 +2077,7 @@ fn ask_for_the_secret_twice(d: &Daemon, target: &Target) {
     let (status, body) = gateway(&gw, "/counter/h/fetch", &fetch_spec(target), Some("K-R"));
     assert_eq!(status, 500, "{body}");
     assert!(body.contains("TURN_FAILED"), "{body}");
-    let (status, answer) = d.api(
+    let (status, answer) = d.call(
         "POST",
         "/v1/actors/counter/h/messages",
         json!({"name": "hmac", "text": "stripe\npayload", "reason": "a refusal"}),
@@ -2234,7 +2115,7 @@ fn a_backend_that_refuses_ends_the_effect_like_an_outage_and_the_log_says_why() 
         lines.iter().any(|line| line.contains("version=current")),
         "{lines:?}"
     );
-    let log = d.serve_log();
+    let log = d.log();
     assert!(!log.contains(BAO_TOKEN), "the credential is in the log");
     assert!(
         !log.contains("permission denied"),
@@ -2269,7 +2150,7 @@ fn a_name_whose_backend_is_no_longer_configured_ends_the_effect_and_the_log_says
 /// A message into a fork that makes `counter/h` HMAC `payload` with `secret`:
 /// the status, the body, and the effect the fork recorded for it.
 fn fork_hmac(d: &Daemon, fork: &str, secret: &str) -> (u16, Value) {
-    d.api(
+    d.call(
         "POST",
         &format!("/v1/forks/{fork}/actors/counter/h/messages"),
         json!({"name": "hmac", "text": format!("{secret}\npayload"), "reason": "a linked name"}),
@@ -2444,7 +2325,7 @@ fn a_foreign_actor_gets_a_linked_name_through_the_resolver() {
     }
     d.link("stripe", "secret/payments#stripe");
     let add = |d: &Daemon, secret: &str| {
-        d.api(
+        d.call(
             "POST",
             "/v1/foreign",
             json!({"name": "echo", "image": "oci-layout:/nonexistent/image.oci", "port": 8080,

@@ -229,6 +229,24 @@ impl Daemon {
         v
     }
 
+    /// One request; any status. Panics with the log when there is no answer.
+    pub fn call(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
+        self.try_api(method, path, body)
+            .unwrap_or_else(|| panic!("API {method} {path} failed: {}", self.log()))
+    }
+
+    /// Polls `f` every 50 ms, up to 1800 times (90 s, secret_backends.rs's
+    /// bound); panics with `what` and the log if it never holds.
+    pub fn wait_until(&self, what: &str, f: impl Fn(&Daemon) -> bool) {
+        for _ in 0..1800 {
+            if f(self) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for {what}: {}", self.log());
+    }
+
     /// SIGKILL and wait; errors ignored; no-op when already stopped.
     pub fn kill9(&mut self) {
         if let Some(mut child) = self.child.take() {

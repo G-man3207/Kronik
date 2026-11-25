@@ -10,15 +10,17 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use kronik_proto::Record;
 use serde_json::{Value, json};
+
+mod common;
+
+use common::Daemon;
 
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -152,110 +154,21 @@ fn serve(stream: TcpStream, st: Arc<(Mutex<ServerState>, Condvar)>) {
 
 // ---------------------------------------------------------------- daemon
 
-struct Daemon {
-    dir: PathBuf,
-    child: Option<Child>,
-}
-
 impl Daemon {
-    fn sock(&self) -> PathBuf {
-        self.dir.join("api.sock")
-    }
-
     fn start(dir: &Path, extra: &[&str]) -> Daemon {
         Daemon::start_logging(dir, extra, "warn")
     }
 
     fn start_logging(dir: &Path, extra: &[&str], level: &str) -> Daemon {
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("serve.log"))
-            .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_kronik"))
-            .arg("serve")
-            .env("KRONIK_DISK_RESERVE", "0B")
-            .arg("--data-dir")
-            .arg(dir.join("data"))
-            .args(["--http-listen", "127.0.0.1:0", "--api-socket"])
-            .arg(dir.join("api.sock"))
-            .args(extra)
-            .env("KRONIK_LOG", level)
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        let d = Daemon {
-            dir: dir.to_path_buf(),
-            child: Some(child),
-        };
-        for _ in 0..400 {
-            if d.try_api("GET", "/v1/health", Value::Null)
-                .is_some_and(|(s, _)| s == 200)
-            {
-                return d;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        panic!(
-            "daemon did not start: {}",
-            std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default()
-        );
-    }
-
-    /// SIGKILL.
-    fn kill9(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            c.kill().unwrap();
-            c.wait().unwrap();
-        }
-    }
-
-    fn try_api(&self, method: &str, path: &str, body: Value) -> Option<(u16, Value)> {
-        let mut s = UnixStream::connect(self.sock()).ok()?;
-        let body = if body.is_null() {
-            String::new()
-        } else {
-            body.to_string()
-        };
-        write!(
-            s,
-            "{method} {path} HTTP/1.1\r\nhost: kronik\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .ok()?;
-        let mut r = BufReader::new(s);
-        let mut line = String::new();
-        r.read_line(&mut line).ok()?;
-        let status: u16 = line.split_whitespace().nth(1)?.parse().ok()?;
-        let mut len = 0;
-        loop {
-            let mut h = String::new();
-            r.read_line(&mut h).ok()?;
-            let h = h.trim_end();
-            if h.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = h.split_once(':')
-                && k.eq_ignore_ascii_case("content-length")
-            {
-                len = v.trim().parse().ok()?;
-            }
-        }
-        let mut buf = vec![0; len];
-        r.read_exact(&mut buf).ok()?;
-        Some((status, serde_json::from_slice(&buf).ok()?))
-    }
-
-    fn api(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
-        self.try_api(method, path, body)
-            .unwrap_or_else(|| panic!("API {method} {path} failed"))
+        let mut c = Daemon::command(env!("CARGO_BIN_EXE_kronik"), dir, None);
+        c.args(extra).env("KRONIK_LOG", level);
+        Daemon::spawn(dir, c)
     }
 
     fn deploy(&self) {
         let wasm =
             base64::engine::general_purpose::STANDARD.encode(std::fs::read(COUNTER).unwrap());
-        let (s, v) = self.api(
+        let (s, v) = self.call(
             "POST",
             "/v1/deployments",
             json!({"wasm_base64": wasm, "reason": "kill test"}),
@@ -264,7 +177,7 @@ impl Daemon {
     }
 
     fn grant(&self, cap: &str, delivery: Option<&str>) {
-        let (s, v) = self.api(
+        let (s, v) = self.call(
             "POST",
             "/v1/grants",
             json!({"kind": "counter", "capability": cap, "delivery": delivery, "reason": "kill test"}),
@@ -274,44 +187,20 @@ impl Daemon {
 
     /// Sends a message on a background thread (the daemon may die first).
     fn send_detached(&self, actor: &str, name: &str, text: &str) {
-        let sock = self.sock();
+        let socket = self.socket();
         let path = format!("/v1/actors/{actor}/messages");
-        let body = json!({"name": name, "text": text, "reason": "kill test"}).to_string();
+        let body = json!({"name": name, "text": text, "reason": "kill test"});
         std::thread::spawn(move || {
-            if let Ok(mut s) = UnixStream::connect(sock) {
-                let _ = write!(
-                    s,
-                    "POST {path} HTTP/1.1\r\nhost: kronik\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let mut sink = Vec::new();
-                let _ = s.read_to_end(&mut sink);
-            }
+            let _ = common::try_api(&socket, "POST", &path, &body, None);
         });
     }
 
-    fn wait_until(&self, what: &str, f: impl Fn(&Daemon) -> bool) {
-        for _ in 0..1200 {
-            if f(self) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        panic!("timed out waiting for {what}");
-    }
-
     fn history(&self, actor: &str) -> Vec<Value> {
-        let (s, v) = self.api("GET", &format!("/v1/actors/{actor}/history"), Value::Null);
+        let (s, v) = self.call("GET", &format!("/v1/actors/{actor}/history"), Value::Null);
         if s != 200 {
             return Vec::new();
         }
         v["turns"].as_array().cloned().unwrap_or_default()
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        self.kill9();
     }
 }
 
@@ -491,7 +380,7 @@ fn kill9_before_the_result_unsafe_is_not_retried_and_dead_letters() {
     server.release();
     let d = Daemon::start(dir.path(), &[]);
     d.wait_until("the dead letter", |d| {
-        d.api("GET", "/v1/dead-letters", Value::Null).1["dead_letters"]
+        d.call("GET", "/v1/dead-letters", Value::Null).1["dead_letters"]
             .as_array()
             .is_some_and(|a| !a.is_empty())
     });
@@ -501,7 +390,7 @@ fn kill9_before_the_result_unsafe_is_not_retried_and_dead_letters() {
         1,
         "an unsafe effect must not be sent again"
     );
-    let (_, v) = d.api("GET", "/v1/dead-letters", Value::Null);
+    let (_, v) = d.call("GET", "/v1/dead-letters", Value::Null);
     assert_eq!(v["dead_letters"][0]["error_code"], "EFFECT_OUTCOME_UNKNOWN");
     let turn = &d.history("counter/a")[0];
     assert_eq!(turn["outcome"]["kind"], "effect_outcome_unknown");
@@ -509,7 +398,7 @@ fn kill9_before_the_result_unsafe_is_not_retried_and_dead_letters() {
     assert_eq!(turn["effects"][0]["delivery"], "unsafe");
     // The dead letter's turn holds the request that was not sent again.
     let id = v["dead_letters"][0]["id"].as_str().unwrap().to_owned();
-    let (_, t) = d.api("GET", &format!("/v1/turns/{id}"), Value::Null);
+    let (_, t) = d.call("GET", &format!("/v1/turns/{id}"), Value::Null);
     assert_eq!(t["effects"][0]["target"], "http:127.0.0.1");
 }
 
@@ -532,7 +421,7 @@ fn kill9_after_the_callee_committed_reuses_its_saved_response() {
     let a = &d.history("counter/a")[0];
     assert_eq!(a["effects"][0]["kind"], "actor.call");
     assert_eq!(a["effects"][0]["status"], "ok");
-    let (_, inspect) = d.api("GET", "/v1/actors/counter/b", Value::Null);
+    let (_, inspect) = d.call("GET", "/v1/actors/counter/b", Value::Null);
     assert_eq!(inspect["state"][0]["text"], "1");
 }
 
@@ -542,14 +431,14 @@ fn revealed_secret_is_scrubbed_from_the_daemon_log_and_every_file() {
     let dir = tempfile::tempdir().unwrap();
     let mut d = Daemon::start_logging(dir.path(), &[], "info");
     d.deploy();
-    let (s, v) = d.api(
+    let (s, v) = d.call(
         "PUT",
         "/v1/secrets/db-password",
         json!({"text": SECRET, "reason": "test"}),
     );
     assert_eq!(s, 200, "{v}");
     d.grant("secret-reveal:db-password", None);
-    let (s, v) = d.api(
+    let (s, v) = d.call(
         "POST",
         "/v1/actors/counter/a/messages",
         json!({"name": "reveal-persist", "text": "db-password", "reason": "test"}),
