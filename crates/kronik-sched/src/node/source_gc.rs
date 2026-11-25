@@ -2,7 +2,6 @@
 use crate::node::Node;
 use kronik_core::authority::Authority;
 use kronik_core::error::{ApiError, ErrorCode};
-use kronik_core::snapshot_resources::{SnapshotRootPin, SnapshotRootRegistry};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,8 +51,7 @@ impl Node {
         }
         Ok((root, original))
     }
-    pub(crate) fn retain_native_source_paths(&self) -> Result<SnapshotRootPin, ApiError> {
-        let (root, _original) = self.native_source_directory()?;
-        SnapshotRootRegistry::retain(self.lifecycle.source_roots(), vec![root]).map_err(unavailable)
+    pub(crate) fn check_native_source_directory(&self) -> Result<(), ApiError> {
+        self.native_source_directory().map(|_| ())
     }
 }

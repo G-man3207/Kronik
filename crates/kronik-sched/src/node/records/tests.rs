@@ -116,21 +116,3 @@ async fn stopped_original_native_role_denies_a_capture_waiting_on_actual_deploy_
     assert!(node.capture_system_export_reader().await.is_err());
     drop(deploy);
 }
-
-#[tokio::test]
-async fn actual_native_record_reader_holds_its_physical_source_root_pin() {
-    let data = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = crate::start_local(env, data.path(), NodeConfig::default())
-        .await
-        .unwrap();
-    append(&node, "actual-root-pin").await;
-    let reader = node.capture_system_export_reader().await.unwrap();
-    let pin = reader
-        .root_pin
-        .as_ref()
-        .expect("actual start_local has protected physical storage");
-    assert!(pin.data_is_live_under_publication());
-    assert!(reader.check().is_ok());
-    reader.local_export_page(0, 256, 4 << 20).await.unwrap();
-}

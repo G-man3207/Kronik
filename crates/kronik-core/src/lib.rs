@@ -13,6 +13,5 @@ pub mod http;
 #[cfg(feature = "host-identity")]
 pub mod identity;
 pub mod ids;
-pub mod snapshot_resources;
 pub mod sync;
 pub mod time;

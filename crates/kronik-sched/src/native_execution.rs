@@ -21,7 +21,6 @@ pub(crate) struct Lifecycle {
     // Capabilities and admitted workers retain the SAME original root owner/File.
     // No File::try_clone and no lock reacquisition occurs.
     ownership: Option<kronik_privacy::key_source::DataOwnership>,
-    source_roots: Arc<Mutex<kronik_core::snapshot_resources::SnapshotRootRegistry>>,
 }
 impl Lifecycle {
     pub(crate) fn new(ownership: Option<kronik_privacy::key_source::DataOwnership>) -> Self {
@@ -29,9 +28,6 @@ impl Lifecycle {
             alive: AtomicBool::new(true),
             changed: Notify::new(),
             ownership,
-            source_roots: Arc::new(Mutex::new(
-                kronik_core::snapshot_resources::SnapshotRootRegistry::default(),
-            )),
         }
     }
     pub(crate) fn ownership(&self) -> Option<Arc<std::fs::File>> {
@@ -41,11 +37,6 @@ impl Lifecycle {
     }
     pub(crate) fn data_ownership(&self) -> Option<&kronik_privacy::key_source::DataOwnership> {
         self.ownership.as_ref()
-    }
-    pub(crate) fn source_roots(
-        &self,
-    ) -> &Arc<Mutex<kronik_core::snapshot_resources::SnapshotRootRegistry>> {
-        &self.source_roots
     }
     pub(crate) fn data_is_alive_under_publication(&self) -> bool {
         self.alive.load(Ordering::Acquire)

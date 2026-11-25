@@ -35,9 +35,6 @@ pub struct ShardReader {
     /// Next record's file offset, when the caller has one. A page that
     /// starts there does not CRC-walk the segment prefix.
     resume: Option<ExportResume>,
-    // Absent only when this native constructor has no configured physical
-    // storage. Its actual EnvFs handles are still retained by the readset.
-    root_pin: Option<kronik_core::snapshot_resources::SnapshotRootPin>,
 }
 
 /// Where the next export read should start. The offset is the caller's,
@@ -171,10 +168,6 @@ impl ShardReader {
     pub fn data_is_live_under_publication(&self) -> bool {
         self.execution.active_source_is_live_under_publication()
             && self.epoch.load(Ordering::Acquire) == self.expected_epoch
-            && self
-                .root_pin
-                .as_ref()
-                .is_none_or(|pin| pin.data_is_live_under_publication())
     }
 
     pub async fn page(
@@ -363,7 +356,7 @@ impl Node {
             let (node, execution, epoch, expected_epoch) = captured?;
             let original: AuthLease = execution.clone();
             let _deploy = node.lock_deploy_authorized(&original).await?;
-            let (through, head, root_pin) = {
+            let (through, head) = {
                 let _snapshot = tokio::select! {
                     biased;
                     () = original.cancelled() => return Err(ApiError::new(ErrorCode::Unavailable,
@@ -377,24 +370,20 @@ impl Node {
                         "the original native source configuration changed before capture",
                     ));
                 }
-                let root_pin = if node.cfg.storage.is_some() {
+                if node.cfg.storage.is_some() {
                     let owner = node.clone();
-                    Some(
-                        node.env
-                            .blocking("native-record-reader-roots", move || {
-                                owner.retain_native_source_paths()
-                            })
-                            .await
-                            .ok_or_else(|| {
-                                ApiError::new(
-                                    ErrorCode::Unavailable,
-                                    "the original native source root capture was interrupted",
-                                )
-                            })??,
-                    )
-                } else {
-                    None
-                };
+                    node.env
+                        .blocking("native-record-reader-roots", move || {
+                            owner.check_native_source_directory()
+                        })
+                        .await
+                        .ok_or_else(|| {
+                            ApiError::new(
+                                ErrorCode::Unavailable,
+                                "the original native source root capture was interrupted",
+                            )
+                        })??;
+                }
                 let applied = node.store.db().applied_lsn().map_err(store_err)?;
                 let head = node.applied_cut.frame(applied);
                 if applied > 0 && head.is_none() {
@@ -404,7 +393,7 @@ impl Node {
                     ));
                 }
                 let through = head.map(|(lsn, _)| lsn).unwrap_or(0);
-                (through, head, root_pin)
+                (through, head)
             };
             let (branch, retained_from, readset) = if through == 0 {
                 let readset = node
@@ -466,7 +455,6 @@ impl Node {
                 execution,
                 epoch,
                 expected_epoch,
-                root_pin,
                 resume,
                 point: ShardReadPoint {
                     branch,
