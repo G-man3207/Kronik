@@ -99,20 +99,15 @@ const RETENTION_HINT: &str =
 
 pub(crate) fn history_text(history: Duration) -> String {
     let ms = history.as_millis();
-    if ms == 0 {
-        return "0ms".to_owned();
-    }
-    if ms.is_multiple_of(86_400_000) {
-        return format!("{}d", ms / 86_400_000);
-    }
-    if ms.is_multiple_of(3_600_000) {
-        return format!("{}h", ms / 3_600_000);
-    }
-    if ms.is_multiple_of(60_000) {
-        return format!("{}m", ms / 60_000);
-    }
-    if ms.is_multiple_of(1_000) {
-        return format!("{}s", ms / 1_000);
+    for (unit, factor) in [
+        ("d", 86_400_000),
+        ("h", 3_600_000),
+        ("m", 60_000),
+        ("s", 1_000),
+    ] {
+        if ms >= factor && ms.is_multiple_of(factor) {
+            return format!("{}{unit}", ms / factor);
+        }
     }
     format!("{ms}ms")
 }
@@ -200,7 +195,7 @@ pub fn config_at_with(index: &ProductionIndex, lsn: Lsn, sql_default: u64) -> Co
     } else {
         Config::default().with_sql_default(sql_default)
     };
-    for r in index.config_records(lsn) {
+    for (_, r) in index.config_records(lsn) {
         c.apply(&r);
     }
     c
@@ -353,5 +348,25 @@ mod atomic_write_tests {
         })
         .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new answers");
+    }
+}
+
+#[cfg(test)]
+mod history_text_tests {
+    use super::history_text;
+    use std::time::Duration;
+
+    #[test]
+    fn picks_the_largest_unit_that_divides_the_history() {
+        for (ms, text) in [
+            (0, "0ms"),
+            (1_500, "1500ms"),
+            (90_000, "90s"),
+            (120_000, "2m"),
+            (10_800_000, "3h"),
+            (604_800_000, "7d"),
+        ] {
+            assert_eq!(history_text(Duration::from_millis(ms)), text, "{ms}ms");
+        }
     }
 }

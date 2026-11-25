@@ -208,17 +208,12 @@ impl Proposal {
                     "retention cut the window: {} back from the newest root input reaches \
                      before lsn {}, the oldest point the log and snapshots still hold, so \
                      only the root inputs after it were replayed",
-                    duration_text(c.window_ms),
+                    crate::history_text(Duration::from_millis(c.window_ms)),
                     c.kept_from_lsn
                 )
             })
             .collect()
     }
-}
-
-/// `3600000` -> `1h`.
-fn duration_text(ms: u64) -> String {
-    crate::history_text(Duration::from_millis(ms))
 }
 
 /// What `propose` needs besides the code.

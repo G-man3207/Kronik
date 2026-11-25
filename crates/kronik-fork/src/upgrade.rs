@@ -148,7 +148,7 @@ pub async fn check_with_pool(
     );
     let mut config_history = kronik_effects::ConfigHistory::default();
     let mut versions = BTreeMap::new();
-    for (_, record) in index.config_records_upto(head) {
+    for (_, record) in index.config_records(head) {
         if let kronik_proto::Record::Deployment(deployment) = &record {
             for kind in &deployment.kinds {
                 let hash =
