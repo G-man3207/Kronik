@@ -9,7 +9,7 @@ mod common;
 use std::sync::Arc;
 
 use common::*;
-use kronik_core::ids::ActorRef;
+use kronik_core::ids::{ActorRef, hex};
 use kronik_effects::InForks;
 use kronik_fork::diff::DiffOptions;
 use kronik_fork::proposal::Proposals;
@@ -20,10 +20,7 @@ use prost::Message as _;
 const KEY: &str = "fork-key-VALUE-91c4e2";
 
 fn hmac_hex(data: &[u8]) -> String {
-    kronik_effects::crypto::hmac_sha256(KEY.as_bytes(), data)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex(&kronik_effects::crypto::hmac_sha256(KEY.as_bytes(), data))
 }
 
 fn computations() -> u64 {
@@ -238,5 +235,5 @@ fn recorded_denies_an_unmatched_call_and_compute_does_not_leak_the_key() {
 }
 
 fn hex_of(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    hex(bytes)
 }

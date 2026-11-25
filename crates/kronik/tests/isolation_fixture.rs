@@ -813,10 +813,7 @@ fn create(args: &[String]) -> Result<()> {
     eprintln!("retained owned proof: {}", root.display());
     let mut random = [0u8; 16];
     fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-    let token = random
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let token = kronik_core::ids::hex(&random);
     let product = Path::new(&args[1]).canonicalize()?;
     let helper = std::env::current_exe()?.canonicalize()?;
     let product_metadata = product.metadata()?;

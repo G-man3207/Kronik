@@ -1004,6 +1004,7 @@ fn scrub_str<N: AsRef<str>, V: AsRef<[u8]>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kronik_core::ids::{hex, unhex};
 
     #[test]
     fn a_rematched_stream_finds_a_value_that_straddles_the_switch() {
@@ -1321,10 +1322,6 @@ mod tests {
         (request, target)
     }
 
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
     /// Version 2 fingerprints are recorded in every log: their bytes never
     /// change (ADR 0134 adds version 3 beside them). The request is decoded
     /// from the bytes a release before it wrote, without fields 6 and 7.
@@ -1333,10 +1330,7 @@ mod tests {
         let (request, target) = prepared("k1", "1");
         let written = "0a04504f5354122b68747470733a2f2f6170692e6578616d706c652e636f6d2f76312f636861726765733f74733d3126613d621a0f0a09782d6170692d6b657912026b311a0e0a08582d54656e616e74120274311a140a0a757365722d6167656e7412066b726f6e696b22027b7d2802";
         assert_eq!(hex(&prost::Message::encode_to_vec(&request)), written);
-        let bytes: Vec<u8> = (0..written.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&written[i..i + 2], 16).unwrap())
-            .collect();
+        let bytes = unhex(written).unwrap();
         let decoded: pb::HttpEffectRequest = prost::Message::decode(bytes.as_slice()).unwrap();
         assert!(decoded.fingerprint_excluded_headers.is_empty());
         assert_eq!(

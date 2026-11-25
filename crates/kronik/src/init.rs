@@ -1760,8 +1760,7 @@ mod tests {
         let exe = host.exe.to_string_lossy();
         let normalized = default.replace(exe.as_ref(), "@KRONIK@");
         let digest = sha2::Sha256::digest(normalized.as_bytes());
-        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        assert_eq!(hex, V041_UNIT_SHA256);
+        assert_eq!(kronik_core::ids::hex(&digest), V041_UNIT_SHA256);
         for absent in ["Delegate", "LoadCredential", "@KEY_"] {
             assert!(!default.contains(absent), "{absent}");
         }

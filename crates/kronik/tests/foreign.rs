@@ -289,10 +289,7 @@ fn containers(bin: &str, root: &Path, quiet: &str) -> Vec<String> {
 
 fn sha256_hex(b: &[u8]) -> String {
     use sha2::Digest as _;
-    sha2::Sha256::digest(b)
-        .iter()
-        .map(|x| format!("{x:02x}"))
-        .collect()
+    kronik_core::ids::hex(&sha2::Sha256::digest(b))
 }
 
 fn files_containing(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
@@ -1474,7 +1471,7 @@ fn random_token() -> String {
         .unwrap()
         .read_exact(&mut bytes)
         .unwrap();
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    kronik_core::ids::hex(&bytes)
 }
 
 /// The report of one check of the probe `actor`, asked through the counter
