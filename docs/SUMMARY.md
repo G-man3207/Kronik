@@ -159,3 +159,4 @@
 - [ADR 0158: A SQL secret is scanned once, then only in rows the turn wrote](adr/0158-sql-secret-scrub-scans-once.md)
 - [ADR 0159: Erasure defers foreign keys and refuses another subject's reference](adr/0159-erasure-defers-foreign-keys.md)
 - [ADR 0160: Apply a turn's SQL changesets together](adr/0160-cross-subject-foreign-key-apply.md)
+- [ADR 0161: A forked grounding row is a changed target for approvals](adr/0161-forked-grounding-changed-target.md)

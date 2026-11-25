@@ -720,11 +720,12 @@ differs from it:
   whose final state differs.
 - **Approvals across catch-up**: an approval holds for the diff it was
   given for, and also for a later diff (after catch-up) whose outcome is
-  not stricter, whose changed targets (approximate or synthetic grounding
-  rows, changed effects) were all changed when approved, and which replays
-  every root input the approved diff sampled in isolation. A later diff
-  that drops one of those roots needs a new approval, even if its changed
-  targets are a subset: the approval does not cover evidence it never saw.
+  not stricter, whose changed targets (approximate, forked or synthetic
+  grounding rows, changed effects) were all changed when approved, and which
+  replays every root input the approved diff sampled in isolation. A later
+  diff that drops one of those roots needs a new approval, even if its
+  changed targets are a subset: the approval does not cover evidence it
+  never saw.
 - **Both modes**: continuous replay runs on its own task next to the
   isolated workers (one fewer isolated worker).
 - **Stub rules** come with a replay or proposal (`stubs` in the request:
