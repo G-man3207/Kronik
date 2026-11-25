@@ -581,3 +581,24 @@ fn persisted_reason_uses_the_existing_credential_aware_output_predicate() {
     );
     assert_eq!(for_log(&token, Some(no_values)), "[secret:token]");
 }
+
+#[test]
+fn bounded_writer_refuses_growth_before_allocation_and_does_not_lose_accepted_bytes() {
+    use std::io::Write as _;
+
+    let mut output = BoundedWriter::new(4);
+    output.write_all(b"1234").unwrap();
+    assert!(output.write_all(b"5").is_err());
+    assert!(output.exceeded());
+    assert_eq!(output.count(), 4);
+    assert_eq!(output.into_bytes(), b"1234");
+
+    let mut counted = BoundedWriter::counting(3);
+    counted.write_all(b"ab").unwrap();
+    assert!(!counted.exceeded());
+    assert_eq!(counted.count(), 2);
+    assert!(counted.write_all(b"cd").is_err());
+    assert!(counted.exceeded());
+    assert_eq!(counted.count(), 2);
+    assert!(counted.into_bytes().is_empty());
+}

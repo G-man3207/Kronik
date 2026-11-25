@@ -7,10 +7,9 @@
 use std::ops::{Deref, DerefMut};
 
 use kronik_effects::http::{CompiledScrubber, ScrubError};
-use kronik_sched::scrub::{MAX_JSON_OUTPUT_BYTES, MAX_SECRET_PATTERN_BYTES};
+use kronik_sched::scrub::{BoundedWriter, MAX_JSON_OUTPUT_BYTES, MAX_SECRET_PATTERN_BYTES};
 use serde::Serialize;
 use serde_json::Value;
-use std::io::{self, Write};
 
 use crate::types::*;
 use crate::{ApiError, ErrorCode, Result, internal};
@@ -111,77 +110,28 @@ pub(super) fn scrub_error(error: ScrubError) -> ApiError {
     }
 }
 
-struct BoundedWriter {
-    bytes: Vec<u8>,
-    remaining: usize,
-    count: usize,
-    collect: bool,
-    exceeded: bool,
-}
-
-impl Write for BoundedWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > self.remaining {
-            self.exceeded = true;
-            return Err(io::Error::other("JSON output limit"));
-        }
-        if self.collect {
-            let required = self.count + bytes.len();
-            if required > self.bytes.capacity() {
-                let limit = self.count + self.remaining;
-                let capacity = self
-                    .bytes
-                    .capacity()
-                    .saturating_mul(2)
-                    .max(required)
-                    .min(limit);
-                self.bytes
-                    .try_reserve_exact(capacity - self.bytes.len())
-                    .map_err(|_| io::Error::other("JSON output allocation unavailable"))?;
-            }
-            self.bytes.extend_from_slice(bytes);
-        }
-        self.remaining -= bytes.len();
-        self.count += bytes.len();
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn writer(limit: usize, collect: bool) -> BoundedWriter {
-    BoundedWriter {
-        bytes: Vec::new(),
-        remaining: limit,
-        count: 0,
-        collect,
-        exceeded: false,
-    }
-}
-
 fn encoded_len<T: Serialize + ?Sized>(value: &T, limit: usize) -> Result<usize> {
-    let mut output = writer(limit, false);
+    let mut output = BoundedWriter::counting(limit);
     if let Err(error) = serde_json::to_writer(&mut output, value) {
-        return Err(if output.exceeded {
+        return Err(if output.exceeded() {
             scrub_error(ScrubError::OutputLimit)
         } else {
             internal(error)
         });
     }
-    Ok(output.count)
+    Ok(output.count())
 }
 
 pub(super) fn bounded_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
-    let mut output = writer(MAX_JSON_OUTPUT_BYTES, true);
+    let mut output = BoundedWriter::new(MAX_JSON_OUTPUT_BYTES);
     if let Err(error) = serde_json::to_writer(&mut output, value) {
-        return Err(if output.exceeded {
+        return Err(if output.exceeded() {
             scrub_error(ScrubError::OutputLimit)
         } else {
             internal(error)
         });
     }
-    Ok(output.bytes)
+    Ok(output.into_bytes())
 }
 
 fn text(value: &mut String, context: &mut Context<'_>) {
@@ -1324,14 +1274,6 @@ mod tests {
         let mut context = Context::new(&inventory, 5);
         text(&mut escaped, &mut context);
         assert!(matches!(context.error, Some(ScrubError::OutputLimit)));
-    }
-
-    #[test]
-    fn bounded_writer_rejects_before_extending() {
-        let mut output = writer(3, true);
-        output.write_all(b"ab").unwrap();
-        assert!(output.write_all(b"cd").is_err());
-        assert_eq!(output.bytes, b"ab");
     }
 
     #[test]
