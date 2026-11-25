@@ -151,25 +151,8 @@ async fn real_owned_wss_opening_and_each_command_keep_the_original_ordinary_auth
     listener.set_nonblocking(true).unwrap();
     let url = format!("https://{}", listener.local_addr().unwrap());
     let issuer = Network::default();
-    let mut ca_params = rcgen::CertificateParams::default();
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![
-        rcgen::KeyUsagePurpose::KeyCertSign,
-        rcgen::KeyUsagePurpose::CrlSign,
-    ];
-    let ca_key = kronik_fleet::identity::ed25519_key(&[41; 32]).unwrap();
-    let ca = ca_params.self_signed(&ca_key).unwrap();
-    *issuer.issuer.lock().unwrap() = Some(rcgen::Issuer::new(ca_params, ca_key));
-    let mut protected_ca = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
-    protected_ca.write_all(ca.pem().as_bytes()).unwrap();
-    let ca_file = directory.path().join("ca.pem");
-    protected_ca.persist(&ca_file).unwrap();
-    let server_key = kronik_fleet::identity::ed25519_key(&[42; 32]).unwrap();
-    let mut server_params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
-    server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
-    let server_cert = server_params
-        .signed_by(&server_key, issuer.issuer.lock().unwrap().as_ref().unwrap())
-        .unwrap();
+    let (ca, ca_file) = controller_ca(directory.path(), &issuer, 41);
+    let (server_key, server_cert) = server_certificate(&issuer, 42);
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
@@ -310,15 +293,7 @@ async fn real_owned_wss_opening_and_each_command_keep_the_original_ordinary_auth
     })
     .await
     .unwrap();
-    let mut store = TokenStore::open_file(&keys.join("tokens.db")).unwrap();
-    store
-        .bind_before_any_issuer(node.publication_domain())
-        .unwrap();
-    let startup_original = node.local_operator_authority().unwrap();
-    store
-        .bind_execution_before_any_issuer(&node.publication_domain(), startup_original.clone())
-        .unwrap();
-    let tokens = Arc::new(store);
+    let (tokens, startup_original) = bound_tokens(&node, &keys);
     let api = crate::Api::new(node.clone())
         .with_tokens(tokens.clone())
         .unwrap();
