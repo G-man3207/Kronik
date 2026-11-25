@@ -2486,10 +2486,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let api = crate::Api::new(node.clone())
-            .with_tokens(auth.tokens.clone())
-            .unwrap()
-            .with_browser(auth.clone());
+        let api = browser_api(&node, &auth);
         let mut mutation = request(administrator.unwrap());
         mutation.method = "PUT".into();
         mutation.path = "/v1/auth/config".into();
@@ -2579,10 +2576,7 @@ mod tests {
         .await
         .unwrap();
         for auth in [configured.clone(), disabled] {
-            let api = crate::Api::new(node.clone())
-                .with_tokens(auth.tokens.clone())
-                .unwrap()
-                .with_browser(auth.clone());
+            let api = browser_api(&node, &auth);
             assert_eq!(
                 auth.caller(&ordinary).unwrap().token_id,
                 "token:prefix-collision"
@@ -3106,13 +3100,18 @@ mod tests {
         fixture_for_node(node, [Scope::Read].into(), node.sealer().clone()).await
     }
 
+    /// The browser-facing API over `node`, with `auth`'s token store.
+    fn browser_api(node: &Arc<kronik_sched::Node>, auth: &Arc<BrowserAuth>) -> crate::Api {
+        crate::Api::new(node.clone())
+            .with_tokens(auth.tokens.clone())
+            .unwrap()
+            .with_browser(auth.clone())
+    }
+
     #[tokio::test]
     async fn typed_login_history_uses_the_original_session_and_actual_durable_receipt() {
         let (auth, credential, bearer, (_dir, node)) = fixture().await;
-        let api = crate::Api::new(node.clone())
-            .with_tokens(auth.tokens.clone())
-            .unwrap()
-            .with_browser(auth.clone());
+        let api = browser_api(&node, &auth);
         let captured = api.capture_binding(&request(credential.clone())).unwrap();
         let session = captured.session().unwrap().clone();
         let (source, _plan) = api
@@ -3220,19 +3219,24 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn cancelled_callback_denies_its_detached_blocking_identity_continuation() {
-        let dir = tempfile::tempdir().unwrap();
-        let env = Env::real(tokio::runtime::Handle::current());
-        let node = kronik_sched::start_local(env, dir.path(), kronik_sched::NodeConfig::default())
-            .await
-            .unwrap();
-        let (auth, existing, bearer) = committed_browser_fixture(&node).await;
-        let api = crate::Api::new(node.clone())
-            .with_tokens(auth.tokens.clone())
-            .unwrap()
-            .with_browser(auth.clone());
-        let (credential, mut draft, original, cleanup) = pending_native_session(&auth, &existing);
+    struct PendingLogin {
+        credential: String,
+        draft: Session,
+        original: kronik_core::authority::SessionLease,
+        cleanup: PendingSession,
+        owner: String,
+        receipt: SourcePos,
+        plan: kronik_sched::SubjectKeyPlan,
+    }
+
+    /// Starts a native login the way the callback does, and records it.
+    async fn pending_login(
+        api: &crate::Api,
+        auth: &Arc<BrowserAuth>,
+        existing: &str,
+        reason: &str,
+    ) -> PendingLogin {
+        let (credential, draft, original, cleanup) = pending_native_session(auth, existing);
         let owner = principal(
             original
                 .revocation()
@@ -3241,17 +3245,46 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        let (_receipt, plan) = api
+        let (receipt, plan) = api
             .record_native_oidc_login(
                 pb::Audit {
                     token_id: owner.clone(),
-                    reason: "real detached blocking callback".into(),
+                    reason: reason.into(),
                     wall_time_ms: auth.env.clock.wall_ms(),
                 },
                 original.clone(),
             )
             .await
             .unwrap();
+        PendingLogin {
+            credential,
+            draft,
+            original,
+            cleanup,
+            owner,
+            receipt,
+            plan,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_callback_denies_its_detached_blocking_identity_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::real(tokio::runtime::Handle::current());
+        let node = kronik_sched::start_local(env, dir.path(), kronik_sched::NodeConfig::default())
+            .await
+            .unwrap();
+        let (auth, existing, bearer) = committed_browser_fixture(&node).await;
+        let api = browser_api(&node, &auth);
+        let PendingLogin {
+            credential,
+            mut draft,
+            original,
+            cleanup,
+            owner,
+            plan,
+            ..
+        } = pending_login(&api, &auth, &existing, "real detached blocking callback").await;
         let value =
             verified_identity_value(&auth.sealer, "https://issuer", "stable-subject", &owner)
                 .unwrap();
@@ -3311,10 +3344,7 @@ mod tests {
     #[tokio::test]
     async fn unpublished_callback_is_not_a_browser_session_or_a_replayable_login() {
         let (auth, existing, bearer, (_dir, node)) = fixture().await;
-        let api = crate::Api::new(node.clone())
-            .with_tokens(auth.tokens.clone())
-            .unwrap()
-            .with_browser(auth.clone());
+        let api = browser_api(&node, &auth);
         let (credential, _, original, cleanup) = pending_native_session(&auth, &existing);
         original.check().unwrap();
         assert!(auth.session(&credential).is_err());
@@ -3369,10 +3399,7 @@ mod tests {
                 .capture_for_scope(&request(credential.clone()), Scope::Read)
                 .is_err()
         );
-        let api = crate::Api::new(node)
-            .with_tokens(auth.tokens.clone())
-            .unwrap()
-            .with_browser(auth.clone());
+        let api = browser_api(&node, &auth);
         let mut req = request(credential);
         req.path = "/v1/auth/session".into();
         assert!(auth.route(&req, None, &api, None).await.unwrap().is_err());
@@ -3414,10 +3441,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let api = crate::Api::new(node)
-            .with_tokens(auth.tokens.clone())
-            .unwrap()
-            .with_browser(auth.clone());
+        let api = browser_api(&node, &auth);
         let mut req = request(credential.clone());
         req.path = "/v1/auth/session".into();
         let before_body = auth.capture_protocol_request(&req, &api).unwrap().unwrap();
@@ -3454,10 +3478,7 @@ mod tests {
             .await
             .unwrap();
         let (auth, existing, bearer) = committed_browser_fixture(&node).await;
-        let api = crate::Api::new(node.clone())
-            .with_tokens(auth.tokens.clone())
-            .unwrap()
-            .with_browser(auth.clone());
+        let api = browser_api(&node, &auth);
         let credential = format!("{SESSION_PREFIX}{}", random(&auth.env));
         let mut draft = auth.session(&existing).unwrap();
         draft.verified_identity = None;
@@ -3503,10 +3524,7 @@ mod tests {
             subject,
         )
         .await;
-        let api = crate::Api::new(node.clone())
-            .with_tokens(auth.tokens.clone())
-            .unwrap()
-            .with_browser(auth.clone());
+        let api = browser_api(&node, &auth);
         for mode in [pb::PrivacyState::Off, pb::PrivacyState::On] {
             node.set_privacy_mode(
                 mode,
@@ -3634,30 +3652,22 @@ mod tests {
             panic!("expected protected original identity")
         };
         let retained_version = retained.key_version;
-        let api = crate::Api::new(node.clone())
-            .with_tokens(auth.tokens.clone())
-            .unwrap()
-            .with_browser(auth.clone());
-        let (credential, mut draft, original, cleanup) = pending_native_session(&auth, &existing);
-        let owner = principal(
-            original
-                .revocation()
-                .principal_hash
-                .as_slice()
-                .try_into()
-                .unwrap(),
-        );
-        let (_receipt, plan) = api
-            .record_native_oidc_login(
-                pb::Audit {
-                    token_id: owner.clone(),
-                    reason: "retain exact callback key through ordinary rotation".into(),
-                    wall_time_ms: auth.env.clock.wall_ms(),
-                },
-                original.clone(),
-            )
-            .await
-            .unwrap();
+        let api = browser_api(&node, &auth);
+        let PendingLogin {
+            credential,
+            mut draft,
+            original,
+            cleanup,
+            owner,
+            plan,
+            ..
+        } = pending_login(
+            &api,
+            &auth,
+            &existing,
+            "retain exact callback key through ordinary rotation",
+        )
+        .await;
         let rotated_version = node
             .sealer()
             .keystore()
@@ -3714,31 +3724,16 @@ mod tests {
                     .await
                     .unwrap();
             let (auth, existing, bearer) = committed_browser_fixture(&node).await;
-            let api = crate::Api::new(node.clone())
-                .with_tokens(auth.tokens.clone())
-                .unwrap()
-                .with_browser(auth.clone());
-            let (credential, mut draft, original, cleanup) =
-                pending_native_session(&auth, &existing);
-            let owner = principal(
-                original
-                    .revocation()
-                    .principal_hash
-                    .as_slice()
-                    .try_into()
-                    .unwrap(),
-            );
-            let (receipt, plan) = api
-                .record_native_oidc_login(
-                    pb::Audit {
-                        token_id: owner.clone(),
-                        reason: "actual pending callback key fence".into(),
-                        wall_time_ms: auth.env.clock.wall_ms(),
-                    },
-                    original.clone(),
-                )
-                .await
-                .unwrap();
+            let api = browser_api(&node, &auth);
+            let PendingLogin {
+                credential,
+                mut draft,
+                original,
+                cleanup,
+                owner,
+                receipt,
+                plan,
+            } = pending_login(&api, &auth, &existing, "actual pending callback key fence").await;
             let value =
                 verified_identity_value(&auth.sealer, "https://issuer", "stable-subject", &owner)
                     .unwrap();
@@ -3799,32 +3794,23 @@ mod tests {
             .await
             .unwrap();
         let (auth, existing, bearer) = committed_browser_fixture(&node).await;
-        let api = crate::Api::new(node.clone())
-            .with_tokens(auth.tokens.clone())
-            .unwrap()
-            .with_browser(auth.clone());
+        let api = browser_api(&node, &auth);
         for wrong_sealer in [true, false] {
-            let (credential, mut draft, original, cleanup) =
-                pending_native_session(&auth, &existing);
-            let owner = principal(
-                original
-                    .revocation()
-                    .principal_hash
-                    .as_slice()
-                    .try_into()
-                    .unwrap(),
-            );
-            let (_receipt, plan) = api
-                .record_native_oidc_login(
-                    pb::Audit {
-                        token_id: owner.clone(),
-                        reason: "actual physical and original-session binding".into(),
-                        wall_time_ms: auth.env.clock.wall_ms(),
-                    },
-                    original.clone(),
-                )
-                .await
-                .unwrap();
+            let PendingLogin {
+                credential,
+                mut draft,
+                original,
+                cleanup,
+                owner,
+                plan,
+                ..
+            } = pending_login(
+                &api,
+                &auth,
+                &existing,
+                "actual physical and original-session binding",
+            )
+            .await;
             let mut other_cleanup = None;
             let candidate = if wrong_sealer {
                 original.clone()
@@ -3893,10 +3879,7 @@ mod tests {
                     .await
                     .unwrap();
             let (auth, existing, _) = committed_browser_fixture(&node).await;
-            let api = crate::Api::new(node.clone())
-                .with_tokens(auth.tokens.clone())
-                .unwrap()
-                .with_browser(auth.clone());
+            let api = browser_api(&node, &auth);
             let change = crate::tokens::Change {
                 wall_ms: auth.env.clock.wall_ms(),
                 by: "unix:uid=0",
@@ -4053,10 +4036,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (auth, credential, _, (_dir, node)) =
                 fixture_with_scopes([Scope::Read, Scope::Admin].into()).await;
-            let api = crate::Api::new(node.clone())
-                .with_tokens(auth.tokens.clone())
-                .unwrap()
-                .with_browser(auth.clone());
+            let api = browser_api(&node, &auth);
             let mut req = request(credential.clone());
             req.path = "/v1/tokens".into();
             let permitted = api.handle(req.clone()).await;
@@ -4085,10 +4065,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (auth, credential, _, (_dir, node)) =
                 fixture_with_scopes([Scope::Read, Scope::Admin].into()).await;
-            let api = crate::Api::new(node.clone())
-                .with_tokens(auth.tokens.clone())
-                .unwrap()
-                .with_browser(auth.clone());
+            let api = browser_api(&node, &auth);
             let mut req = request(credential.clone());
             req.path = "/v1/tokens".into();
             let permitted = api.handle(req.clone()).await;
@@ -4220,7 +4197,7 @@ mod tests {
             req.path = "/v1/auth/logout".into();
             req.body = br#"{"reason":"self logout despite caller disconnect","dry_run":false}"#.to_vec();
             req.bearer = auth.credential(None, Some(&cookies), "POST", Some("https://admin"), Some("csrf")).unwrap();
-            let api = Arc::new(crate::Api::new(node.clone()).with_tokens(auth.tokens.clone()).unwrap().with_browser(auth.clone()));
+            let api = Arc::new(browser_api(&node, &auth));
             let mut original = api.capture_binding(&req).unwrap();
             let (admitted, observed) = tokio::sync::oneshot::channel();
             let session: kronik_core::authority::SessionLease = Arc::new(TransitionSession {
