@@ -14,7 +14,7 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
 use std::time::Duration;
 
@@ -190,32 +190,6 @@ fn wasm(guest: &str) -> String {
         .encode(std::fs::read(Path::new(GUESTS).join(format!("{guest}.wasm"))).unwrap())
 }
 
-/// A plain HTTP server on a free port that answers every request with 200
-/// and the body `pong`, until the test process exits. Returns its address.
-// A test harness thread, not daemon code (ADR 0004).
-#[allow(clippy::disallowed_methods)]
-fn http_target() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut s) = stream else { continue };
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 1024];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                match s.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => request.extend_from_slice(&chunk[..n]),
-                }
-            }
-            let _ = s.write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\npong",
-            );
-        }
-    });
-    addr
-}
-
 /// Every fork turn a diff names.
 fn sampled_turns(diff: &Value) -> BTreeSet<String> {
     diff["samples"]
@@ -253,7 +227,7 @@ fn real_diffs_and_turns_match_their_schemas() {
     let s = Schemas::compile();
     let tmp = tempfile::tempdir().unwrap();
     let d = Daemon::start(tmp.path());
-    let target = http_target();
+    let (target, _) = common::http_target("127.0.0.1", "pong");
     d.deploy("counter");
     d.deploy("notes");
     d.api(

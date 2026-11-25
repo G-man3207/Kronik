@@ -13,7 +13,8 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -72,6 +73,38 @@ fn below_ephemeral() -> (u16, u16) {
         "the ephemeral port range starts at {start}: no room below it for test ports"
     );
     (start / 2, start)
+}
+
+/// A plain HTTP server on `ip`, on a port of its own, that answers every
+/// request with 200 and `body` until the test process exits: its
+/// address (`ip:port`) and how many requests it accepted.
+// A test harness thread, not daemon code (ADR 0004).
+#[allow(clippy::disallowed_methods)]
+pub fn http_target(ip: &str, body: &'static str) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind((ip, 0)).unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (addr, hits)
 }
 
 /// One request to the API on the Unix socket `socket`, as `token` when
