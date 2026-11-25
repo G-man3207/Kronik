@@ -9,6 +9,8 @@
 // Test harness code: unwraps, std threads and std time are fine here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
@@ -97,20 +99,7 @@ impl Daemon {
         body: Value,
         token: Option<&str>,
     ) -> Option<(u16, Value)> {
-        let mut s = UnixStream::connect(self.dir.join("api.sock")).ok()?;
-        let body = if body.is_null() {
-            String::new()
-        } else {
-            body.to_string()
-        };
-        let auth = token.map_or(String::new(), |t| format!("authorization: Bearer {t}\r\n"));
-        write!(
-            s,
-            "{method} {path} HTTP/1.1\r\nhost: kronik\r\n{auth}content-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .ok()?;
-        read_response(&mut BufReader::new(s))
+        common::try_api(&self.dir.join("api.sock"), method, path, &body, token)
     }
 
     fn api_as(&self, method: &str, path: &str, body: Value, token: Option<&str>) -> Value {
@@ -186,29 +175,6 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-fn read_response(r: &mut impl BufRead) -> Option<(u16, Value)> {
-    let mut line = String::new();
-    r.read_line(&mut line).ok()?;
-    let status: u16 = line.split_whitespace().nth(1)?.parse().ok()?;
-    let mut len = 0;
-    loop {
-        let mut h = String::new();
-        r.read_line(&mut h).ok()?;
-        let h = h.trim_end();
-        if h.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = h.split_once(':')
-            && k.eq_ignore_ascii_case("content-length")
-        {
-            len = v.trim().parse().ok()?;
-        }
-    }
-    let mut buf = vec![0; len];
-    r.read_exact(&mut buf).ok()?;
-    Some((status, serde_json::from_slice(&buf).ok()?))
 }
 
 /// Every byte of the log segments.
