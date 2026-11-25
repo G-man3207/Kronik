@@ -631,7 +631,9 @@ async fn offline_sealer(
 /// S-16 (1): a sealed request whose subject was erased is replayed from its
 /// recording and reported, not declared divergent. A window shorter than the
 /// gap to the erased turn skips it and reports nothing - that is the v0.4.1
-/// workaround, still passing.
+/// workaround, still passing. S-16 (5): the replay serves the recorded outcome
+/// of the erased request - an exact effect, not a synthetic denial the guest
+/// has to handle.
 #[test]
 fn an_erased_request_is_unverifiable_not_divergence() {
     let dir = tempdir();
@@ -650,6 +652,16 @@ fn an_erased_request_is_unverifiable_not_divergence() {
     assert_eq!(long.diff.summary.unverifiable, 1);
     assert_eq!(long.diff.effects.removed, 0);
     assert_eq!(long.diff.effects.added, 0);
+    let fetch = long
+        .diff
+        .grounding
+        .iter()
+        .find(|g| g.kind == "http.fetch")
+        .expect("no http.fetch grounding row");
+    assert_eq!(fetch.exact, 1, "{fetch:?}");
+    assert_eq!((fetch.approximate, fetch.synthetic, fetch.live), (0, 0, 0));
+    assert_eq!(long.diff.summary.synthetic, 0);
+    assert_eq!(long.diff.summary.exact, 1);
 
     let short = check_dir(&rt, dir.path(), Duration::from_millis(10));
     assert!(short.report.passed, "{:?}", short.report);
@@ -1198,26 +1210,6 @@ fn an_erasure_in_the_window_removes_state_written_before_it() {
     assert!(d.state.continuous.is_empty(), "{text}");
     assert_eq!(d.summary.unverifiable, 0, "{text}");
     keep(&dir, "erased-before-window");
-}
-
-/// S-16 (5): the replay serves the recorded outcome of an erased request - an
-/// exact effect, not a synthetic denial the guest has to handle.
-#[test]
-fn replay_serves_the_recorded_outcome_of_an_erased_request() {
-    let dir = tempdir();
-    let rt = rt();
-    erased_workload(&rt, dir.path());
-    let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
-    let fetch = checked
-        .diff
-        .grounding
-        .iter()
-        .find(|g| g.kind == "http.fetch")
-        .expect("no http.fetch grounding row");
-    assert_eq!(fetch.exact, 1, "{fetch:?}");
-    assert_eq!((fetch.approximate, fetch.synthetic, fetch.live), (0, 0, 0));
-    assert_eq!(checked.diff.summary.synthetic, 0);
-    assert_eq!(checked.diff.summary.exact, 1);
 }
 
 /// S-16 (3): an erased request whose recorded outcome was a failure does not
