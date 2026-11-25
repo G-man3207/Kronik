@@ -6123,43 +6123,6 @@ mod tests {
         );
     }
 
-    fn plan(conn: &Connection, sql: &str) -> Vec<String> {
-        let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-        st.query_map(["user:1"], |r| r.get(3))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    }
-
-    fn assert_search(conn: &Connection, sql: &str) {
-        let plan = plan(conn, sql);
-        assert!(
-            plan.iter().any(|d| d.starts_with("SEARCH ")),
-            "{sql} has no indexed lookup: {plan:?}"
-        );
-        assert!(
-            plan.iter().all(|d| !d.starts_with("SCAN ")),
-            "{sql} scans: {plan:?}"
-        );
-    }
-
-    fn assert_search_at(conn: &Connection, sql: &str, arg: i64) {
-        let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-        let plan: Vec<String> = st
-            .query_map([arg], |r| r.get(3))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert!(
-            plan.iter().any(|d| d.starts_with("SEARCH ")),
-            "{sql} has no indexed lookup: {plan:?}"
-        );
-        assert!(
-            plan.iter().all(|d| !d.starts_with("SCAN ")),
-            "{sql} scans: {plan:?}"
-        );
-    }
-
     /// Issue #161: subject deletes and queued-body tombstones use an index.
     /// A large unrelated kv table and mailbox are not scanned to erase one
     /// subject.
@@ -6230,7 +6193,7 @@ mod tests {
             .copied()
             .chain([super::TIMER_SUBJECT_PROBE, super::MAILBOX_SUBJECT_PROBE])
         {
-            assert_search(&db.conn, sql);
+            crate::assert_search(&db.conn, sql, "user:1");
         }
         let before = crate::snapshot::hash_for_test(&db, &["timers", "mailbox"]);
         db.conn
@@ -6389,8 +6352,8 @@ mod tests {
             .query_row("SELECT subject FROM mailbox", [], |r| r.get(0))
             .unwrap();
         assert_eq!((timer, mail), ("user:9".into(), "user:9".into()));
-        assert_search(&db.conn, super::TIMER_SUBJECT_PROBE);
-        assert_search(&db.conn, super::MAILBOX_SUBJECT_PROBE);
+        crate::assert_search(&db.conn, super::TIMER_SUBJECT_PROBE, "user:1");
+        crate::assert_search(&db.conn, super::MAILBOX_SUBJECT_PROBE, "user:1");
     }
     /// Issue #162: the retention deletes search, and they delete only the
     /// rows below the bound.
@@ -6404,9 +6367,9 @@ mod tests {
             super::INGRESS_BEFORE,
             super::DELIVERIES_BEFORE,
         ] {
-            assert_search_at(&db.conn, sql, 1);
+            crate::assert_search(&db.conn, sql, 1);
         }
-        assert_search(&db.conn, super::DELIVERIES_SUBJECT);
+        crate::assert_search(&db.conn, super::DELIVERIES_SUBJECT, "user:1");
         db.conn
             .execute_batch(
                 "INSERT INTO trees (root, lsn) VALUES ('a', 1), ('a', 5), ('b', 9);
@@ -6549,7 +6512,7 @@ mod tests {
             super::COMPACT_INGRESS,
             super::INGRESS_BEFORE,
         ] {
-            assert_search_at(&db.conn, sql, 1);
+            crate::assert_search(&db.conn, sql, 1);
         }
     }
 
@@ -6572,7 +6535,7 @@ mod tests {
             .query_row("SELECT count(*) FROM trees", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "the rebuild had a row to copy");
-        assert_search_at(&db.conn, super::COMPACT_TREES, 1);
+        crate::assert_search(&db.conn, super::COMPACT_TREES, 1);
     }
 
     fn timer_fire(id: u64, due: u64) -> Option<pb::Input> {

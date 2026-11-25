@@ -2419,14 +2419,6 @@ mod tests {
         }
     }
 
-    fn plan(conn: &Connection, sql: &str) -> Vec<String> {
-        let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-        st.query_map(["user:1"], |r| r.get(3))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    }
-
     /// Issue #196: `DELETE WHERE _subject = ?` searches, including on a
     /// database created before the index and on a case-variant column.
     #[test]
@@ -2445,15 +2437,7 @@ mod tests {
         }
         let actor = SqlActor::open(&opener, "notes/old", Limits::default()).unwrap();
         let sql = subject_delete_sql("notes");
-        let plan = plan(&actor.conn, &sql);
-        assert!(
-            plan.iter().any(|d| d.starts_with("SEARCH ")),
-            "{sql} has no indexed lookup: {plan:?}"
-        );
-        assert!(
-            plan.iter().all(|d| !d.starts_with("SCAN ")),
-            "{sql} scans: {plan:?}"
-        );
+        crate::assert_search(&actor.conn, &sql, "user:1");
         let gone = actor.conn.execute(&sql, ["user:1"]).unwrap();
         assert_eq!(gone, 1);
     }

@@ -41,6 +41,27 @@ pub(crate) fn apply_lock_held() -> bool {
     APPLY_LOCK_DEPTH.with(|c| c.get() > 0)
 }
 
+/// Asserts that `sql`, with `arg` bound to `?1`, uses an index and scans
+/// no table.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn assert_search(conn: &rusqlite::Connection, sql: &str, arg: impl rusqlite::ToSql) {
+    let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    let plan: Vec<String> = st
+        .query_map([arg], |r| r.get(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        plan.iter().any(|d| d.starts_with("SEARCH ")),
+        "{sql} has no indexed lookup: {plan:?}"
+    );
+    assert!(
+        plan.iter().all(|d| !d.starts_with("SCAN ")),
+        "{sql} scans: {plan:?}"
+    );
+}
+
 /// How many times this thread has taken the apply lock. A state-hash test
 /// asserts an integrity request does not add to it.
 #[cfg(test)]
@@ -1116,21 +1137,11 @@ mod erasure_lock_tests {
         };
         {
             let db = store.db();
-            let plan: Vec<String> = db
-                .conn()
-                .prepare(
-                    "EXPLAIN QUERY PLAN SELECT message_id, outcome FROM deliveries \
-                     WHERE subject = ?1 AND outcome IS NOT NULL",
-                )
-                .unwrap()
-                .query_map(["user:1"], |r| r.get(3))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap();
-            assert!(
-                plan.iter().any(|d| d.starts_with("SEARCH "))
-                    && plan.iter().all(|d| !d.starts_with("SCAN ")),
-                "deliveries subject select scans: {plan:?}"
+            crate::assert_search(
+                db.conn(),
+                "SELECT message_id, outcome FROM deliveries \
+                 WHERE subject = ?1 AND outcome IS NOT NULL",
+                "user:1",
             );
             let tx = db.conn().unchecked_transaction().unwrap();
             tx.execute(
