@@ -97,6 +97,50 @@ fn audit() -> Option<pb::Audit> {
     })
 }
 
+/// The webhook settings most tests use: a closed local port and key version 7.
+fn webhook_settings() -> Settings {
+    Settings {
+        url: "http://127.0.0.1:9/events".into(),
+        secret: SecretVersion {
+            name: "webhook-key".into(),
+            version: 7,
+            branch: "main".into(),
+            version_hash: [7; 16],
+            hash_revision: 1,
+            backend: "local".into(),
+            binding: String::new(),
+            reference: String::new(),
+            canonical_ref: String::new(),
+            link_generation: 0,
+            source_version: String::new(),
+        },
+    }
+}
+
+/// A native log in a fresh temporary directory. Keep the directory and the
+/// fatal receiver bound (as `_directory`, `_fatal`, never `_`) until the
+/// test ends.
+async fn native_log() -> (
+    tempfile::TempDir,
+    kronik_log::Log,
+    tokio::sync::mpsc::UnboundedReceiver<kronik_log::Committed>,
+    tokio::sync::oneshot::Receiver<String>,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let env = Env::real(tokio::runtime::Handle::current());
+    let (send, committed) = tokio::sync::mpsc::unbounded_channel();
+    let (fatal, failed) = tokio::sync::oneshot::channel();
+    let (log, _) = kronik_log::Log::open(
+        &env,
+        kronik_log::LogConfig::new(directory.path().to_path_buf(), "main"),
+        send,
+        fatal,
+    )
+    .await
+    .unwrap();
+    (directory, log, committed, failed)
+}
+
 fn configured_stream(
     name: impl Into<Arc<str>>,
     cursors: &Arc<Cursors>,
@@ -186,22 +230,7 @@ async fn revoked_original_disclosure_creates_no_pending_manifest_or_transport() 
         .unwrap();
     let execution = node.local_operator_authority().unwrap();
     let cursors = Arc::new(Cursors::load(env, directory.path()).await.unwrap());
-    let settings = Settings {
-        url: "http://127.0.0.1:9/events".into(),
-        secret: SecretVersion {
-            name: "webhook-key".into(),
-            version: 7,
-            branch: "main".into(),
-            version_hash: [7; 16],
-            hash_revision: 1,
-            backend: "local".into(),
-            binding: String::new(),
-            reference: String::new(),
-            canonical_ref: String::new(),
-            link_generation: 0,
-            source_version: String::new(),
-        },
-    };
+    let settings = webhook_settings();
     let stream = configured_stream("events-revoked-pending:actor-native", &cursors, &settings);
     let mac_calls = Arc::new(AtomicUsize::new(0));
     let counted = mac_calls.clone();
@@ -507,18 +536,7 @@ fn operator_turn() -> pb::TurnRecord {
 
 #[tokio::test]
 async fn decoded_privacy_reseal_request_publishes_request_not_completion() {
-    let directory = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let (committed_tx, mut committed_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (fatal_tx, _fatal_rx) = tokio::sync::oneshot::channel();
-    let (log, _) = kronik_log::Log::open(
-        &env,
-        kronik_log::LogConfig::new(directory.path().to_path_buf(), "main"),
-        committed_tx,
-        fatal_tx,
-    )
-    .await
-    .unwrap();
+    let (_directory, log, mut committed_rx, _fatal) = native_log().await;
     let mapper = mapper();
     let secrets = [
         ("public-mode", b"mode".as_slice()),
@@ -577,18 +595,7 @@ async fn decoded_privacy_reseal_request_publishes_request_not_completion() {
 
 #[tokio::test]
 async fn every_operational_fixture_has_meaningful_versioned_committed_content() {
-    let directory = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let (committed_tx, mut committed_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (fatal_tx, _fatal_rx) = tokio::sync::oneshot::channel();
-    let (log, _opened) = kronik_log::Log::open(
-        &env,
-        kronik_log::LogConfig::new(directory.path().to_path_buf(), "main"),
-        committed_tx,
-        fatal_tx,
-    )
-    .await
-    .unwrap();
+    let (_directory, log, mut committed_rx, _fatal) = native_log().await;
     let mapper = mapper();
     let secrets = [("webhook-key", b"VALUE-NEEDLE".as_slice())];
     let schema = events::schemas().unwrap();
@@ -780,22 +787,7 @@ async fn committed_pages_restart_rewind_and_prepared_webhook_survive_durable_rel
         .unwrap();
     let execution = node.local_operator_authority().unwrap();
     let cursors = Arc::new(Cursors::load(env.clone(), dir.path()).await.unwrap());
-    let settings = Settings {
-        url: "http://127.0.0.1:9/events".into(),
-        secret: SecretVersion {
-            name: "webhook-key".into(),
-            version: 7,
-            branch: "main".into(),
-            version_hash: [7; 16],
-            hash_revision: 1,
-            backend: "local".into(),
-            binding: String::new(),
-            reference: String::new(),
-            canonical_ref: String::new(),
-            link_generation: 0,
-            source_version: String::new(),
-        },
-    };
+    let settings = webhook_settings();
     let mapper = Arc::new(Mapper {
         keys: Keys::Omit,
         sealer: node.sealer().clone(),
@@ -1174,22 +1166,7 @@ async fn compacted_actor_pending_survives_restart_and_holds_gap_until_ack() {
         )
         .await
         .unwrap();
-    let settings = Settings {
-        url: "http://127.0.0.1:9/events".into(),
-        secret: SecretVersion {
-            name: "webhook-key".into(),
-            version: 7,
-            branch: "main".into(),
-            version_hash: [7; 16],
-            hash_revision: 1,
-            backend: "local".into(),
-            binding: String::new(),
-            reference: String::new(),
-            canonical_ref: String::new(),
-            link_generation: 0,
-            source_version: String::new(),
-        },
-    };
+    let settings = webhook_settings();
     let registered = configured_stream(stream, &cursors, &settings);
     let (reader, snapshot, authorization) = native_disclosure(&node, &execution).await;
     let patterns: Vec<_> = snapshot
@@ -1832,18 +1809,7 @@ async fn canonical_operational_identity_separates_visible_changes_not_sealable_v
 // exercised. Restore this test when the cluster record kinds are implemented.
 #[ignore = "not implemented: needs M16-M19 cluster record kinds 20-25"]
 async fn decoded_operational_wire_records_fsynced_in_native_log_publish_exact_variants() {
-    let directory = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let (send, mut committed) = tokio::sync::mpsc::unbounded_channel();
-    let (fatal, _failed) = tokio::sync::oneshot::channel();
-    let (log, _) = kronik_log::Log::open(
-        &env,
-        kronik_log::LogConfig::new(directory.path().to_path_buf(), "main"),
-        send,
-        fatal,
-    )
-    .await
-    .unwrap();
+    let (_directory, log, mut committed, _fatal) = native_log().await;
     let schema = events::schemas().unwrap();
     for (kind, wire, expected_kind, expected_action, epoch) in [
         (
@@ -1935,18 +1901,7 @@ async fn decoded_operational_wire_records_fsynced_in_native_log_publish_exact_va
 
 #[tokio::test]
 async fn real_secret_version_and_link_wire_records_publish_exact_phase_actions() {
-    let directory = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let (send, mut committed) = tokio::sync::mpsc::unbounded_channel();
-    let (fatal, _failed) = tokio::sync::oneshot::channel();
-    let (log, _) = kronik_log::Log::open(
-        &env,
-        kronik_log::LogConfig::new(directory.path().to_path_buf(), "main"),
-        send,
-        fatal,
-    )
-    .await
-    .unwrap();
+    let (_directory, log, mut committed, _fatal) = native_log().await;
     let schema = events::schemas().unwrap();
     for (kind, wire, expected_kind, expected_action, epoch) in [
         (
@@ -2242,18 +2197,7 @@ fn control_fixtures() -> Vec<(Record, &'static str, Option<events::FleetPhase>)>
 
 #[tokio::test]
 async fn typed_controls_publish_real_native_records_and_closed_fleet_phase() {
-    let directory = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let (send, mut committed) = tokio::sync::mpsc::unbounded_channel();
-    let (fatal, _failed) = tokio::sync::oneshot::channel();
-    let (log, _) = kronik_log::Log::open(
-        &env,
-        kronik_log::LogConfig::new(directory.path().to_path_buf(), "main"),
-        send,
-        fatal,
-    )
-    .await
-    .unwrap();
+    let (_directory, log, mut committed, _fatal) = native_log().await;
     let mut phases = BTreeMap::new();
     for (record, action, phase) in control_fixtures() {
         let decoded = Record::decode(record.kind(), &record.encode()).unwrap();
@@ -3497,18 +3441,7 @@ fn assert_private_auth_event(
 #[tokio::test]
 async fn native_logout_wire_record_is_fsynced_and_public_event_omits_session_identity() {
     let (record, fixture) = logout_wire_record(false);
-    let directory = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let (send, mut committed) = tokio::sync::mpsc::unbounded_channel();
-    let (fatal, _failed) = tokio::sync::oneshot::channel();
-    let (log, _) = kronik_log::Log::open(
-        &env,
-        kronik_log::LogConfig::new(directory.path().to_path_buf(), "main"),
-        send,
-        fatal,
-    )
-    .await
-    .unwrap();
+    let (_directory, log, mut committed, _fatal) = native_log().await;
     let lsn = log.append(record).await.unwrap();
     let record = committed.recv().await.unwrap();
     assert_eq!(record.lsn, lsn);
@@ -4441,18 +4374,7 @@ fn login_wire_record(metadata: bool) -> (Record, serde_json::Value) {
 #[tokio::test]
 async fn native_login_wire_record_is_fsynced_and_public_event_omits_claims_and_principal() {
     let (record, fixture) = login_wire_record(false);
-    let directory = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let (send, mut committed) = tokio::sync::mpsc::unbounded_channel();
-    let (fatal, _failed) = tokio::sync::oneshot::channel();
-    let (log, _) = kronik_log::Log::open(
-        &env,
-        kronik_log::LogConfig::new(directory.path().to_path_buf(), "main"),
-        send,
-        fatal,
-    )
-    .await
-    .unwrap();
+    let (_directory, log, mut committed, _fatal) = native_log().await;
     let lsn = log.append(record).await.unwrap();
     let record = committed.recv().await.unwrap();
     assert_eq!(record.lsn, lsn);
@@ -4479,18 +4401,7 @@ fn metadata_login_wire_record_unit_projection_has_no_actor_or_private_identity_a
 #[tokio::test]
 async fn approval_wire_records_keep_protected_identity_private_and_value_only_reseal_identity_stable()
  {
-    let directory = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let (send, mut commits) = tokio::sync::mpsc::unbounded_channel();
-    let (fatal, _failed) = tokio::sync::oneshot::channel();
-    let (log, _) = kronik_log::Log::open(
-        &env,
-        kronik_log::LogConfig::new(directory.path().to_path_buf(), "main"),
-        send,
-        fatal,
-    )
-    .await
-    .unwrap();
+    let (_directory, log, mut commits, _fatal) = native_log().await;
     let mapper = mapper();
     // The project now keeps approval wire data private; the proto fixture files
     // named by an earlier revision were never committed, so encode the same
@@ -4679,19 +4590,7 @@ async fn real_http_execution_fence_rejects_after_mac_and_owns_already_admitted_d
         let url = format!("http://{}/events", listener.local_addr().unwrap());
         let settings = Settings {
             url,
-            secret: SecretVersion {
-                name: "webhook-key".into(),
-                version: 7,
-                branch: "main".into(),
-                version_hash: [7; 16],
-                hash_revision: 1,
-                backend: "local".into(),
-                binding: String::new(),
-                reference: String::new(),
-                canonical_ref: String::new(),
-                link_generation: 0,
-                source_version: String::new(),
-            },
+            ..webhook_settings()
         };
         let signing_node = node.clone();
         let resolver: Arc<webhook::Resolver> = Arc::new(move |_, message, _original| {
