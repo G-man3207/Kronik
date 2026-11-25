@@ -13,6 +13,7 @@
 # counter is tests/guests/counter.wasm. Needs curl and python3.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. scripts/lib.sh
 
 if [ -z "${KRONIK_TEST_OTLP_ENDPOINT:-}" ] || [ -z "${KRONIK_TEST_JAEGER_QUERY:-}" ]; then
     echo "KRONIK_TEST_OTLP_ENDPOINT and KRONIK_TEST_JAEGER_QUERY are unset." >&2
@@ -78,11 +79,7 @@ EOF
 start_serve() {
     setsid "$bin" serve --config "$cfg" >>"$log" 2>&1 &
     pid=$!
-    for _ in $(seq 1 100); do
-        curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null 2>&1 && return 0
-        sleep 0.1
-    done
-    fail "daemon not healthy"
+    wait_healthy "$sock" "$log"
 }
 
 stop_serve() {

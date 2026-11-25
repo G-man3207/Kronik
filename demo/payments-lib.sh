@@ -9,6 +9,8 @@
 # `api`, `field`, `b64`, `http`, `invoice`, `payments_cleanup`) and keeps its
 # own preflight and serve steps because of its external owned mode.
 
+. scripts/lib.sh
+
 layout=examples/dist/fake-payments.oci
 api_key="demo-key-$(date +%s%N | sha256sum | cut -c1-16)"
 
@@ -75,11 +77,7 @@ payments_serve() { # [EXTRA-TOML]: reset the sandbox, serve, wait for health
     setsid "$bin" serve --config "$dir/kronik.toml" --http-listen "127.0.0.1:$port" \
         --admin-listen 127.0.0.1:0 --api-socket "$sock" >>"$dir/serve.log" 2>&1 &
     pid=$!
-    for _ in $(seq 400); do
-        curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null 2>&1 && break
-        sleep 0.05
-    done
-    curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null || fail "daemon not healthy"
+    wait_healthy "$sock" "$dir/serve.log"
 }
 
 payments_deploy() { # [EXTRA-CAPABILITY]: manifests, foreign actor, billing and

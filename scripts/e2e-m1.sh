@@ -17,6 +17,7 @@
 # build --release -p kronik).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. scripts/lib.sh
 
 dir="${1:-/var/tmp/kronik-e2e}"
 port="${2:-47811}"
@@ -49,15 +50,7 @@ start() {
     setsid "$bin" serve --data-dir "$dir/data" --http-listen "127.0.0.1:$port" \
         --api-socket "$sock" >>"$dir/serve.log" 2>&1 &
     pid=$!
-    for _ in $(seq 1 100); do
-        if curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null 2>&1; then
-            return
-        fi
-        sleep 0.1
-    done
-    echo "FAIL: daemon did not become healthy" >&2
-    cat "$dir/serve.log" >&2
-    exit 1
+    wait_healthy "$sock" "$dir/serve.log"
 }
 
 stop() {

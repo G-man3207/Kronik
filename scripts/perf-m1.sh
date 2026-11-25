@@ -7,6 +7,7 @@
 # (cargo build --release --manifest-path tools/loadgen/Cargo.toml).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. scripts/lib.sh
 
 dir="${1:-/var/tmp/kronik-perf}"
 port="${2:-47813}"
@@ -21,15 +22,7 @@ setsid "$bin" serve --data-dir "$dir/data" --http-listen "127.0.0.1:$port" \
     --api-socket "$sock" >>"$dir/serve.log" 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null; wait $pid 2>/dev/null' EXIT
-for _ in $(seq 1 1200); do
-    curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null 2>&1 && break
-    sleep 0.05
-done
-curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null 2>&1 || {
-    echo "FAIL: daemon did not become healthy in 60 s" >&2
-    tail -n 40 "$dir/serve.log" >&2
-    exit 1
-}
+wait_healthy "$sock" "$dir/serve.log"
 python3 -c "import base64,json; print(json.dumps({'wasm_base64': base64.b64encode(open('tests/guests/counter.wasm','rb').read()).decode(), 'reason': 'perf'}))" >"$dir/deploy.json"
 curl -sf --unix-socket "$sock" -X POST -d @"$dir/deploy.json" http://kronik/v1/deployments >/dev/null
 

@@ -21,6 +21,7 @@
 #            _subject per turn).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. scripts/lib.sh
 base="${1:?usage: scripts/bench-privacy.sh BASE NEW [RUNS] [SECONDS]}"
 new="${2:?usage: scripts/bench-privacy.sh BASE NEW [RUNS] [SECONDS]}"
 runs="${3:-5}"
@@ -54,15 +55,7 @@ measure() { # BIN LABEL MODE -> JSON lines on stdout
         --api-listen "127.0.0.1:$api_port" --admin-listen 127.0.0.1:0 \
         --api-socket "$dir/api.sock" >>"$dir/serve.log" 2>&1 &
     pid=$!
-    for _ in $(seq 1 1200); do
-        curl -sf --unix-socket "$dir/api.sock" http://kronik/v1/health >/dev/null 2>&1 && break
-        sleep 0.05
-    done
-    curl -sf --unix-socket "$dir/api.sock" http://kronik/v1/health >/dev/null 2>&1 || {
-        echo "FAIL: daemon did not become healthy in 60 s" >&2
-        tail -n 40 "$dir/serve.log" >&2
-        exit 1
-    }
+    wait_healthy "$dir/api.sock" "$dir/serve.log"
     for g in counter notes; do
         python3 -c "import base64,json,sys; print(json.dumps({'wasm_base64': base64.b64encode(open(sys.argv[1],'rb').read()).decode(), 'reason': 'bench'}))" \
             "tests/guests/$g.wasm" >"$dir/deploy.json"
