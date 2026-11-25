@@ -11,69 +11,21 @@
 // listener on the tokio runtime directly.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
-use std::sync::Arc;
+mod common;
+
 use std::time::Duration;
 
+use common::{Server, ask, server, until};
 use futures_util::{SinkExt as _, StreamExt as _};
-use kronik_core::env::Env;
-use kronik_gateway::{Gateway, GatewayConfig};
 use kronik_proto::log::v1 as pb;
 use kronik_sched::connections::ConnectionsConfig;
-use kronik_sched::{Node, NodeConfig, start_local};
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
-const ROOM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/room.wasm");
-
 type Client = WebSocketStream<TcpStream>;
-
-struct Server {
-    _dir: tempfile::TempDir,
-    node: Arc<Node>,
-    addr: std::net::SocketAddr,
-    task: tokio::task::JoinHandle<std::io::Result<()>>,
-}
-
-async fn server(connections: ConnectionsConfig) -> Server {
-    let dir = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(
-        env,
-        dir.path(),
-        NodeConfig {
-            connections,
-            ..NodeConfig::default()
-        },
-    )
-    .await
-    .unwrap();
-    let audit = pb::Audit {
-        token_id: "t".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    };
-    node.deploy(
-        &std::fs::read(ROOM).unwrap(),
-        audit,
-        false,
-        node.local_operator_authority().unwrap(),
-    )
-    .await
-    .unwrap();
-    let gw = Arc::new(Gateway::new(node.clone(), GatewayConfig::default()));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let task = tokio::spawn(kronik_gateway::server::serve(listener, gw, 64));
-    Server {
-        _dir: dir,
-        node,
-        addr,
-        task,
-    }
-}
 
 impl Server {
     async fn connect(&self, path: &str, protocols: Option<&str>) -> (Client, Option<String>) {
@@ -95,42 +47,7 @@ impl Server {
 
     /// The closes the room recorded (`<conn> <initiator> <code> <reason>`).
     async fn closes(&self) -> String {
-        self.send("closes").await
-    }
-
-    async fn send(&self, name: &str) -> String {
-        let r = self
-            .node
-            .send(
-                kronik_core::ids::ActorRef::parse("room/lobby").unwrap(),
-                pb::Message {
-                    name: name.into(),
-                    content_type: "text/plain".into(),
-                    body: Some(pb::Sealable {
-                        subject: None,
-                        value: Some(pb::sealable::Value::Plain(vec![])),
-                    }),
-                    blobs: vec![],
-                    retained_compensation_source: None,
-                },
-                pb::Audit {
-                    token_id: "t".into(),
-                    reason: "test".into(),
-                    wall_time_ms: 0,
-                },
-                false,
-                self.node.local_operator_authority().unwrap(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        match r.outcome.output {
-            Some(pb::outcome::Output::Reply(m)) => match m.body.and_then(|b| b.value) {
-                Some(pb::sealable::Value::Plain(b)) => String::from_utf8(b).unwrap(),
-                _ => String::new(),
-            },
-            _ => String::new(),
-        }
+        ask(&self.node, "closes", b"").await
     }
 }
 
@@ -153,23 +70,6 @@ async fn text(ws: &mut Client) -> String {
     match next(ws).await {
         Message::Text(t) => t.as_str().to_owned(),
         other => panic!("expected text, got {other:?}"),
-    }
-}
-
-/// Polls `f` every 10 ms until it is true, and fails at the wall-clock
-/// deadline otherwise: a budget in time, not in sleeps, so that a slow
-/// runner cannot decide whether the daemon met its timers. Returns when
-/// the predicate was first seen true.
-async fn until(what: &str, budget: Duration, f: impl AsyncFn() -> bool) -> tokio::time::Instant {
-    let deadline = tokio::time::Instant::now() + budget;
-    loop {
-        if f().await {
-            return tokio::time::Instant::now();
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("timed out waiting for {what}");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
