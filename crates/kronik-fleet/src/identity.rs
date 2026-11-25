@@ -5,7 +5,7 @@ use rcgen::{CertificateParams, KeyPair};
 use rustls_pki_types::PrivatePkcs8KeyDer;
 use zeroize::Zeroizing;
 
-use crate::env::EntropySource;
+use kronik_core::env::EntropySource;
 
 /// An Ed25519 key from a 32-byte seed (PKCS#8 v1).
 pub fn ed25519_key(seed: &[u8; 32]) -> Result<KeyPair, rcgen::Error> {

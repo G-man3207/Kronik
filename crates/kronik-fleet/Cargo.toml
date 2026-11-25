@@ -9,11 +9,12 @@ publish.workspace = true
 [dependencies]
 bytes = { workspace = true }
 http = { workspace = true }
-kronik-core = { workspace = true, features = ["host-identity", "schemars"] }
+kronik-core = { workspace = true, features = ["schemars"] }
 kronik-log = { workspace = true }
 kronik-otel = { workspace = true }
 kronik-proto = { workspace = true }
 kronik-sched = { workspace = true }
+rcgen = { workspace = true }
 rustls-pki-types = { workspace = true }
 rustls = { workspace = true }
 x509-parser = { workspace = true }

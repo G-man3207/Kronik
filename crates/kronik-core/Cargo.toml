@@ -7,8 +7,6 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-# Host leaf-key/CSR custody is not enabled by the default guest SDK core.
-host-identity = ["dep:rcgen", "dep:rustls-pki-types"]
 # Production implementations of the Env traits (tokio runtime and std).
 real = [
     "dep:getrandom",
@@ -52,8 +50,6 @@ rustls-native-certs = { workspace = true, optional = true }
 ring = { workspace = true, optional = true }
 kronik-proto = { workspace = true }
 pin-project-lite = { workspace = true }
-rcgen = { workspace = true, optional = true }
-rustls-pki-types = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -66,6 +62,7 @@ zeroize = { workspace = true }
 # The env tests run on a current-thread runtime without the `real` feature.
 tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = { workspace = true }
+rcgen = { workspace = true }
 
 [[test]]
 name = "process_exchange_threads"

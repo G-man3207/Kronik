@@ -2005,7 +2005,6 @@ dependencies = [
  "rustix",
  "rustls",
  "rustls-native-certs",
- "rustls-pki-types",
  "schemars",
  "serde",
  "serde_json",
