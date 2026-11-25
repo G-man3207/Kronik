@@ -915,6 +915,15 @@ mod tests {
         }
     }
 
+    /// A registry object served under its own digest, which the
+    /// `Docker-Content-Digest` header repeats.
+    fn honest(digest: &str, body: &[u8], content_type: &'static str) -> (String, Served) {
+        (
+            digest.to_owned(),
+            served(body, Some(digest.to_owned()), content_type),
+        )
+    }
+
     fn sha512_digest(bytes: &[u8]) -> String {
         use sha2::Digest as _;
         format!("sha512:{}", hex(&sha2::Sha512::digest(bytes)))
@@ -1061,22 +1070,8 @@ mod tests {
         let tmp = temp_dir();
         let image = packed_image(&tmp);
         let registry = serve([
-            (
-                image.manifest_digest.clone(),
-                served(
-                    &image.manifest,
-                    Some(image.manifest_digest.clone()),
-                    MEDIA_MANIFEST,
-                ),
-            ),
-            (
-                image.config_digest.clone(),
-                served(
-                    &image.config,
-                    Some(image.config_digest.clone()),
-                    MEDIA_CONFIG,
-                ),
-            ),
+            honest(&image.manifest_digest, &image.manifest, MEDIA_MANIFEST),
+            honest(&image.config_digest, &image.config, MEDIA_CONFIG),
             (
                 image.layer_digest.clone(),
                 served(
@@ -1158,34 +1153,10 @@ mod tests {
         let index_bytes = serde_json::to_vec(&index).unwrap();
         let index_digest = sha256_digest(&index_bytes);
         let registry = serve([
-            (
-                index_digest.clone(),
-                served(&index_bytes, Some(index_digest.clone()), MEDIA_INDEX),
-            ),
-            (
-                image.manifest_digest.clone(),
-                served(
-                    &image.manifest,
-                    Some(image.manifest_digest.clone()),
-                    MEDIA_MANIFEST,
-                ),
-            ),
-            (
-                image.config_digest.clone(),
-                served(
-                    &image.config,
-                    Some(image.config_digest.clone()),
-                    MEDIA_CONFIG,
-                ),
-            ),
-            (
-                image.layer_digest.clone(),
-                served(
-                    &image.layer,
-                    Some(image.layer_digest.clone()),
-                    MEDIA_LAYER_GZIP,
-                ),
-            ),
+            honest(&index_digest, &index_bytes, MEDIA_INDEX),
+            honest(&image.manifest_digest, &image.manifest, MEDIA_MANIFEST),
+            honest(&image.config_digest, &image.config, MEDIA_CONFIG),
+            honest(&image.layer_digest, &image.layer, MEDIA_LAYER_GZIP),
         ]);
         let store = BlobStore::new(tmp.path().join("blobs"));
         let err = pull_pin(&store, &registry, &index_digest)
@@ -1210,26 +1181,9 @@ mod tests {
         let manifest = serde_json::to_vec(&doc).unwrap();
         let pinned = sha256_digest(&manifest);
         let registry = serve([
-            (
-                pinned.clone(),
-                served(&manifest, Some(pinned.clone()), MEDIA_MANIFEST),
-            ),
-            (
-                image.config_digest.clone(),
-                served(
-                    &image.config,
-                    Some(image.config_digest.clone()),
-                    MEDIA_CONFIG,
-                ),
-            ),
-            (
-                image.layer_digest.clone(),
-                served(
-                    &image.layer,
-                    Some(image.layer_digest.clone()),
-                    MEDIA_LAYER_GZIP,
-                ),
-            ),
+            honest(&pinned, &manifest, MEDIA_MANIFEST),
+            honest(&image.config_digest, &image.config, MEDIA_CONFIG),
+            honest(&image.layer_digest, &image.layer, MEDIA_LAYER_GZIP),
         ]);
         let store = BlobStore::new(tmp.path().join("blobs"));
         let err = pull_pin(&store, &registry, &pinned).await.unwrap_err();
