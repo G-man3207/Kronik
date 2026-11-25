@@ -774,10 +774,10 @@ fn the_first_cycle_leaves_the_certificate_the_start_made_alone() {
     });
 }
 
-// The fixtures below are those of `recovery/tests.rs`: a secret in the
-// ledger and a turn whose record cites it.
+// The fixtures below are shared with `recovery/tests.rs` and
+// `erasure_tests.rs`: a secret in the ledger and a turn whose record cites it.
 
-fn plain(bytes: Vec<u8>) -> Option<pb::Sealable> {
+pub(super) fn plain(bytes: Vec<u8>) -> Option<pb::Sealable> {
     Some(pb::Sealable {
         subject: None,
         value: Some(pb::sealable::Value::Plain(bytes)),
@@ -810,7 +810,7 @@ pub(super) fn begin(node: &Node) -> pb::TurnBegin {
     }
 }
 
-fn reveal(metadata: SecretMeta, ordinal: u32) -> pb::EffectRecord {
+pub(super) fn reveal(metadata: SecretMeta, ordinal: u32) -> pb::EffectRecord {
     let mut reference = pb::SecretRef {
         name: metadata.name.clone(),
         version_hash: metadata.version_hash,
