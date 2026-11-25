@@ -29,7 +29,7 @@ use kronik_runtime::{
 use kronik_sched::effects::{map_call_outcome, outcome_of_fetch, outcome_of_send_now};
 use kronik_sched::host::{SqlHandle, SqlTurn};
 use kronik_store::Store;
-use kronik_store::sql::{Limits, MemOpener, SqlPool, TurnOpts};
+use kronik_store::sql::TurnOpts;
 use prost::Message as _;
 
 use crate::index::{ProductionIndex, RootInput};
@@ -300,22 +300,12 @@ pub struct TreeResult {
     pub turns: Vec<ForkTurn>,
 }
 
-/// A fresh in-memory store (production cursors and fork stores).
-pub fn memory_store() -> Result<Arc<Store>, ReplayError> {
-    let conn = rusqlite::Connection::open_in_memory()
-        .map_err(|e| ReplayError::Store(kronik_store::StoreError::Sqlite(e)))?;
-    Ok(Store::open(
-        conn,
-        SqlPool::new(Arc::new(MemOpener), Limits::default(), usize::MAX),
-    )?)
-}
-
 /// A production cursor at the start of the index: its base snapshot loaded
 /// into memory, else an empty store.
 pub fn cursor(index: &ProductionIndex) -> Result<Arc<Store>, ReplayError> {
     let store = match &index.base {
         Some(b) => shared_image(index, &b.dir)?.open()?,
-        None => memory_store()?,
+        None => Store::memory()?,
     };
 
     // Production's sealed SQL changesets are opened as they are applied.

@@ -398,7 +398,7 @@ mod tests {
     fn state_reads_replace_production_values_by_provenance() {
         use kronik_log::{Committed, Position};
         use kronik_proto::Record;
-        let store = crate::replay::memory_store().unwrap();
+        let store = kronik_store::Store::memory().unwrap();
         store
             .apply(&[Committed {
                 lsn: 1,
@@ -497,7 +497,7 @@ mod tests {
             "an erased state value must stay sealed: {:?}",
             t.writes[0]
         );
-        let store = crate::replay::memory_store().unwrap();
+        let store = kronik_store::Store::memory().unwrap();
         store
             .apply(&[kronik_log::Committed {
                 lsn: 1,
@@ -523,7 +523,7 @@ mod tests {
     /// a turn before that position is not marked.
     #[test]
     fn a_read_of_unverified_state_marks_the_turn() {
-        let store = crate::replay::memory_store().unwrap();
+        let store = kronik_store::Store::memory().unwrap();
         let privacy = ForkPrivacy::plain();
         let actor = ActorRef::parse("counter/a").unwrap();
         let taint = Arc::new(Mutex::new(Taint::default()));

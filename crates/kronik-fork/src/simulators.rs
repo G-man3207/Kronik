@@ -160,7 +160,7 @@ pub struct Simulators {
 impl Simulators {
     pub fn new(index: &ProductionIndex, overrides: &[SimulatorOverride]) -> Simulators {
         let mut latest: BTreeMap<String, (Lsn, pb::SimulatorConfig, bool)> = BTreeMap::new();
-        for (lsn, record) in index.config_records_upto(index.fork_lsn) {
+        for (lsn, record) in index.config_records(index.fork_lsn) {
             if let Record::SimulatorConfig(m) = record {
                 latest.insert(m.target.clone(), (lsn, m, false));
             }

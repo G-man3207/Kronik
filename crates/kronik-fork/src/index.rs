@@ -568,21 +568,9 @@ impl ProductionIndex {
         })
     }
 
-    /// Configuration records (deployments, grants, limits, foreign actors,
-    /// secret links) up to `lsn`.
-    pub fn config_records(&self, upto: Lsn) -> Vec<Record> {
-        let base = self
-            .base
-            .iter()
-            .flat_map(|b| b.config.iter())
-            .filter(|(l, _)| *l <= upto)
-            .map(|(_, r)| r.clone());
-        base.chain(self.records_config(upto)).collect()
-    }
-
     /// Every configuration record with its LSN up to `upto`: the base
     /// snapshot's, then the window's, in LSN order.
-    pub fn config_records_upto(&self, upto: Lsn) -> Vec<(Lsn, Record)> {
+    pub fn config_records(&self, upto: Lsn) -> Vec<(Lsn, Record)> {
         let base = self
             .base
             .iter()
@@ -595,14 +583,6 @@ impl ProductionIndex {
             .filter(|c| c.lsn <= upto)
             .filter_map(|c| config_view(&c.record).map(|r| (c.lsn, r)));
         base.chain(window).collect()
-    }
-
-    fn records_config(&self, upto: Lsn) -> Vec<Record> {
-        self.records
-            .iter()
-            .filter(|c| c.lsn <= upto)
-            .filter_map(|c| config_view(&c.record))
-            .collect()
     }
 
     /// Each kind's code as of `upto` (the last deployment of each kind).
