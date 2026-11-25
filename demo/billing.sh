@@ -77,10 +77,7 @@ if [ "$external" = 0 ]; then
     setsid "$bin" serve --config "$dir/kronik.toml" --http-listen "127.0.0.1:$port" \
         --admin-listen 127.0.0.1:0 --api-socket "$sock" >>"$dir/serve.log" 2>&1 &
     pid=$!
-    for _ in $(seq 400); do
-        curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null 2>&1 && break
-        sleep 0.05
-    done
+    wait_healthy "$sock" "$dir/serve.log"
 fi
 
 manifest=$(api POST /v1/deployments "{\"wasm_base64\":\"$(b64 "$billing")\",\"dry_run\":true,\"reason\":\"demo manifest\"}")

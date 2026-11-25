@@ -15,6 +15,7 @@
 # PORT+1), KRONIK_BIN target/release/kronik. Needs curl and python3.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. scripts/lib.sh
 
 dir="${1:-/var/tmp/kronik-e2e-relay}"
 port="${2:-47821}"
@@ -88,10 +89,7 @@ target_pid=$!
 setsid "$bin" serve --data-dir "$dir/data" --http-listen "127.0.0.1:$port" \
     --api-socket "$sock" >>"$dir/serve.log" 2>&1 &
 pid=$!
-for _ in $(seq 1 100); do
-    curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null 2>&1 && break
-    sleep 0.1
-done
+wait_healthy "$sock" "$dir/serve.log"
 
 python3 -c "import base64,json,sys; print(json.dumps({'wasm_base64': base64.b64encode(open(sys.argv[1],'rb').read()).decode(), 'reason': 'e2e deploy'}))" "$relay" >"$dir/deploy.json"
 expect "deploy" "webhook-relay http:webhooks.example.com,secret:relay-signing-key" "$(api -X POST -d @"$dir/deploy.json" http://kronik/v1/deployments | json 'd["deployment"]["kind"] + " " + ",".join(d["deployment"]["capabilities"])')"

@@ -20,6 +20,7 @@
 # KRONIK_BIN target/release/kronik.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. scripts/lib.sh
 
 dir="${1:-/var/tmp/kronik-m1}"
 port="${2:-47812}"
@@ -59,15 +60,7 @@ start() {
     setsid "$bin" serve --data-dir "$dir/data" --http-listen "127.0.0.1:$port" \
         --api-socket "$sock" >>"$dir/serve.log" 2>&1 &
     pid=$!
-    # A hosted runner is shared and slow to start a daemon: a minute is a
-    # start that is not coming, ten seconds can be a busy machine.
-    for _ in $(seq 1 1200); do
-        curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null 2>&1 && return
-        sleep 0.05
-    done
-    echo "FAIL: daemon did not become healthy in 60 s" >&2
-    tail -n 40 "$dir/serve.log" >&2
-    exit 1
+    wait_healthy "$sock" "$dir/serve.log"
 }
 stop() { [ -n "$pid" ] && kill "$pid" 2>/dev/null && wait "$pid" 2>/dev/null; pid=""; }
 trap stop EXIT

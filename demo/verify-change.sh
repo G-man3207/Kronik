@@ -20,6 +20,7 @@
 # It audits the exact nonroot fixture, retains evidence, and never stops/removes it.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. scripts/lib.sh
 
 started=$(date +%s)
 dir="${1:-/var/tmp/kronik-verify-change}"
@@ -100,12 +101,8 @@ if [ "$external" = 0 ]; then
     setsid "$bin" serve --data-dir "$dir/data" --http-listen "127.0.0.1:$port" \
         --api-socket "$sock" >>"$dir/serve.log" 2>&1 &
     pid=$!
-    for _ in $(seq 1 100); do
-        curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null 2>&1 && break
-        sleep 0.1
-    done
 fi
-curl -sf --unix-socket "$sock" http://kronik/v1/health >/dev/null || fail "daemon not healthy"
+wait_healthy "$sock" "$dir/serve.log"
 
 step "deploy counter"
 r=$(api POST /v1/deployments "{\"wasm_base64\":\"$(b64 "$old")\",\"dry_run\":true,\"reason\":\"demo manifest\"}")

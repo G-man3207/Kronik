@@ -11,6 +11,7 @@
 # (decimal n, not the examples' JSON). Needs curl and python3.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+. scripts/lib.sh
 
 if [ -z "${KRONIK_TEST_S3_URL:-}" ] || [ -z "${KRONIK_TEST_S3_ENDPOINT:-}" ]; then
     echo "KRONIK_TEST_S3_URL and KRONIK_TEST_S3_ENDPOINT are unset." >&2
@@ -99,11 +100,7 @@ start_serve() { # CONFIG SOCKET LOG
     log=$3
     setsid "$bin" serve --config "$1" >>"$3" 2>&1 &
     pid=$!
-    for _ in $(seq 1 100); do
-        curl -sf --unix-socket "$2" http://kronik/v1/health >/dev/null 2>&1 && return 0
-        sleep 0.1
-    done
-    fail "daemon not healthy ($1)"
+    wait_healthy "$2" "$3"
 }
 
 stop_serve() {
