@@ -9,11 +9,10 @@
 // Test harness code: unwraps, std threads and std time are fine here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -21,117 +20,17 @@ use std::time::Duration;
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-const GUESTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests");
+mod common;
 
-struct Daemon {
-    dir: PathBuf,
-    child: Option<Child>,
-    http: String,
-}
+use common::Daemon;
+
+const GUESTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests");
 
 impl Daemon {
     fn start(dir: &Path, config: &str) -> Daemon {
-        let file = dir.join("kronik.toml");
-        std::fs::write(
-            &file,
-            format!("[server]\ndata_dir = {:?}\n\n{config}", dir.join("data")),
-        )
-        .unwrap();
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("serve.log"))
-            .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_kronik"))
-            .arg("serve")
-            .arg("--config")
-            .arg(&file)
-            .args([
-                "--http-listen",
-                "127.0.0.1:0",
-                "--admin-listen",
-                "127.0.0.1:0",
-                "--test-preview-sweep-ms",
-                "100",
-                "--api-socket",
-            ])
-            .arg(dir.join("api.sock"))
-            .env("KRONIK_LOG", "info")
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        let mut d = Daemon {
-            dir: dir.to_path_buf(),
-            child: Some(child),
-            http: String::new(),
-        };
-        for _ in 0..800 {
-            if let Some((200, v)) = d.try_api("GET", "/v1/health", Value::Null) {
-                d.http = v["http_listen"].as_str().unwrap().to_owned();
-                return d;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        panic!("daemon did not start: {}", d.serve_log());
-    }
-
-    fn serve_log(&self) -> String {
-        std::fs::read_to_string(self.dir.join("serve.log")).unwrap_or_default()
-    }
-
-    fn stop(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = Command::new("kill")
-                .arg("-TERM")
-                .arg(c.id().to_string())
-                .status();
-            let _ = c.wait();
-        }
-    }
-
-    fn try_api(&self, method: &str, path: &str, body: Value) -> Option<(u16, Value)> {
-        let mut s = UnixStream::connect(self.dir.join("api.sock")).ok()?;
-        let body = if body.is_null() {
-            String::new()
-        } else {
-            body.to_string()
-        };
-        write!(
-            s,
-            "{method} {path} HTTP/1.1\r\nhost: kronik\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .ok()?;
-        let mut r = BufReader::new(s);
-        let mut line = String::new();
-        r.read_line(&mut line).ok()?;
-        let status: u16 = line.split_whitespace().nth(1)?.parse().ok()?;
-        let mut len = 0;
-        loop {
-            let mut h = String::new();
-            r.read_line(&mut h).ok()?;
-            let h = h.trim_end();
-            if h.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = h.split_once(':')
-                && k.eq_ignore_ascii_case("content-length")
-            {
-                len = v.trim().parse().ok()?;
-            }
-        }
-        let mut buf = vec![0; len];
-        r.read_exact(&mut buf).ok()?;
-        Some((status, serde_json::from_slice(&buf).ok()?))
-    }
-
-    fn api(&self, method: &str, path: &str, body: Value) -> Value {
-        let (s, v) = self
-            .try_api(method, path, body)
-            .unwrap_or_else(|| panic!("API {method} {path} failed: {}", self.serve_log()));
-        assert_eq!(s, 200, "{method} {path}: {v}");
-        v
+        let mut c = Daemon::command(env!("CARGO_BIN_EXE_kronik"), dir, Some(config));
+        c.args(["--test-preview-sweep-ms", "100"]);
+        Daemon::spawn(dir, c)
     }
 
     /// A gateway request: (status, body).
@@ -216,12 +115,6 @@ impl Daemon {
 
     fn fork_dir(&self, id: &str) -> PathBuf {
         self.dir.join("data").join("branches").join(id)
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
 
@@ -484,7 +377,7 @@ fn previews_are_deleted_after_their_ttl_also_across_a_restart() {
         .as_str()
         .unwrap()
         .to_owned();
-    d.stop();
+    d.term();
     std::thread::sleep(Duration::from_millis(2_000));
     let d = Daemon::start(tmp.path(), "");
     wait_until("its directory is gone", || !d.fork_dir(&id).exists());
