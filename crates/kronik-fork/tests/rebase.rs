@@ -198,8 +198,7 @@ fn rollback_by_replay_after_a_migration_restores_the_old_state() {
     assert!(r.id.starts_with("r-"), "{}", r.id);
     let info = r.rebase.clone().unwrap();
     assert_eq!(info.rolled_back_epoch, s.epoch);
-    let d: Value =
-        serde_json::from_slice(&p.rt.block_on(s.props.diff(&r.id, false, false)).unwrap()).unwrap();
+    let d: Value = diff_json(p, &s.props, &r.id);
     // The extra GET happened under the new code; the POSTs the old code
     // makes too (exact) are not listed.
     let irr = &d["irreversible"];
@@ -1358,8 +1357,7 @@ fn a_rebase_uses_recordings_only_and_its_dry_run_writes_nothing() {
         seen.lock().unwrap().is_empty(),
         "the rebase asked the model"
     );
-    let d: Value =
-        serde_json::from_slice(&p.rt.block_on(props.diff(&r.id, false, false)).unwrap()).unwrap();
+    let d: Value = diff_json(&p, &props, &r.id);
     let by = d["summary"]["synthetic_by"]
         .as_object()
         .cloned()
@@ -1416,9 +1414,7 @@ fn a_message_pending_at_the_fork_point_is_replayed() {
             p.owner(),
         ))
         .unwrap();
-    let d: Value =
-        serde_json::from_slice(&p.rt.block_on(props.diff(&prop.id, false, false)).unwrap())
-            .unwrap();
+    let d: Value = diff_json(&p, &props, &prop.id);
     let f = d["state"]["continuous"]
         .as_array()
         .unwrap()
@@ -1958,28 +1954,17 @@ fn a_fork_at_the_switch_skips_snapshots_inside_the_rebased_window() {
             std::fs::remove_dir_all(snap).unwrap();
         }
     }
-    s.p.rt
-        .block_on(s.props.create_fork(
-            Some("after".into()),
-            switch_lsn,
-            false,
-            audit(),
-            false,
-            s.p.owner(),
-        ))
-        .unwrap();
-    s.p.rt
-        .block_on(s.props.fork_replay(
-            "after",
-            None,
-            DiffOptions {
-                mode: Mode::Continuous,
-                ..DiffOptions::default()
-            },
-            Some(2),
-            s.p.owner(),
-        ))
-        .unwrap();
+    new_fork(&s.p, &s.props, "after", switch_lsn, false, None);
+    replay_fork(
+        &s.p,
+        &s.props,
+        "after",
+        DiffOptions {
+            mode: Mode::Continuous,
+            ..DiffOptions::default()
+        },
+        Some(2),
+    );
 }
 
 /// The real file system, with the free space the test sets.

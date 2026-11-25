@@ -227,33 +227,12 @@ fn a_fork_replays_blob_turns_without_divergence() {
     assert_eq!(served, 2, "production fetched twice");
 
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
-    p.rt.block_on(props.create_fork(
-        Some("blobs".into()),
-        fork_at,
-        false,
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
-    p.rt.block_on(props.fork_replay(
-        "blobs",
-        None,
-        DiffOptions {
-            mode: Mode::Both,
-            ..DiffOptions::default()
-        },
-        None,
-        p.owner(),
-    ))
-    .unwrap();
+    let diff = replay(&p, &props, "blobs", fork_at, false);
     assert_eq!(
         requests.load(Ordering::SeqCst),
         served,
         "the replay served the recordings"
     );
-    let diff: serde_json::Value =
-        serde_json::from_slice(&p.rt.block_on(props.diff("blobs", false, false)).unwrap()).unwrap();
     let summary = &diff["summary"];
     assert_eq!(summary["divergent_turns"], 0, "{diff:#}");
     assert_eq!(summary["unverifiable"], 0, "{diff:#}");
@@ -315,28 +294,19 @@ fn replay(
     fork_at: u64,
     no_pii: bool,
 ) -> serde_json::Value {
-    p.rt.block_on(props.create_fork(
-        Some(name.into()),
-        fork_at,
-        no_pii,
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
-    p.rt.block_on(props.fork_replay(
+    new_fork(p, props, name, fork_at, no_pii, None);
+    serde_json::from_slice(&replay_fork(
+        p,
+        props,
         name,
-        None,
         DiffOptions {
             mode: Mode::Both,
             no_pii,
             ..DiffOptions::default()
         },
         None,
-        p.owner(),
     ))
-    .unwrap();
-    serde_json::from_slice(&p.rt.block_on(props.diff(name, false, false)).unwrap()).unwrap()
+    .unwrap()
 }
 
 /// M25 §9: a `--no-pii` fork reads a subject's blob as its pseudonym, never

@@ -56,30 +56,19 @@ fn a_fork_reveals_only_the_placeholder_and_writes_no_secret_value() {
     p.settle();
 
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
-    p.rt.block_on(props.create_fork(
-        Some("probe".into()),
-        fork_lsn,
-        false,
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
+    new_fork(&p, &props, "probe", fork_lsn, false, None);
     for mode in [Mode::Isolated, Mode::Continuous] {
-        p.rt.block_on(props.fork_replay(
+        let d: serde_json::Value = serde_json::from_slice(&replay_fork(
+            &p,
+            &props,
             "probe",
-            None,
             DiffOptions {
                 mode,
                 ..DiffOptions::default()
             },
             None,
-            p.owner(),
         ))
         .unwrap();
-        let d: serde_json::Value =
-            serde_json::from_slice(&p.rt.block_on(props.diff("probe", false, false)).unwrap())
-                .unwrap();
         // The placeholder rebuilds production's (scrubbed) requests: every
         // effect is answered exactly, nothing changed.
         let s = &d["summary"];
@@ -127,30 +116,19 @@ fn replay_of_an_effect_without_its_secret(name: &str, text: &str, committed: boo
     );
 
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
-    p.rt.block_on(props.create_fork(
-        Some("probe".into()),
-        fork_lsn,
-        false,
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
+    new_fork(&p, &props, "probe", fork_lsn, false, None);
     for mode in [Mode::Isolated, Mode::Continuous] {
-        p.rt.block_on(props.fork_replay(
+        let d: serde_json::Value = serde_json::from_slice(&replay_fork(
+            &p,
+            &props,
             "probe",
-            None,
             DiffOptions {
                 mode,
                 ..DiffOptions::default()
             },
             None,
-            p.owner(),
         ))
         .unwrap();
-        let d: serde_json::Value =
-            serde_json::from_slice(&p.rt.block_on(props.diff("probe", false, false)).unwrap())
-                .unwrap();
         let s = &d["summary"];
         assert_eq!(
             (
@@ -243,8 +221,7 @@ fn replay_probe(
     lsn: u64,
 ) -> Result<serde_json::Value, kronik_core::error::ApiError> {
     let props = Arc::new(Proposals::open(p.node.clone(), dir.to_path_buf()).unwrap());
-    p.rt.block_on(props.create_fork(Some(name.into()), lsn, false, audit(), false, p.owner()))
-        .unwrap();
+    new_fork(p, &props, name, lsn, false, None);
     p.rt.block_on(props.fork_replay(
         name,
         None,
@@ -255,7 +232,7 @@ fn replay_probe(
         None,
         p.owner(),
     ))?;
-    Ok(serde_json::from_slice(&p.rt.block_on(props.diff(name, false, false)).unwrap()).unwrap())
+    Ok(diff_json(p, &props, name))
 }
 
 /// Production records a secret header without a version only for an effect that

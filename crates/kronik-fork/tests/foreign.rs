@@ -210,17 +210,15 @@ fn a_continuous_fork_talks_to_a_copy_from_the_nearest_checkpoint() {
         ..DiffOptions::default()
     };
     let replay = |name: &str, at: u64, code: &str| {
-        p.rt.block_on(props.create_fork(Some(name.into()), at, false, audit(), false, p.owner()))
-            .unwrap();
-        let wasm = std::fs::read(guest(code)).unwrap();
-        p.rt.block_on(props.fork_deploy(name, &wasm, false, p.owner()))
-            .unwrap();
-        p.rt.block_on(props.fork_replay(name, None, continuous.clone(), None, p.owner()))
-            .unwrap();
-        let d: serde_json::Value =
-            serde_json::from_slice(&p.rt.block_on(props.diff(name, false, false)).unwrap())
-                .unwrap();
-        d
+        new_fork(&p, &props, name, at, false, Some(code));
+        serde_json::from_slice::<serde_json::Value>(&replay_fork(
+            &p,
+            &props,
+            name,
+            continuous.clone(),
+            None,
+        ))
+        .unwrap()
     };
 
     // New code changes the request: the copy (checkpoint "a", then main's
@@ -334,18 +332,6 @@ fn call(p: &Proc, body: &str) -> u64 {
     .lsn
 }
 
-fn fork_diff(p: &Proc, props: &Proposals, name: &str) -> serde_json::Value {
-    serde_json::from_slice(&p.rt.block_on(props.diff(name, false, false)).unwrap()).unwrap()
-}
-
-fn new_fork(p: &Proc, props: &Arc<Proposals>, name: &str, at: u64, no_pii: bool, code: &str) {
-    p.rt.block_on(props.create_fork(Some(name.into()), at, no_pii, audit(), false, p.owner()))
-        .unwrap();
-    let wasm = std::fs::read(guest(code)).unwrap();
-    p.rt.block_on(props.fork_deploy(name, &wasm, false, p.owner()))
-        .unwrap();
-}
-
 fn propose_at(
     p: &Proc,
     props: &Arc<Proposals>,
@@ -377,7 +363,7 @@ fn a_second_replay_stops_the_old_copy_first() {
     let dir = tempdir();
     let host = Arc::new(Host::default());
     let (p, props, fork_lsn) = pg_node(dir.path(), &host);
-    new_fork(&p, &props, "f", fork_lsn, false, "counter-body-v2");
+    new_fork(&p, &props, "f", fork_lsn, false, Some("counter-body-v2"));
     let continuous = DiffOptions {
         mode: kronik_fork::diff::Mode::Continuous,
         ..DiffOptions::default()
@@ -388,7 +374,7 @@ fn a_second_replay_stops_the_old_copy_first() {
     }
     assert_eq!(*host.clean_starts.lock().unwrap(), [true, true]);
     // A deployment into the fork stops its copy too.
-    new_fork(&p, &props, "g", fork_lsn, false, "counter-body-v2");
+    new_fork(&p, &props, "g", fork_lsn, false, Some("counter-body-v2"));
     p.rt.block_on(props.fork_replay("g", None, continuous, None, p.owner()))
         .unwrap();
     let wasm = std::fs::read(guest("counter")).unwrap();
@@ -404,10 +390,10 @@ fn both_mode_takes_copied_answers_from_the_continuous_view() {
     let dir = tempdir();
     let host = Arc::new(Host::default());
     let (p, props, fork_lsn) = pg_node(dir.path(), &host);
-    new_fork(&p, &props, "f", fork_lsn, false, "counter-body-v2");
+    new_fork(&p, &props, "f", fork_lsn, false, Some("counter-body-v2"));
     p.rt.block_on(props.fork_replay("f", None, DiffOptions::default(), None, p.owner()))
         .unwrap();
-    let d = fork_diff(&p, &props, "f");
+    let d = diff_json(&p, &props, "f");
     assert_eq!(d["options"]["mode"], "both", "{d}");
     assert_eq!(
         (&d["summary"]["forked"], &d["summary"]["approximate"]),
@@ -425,14 +411,14 @@ fn a_fork_without_personal_data_gets_no_copies() {
     let dir = tempdir();
     let host = Arc::new(Host::default());
     let (p, props, fork_lsn) = pg_node(dir.path(), &host);
-    new_fork(&p, &props, "f", fork_lsn, true, "counter-body-v2");
+    new_fork(&p, &props, "f", fork_lsn, true, Some("counter-body-v2"));
     let continuous = DiffOptions {
         mode: kronik_fork::diff::Mode::Continuous,
         ..DiffOptions::default()
     };
     p.rt.block_on(props.fork_replay("f", None, continuous, None, p.owner()))
         .unwrap();
-    let d = fork_diff(&p, &props, "f");
+    let d = diff_json(&p, &props, "f");
     assert_eq!(d["options"]["foreign"][0]["mode"], "recorded", "{d}");
     assert_eq!(
         d["options"]["foreign"][0]["why"],
@@ -450,14 +436,14 @@ fn calls_of_a_turn_across_the_fork_point_reach_the_copy_once() {
     let host = Arc::new(Host::default());
     let (p, props, b) = pg_node(dir.path(), &host);
     // Inside b's turn: its call is logged, its turn record is not.
-    new_fork(&p, &props, "f", b - 1, false, "counter");
+    new_fork(&p, &props, "f", b - 1, false, Some("counter"));
     let continuous = DiffOptions {
         mode: kronik_fork::diff::Mode::Continuous,
         ..DiffOptions::default()
     };
     p.rt.block_on(props.fork_replay("f", None, continuous, None, p.owner()))
         .unwrap();
-    let d = fork_diff(&p, &props, "f");
+    let d = diff_json(&p, &props, "f");
     assert_eq!(d["options"]["foreign"][0]["replayed_calls"], 0, "{d}");
     let copy = host.copies.lock().unwrap()[0].clone();
     assert_eq!(*copy.service.0.lock().unwrap(), ["a", "b", "c"]);
@@ -498,7 +484,7 @@ fn dry_runs_rebases_and_rejected_proposals_keep_no_copies() {
             p.owner(),
         ))
         .unwrap();
-    let d = fork_diff(&p, &props, &r.id);
+    let d = diff_json(&p, &props, &r.id);
     assert_eq!(d["options"]["foreign"][0]["mode"], "recorded", "{d}");
     assert_eq!(
         d["options"]["foreign"][0]["why"],
@@ -542,14 +528,14 @@ fn checkpoints_and_copies_keep_to_the_disk_reserve() {
     let (p, props, fork_lsn) = pg_node(dir.path(), &host);
     // A checkpoint that would not fit above the reserve.
     *host.ck_bytes.lock().unwrap() = Some(u64::MAX / 4);
-    new_fork(&p, &props, "f", fork_lsn, false, "counter-body-v2");
+    new_fork(&p, &props, "f", fork_lsn, false, Some("counter-body-v2"));
     let continuous = DiffOptions {
         mode: kronik_fork::diff::Mode::Continuous,
         ..DiffOptions::default()
     };
     p.rt.block_on(props.fork_replay("f", None, continuous, None, p.owner()))
         .unwrap();
-    let d = fork_diff(&p, &props, "f");
+    let d = diff_json(&p, &props, "f");
     assert_eq!(d["options"]["foreign"][0]["mode"], "recorded", "{d}");
     assert!(
         d["options"]["foreign"][0]["why"]
@@ -596,7 +582,7 @@ fn a_replay_completes_after_its_caller_is_dropped_and_its_copies_never_leak() {
     let dir = tempdir();
     let host = Arc::new(Host::default());
     let (p, props, fork_lsn) = pg_node(dir.path(), &host);
-    new_fork(&p, &props, "f", fork_lsn, false, "counter-body-v2");
+    new_fork(&p, &props, "f", fork_lsn, false, Some("counter-body-v2"));
     host.hold_copies
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let continuous = DiffOptions {

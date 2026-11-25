@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Proc, audit, guest, tempdir};
+use common::{Proc, audit, diff_json, guest, tempdir};
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::Lsn;
 use kronik_fork::diff::DiffOptions;
@@ -459,9 +459,7 @@ fn a_window_cut_by_retention_is_reported() {
         warnings.len() == 1 && warnings[0].contains("retention cut the window"),
         "{warnings:?}"
     );
-    let diff: serde_json::Value =
-        serde_json::from_slice(&p.rt.block_on(props.diff(&prop.id, false, false)).unwrap())
-            .unwrap();
+    let diff = diff_json(&p, &props, &prop.id);
     assert_eq!(
         diff["base"]["window_cut"]["kept_from_lsn"], snap.lsn,
         "{}",

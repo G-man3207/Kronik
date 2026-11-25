@@ -114,15 +114,7 @@ fn recorded_denies_an_unmatched_call_and_compute_does_not_leak_the_key() {
     let before = computations();
     let fork_lsn = p.settle();
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
-    p.rt.block_on(props.create_fork(
-        Some("recorded".into()),
-        fork_lsn,
-        false,
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
+    new_fork(&p, &props, "recorded", fork_lsn, false, None);
 
     let denied = fork_hmac(&p, &props, "recorded", "payload");
     let denied_text = reply_text(&denied);
@@ -156,19 +148,9 @@ fn recorded_denies_an_unmatched_call_and_compute_does_not_leak_the_key() {
     let main = p.send("counter/b", "hmac", "signing\nsame");
     assert!(main.committed(), "{main:?}");
     let matched_at = p.settle();
-    p.rt.block_on(props.create_fork(
-        Some("matched".into()),
-        matched_at,
-        false,
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
-    p.rt.block_on(props.fork_replay("matched", None, DiffOptions::default(), None, p.owner()))
-        .unwrap();
+    new_fork(&p, &props, "matched", matched_at, false, None);
+    let diff_bytes = replay_fork(&p, &props, "matched", DiffOptions::default(), None);
     assert_eq!(computations(), before, "a recording is not a computation");
-    let diff_bytes = p.rt.block_on(props.diff("matched", false, false)).unwrap();
     let diff_text = String::from_utf8_lossy(&diff_bytes);
     assert_key_absent("matched diff", &diff_bytes, &diff_text);
     let markdown =
@@ -177,15 +159,7 @@ fn recorded_denies_an_unmatched_call_and_compute_does_not_leak_the_key() {
 
     grant(&p, InForks::Compute);
     let compute_at = p.settle();
-    p.rt.block_on(props.create_fork(
-        Some("compute".into()),
-        compute_at,
-        false,
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
+    new_fork(&p, &props, "compute", compute_at, false, None);
     let signed = fork_hmac(&p, &props, "compute", "other");
     let signed_text = reply_text(&signed);
     let want = hmac_hex(b"other");
@@ -218,9 +192,7 @@ fn recorded_denies_an_unmatched_call_and_compute_does_not_leak_the_key() {
     );
     assert_key_absent("compute effect response", response, &hex_of(response));
 
-    p.rt.block_on(props.fork_replay("compute", None, DiffOptions::default(), None, p.owner()))
-        .unwrap();
-    let compute_diff = p.rt.block_on(props.diff("compute", false, false)).unwrap();
+    let compute_diff = replay_fork(&p, &props, "compute", DiffOptions::default(), None);
     let compute_diff_text = String::from_utf8_lossy(&compute_diff);
     assert_key_absent("compute diff", &compute_diff, &compute_diff_text);
     let compute_md =
