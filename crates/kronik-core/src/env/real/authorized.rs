@@ -18,6 +18,24 @@ use crate::env::{
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Startup requests made before any request authority exists.
+pub(super) struct Unscoped;
+
+impl crate::authority::Authority for Unscoped {
+    fn check(&self) -> Result<(), crate::error::ApiError> {
+        Ok(())
+    }
+    fn cancelled(&self) -> BoxFuture<'static, ()> {
+        Box::pin(std::future::pending())
+    }
+    fn admit(
+        &self,
+        effect: &mut dyn FnMut() -> Result<(), crate::error::ApiError>,
+    ) -> Result<(), crate::error::ApiError> {
+        effect()
+    }
+}
+
 pub(super) fn send(
     connector: Result<Connector, String>,
     req: HttpRequest,
