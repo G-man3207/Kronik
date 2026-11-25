@@ -1325,15 +1325,12 @@ mod sql_pool_apply_tests {
         }
     }
 
-    fn store(capacity: usize, retain: Option<usize>) -> (Arc<Store>, Arc<Counting>) {
+    fn store(capacity: usize) -> (Arc<Store>, Arc<Counting>) {
         let counting = Arc::new(Counting {
             inner: MemOpener,
             opens_under_lock: AtomicUsize::new(0),
         });
         let pool = SqlPool::new(counting.clone(), Limits::default(), capacity);
-        if let Some(n) = retain {
-            pool.retain_opened(n);
-        }
         (
             Store::open(Connection::open_in_memory().unwrap(), pool).unwrap(),
             counting,
@@ -1380,13 +1377,13 @@ mod sql_pool_apply_tests {
     /// while the apply lock is held, and that hold stays with a warm run.
     #[test]
     fn a_thousand_sql_actors_do_not_open_under_the_apply_lock() {
-        let (warm, _) = store(64, None);
+        let (warm, _) = store(64);
         apply_round(&warm, 1, 64, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
         let _ = take_apply_lock_hold();
         apply_round(&warm, 65, 64, "CREATE TABLE t2 (id INTEGER PRIMARY KEY)");
         let warm_per = take_apply_lock_hold() / 64u32;
 
-        let (cold, counting) = store(256, None);
+        let (cold, counting) = store(256);
         apply_round(&cold, 1, 1_000, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
         assert_eq!(
             counting.opens_under_lock.load(Ordering::Relaxed),

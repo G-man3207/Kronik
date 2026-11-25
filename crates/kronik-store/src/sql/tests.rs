@@ -40,6 +40,14 @@ fn commit(
     (t, res)
 }
 
+/// [`commit`], asserting that every statement succeeded.
+#[track_caller]
+fn commit_ok(a: &mut SqlActor, o: &TurnOpts, stmts: &[&str], lsn: u64) -> TurnSql {
+    let (t, res) = commit(a, o, stmts, lsn);
+    assert!(res.iter().all(|r| r.is_ok()), "{res:?}");
+    t
+}
+
 const SCHEMA: &[&str] = &[
     "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
      _subject TEXT DEFAULT (kronik_subject()))",
@@ -51,8 +59,7 @@ const SCHEMA: &[&str] = &[
 fn ddl_is_recorded_and_a_rebuild_has_the_same_hash() {
     let mut live = actor("live");
     let mut log = Vec::new();
-    let (t, res) = commit(&mut live, &opts(1, 1_000, true), SCHEMA, 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let t = commit_ok(&mut live, &opts(1, 1_000, true), SCHEMA, 1);
     assert_eq!(t.ddl, SCHEMA);
     log.push(t);
     for i in 0..20u64 {
@@ -67,8 +74,7 @@ fn ddl_is_recorded_and_a_rebuild_has_the_same_hash() {
             format!("DELETE FROM notes WHERE id = {}", i / 2),
         ];
         let stmts: Vec<&str> = stmts.iter().map(String::as_str).collect();
-        let (t, res) = commit(&mut live, &o, &stmts, i + 2);
-        assert!(res.iter().all(Result::is_ok), "{res:?}");
+        let t = commit_ok(&mut live, &o, &stmts, i + 2);
         log.push(t);
     }
     let mut rebuilt = actor("rebuilt");
@@ -299,8 +305,7 @@ fn physical_diagnostics_are_denied_in_guest_private_prepare_and_schema_replay() 
 #[test]
 fn a_caught_sql_error_does_not_fail_the_turn() {
     let mut a = actor("recover");
-    let (_, res) = commit(&mut a, &opts(1, 1, true), &SCHEMA[..1], 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    commit_ok(&mut a, &opts(1, 1, true), &SCHEMA[..1], 1);
     for bad in [
         "THIS IS NOT SQL",
         "VACUUM",
@@ -347,15 +352,13 @@ fn a_copy_during_an_open_turn_holds_the_applied_rows() {
         root: dir.path().to_path_buf(),
     };
     let mut a = SqlActor::open(&opener, "notes/n", Limits::default()).unwrap();
-    let (_, res) = commit(&mut a, &opts(1, 1_000, true), &SCHEMA[..1], 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
-    let (_, res) = commit(
+    commit_ok(&mut a, &opts(1, 1_000, true), &SCHEMA[..1], 1);
+    commit_ok(
         &mut a,
         &opts(2, 2_000, false),
         &["INSERT INTO notes(body) VALUES ('applied')"],
         2,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
     a.begin_turn(&opts(3, 3_000, false)).unwrap();
     a.query("INSERT INTO notes(body) VALUES ('in the turn')", &[])
         .unwrap();
@@ -385,11 +388,10 @@ fn a_rewritten_changeset_applies_pseudonyms_and_keeps_the_primary_key() {
          payload BLOB, _subject TEXT DEFAULT (kronik_subject()))",
     ];
     let mut live = actor("rewrite-live");
-    let (_, res) = commit(&mut live, &opts(1, 1, true), &schema, 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    commit_ok(&mut live, &opts(1, 1, true), &schema, 1);
     let mut o = opts(2, 2, false);
     o.default_subject = Some("user:1".into());
-    let (t, res) = commit(
+    let t = commit_ok(
         &mut live,
         &o,
         &[
@@ -400,7 +402,6 @@ fn a_rewritten_changeset_applies_pseudonyms_and_keeps_the_primary_key() {
         ],
         2,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
     let (subject, cs) = t.changesets.first().expect("one changeset");
     assert_eq!(subject.as_deref(), Some("user:1"));
     let subject_at: i64 = live
@@ -481,29 +482,25 @@ fn a_text_cell_equal_to_the_subject_is_rewritten_and_subject_is_not() {
         body TEXT NOT NULL, \
         amount REAL NOT NULL)";
     let mut live = actor("equal-subject-live");
-    let (_, res) = commit(&mut live, &opts(1, 1, true), &[schema], 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
-    let (inserted, res) = commit(
+    commit_ok(&mut live, &opts(1, 1, true), &[schema], 1);
+    let inserted = commit_ok(
         &mut live,
         &as_subject(2, "user:1"),
         &["INSERT INTO notes(body, amount) VALUES ('user:1', 1.5)"],
         2,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
-    let (seeded, res) = commit(
+    let seeded = commit_ok(
         &mut live,
         &as_subject(3, "user:2"),
         &["INSERT INTO notes(body, amount) VALUES ('hello', 2.25)"],
         3,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
-    let (updated, res) = commit(
+    let updated = commit_ok(
         &mut live,
         &as_subject(4, "user:3"),
         &["UPDATE notes SET body = 'user:2' WHERE id = 2"],
         4,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
     assert_eq!(updated.changesets[0].0.as_deref(), Some("user:2"));
 
     let rewrite = |_: &str, value: &[u8]| {
@@ -572,8 +569,7 @@ fn as_subject(seed: u8, subject: &str) -> TurnOpts {
 /// An actor with [`SUBJECT_TABLE`], created at LSN 1.
 fn subject_actor(name: &str) -> SqlActor {
     let mut a = actor(name);
-    let (_, res) = commit(&mut a, &opts(1, 1, true), &[SUBJECT_TABLE], 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    commit_ok(&mut a, &opts(1, 1, true), &[SUBJECT_TABLE], 1);
     a
 }
 
@@ -625,7 +621,7 @@ fn subject_changes(cs: &[u8]) -> Vec<(ffi::Op, Option<String>, Option<String>)> 
 #[test]
 fn subjects_split_one_turn_into_a_changeset_per_row_subject() {
     let mut live = subject_actor("split-live");
-    let (t, res) = commit(
+    let t = commit_ok(
         &mut live,
         &as_subject(2, "user:1"),
         &[
@@ -635,7 +631,6 @@ fn subjects_split_one_turn_into_a_changeset_per_row_subject() {
         ],
         2,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
     let subjects: Vec<Option<&str>> = t.changesets.iter().map(|(s, _)| s.as_deref()).collect();
     assert_eq!(
         subjects,
@@ -685,33 +680,30 @@ fn subjects_split_one_turn_into_a_changeset_per_row_subject() {
 #[test]
 fn subjects_row_subject_wins_over_the_turns_default_subject() {
     let mut a = subject_actor("row-subject");
-    let (_, res) = commit(
+    commit_ok(
         &mut a,
         &as_subject(2, "user:2"),
         &["INSERT INTO notes(body) VALUES ('two')"],
         2,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
-    let (t, res) = commit(
+    let t = commit_ok(
         &mut a,
         &as_subject(3, "user:3"),
         &["UPDATE notes SET body = 'two, edited' WHERE id = 1"],
         3,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
     assert_eq!(t.changesets.len(), 1, "{t:?}");
     assert_eq!(t.changesets[0].0.as_deref(), Some("user:2"));
     assert_eq!(
         subject_changes(&t.changesets[0].1),
         [(ffi::Op::Update, Some("two, edited".to_owned()), None)]
     );
-    let (t, res) = commit(
+    let t = commit_ok(
         &mut a,
         &as_subject(4, "user:3"),
         &["DELETE FROM notes WHERE id = 1"],
         4,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
     assert_eq!(t.changesets.len(), 1, "{t:?}");
     assert_eq!(t.changesets[0].0.as_deref(), Some("user:2"));
     assert_eq!(
@@ -734,13 +726,12 @@ fn subjects_row_subject_wins_over_the_turns_default_subject() {
 #[test]
 fn subjects_move_detected() {
     let mut a = subject_actor("move");
-    let (_, res) = commit(
+    commit_ok(
         &mut a,
         &as_subject(2, "user:1"),
         &["INSERT INTO notes(body) VALUES ('one')"],
         2,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
 
     for statements in [
         &["INSERT OR REPLACE INTO notes(id, body, _subject) VALUES (1, 'moved', 'user:2')"][..],
@@ -777,20 +768,18 @@ fn subjects_move_detected() {
         [(1, "one".to_owned(), "user:1".to_owned())]
     );
 
-    let (deleted, res) = commit(
+    let deleted = commit_ok(
         &mut a,
         &as_subject(5, "user:1"),
         &["DELETE FROM notes WHERE id = 1"],
         3,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
-    let (inserted, res) = commit(
+    let inserted = commit_ok(
         &mut a,
         &as_subject(6, "user:2"),
         &["INSERT INTO notes(id, body) VALUES (1, 'moved')"],
         4,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
     assert_eq!(deleted.changesets[0].0.as_deref(), Some("user:1"));
     assert_eq!(inserted.changesets[0].0.as_deref(), Some("user:2"));
     assert_eq!(
@@ -810,8 +799,7 @@ fn a_subject_turn_cannot_write_a_table_without_subject_column() {
         "CREATE TABLE plain (id INTEGER PRIMARY KEY, body TEXT)",
     ];
     let mut a = actor("untagged");
-    let (_, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    commit_ok(&mut a, &opts(1, 1, true), &schema, 1);
 
     let mut with_subject = opts(2, 2, false);
     with_subject.default_subject = Some("user:1".into());
@@ -829,22 +817,20 @@ fn a_subject_turn_cannot_write_a_table_without_subject_column() {
     a.end_turn(false).unwrap();
     assert_eq!(left.values[0][0], Value::Integer(0), "{left:?}");
 
-    let (t, res) = commit(
+    let t = commit_ok(
         &mut a,
         &opts(4, 4, false),
         &["INSERT INTO plain(body) VALUES ('system')"],
         2,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
     assert!(!t.changesets.is_empty());
 
-    let (t, res) = commit(
+    let t = commit_ok(
         &mut a,
         &with_subject,
         &["INSERT INTO tagged(body) VALUES ('kept')"],
         3,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
     assert!(
         t.changesets
             .iter()
@@ -872,8 +858,7 @@ fn a_subject_column_of_any_ascii_case_is_erased_and_pseudonymized() {
          payload BLOB, \"_Subject\" TEXT DEFAULT (kronik_subject()))",
     ];
     let mut a = actor("case-subject");
-    let (_, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    commit_ok(&mut a, &opts(1, 1, true), &schema, 1);
     assert!(
         !a.has_table_without_subject().unwrap(),
         "a case-variant subject column is still a subject column"
@@ -881,22 +866,20 @@ fn a_subject_column_of_any_ascii_case_is_erased_and_pseudonymized() {
 
     let mut first = opts(2, 2, false);
     first.default_subject = Some("user:1".into());
-    let (_, res) = commit(
+    commit_ok(
         &mut a,
         &first,
         &["INSERT INTO notes(body, payload) VALUES ('ROW-secret', x'0102')"],
         2,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
     let mut second = opts(3, 3, false);
     second.default_subject = Some("user:2".into());
-    let (_, res) = commit(
+    commit_ok(
         &mut a,
         &second,
         &["INSERT INTO notes(body, payload) VALUES ('ROW-other', x'0304')"],
         3,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
 
     a.pseudonymize_subject_cells(|_, value| {
         let mut out = b"pii:".to_vec();
@@ -956,8 +939,7 @@ fn holds(haystack: &[u8], needle: &[u8]) -> bool {
 fn scrubbing_covers_blob_cells_and_binary_secrets() {
     let mut a = actor("scrub-blobs");
     let schema = ["CREATE TABLE keys (id INTEGER PRIMARY KEY, t TEXT, b BLOB)"];
-    let (_, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    commit_ok(&mut a, &opts(1, 1, true), &schema, 1);
     let text = "sk-live-0123456789";
     let binary: &[u8] = &[0x00, 0xff, 0x10, 0x80, 0x7f, 0x01];
     let blob = |parts: &[&[u8]]| Value::Blob(parts.concat());
@@ -1027,21 +1009,19 @@ fn scrubbing_covers_blob_cells_and_binary_secrets() {
 #[test]
 fn a_read_only_sql_turn_does_not_scrub() {
     let mut a = actor("no-write");
-    let (_, res) = commit(
+    commit_ok(
         &mut a,
         &opts(1, 1, true),
         &["CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)"],
         1,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
     let text = "sk-live-0123456789";
-    let (_, res) = commit(
+    commit_ok(
         &mut a,
         &opts(2, 2, false),
         &[&format!("INSERT INTO notes(body) VALUES ('{text}')")],
         2,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
     a.begin_turn(&opts(3, 3, false)).unwrap();
     a.query("SELECT body FROM notes", &[]).unwrap();
     assert_eq!(a.scrub(&[("api", text.as_bytes())]).unwrap(), 0);
@@ -1059,8 +1039,7 @@ fn a_read_only_sql_turn_does_not_scrub() {
 fn the_first_write_that_sees_a_secret_scrubs_untouched_cells() {
     let mut a = actor("once");
     let schema = ["CREATE TABLE keys (id INTEGER PRIMARY KEY, t TEXT, b BLOB)"];
-    let (schema_turn, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let schema_turn = commit_ok(&mut a, &opts(1, 1, true), &schema, 1);
     let text = "sk-live-0123456789";
     let binary: &[u8] = &[0x00, 0xff, 0x10, 0x80, 0x7f, 0x01];
     a.begin_turn(&opts(2, 2, false)).unwrap();
@@ -1122,8 +1101,7 @@ fn a_seen_secret_is_scrubbed_from_written_cells_without_scanning() {
         "CREATE TABLE keys (id INTEGER PRIMARY KEY, t TEXT, b BLOB)",
         "CREATE TABLE loose (body TEXT)",
     ];
-    let (_, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    commit_ok(&mut a, &opts(1, 1, true), &schema, 1);
     let text = "sk-live-0123456789";
     let binary: &[u8] = &[0x00, 0xff, 0x10, 0x80, 0x7f, 0x01];
     a.begin_turn(&opts(2, 2, false)).unwrap();
@@ -1232,13 +1210,12 @@ fn reopening_an_actor_does_not_rescan_a_scrubbed_secret() {
     let text: &[u8] = b"sk-live-0123456789";
     {
         let mut a = SqlActor::open(&opener, "notes/n", Limits::default()).unwrap();
-        let (_, res) = commit(
+        commit_ok(
             &mut a,
             &opts(1, 1, true),
             &["CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)"],
             1,
         );
-        assert!(res.iter().all(Result::is_ok), "{res:?}");
         a.begin_turn(&opts(2, 2, false)).unwrap();
         a.execute("INSERT INTO notes(body) VALUES ('warm')", &[])
             .unwrap();
@@ -1274,17 +1251,15 @@ fn blob_of(value: &Value) -> Vec<u8> {
 #[test]
 fn an_erasure_during_a_turn_is_not_rolled_back_by_its_end() {
     let mut a = actor("mid-turn");
-    let (_, res) = commit(&mut a, &opts(1, 1, true), &SCHEMA[..1], 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    commit_ok(&mut a, &opts(1, 1, true), &SCHEMA[..1], 1);
     let mut o = opts(2, 2, false);
     o.default_subject = Some("user:1".into());
-    let (_, res) = commit(
+    commit_ok(
         &mut a,
         &o,
         &["INSERT INTO notes(body) VALUES ('personal')"],
         2,
     );
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
     let mut o = opts(3, 3, false);
     o.default_subject = Some("user:2".into());
     a.begin_turn(&o).unwrap();
@@ -1327,8 +1302,7 @@ fn a_quoted_table_name_erases_splits_and_hashes() {
          _subject TEXT DEFAULT (kronik_subject()))",
     ];
     let mut live = actor("quoted-live");
-    let (schema_turn, res) = commit(&mut live, &opts(1, 1, true), &schema, 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let schema_turn = commit_ok(&mut live, &opts(1, 1, true), &schema, 1);
 
     let inserts = [
         "INSERT INTO \"a\"\"b\"(body) VALUES ('pk-mine')",
@@ -1336,15 +1310,13 @@ fn a_quoted_table_name_erases_splits_and_hashes() {
         "INSERT INTO \"c\"\"d\"(body) VALUES ('row-mine')",
         "INSERT INTO \"c\"\"d\"(body, _subject) VALUES ('row-theirs', 'user:2')",
     ];
-    let (inserted, res) = commit(&mut live, &as_subject(2, "user:1"), &inserts, 2);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let inserted = commit_ok(&mut live, &as_subject(2, "user:1"), &inserts, 2);
 
     let updates = [
         "UPDATE \"a\"\"b\" SET body = 'pk-edited' WHERE \"id\"\"x\" = 1",
         "UPDATE \"c\"\"d\" SET body = 'row-edited' WHERE rowid = 1",
     ];
-    let (updated, res) = commit(&mut live, &as_subject(3, "user:3"), &updates, 3);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let updated = commit_ok(&mut live, &as_subject(3, "user:3"), &updates, 3);
     assert!(
         updated
             .changesets
@@ -1424,16 +1396,14 @@ fn a_failed_erasure_statement_rolls_the_savepoint_back() {
          parent INTEGER NOT NULL REFERENCES \"m\"\"parent\"(id), _subject TEXT)",
     ];
     let mut a = actor("erasure-rollback");
-    let (_, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    commit_ok(&mut a, &opts(1, 1, true), &schema, 1);
     let inserts = [
         "INSERT INTO early(body) VALUES ('kept')",
         "INSERT INTO early(body, _subject) VALUES ('other', 'user:2')",
         "INSERT INTO \"m\"\"parent\"(id, _subject) VALUES (1, 'user:1')",
         "INSERT INTO \"z\"\"child\"(id, parent, _subject) VALUES (1, 1, 'user:1')",
     ];
-    let (_, res) = commit(&mut a, &as_subject(2, "user:1"), &inserts, 2);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    commit_ok(&mut a, &as_subject(2, "user:1"), &inserts, 2);
 
     let err = a.erase_subject("user:1", 3).unwrap_err();
     assert!(
@@ -1462,8 +1432,7 @@ fn a_failed_erasure_statement_rolls_the_savepoint_back() {
         "the earlier delete in the same erasure was committed"
     );
 
-    let (_, res) = commit(&mut a, &opts(4, 4, true), &["DROP TRIGGER block_early"], 3);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    commit_ok(&mut a, &opts(4, 4, true), &["DROP TRIGGER block_early"], 3);
     let n = a.erase_subject("user:1", 4).unwrap();
     assert!(n >= 3, "erasure after the rollback did not delete: {n}");
     assert_eq!(a.applied_lsn().unwrap(), 4);
@@ -1494,10 +1463,8 @@ fn a_same_subject_parent_and_child_erase_together() {
         "INSERT INTO line(id, account_id, _subject) VALUES (2, 2, 'user:2')",
     ];
     let mut live = actor("fk-live");
-    let (schema_turn, res) = commit(&mut live, &opts(1, 1, true), &schema, 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
-    let (inserted, res) = commit(&mut live, &as_subject(2, "user:1"), &inserts, 2);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    let schema_turn = commit_ok(&mut live, &opts(1, 1, true), &schema, 1);
+    let inserted = commit_ok(&mut live, &as_subject(2, "user:1"), &inserts, 2);
 
     let n = live.erase_subject("user:1", 3).unwrap();
     assert!(n >= 2, "parent and child were not both deleted: {n}");
@@ -1554,10 +1521,8 @@ fn another_subjects_reference_blocks_erasure() {
         "INSERT INTO \"z\"\"child\"(id, account_id, _subject) VALUES (1, 1, 'user:2')",
     ];
     let mut a = actor("fk-blocked");
-    let (_, res) = commit(&mut a, &opts(1, 1, true), &schema, 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
-    let (_, res) = commit(&mut a, &as_subject(2, "user:1"), &inserts, 2);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    commit_ok(&mut a, &opts(1, 1, true), &schema, 1);
+    commit_ok(&mut a, &as_subject(2, "user:1"), &inserts, 2);
 
     let err = a.erase_subject("user:1", 3).unwrap_err();
     assert!(
@@ -1605,8 +1570,7 @@ fn an_implicit_parent_key_erases_and_a_cross_subject_child_blocks() {
          account_id INTEGER REFERENCES Account(id))",
     ];
     let mut live = actor("fk-implicit");
-    let (_, res) = commit(&mut live, &opts(1, 1, true), &schema, 1);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    commit_ok(&mut live, &opts(1, 1, true), &schema, 1);
     live.set_host();
     live.conn
         .execute_batch(
@@ -1621,8 +1585,7 @@ fn an_implicit_parent_key_erases_and_a_cross_subject_child_blocks() {
         "INSERT INTO pair(a, b, _subject) VALUES (1, 2, 'user:1')",
         "INSERT INTO edge(id, x, y, _subject) VALUES (1, 1, 2, 'user:1')",
     ];
-    let (_, res) = commit(&mut live, &as_subject(2, "user:1"), &inserts, 2);
-    assert!(res.iter().all(Result::is_ok), "{res:?}");
+    commit_ok(&mut live, &as_subject(2, "user:1"), &inserts, 2);
     live.erase_subject("user:1", 3).unwrap();
     assert_eq!(live.applied_lsn().unwrap(), 3);
     assert!(live.conn.is_autocommit());
@@ -1690,18 +1653,6 @@ fn a_small_pool_still_evicts_when_nothing_asks_it_to_grow() {
     assert_eq!(open.len(), 1);
     assert!(open.contains_key("b/1"));
     assert!(!open.contains_key("a/1"));
-}
-
-#[test]
-fn retain_opened_keeps_actors_past_the_constructed_capacity() {
-    let pool = SqlPool::new(Arc::new(MemOpener), Limits::default(), 1);
-    pool.retain_opened(3);
-    for name in ["a/1", "b/1", "c/1"] {
-        drop(pool.get(name).unwrap());
-    }
-    let g = pool.inner.lock().unwrap();
-    assert_eq!(g.open.len(), 3);
-    assert!(g.capacity >= 3);
 }
 
 #[test]
