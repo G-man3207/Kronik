@@ -13,6 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use common::free_port;
+use kronik_runtime::{KRONIK_VERSION, WASMTIME_VERSION};
 use serde_json::{Value, json};
 
 const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
@@ -260,6 +261,23 @@ fn explain_needs_no_daemon() {
     );
     // A topic or --list is required.
     assert_eq!(kronik(&none, &["explain"], None).code, 2);
+}
+
+#[test]
+fn version_flag_prints_kronik_wasmtime_and_engine_versions() {
+    let output = Command::new(KRONIK).arg("--version").output().unwrap();
+    assert!(
+        output.status.success(),
+        "kronik --version failed: {output:?}"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "kronik {KRONIK_VERSION}\n\
+             wasmtime {WASMTIME_VERSION}\n\
+             engine kronik-{KRONIK_VERSION}+wasmtime-{WASMTIME_VERSION}\n"
+        )
+    );
 }
 
 #[test]
@@ -1839,6 +1857,56 @@ fn privacy_mode_status_and_erase() {
         .json();
     assert_eq!(v["subject"], "user:2", "{v}");
     assert!(v["lsn"].as_u64().is_some(), "{v}");
+}
+
+/// `kronik privacy reseal` against a real `kronik serve`. Fails if the route
+/// is not wired.
+#[test]
+fn privacy_reseal_is_wired() {
+    let d = Daemon::start();
+
+    let off = d.run(&["privacy", "reseal", "--reason", "too soon"]);
+    assert_eq!(off.code, 1, "{off:?}");
+    assert!(off.stderr.contains("BAD_REQUEST"), "{off:?}");
+    assert!(off.stderr.contains("privacy mode is off"), "{off:?}");
+
+    assert_eq!(
+        d.run(&["privacy", "mode", "on", "--reason", "gdpr"]).code,
+        0
+    );
+
+    let dry = d.run(&["privacy", "reseal", "--reason", "seal history", "--dry-run"]);
+    assert_eq!(dry.code, 0, "{dry:?}");
+    assert!(dry.stdout.contains("nothing was written"), "{dry:?}");
+    assert!(
+        dry.stdout
+            .contains("Next     kronik privacy reseal --reason 'seal history'"),
+        "{dry:?}"
+    );
+
+    let done = d.run(&["--json", "privacy", "reseal", "--reason", "seal history"]);
+    assert_eq!(done.code, 0, "{done:?}");
+    let v = done.json();
+    assert_eq!(v["dry_run"], false, "{v}");
+    assert!(v["segments"].is_u64(), "{v}");
+
+    let status = d.run(&["--json", "privacy", "status"]);
+    assert_eq!(status.code, 0, "{status:?}");
+    let s = status.json();
+    for field in [
+        "segments_done",
+        "segments_total",
+        "values_sealed",
+        "tombstones",
+        "pending_segments",
+    ] {
+        assert!(s["reseal"][field].is_u64(), "{field}: {s}");
+    }
+    assert!(s["pending_erasures"].is_u64(), "{s}");
+
+    let human = d.run(&["privacy", "status"]);
+    assert!(human.stdout.contains("Reseal"), "{human:?}");
+    assert!(human.stdout.contains("Erasures"), "{human:?}");
 }
 
 /// `POST path` with `body` to the gateway at `addr`: the response body.
