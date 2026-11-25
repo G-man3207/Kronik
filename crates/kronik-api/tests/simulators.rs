@@ -3,40 +3,17 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 
-use base64::Engine as _;
-use kronik_api::{Api, ApiRequest};
+use common::{call, wasm};
+use kronik_api::Api;
 use kronik_core::env::Env;
 use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
-
-const GUESTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests");
-
-async fn call(api: &Api, method: &str, path: &str, body: Value) -> (u16, Value) {
-    let r = api
-        .handle(ApiRequest {
-            method: method.into(),
-            path: path.into(),
-            query: String::new(),
-            body: if body.is_null() {
-                vec![]
-            } else {
-                body.to_string().into_bytes()
-            },
-            token_id: "unix:uid=0".into(),
-            bearer: None,
-        })
-        .await;
-    (r.status, serde_json::from_slice(&r.body).unwrap())
-}
-
-fn wasm(name: &str) -> String {
-    base64::engine::general_purpose::STANDARD
-        .encode(std::fs::read(format!("{GUESTS}/{name}.wasm")).unwrap())
-}
 
 /// An HTTP server answering 200 "ok" to everything.
 fn server() -> String {

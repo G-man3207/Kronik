@@ -4,40 +4,15 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::sync::Arc;
 
-use base64::Engine as _;
-use kronik_api::{Api, ApiRequest};
+use common::{call, wasm};
+use kronik_api::Api;
 use kronik_core::env::Env;
 use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
-
-const COUNTER: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/guests/counter.wasm"
-);
-
-fn wasm() -> String {
-    base64::engine::general_purpose::STANDARD.encode(std::fs::read(COUNTER).unwrap())
-}
-
-async fn call(api: &Api, method: &str, path: &str, body: Value) -> (u16, Value) {
-    let r = api
-        .handle(ApiRequest {
-            method: method.into(),
-            path: path.into(),
-            query: String::new(),
-            body: if body.is_null() {
-                vec![]
-            } else {
-                body.to_string().into_bytes()
-            },
-            token_id: "unix:uid=0".into(),
-            bearer: None,
-        })
-        .await;
-    (r.status, serde_json::from_slice(&r.body).unwrap())
-}
 
 fn closed_segments(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let log = dir.join("branches/main/log");
@@ -85,7 +60,7 @@ async fn reseal_seals_off_mode_history_and_an_identity_replay_is_empty() {
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm(), "reason": "r"}),
+        json!({"wasm_base64": wasm("counter"), "reason": "r"}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
@@ -261,7 +236,7 @@ async fn reseal_seals_dead_letters_in_state_db() {
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm(), "reason": "r"}),
+        json!({"wasm_base64": wasm("counter"), "reason": "r"}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
@@ -413,7 +388,7 @@ async fn counter_node_with(dir: &std::path::Path, env: Env) -> (Arc<kronik_sched
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm(), "reason": "r"}),
+        json!({"wasm_base64": wasm("counter"), "reason": "r"}),
     )
     .await;
     assert_eq!(s, 200, "{v}");

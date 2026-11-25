@@ -2,36 +2,19 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use kronik_api::{Api, ApiRequest};
+use common::wasm;
+use kronik_api::Api;
 use kronik_core::env::Env;
 use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
 
-const COUNTER: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/guests/counter.wasm"
-);
-
 async fn call(api: &Api, method: &str, path: &str, body: Value) -> Value {
-    let (path, query) = path.split_once('?').unwrap_or((path, ""));
-    let response = api
-        .handle(ApiRequest {
-            method: method.into(),
-            path: path.into(),
-            query: query.into(),
-            body: if body.is_null() {
-                Vec::new()
-            } else {
-                serde_json::to_vec(&body).unwrap()
-            },
-            token_id: "unix:uid=0".into(),
-            bearer: None,
-        })
-        .await;
-    let value: Value = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(response.status, 200, "{method} {path}: {value}");
+    let (status, value) = common::call(api, method, path, body).await;
+    assert_eq!(status, 200, "{method} {path}: {value}");
     value
 }
 
@@ -56,7 +39,7 @@ async fn retained_free_data_is_scrubbed_without_corrupting_typed_api_fields() {
         "POST",
         "/v1/deployments",
         json!({
-            "wasm_base64": STANDARD.encode(std::fs::read(COUNTER).unwrap()),
+            "wasm_base64": wasm("counter"),
             "reason": "install fixture"
         }),
     )

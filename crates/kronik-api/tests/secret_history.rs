@@ -14,47 +14,19 @@
 // is a harness thread.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
-use std::collections::BTreeSet;
-use std::io::{Read, Write};
-use std::net::TcpListener;
+mod common;
+
 use std::sync::Arc;
 
-use base64::Engine as _;
-use kronik_api::auth::{Authenticator, Caller, Scope};
+use common::{Reader, http_target, wasm};
 use kronik_api::{Api, ApiRequest};
 use kronik_core::env::Env;
-use kronik_core::error::ApiError;
 use kronik_sched::{Node, NodeConfig, start_local};
 use serde_json::{Value, json};
-
-const COUNTER: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/guests/counter.wasm"
-);
 
 const FIRST: &str = "first-value-1111";
 const SECOND: &str = "second-value-2222";
 const THIRD: &str = "third-value-3333";
-
-/// A caller with `read` only: no `pii:read`, no `operate`.
-struct Reader(Arc<Node>);
-
-impl Authenticator for Reader {
-    fn caller(&self, _req: &ApiRequest) -> Result<Caller, ApiError> {
-        Ok(Caller {
-            token_id: "token:reader".into(),
-            scopes: BTreeSet::from([Scope::Read]),
-        })
-    }
-
-    fn authority(
-        &self,
-        _req: &ApiRequest,
-        _required: Scope,
-    ) -> Result<kronik_core::authority::AuthLease, ApiError> {
-        self.0.local_operator_authority()
-    }
-}
 
 async fn call(api: &Api, method: &str, path: &str, body: Value) -> Value {
     let (path, query) = path.split_once('?').unwrap_or((path, ""));
@@ -105,30 +77,6 @@ async fn read_only(api: &Api, path: &str) -> Value {
     v
 }
 
-/// A plain HTTP server on a free port that answers every request with 200
-/// and the body `pong`, until the test process exits. Returns its address.
-fn http_target() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut s) = stream else { continue };
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 1024];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                match s.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => request.extend_from_slice(&chunk[..n]),
-                }
-            }
-            let _ = s.write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\npong",
-            );
-        }
-    });
-    addr
-}
-
 /// A node with the counter deployed and the grants its effects need.
 async fn node_with_grants(dir: &std::path::Path) -> (Api, Arc<Node>) {
     let node = start_local(
@@ -139,12 +87,11 @@ async fn node_with_grants(dir: &std::path::Path) -> (Api, Arc<Node>) {
     .await
     .unwrap();
     let api = Api::new(node.clone());
-    let wasm = base64::engine::general_purpose::STANDARD.encode(std::fs::read(COUNTER).unwrap());
     call(
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm, "reason": "deploy"}),
+        json!({"wasm_base64": wasm("counter"), "reason": "deploy"}),
     )
     .await;
     for capability in ["http:127.0.0.1", "secret:signing", "secret-reveal:signing"] {

@@ -6,62 +6,19 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::BTreeSet;
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine as _;
-use kronik_api::auth::{Authenticator, Caller, Scope};
-use kronik_api::{Api, ApiRequest};
+use common::{Reader, call, wasm};
+use kronik_api::Api;
 use kronik_core::env::Env;
-use kronik_core::error::ApiError;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::connections::RecordingTransport;
 use kronik_sched::{Node, NodeConfig, start_local};
 use serde_json::{Value, json};
-
-const ROOM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/room.wasm");
-
-/// A caller with `read` only: no `pii:read`, no `operate`.
-struct Reader(Arc<Node>);
-
-impl Authenticator for Reader {
-    fn caller(&self, _req: &ApiRequest) -> Result<Caller, ApiError> {
-        Ok(Caller {
-            token_id: "token:reader".into(),
-            scopes: BTreeSet::from([Scope::Read]),
-        })
-    }
-
-    fn authority(
-        &self,
-        _req: &ApiRequest,
-        _required: Scope,
-    ) -> Result<kronik_core::authority::AuthLease, ApiError> {
-        self.0.local_operator_authority()
-    }
-}
-
-/// The status and the JSON answer.
-async fn call(api: &Api, method: &str, path: &str, body: Value) -> (u16, Value) {
-    let (path, query) = path.split_once('?').unwrap_or((path, ""));
-    let r = api
-        .handle(ApiRequest {
-            method: method.into(),
-            path: path.into(),
-            query: query.into(),
-            body: if body.is_null() {
-                vec![]
-            } else {
-                body.to_string().into_bytes()
-            },
-            token_id: "unix:uid=0".into(),
-            bearer: None,
-        })
-        .await;
-    (r.status, serde_json::from_slice(&r.body).unwrap())
-}
 
 async fn get(api: &Api, path: &str) -> Value {
     let (status, v) = call(api, "GET", path, Value::Null).await;
@@ -87,12 +44,11 @@ async fn room() -> Room {
     .unwrap();
     let api = Api::new(node.clone());
     let reader = Api::new(node.clone()).with_authenticator(Arc::new(Reader(node.clone())));
-    let wasm = base64::engine::general_purpose::STANDARD.encode(std::fs::read(ROOM).unwrap());
     let (status, v) = call(
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm, "reason": "deploy"}),
+        json!({"wasm_base64": wasm("room"), "reason": "deploy"}),
     )
     .await;
     assert_eq!(status, 200, "{v}");

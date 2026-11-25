@@ -12,34 +12,9 @@ use kronik_core::env::Env;
 use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
 
-const COUNTER: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/guests/counter.wasm"
-);
-const NOTES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/notes.wasm");
+mod common;
 
-async fn call(api: &Api, method: &str, path: &str, body: Value) -> (u16, Value) {
-    let (path, query) = path.split_once('?').unwrap_or((path, ""));
-    let r = api
-        .handle(ApiRequest {
-            method: method.into(),
-            path: path.into(),
-            query: query.into(),
-            body: if body.is_null() {
-                vec![]
-            } else {
-                body.to_string().into_bytes()
-            },
-            token_id: "unix:uid=0".into(),
-            bearer: None,
-        })
-        .await;
-    (r.status, serde_json::from_slice(&r.body).unwrap())
-}
-
-fn wasm(path: &str) -> String {
-    base64::engine::general_purpose::STANDARD.encode(std::fs::read(path).unwrap())
-}
+use common::{call, wasm};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn endpoints() {
@@ -59,7 +34,7 @@ async fn endpoints() {
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm(COUNTER), "reason": " "}),
+        json!({"wasm_base64": wasm("counter"), "reason": " "}),
     )
     .await;
     assert_eq!(
@@ -71,7 +46,7 @@ async fn endpoints() {
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm(COUNTER), "reason": "r", "dry_run": true}),
+        json!({"wasm_base64": wasm("counter"), "reason": "r", "dry_run": true}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
@@ -83,7 +58,7 @@ async fn endpoints() {
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm(COUNTER), "reason": "first deploy"}),
+        json!({"wasm_base64": wasm("counter"), "reason": "first deploy"}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
@@ -96,7 +71,7 @@ async fn endpoints() {
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm(NOTES), "reason": "notes"}),
+        json!({"wasm_base64": wasm("notes"), "reason": "notes"}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
@@ -217,7 +192,7 @@ async fn m2_endpoints() {
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm(COUNTER), "reason": "r"}),
+        json!({"wasm_base64": wasm("counter"), "reason": "r"}),
     )
     .await;
 
@@ -462,15 +437,11 @@ async fn m3_endpoints() {
     let proposals =
         kronik_fork::proposal::Proposals::open(node.clone(), dir.path().to_path_buf()).unwrap();
     let api = Arc::new(Api::new(node.clone()).with_proposals(Arc::new(proposals)));
-    let step2 = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/guests/counter-step2.wasm"
-    );
     let (s, v) = call(
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm(COUNTER), "reason": "r"}),
+        json!({"wasm_base64": wasm("counter"), "reason": "r"}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
@@ -502,7 +473,7 @@ async fn m3_endpoints() {
         &api,
         "POST",
         "/v1/forks/try/deployments",
-        json!({"wasm_base64": wasm(step2), "reason": "r"}),
+        json!({"wasm_base64": wasm("counter-step2"), "reason": "r"}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
@@ -691,7 +662,7 @@ async fn m3_endpoints() {
         &api,
         "POST",
         "/v1/proposals",
-        json!({"wasm_base64": [wasm(step2)], "reason": "r", "threads": 2}),
+        json!({"wasm_base64": [wasm("counter-step2")], "reason": "r", "threads": 2}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
@@ -805,7 +776,7 @@ async fn secret_values_are_scrubbed_from_base64_payloads_too() {
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm(COUNTER), "reason": "r"}),
+        json!({"wasm_base64": wasm("counter"), "reason": "r"}),
     )
     .await;
     call(
@@ -1140,7 +1111,7 @@ async fn incomplete_secret_inventory_blocks_disclosure_not_unrelated_turns() {
     for (path, body) in [
         (
             "/v1/deployments",
-            json!({"wasm_base64": wasm(COUNTER), "reason": "bootstrap"}),
+            json!({"wasm_base64": wasm("counter"), "reason": "bootstrap"}),
         ),
         (
             "/v1/actors/counter/a/messages",
@@ -1223,7 +1194,7 @@ async fn an_orphan_of_a_sealed_call_keeps_the_callee_turn() {
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm(COUNTER), "reason": "r"}),
+        json!({"wasm_base64": wasm("counter"), "reason": "r"}),
     )
     .await;
     let (s, v) = call(
@@ -1262,7 +1233,7 @@ async fn a_plus_in_a_path_segment_is_a_plus() {
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm(COUNTER), "reason": "deploy"}),
+        json!({"wasm_base64": wasm("counter"), "reason": "deploy"}),
     )
     .await;
     assert_eq!(s, 200, "{v}");

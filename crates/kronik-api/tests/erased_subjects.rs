@@ -9,65 +9,20 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
-use std::io::{Read, Write};
-use std::net::TcpListener;
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
-use kronik_api::{Api, ApiRequest};
+use common::{call, http_target, wasm};
+use kronik_api::Api;
 use kronik_core::env::Env;
 use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
 
-const COUNTER: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/guests/counter.wasm"
-);
 const COVERAGE: &str = "secret-coverage.json";
 const SECRET: &str = "the-value-of-the-api-key";
-
-async fn raw(api: &Api, method: &str, path: &str, body: Value) -> (u16, Value) {
-    let r = api
-        .handle(ApiRequest {
-            method: method.into(),
-            path: path.into(),
-            query: String::new(),
-            body: if body.is_null() {
-                vec![]
-            } else {
-                body.to_string().into_bytes()
-            },
-            token_id: "unix:uid=0".into(),
-            bearer: None,
-        })
-        .await;
-    (r.status, serde_json::from_slice(&r.body).unwrap())
-}
-
-/// A local HTTP target that answers every request with `pong`.
-fn http_target() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut s) = stream else { continue };
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 1024];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                match s.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => request.extend_from_slice(&chunk[..n]),
-                }
-            }
-            let _ = s.write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\npong",
-            );
-        }
-    });
-    addr
-}
 
 /// A node over `dir` on a runtime of its own. Dropping the site drops the
 /// runtime with everything the node spawned: a crash.
@@ -96,7 +51,7 @@ impl Site {
 
     /// One call, as it answers: the tests below look at 503s themselves.
     fn call(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
-        self.runtime.block_on(raw(&self.api, method, path, body))
+        self.runtime.block_on(call(&self.api, method, path, body))
     }
 
     /// A call that has to succeed. A change of the inventory (a deployment, a
@@ -120,12 +75,10 @@ impl Site {
 
     /// The deployment, the grants, the secret and the privacy mode.
     fn set_up(&self) {
-        let wasm =
-            base64::engine::general_purpose::STANDARD.encode(std::fs::read(COUNTER).unwrap());
         self.ok(
             "POST",
             "/v1/deployments",
-            json!({"wasm_base64": wasm, "reason": "r"}),
+            json!({"wasm_base64": wasm("counter"), "reason": "r"}),
         );
         for capability in ["http:127.0.0.1", "secret:api-key"] {
             self.ok(
