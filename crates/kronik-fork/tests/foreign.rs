@@ -162,16 +162,6 @@ fn ck(name: &str, lsn: u64) -> Checkpoint {
     }
 }
 
-fn message(body: &str) -> pb::Message {
-    pb::Message {
-        name: "fetch-ok".into(),
-        content_type: "text/plain".into(),
-        body: plain(body),
-        blobs: vec![],
-        retained_compensation_source: None,
-    }
-}
-
 #[test]
 fn a_continuous_fork_talks_to_a_copy_from_the_nearest_checkpoint() {
     let dir = tempdir();
@@ -258,7 +248,7 @@ fn a_continuous_fork_talks_to_a_copy_from_the_nearest_checkpoint() {
         p.rt.block_on(props.fork_send(
             "changed",
             actor,
-            message("POST foreign://pg/sql\n\nd"),
+            msg("fetch-ok", "POST foreign://pg/sql\n\nd"),
             p.owner(),
         ))
         .unwrap();

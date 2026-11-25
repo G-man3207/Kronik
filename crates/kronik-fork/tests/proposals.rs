@@ -565,13 +565,7 @@ fn messages_into_a_fork_reach_the_network_only_as_allowlisted_gets() {
         .unwrap();
     assert!(f.options.no_pii);
     let send = |body: String| {
-        let m = pb::Message {
-            name: "fetch-ok".into(),
-            content_type: "text/plain".into(),
-            body: plain(&body),
-            blobs: vec![],
-            retained_compensation_source: None,
-        };
+        let m = msg("fetch-ok", &body);
         let actor = kronik_core::ids::ActorRef::parse("counter/x").unwrap();
         p.rt.block_on(props.fork_send("probe", actor, m, p.owner()))
             .unwrap()
@@ -686,13 +680,7 @@ fn inputs_inside_the_promote_gap_stay_unverified() {
         );
         let authority = authority.clone();
         senders.push(p.rt.spawn(async move {
-            let m = pb::Message {
-                name: "increment".into(),
-                content_type: "text/plain".into(),
-                body: plain(""),
-                blobs: vec![],
-                retained_compensation_source: None,
-            };
+            let m = msg("increment", "");
             while !stop.load(Ordering::Relaxed) {
                 let _ = node
                     .send(actor.clone(), m.clone(), audit(), false, authority.clone())
@@ -870,17 +858,11 @@ fn a_running_proposal_refuses_send_approve_request_approval_and_diff() {
     let dir = tempdir();
     let p = Proc::start(dir.path());
     let (props, gate, id) = held_job(&p, dir.path());
-    let msg = || pb::Message {
-        name: "increment".into(),
-        content_type: "text/plain".into(),
-        body: plain(""),
-        blobs: vec![],
-        retained_compensation_source: None,
-    };
+    let increment = || msg("increment", "");
     let actor = || kronik_core::ids::ActorRef::parse("counter/a").unwrap();
     let running = ErrorCode::ProposalRunning;
     let r =
-        p.rt.block_on(props.fork_send(&id, actor(), msg(), p.owner()));
+        p.rt.block_on(props.fork_send(&id, actor(), increment(), p.owner()));
     assert_eq!(r.unwrap_err().code, running);
     let r =
         p.rt.block_on(props.approve(&id, audit(), false, None, p.owner()));
@@ -897,7 +879,7 @@ fn a_running_proposal_refuses_send_approve_request_approval_and_diff() {
     finish(&props, &gate, &id);
     assert_eq!(p.rt.block_on(props.get(&id)).unwrap().status, "evaluated");
     p.rt.block_on(props.diff(&id, false, false)).unwrap();
-    p.rt.block_on(props.fork_send(&id, actor(), msg(), p.owner()))
+    p.rt.block_on(props.fork_send(&id, actor(), increment(), p.owner()))
         .unwrap();
 }
 

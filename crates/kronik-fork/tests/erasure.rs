@@ -14,19 +14,6 @@ use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use prost::Message as _;
 
-fn subject_msg(name: &str, body: &str, subject: &str) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: Some(subject.into()),
-            value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-        }),
-        blobs: Vec::new(),
-        retained_compensation_source: None,
-    }
-}
-
 fn send_subject(p: &Proc, name: &str, body: &str, subject: &str) -> kronik_sched::TurnResult {
     p.rt.block_on(p.node.send(
         ActorRef::parse("counter/a").unwrap(),

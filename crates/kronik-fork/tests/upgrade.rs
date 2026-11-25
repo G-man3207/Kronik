@@ -3,6 +3,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
+use common::{audit, msg, subject_msg, tempdir};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,32 +20,7 @@ use kronik_sched::{Node, NodeConfig, StartError, start_local};
 use tokio::runtime::Runtime;
 
 fn guest(name: &str) -> Vec<u8> {
-    std::fs::read(format!(
-        "{}/../../tests/guests/{name}.wasm",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap()
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
-
-fn msg(name: &str, body: &str) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-        }),
-        blobs: vec![],
-        retained_compensation_source: None,
-    }
+    std::fs::read(common::guest(name)).unwrap()
 }
 
 fn rt() -> Runtime {
@@ -88,13 +66,6 @@ fn start_when_released(rt: &Runtime, dir: &Path) -> Arc<Node> {
             Err(error) => panic!("start failed: {error}"),
         }
     }
-}
-
-fn tempdir() -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix("upgrade-")
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .unwrap()
 }
 
 /// The local operator's original node-lifetime authority.
@@ -517,14 +488,6 @@ fn upgrade_replays_recorded_code_across_a_same_kind_deployment() {
 }
 
 // ---------------------------------------------------------------- S-16
-
-/// A message whose body is tagged with `subject`: the turn's default subject,
-/// so the effects it records are sealed for that subject.
-fn subject_msg(name: &str, body: &str, subject: &str) -> pb::Message {
-    let mut m = msg(name, body);
-    m.body.as_mut().unwrap().subject = Some(subject.into());
-    m
-}
 
 /// Privacy mode on; one turn whose `http.fetch` request is sealed for
 /// `user:1` (the target refuses the connection, so nothing listens), the

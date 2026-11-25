@@ -144,6 +144,24 @@ pub fn plain(b: &str) -> Option<pb::Sealable> {
     })
 }
 
+/// A plain-text message `name` with `body`.
+pub fn msg(name: &str, body: &str) -> pb::Message {
+    pb::Message {
+        name: name.into(),
+        content_type: "text/plain".into(),
+        body: plain(body),
+        blobs: vec![],
+        retained_compensation_source: None,
+    }
+}
+
+/// `msg` with its body tagged with `subject`.
+pub fn subject_msg(name: &str, body: &str, subject: &str) -> pb::Message {
+    let mut m = msg(name, body);
+    m.body.as_mut().unwrap().subject = Some(subject.into());
+    m
+}
+
 pub fn http_body(r: &TurnResult) -> String {
     match &r.outcome.output {
         Some(pb::outcome::Output::Http(h)) => {
@@ -355,17 +373,10 @@ impl Proc {
     }
 
     pub fn send(&self, actor: &str, name: &str, body: &str) -> TurnResult {
-        let m = pb::Message {
-            name: name.into(),
-            content_type: "text/plain".into(),
-            body: plain(body),
-            blobs: vec![],
-            retained_compensation_source: None,
-        };
         self.rt
             .block_on(self.node.send(
                 ActorRef::parse(actor).unwrap(),
-                m,
+                msg(name, body),
                 audit(),
                 false,
                 self.owner(),
