@@ -2,7 +2,8 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-24
-- **Updated:** 2026-10-30 (security patch and upgrade contract)
+- **Updated:** 2026-10-30 (security patch and upgrade contract), 2026-11-25
+  (engine version literal)
 
 ## Context
 
@@ -362,3 +363,20 @@ digest
 `b3:0cef2655a32d2d62a9b35c9af917d712682bf65f743a959a058bab5e841e571e` on the
 AMD development machine and on the Intel VPS, and `handle --msg call` gave
 `b3:2e3fd2b69e2a24b8f3454e37026f8f2861a545396f96e02c11c9ca10adb0ef41` on both.
+
+## Amendment (2026-11-25): the engine version's Wasmtime part is a literal
+
+`crates/kronik-runtime` no longer reads `wasmtime_environ::VERSION`.
+`WASMTIME_VERSION` is the literal `"50.0.1"`, and `ENGINE_VERSION` is
+`concat!("kronik-", env!("CARGO_PKG_VERSION"), "+wasmtime-", "50.0.1")`, so
+the format and value of §3 are unchanged. `wasmtime-environ` is no longer a
+direct dependency of the crate; `wasmtime` still pins it at the same version
+transitively.
+
+The literal is guarded rather than derived. The §1 lockfile test checks
+`WASMTIME_VERSION` against the five Wasmtime packages named there, including
+the transitive `wasmtime-environ`, and
+`engine_version_names_the_kronik_and_wasmtime_versions` checks that
+`ENGINE_VERSION` names `KRONIK_VERSION` and `WASMTIME_VERSION`. A Wasmtime
+upgrade that moves the lockfile past the literal therefore fails the first
+test, and an edit to only one of the two literals fails the second.

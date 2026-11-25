@@ -28,54 +28,29 @@ pub const KRONIK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The version of the Wasmtime engine linked into this build.
 ///
-/// `wasmtime` does not export its own version, so it is read from
-/// `wasmtime-environ`, which every `wasmtime` release requires at exactly its
-/// own version. A test checks that both resolve to this version.
-pub const WASMTIME_VERSION: &str = wasmtime_environ::VERSION;
+/// `wasmtime` does not export its own version. This literal is the version the
+/// workspace pins; a test checks it against the Wasmtime packages in
+/// `Cargo.lock`, including the transitive `wasmtime-environ`.
+pub const WASMTIME_VERSION: &str = "50.0.1";
 
 /// The engine version, `kronik-<Kronik version>+wasmtime-<Wasmtime version>`.
-pub const ENGINE_VERSION: &str = match core::str::from_utf8(&ENGINE_VERSION_BYTES) {
-    Ok(version) => version,
-    Err(_) => panic!("the engine version is not valid UTF-8"),
-};
-
-const ENGINE_VERSION_PARTS: [&str; 4] = ["kronik-", KRONIK_VERSION, "+wasmtime-", WASMTIME_VERSION];
-
-const ENGINE_VERSION_BYTES: [u8; total_len(&ENGINE_VERSION_PARTS)] =
-    concat_bytes(&ENGINE_VERSION_PARTS);
-
-/// Sums the byte lengths of `parts` at compile time.
-const fn total_len(parts: &[&str]) -> usize {
-    let mut len = 0;
-    let mut i = 0;
-    while i < parts.len() {
-        len += parts[i].len();
-        i += 1;
-    }
-    len
-}
-
-/// Concatenates `parts` at compile time. `N` must equal `total_len(parts)`.
-const fn concat_bytes<const N: usize>(parts: &[&str]) -> [u8; N] {
-    let mut out = [0; N];
-    let mut pos = 0;
-    let mut i = 0;
-    while i < parts.len() {
-        let bytes = parts[i].as_bytes();
-        let mut j = 0;
-        while j < bytes.len() {
-            out[pos] = bytes[j];
-            pos += 1;
-            j += 1;
-        }
-        i += 1;
-    }
-    out
-}
+///
+/// The Wasmtime part repeats [`WASMTIME_VERSION`] because `concat!` cannot
+/// read a constant. A test checks that the two agree.
+pub const ENGINE_VERSION: &str =
+    concat!("kronik-", env!("CARGO_PKG_VERSION"), "+wasmtime-", "50.0.1",);
 
 #[cfg(test)]
 mod tests {
-    use super::WASMTIME_VERSION;
+    use super::{ENGINE_VERSION, KRONIK_VERSION, WASMTIME_VERSION};
+
+    #[test]
+    fn engine_version_names_the_kronik_and_wasmtime_versions() {
+        assert_eq!(
+            ENGINE_VERSION,
+            format!("kronik-{KRONIK_VERSION}+wasmtime-{WASMTIME_VERSION}")
+        );
+    }
 
     #[test]
     fn wasmtime_version_is_the_locked_wasmtime_version() {
