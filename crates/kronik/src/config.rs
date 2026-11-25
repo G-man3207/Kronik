@@ -1372,7 +1372,6 @@ impl Config {
     /// gets `*.<preview_domain>`; the hook gets two minutes per call.
     pub fn certificates(&self) -> Option<kronik_gateway::tls::Certificates> {
         use kronik_gateway::tls::{Acme, Certificates, ExecHook, Wildcard};
-        use std::sync::Arc;
         match self.tls.mode {
             TlsMode::Off => None,
             TlsMode::Files => Some(Certificates::Files {
@@ -1388,10 +1387,10 @@ impl Config {
                 wildcard: self.tls.dns01_hook.clone().and_then(|program| {
                     Some(Wildcard {
                         domain: self.gateway.preview_domain.clone()?,
-                        dns01: Arc::new(ExecHook {
+                        dns01: ExecHook {
                             program,
                             timeout: Duration::from_secs(120),
-                        }),
+                        },
                         propagation: self.tls.dns01_propagation.0,
                     })
                 }),
