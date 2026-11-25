@@ -3,6 +3,13 @@
 //! output or effects do not fit fails with `TURN_TOO_LARGE` and writes a
 //! record that does fit, no record over the limit is ever written, no
 //! `TurnBegin` stays open, and the history reads and the node restarts.
+//!
+//! The effect bytes one turn may record (ADR 0145, issue #74): a kind's
+//! `effect_bytes_per_turn` bounds the requests and responses its turns'
+//! effect results hold inline. An effect that would pass it fails with
+//! `EFFECT_BYTES_EXCEEDED` recorded as its result: before it is sent when
+//! its request alone does not fit, else its response is not recorded. The
+//! turn goes on, and the limit is exact.
 
 // Test helpers outside #[test] functions may unwrap, and the test server
 // uses plain std threads.
@@ -241,6 +248,41 @@ fn turn_record(p: &Proc, r: &TurnResult) -> pb::TurnRecord {
         Record::TurnRecord(t) => t,
         other => panic!("not a turn record: {other:?}"),
     }
+}
+
+impl Proc {
+    /// Sets the counter type's effect bytes per turn.
+    fn effect_bytes(&self, bytes: u64) {
+        self.rt
+            .block_on(self.node.set_limits(
+                pb::Limits {
+                    kind: "counter".into(),
+                    effect_bytes_per_turn: Some(bytes),
+                    ..Default::default()
+                },
+                audit(),
+                false,
+                self.owner(),
+            ))
+            .unwrap();
+    }
+
+    /// `counter/<key>` fetches `spec` in one turn; its only effect.
+    fn fetch(&self, key: &str, spec: &str) -> (TurnResult, pb::EffectRecord) {
+        let r = self.send(&format!("counter/{key}"), msg("fetch", spec.as_bytes()));
+        let record = turn_record(self, &r);
+        assert_eq!(record.effects.len(), 1, "{:?}", record.effects);
+        (r, record.effects[0].clone())
+    }
+}
+
+fn setup() -> (Server, tempfile::TempDir, Proc) {
+    let server = Server::start();
+    let dir = tempfile::tempdir().unwrap();
+    let p = start_limit(dir.path(), kronik_log::MAX_RECORD);
+    p.deploy();
+    p.grant("http:127.0.0.1");
+    (server, dir, p)
 }
 
 /// A reply over what one record holds: before the fix the node committed a
@@ -707,4 +749,121 @@ fn an_open_turn_whose_compensations_no_longer_fit_is_closed_not_rerun_for_ever()
         "the begin's segment was not deleted"
     );
     assert_eq!(p.node.retention_pin(), None);
+}
+
+/// The default is 32 MiB, recorded with the kind's other limits.
+#[test]
+fn the_default_is_32_mib_and_a_set_limit_is_in_the_log() {
+    assert_eq!(
+        kronik_effects::KindLimits::default().effect_bytes_per_turn,
+        32 << 20
+    );
+    let (_server, _dir, p) = setup();
+    p.effect_bytes(1 << 20);
+    let config = p.node.config_now();
+    assert_eq!(config.limits("counter").effect_bytes_per_turn, 1 << 20);
+    assert_eq!(config.limits("other").effect_bytes_per_turn, 32 << 20);
+}
+
+/// A response that would pass what is left fails its effect: the request
+/// was sent, the response is not recorded, and the result says
+/// EFFECT_BYTES_EXCEEDED; the guest gets `too-large` and goes on (the
+/// counter guest then fails its turn, as for any failed fetch).
+#[test]
+fn a_response_past_the_effect_bytes_is_sent_and_not_recorded() {
+    let (server, _dir, p) = setup();
+    p.effect_bytes(64 << 10);
+    let (r, effect) = p.fetch("a", &format!("GET {}", server.url("/big/100000")));
+    assert!(!r.committed());
+    assert!(r.outcome.message.contains("TooLarge"), "{:?}", r.outcome);
+    assert_eq!(effect.status, pb::EffectStatus::TooLarge as i32);
+    assert!(effect.request.is_some() && effect.response.is_none());
+    assert!(
+        effect.error.starts_with("EFFECT_BYTES_EXCEEDED:") && effect.error.contains("not recorded"),
+        "{}",
+        effect.error
+    );
+    assert_eq!(server.seen(), ["/big/100000"]);
+}
+
+/// A request that alone would pass what is left is not sent.
+#[test]
+fn a_request_past_the_effect_bytes_is_not_sent() {
+    let (server, _dir, p) = setup();
+    p.effect_bytes(64 << 10);
+    let spec = format!("POST {}\n\n{}", server.url("/post"), "a".repeat(100 << 10));
+    let (r, effect) = p.fetch("a", &spec);
+    assert!(!r.committed());
+    assert_eq!(effect.status, pb::EffectStatus::TooLarge as i32);
+    assert!(effect.request.is_none() && effect.response.is_none());
+    assert!(effect.error.contains("not sent"), "{}", effect.error);
+    assert!(server.seen().is_empty(), "{:?}", server.seen());
+}
+
+/// What a turn's earlier effects recorded counts: a second request that
+/// no longer fits in what the first left is not sent.
+#[test]
+fn what_earlier_effects_recorded_counts() {
+    let (server, _dir, p) = setup();
+    p.effect_bytes(200 << 10);
+    let body = "a".repeat(150 << 10);
+    let spec = format!(
+        "POST {}\n\n{body}\n---\nPOST {}\n\n{body}",
+        server.url("/one"),
+        server.url("/two")
+    );
+    let r = p.send("counter/a", msg("fetch2", spec.as_bytes()));
+    assert!(!r.committed());
+    let record = turn_record(&p, &r);
+    assert_eq!(record.effects.len(), 2, "{:?}", record.effects);
+    assert_eq!(record.effects[0].status, pb::EffectStatus::Ok as i32);
+    assert!(
+        record.effects[1].error.contains("not sent"),
+        "{:?}",
+        record.effects[1]
+    );
+    assert_eq!(server.seen(), ["/one"]);
+}
+
+/// The limit is exact: an effect that records exactly what is left fits,
+/// one byte less does not.
+#[test]
+fn the_limit_is_exact() {
+    let (server, _dir, p) = setup();
+    let spec = format!("GET {}", server.url("/big/1000"));
+    let (r, effect) = p.fetch("a", &spec);
+    assert!(r.committed(), "{:?}", r.outcome);
+    let exact = kronik_sched::record_budget::effect_bytes(&effect);
+    p.effect_bytes(exact);
+    let (r, effect) = p.fetch("b", &spec);
+    assert!(r.committed(), "{:?}", r.outcome);
+    assert_eq!(kronik_sched::record_budget::effect_bytes(&effect), exact);
+    p.effect_bytes(exact - 1);
+    let (r, effect) = p.fetch("c", &spec);
+    assert!(!r.committed());
+    assert!(
+        effect.error.starts_with("EFFECT_BYTES_EXCEEDED:"),
+        "{}",
+        effect.error
+    );
+    assert_eq!(server.seen().len(), 3);
+}
+
+/// A crash and a re-run: the re-run is charged what the first execution
+/// recorded and refuses the same effects (the failure is the recorded
+/// result, so the turn ends the same way after a restart).
+#[test]
+fn the_failure_survives_a_restart() {
+    let (server, dir, p) = setup();
+    p.effect_bytes(64 << 10);
+    let (r, effect) = p.fetch("a", &format!("GET {}", server.url("/big/100000")));
+    assert!(!r.committed());
+    drop(p);
+    let p = start_limit(dir.path(), kronik_log::MAX_RECORD);
+    let record = turn_record(&p, &r);
+    assert_eq!(record.effects[0], effect);
+    assert_eq!(
+        p.node.config_now().limits("counter").effect_bytes_per_turn,
+        64 << 10
+    );
 }
