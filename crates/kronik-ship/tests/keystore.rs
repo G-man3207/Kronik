@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use common::rt;
+use common::{restore_main, rt};
 use kronik_core::env::Env;
 use kronik_privacy::MasterKey;
 use kronik_privacy::keystore::{KeyLookup, Keystore};
@@ -18,8 +18,7 @@ use kronik_privacy::sealer::{Opened, Sealer};
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{NodeConfig, start_local};
 use kronik_ship::{
-    KeystoreMode, Remote, ShipError, ShipState, current_keystore_revision, restore, ship_keystore,
-    ship_once,
+    KeystoreMode, Remote, ShipError, ShipState, current_keystore_revision, ship_keystore, ship_once,
 };
 
 #[test]
@@ -131,20 +130,7 @@ fn a_keystore_change_is_shipped_pruned_and_restored() {
         dst.path().join("keys/master.key"),
     )
     .unwrap();
-    let runtime = rt();
-    let report = runtime
-        .block_on(restore(
-            &remote,
-            dst.path(),
-            "main",
-            false,
-            &Env::real(runtime.handle().clone()),
-            &Default::default(),
-            KeystoreMode::Require,
-            false,
-            &|_| Ok(()),
-        ))
-        .unwrap();
+    let report = restore_main(&remote, dst.path()).unwrap();
     assert_eq!(report.keystore_backup_ms, Some(wall));
     let installed_owner = kronik_privacy::key_source::lock_data(dst.path()).unwrap();
     let installed = Keystore::open_owned(&installed_owner, &master).unwrap();

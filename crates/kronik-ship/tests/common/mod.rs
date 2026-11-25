@@ -2,7 +2,11 @@
 
 #![allow(dead_code)]
 
+use std::path::Path;
+
+use kronik_core::env::Env;
 use kronik_proto::log::v1 as pb;
+use kronik_ship::{KeystoreMode, Remote, RestoreReport, ShipError, restore};
 use tokio::runtime::Runtime;
 
 pub fn rt() -> Runtime {
@@ -26,6 +30,32 @@ pub fn tempdir(prefix: &str) -> tempfile::TempDir {
         .prefix(prefix)
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap()
+}
+
+/// A new data directory holding only the master key `key`.
+pub fn destination(prefix: &str, key: &[u8]) -> tempfile::TempDir {
+    let dir = tempdir(prefix);
+    std::fs::create_dir_all(dir.path().join("keys")).unwrap();
+    std::fs::write(dir.path().join("keys/master.key"), key).unwrap();
+    dir
+}
+
+/// Restores branch `main` from `remote` into `data` with the default options
+/// (no force, default key sources, the keystore required, no missing blob
+/// allowed, no fault), on a runtime of its own.
+pub fn restore_main(remote: &Remote, data: &Path) -> Result<RestoreReport, ShipError> {
+    let rt = rt();
+    rt.block_on(restore(
+        remote,
+        data,
+        "main",
+        false,
+        &Env::real(rt.handle().clone()),
+        &Default::default(),
+        KeystoreMode::Require,
+        false,
+        &|_| Ok(()),
+    ))
 }
 
 pub fn guest(name: &str) -> Vec<u8> {

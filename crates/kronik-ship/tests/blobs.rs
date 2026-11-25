@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{audit, guest, rt, s3_url, tempdir};
+use common::{audit, destination, guest, restore_main, rt, s3_url, tempdir};
 use kronik_blob::{BlobId, Space, SweepOptions};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
@@ -352,9 +352,7 @@ fn ship_and_restore_blobs(remote: &Remote) {
     // A restore downloads the saved response's blob, checks it, and the
     // restored node reads it.
     let restore_into = |allow: bool| {
-        let dst = tempdir("blob-ship-dst-");
-        std::fs::create_dir_all(dst.path().join("keys")).unwrap();
-        std::fs::write(dst.path().join("keys/master.key"), &key).unwrap();
+        let dst = destination("blob-ship-dst-", &key);
         let rt = rt();
         let r = rt.block_on(restore(
             remote,
@@ -490,24 +488,8 @@ fn restore_keeps_a_timer_only_blob(remote: &Remote) {
     let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
     drop(p);
 
-    let dst = tempdir("blob-timer-dst-");
-    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
-    std::fs::write(dst.path().join("keys/master.key"), &key).unwrap();
-    let r = {
-        let rt = rt();
-        rt.block_on(restore(
-            remote,
-            dst.path(),
-            "main",
-            false,
-            &Env::real(rt.handle().clone()),
-            &Default::default(),
-            KeystoreMode::Require,
-            false,
-            &|_| Ok(()),
-        ))
-        .unwrap()
-    };
+    let dst = destination("blob-timer-dst-", &key);
+    let r = restore_main(remote, dst.path()).unwrap();
     assert!(r.blobs.missing.is_empty(), "{r:?}");
     let q = start(dst.path());
     assert!(
@@ -651,24 +633,8 @@ fn a_deletion_cut_short_never_skips_an_upload() {
 /// A node restored from `remote` into a new directory, started; the
 /// source's master key in place.
 fn restored(remote: &Remote, key: &[u8]) -> (tempfile::TempDir, Proc) {
-    let dst = tempdir("blob-restored-");
-    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
-    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
-    {
-        let rt = rt();
-        rt.block_on(restore(
-            remote,
-            dst.path(),
-            "main",
-            false,
-            &Env::real(rt.handle().clone()),
-            &Default::default(),
-            KeystoreMode::Require,
-            false,
-            &|_| Ok(()),
-        ))
-        .unwrap();
-    }
+    let dst = destination("blob-restored-", key);
+    restore_main(remote, dst.path()).unwrap();
     let q = start(dst.path());
     (dst, q)
 }
