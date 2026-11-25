@@ -2313,7 +2313,6 @@ dependencies = [
  "tracing",
  "wasmparser",
  "wasmtime",
- "wasmtime-environ",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
  "wasmtime-wasi-io",
