@@ -1745,19 +1745,27 @@ impl StateDb {
         Ok(out)
     }
 
-    /// Grant, Limits, ForeignActor and SimulatorConfig records in log order.
-    pub fn config_records(&self) -> Result<Vec<Record>, StoreError> {
+    /// Grant, Limits, PrivacyMode, ForeignActor, SimulatorConfig and
+    /// SecretLink records with their LSN, in log order.
+    pub fn config_records(&self) -> Result<Vec<(Lsn, Record)>, StoreError> {
         let mut st = self
             .conn
-            .prepare_cached("SELECT kind, record FROM config_records ORDER BY lsn")?;
-        let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+            .prepare_cached("SELECT lsn, kind, record FROM config_records ORDER BY lsn")?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as Lsn,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
         let mut out = Vec::new();
         for row in rows {
-            let (kind, bytes) = row?;
-            out.push(
+            let (lsn, kind, bytes) = row?;
+            out.push((
+                lsn,
                 Record::decode(kind as u8, &bytes)
                     .map_err(|e| corrupt(format!("config record in state.db: {e}")))?,
-            );
+            ));
         }
         Ok(out)
     }

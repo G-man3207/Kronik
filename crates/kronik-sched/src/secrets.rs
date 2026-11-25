@@ -1938,7 +1938,11 @@ impl Node {
         let store = self.store().clone();
         self.env
             .blocking("secret-config-history", move || {
-                store.db().config_records().map_err(crate::node::store_err)
+                store
+                    .db()
+                    .config_records()
+                    .map(|rows| rows.into_iter().map(|(_, record)| record).collect())
+                    .map_err(crate::node::store_err)
             })
             .await
             .ok_or_else(unavailable)?
