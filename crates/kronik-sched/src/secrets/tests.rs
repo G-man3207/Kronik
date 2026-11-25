@@ -1,5 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+// The shared revocable test authority, as `src/gate/tests.rs` includes it.
+#[allow(clippy::duplicate_mod)]
+#[path = "../../tests/common/revocable.rs"]
+mod revocable;
+
 use super::*;
 use kronik_core::env::{BoxFuture, Clock, HttpRequest, HttpResponse, Net, NetError};
 use kronik_privacy::secret_backend::config::Definition;
@@ -10,58 +15,6 @@ fn env() -> Env {
     Env::real(tokio::runtime::Handle::current())
 }
 
-#[derive(Default)]
-struct TestAuthority {
-    revoked: Arc<Mutex<bool>>,
-    changed: Arc<tokio::sync::Notify>,
-}
-impl TestAuthority {
-    fn revoke(&self) {
-        *lock(&self.revoked) = true;
-        self.changed.notify_waiters();
-    }
-}
-impl kronik_core::authority::Authority for TestAuthority {
-    fn check(&self) -> Result<(), ApiError> {
-        if *lock(&self.revoked) {
-            Err(ApiError::new(
-                ErrorCode::Unauthenticated,
-                "test authority revoked",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-    fn cancelled(&self) -> BoxFuture<'static, ()> {
-        let revoked = self.revoked.clone();
-        let changed = self.changed.clone();
-        Box::pin(async move {
-            loop {
-                let notified = changed.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                if *lock(&revoked) {
-                    return;
-                }
-                notified.await;
-            }
-        })
-    }
-    fn admit(&self, effect: &mut dyn FnMut() -> Result<(), ApiError>) -> Result<(), ApiError> {
-        let revoked = lock(&self.revoked);
-        if *revoked {
-            Err(ApiError::new(
-                ErrorCode::Unauthenticated,
-                "test authority revoked",
-            ))
-        } else {
-            effect()
-        }
-    }
-}
-fn test_auth() -> AuthLease {
-    Arc::new(TestAuthority::default())
-}
 fn audit() -> pb::Audit {
     pb::Audit {
         token_id: "operator".into(),
@@ -210,7 +163,7 @@ async fn per_name_concurrent_sets_use_one_durable_allocator() {
                 format!("credential-{index}").into_bytes(),
                 &audit(),
                 false,
-                test_auth(),
+                revocable::lease(),
             )
             .await
             .unwrap()
@@ -227,7 +180,7 @@ async fn per_name_concurrent_sets_use_one_durable_allocator() {
     assert!(history.iter().all(active));
     assert_eq!(node.store().db().secret_highwater("token").unwrap(), 12);
     let current = node
-        .resolve_secret("token", None, &node.config_now(), test_auth())
+        .resolve_secret("token", None, &node.config_now(), revocable::lease())
         .await
         .unwrap()
         .unwrap();
@@ -242,7 +195,7 @@ async fn failed_file_reservation_never_becomes_current_and_is_never_reused() {
         b"acknowledged-value".to_vec(),
         &audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
@@ -269,7 +222,7 @@ async fn failed_file_reservation_never_becomes_current_and_is_never_reused() {
             b"acknowledged-successor".to_vec(),
             &audit(),
             false,
-            test_auth(),
+            revocable::lease(),
         )
         .await
         .unwrap()
@@ -283,7 +236,7 @@ async fn failed_file_reservation_never_becomes_current_and_is_never_reused() {
     let history = node.secret_history("token").await.unwrap();
     assert_eq!(history[1].phase, Phase::Active as i32);
     let current = node
-        .resolve_secret("token", None, &node.config_now(), test_auth())
+        .resolve_secret("token", None, &node.config_now(), revocable::lease())
         .await
         .unwrap()
         .unwrap();
@@ -303,11 +256,13 @@ async fn coverage_watermark_persists_survives_restart_and_voids_on_restore() {
         b"watermarked-value".to_vec(),
         &audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
-    node.refresh_secret_inventory(test_auth()).await.unwrap();
+    node.refresh_secret_inventory(revocable::lease())
+        .await
+        .unwrap();
     let manifest = data.path().join("secret-coverage.json");
     let written: coverage::CoverageWatermark =
         serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
@@ -326,7 +281,9 @@ async fn coverage_watermark_persists_survives_restart_and_voids_on_restore() {
     // back to the full scan, rewriting a fresh watermark: never a startup
     // blocker and never a partial trust.
     std::fs::write(&manifest, b"{ not json").unwrap();
-    node.refresh_secret_inventory(test_auth()).await.unwrap();
+    node.refresh_secret_inventory(revocable::lease())
+        .await
+        .unwrap();
     let rewritten: coverage::CoverageWatermark =
         serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
     assert_eq!(rewritten, written);
@@ -341,7 +298,9 @@ async fn coverage_watermark_persists_survives_restart_and_voids_on_restore() {
         ..foreign
     };
     std::fs::write(&manifest, serde_json::to_vec(&voided).unwrap()).unwrap();
-    node.refresh_secret_inventory(test_auth()).await.unwrap();
+    node.refresh_secret_inventory(revocable::lease())
+        .await
+        .unwrap();
     let recertified: coverage::CoverageWatermark =
         serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
     assert_eq!(recertified, written);
@@ -383,7 +342,7 @@ async fn pending_recovery_verifies_matching_file_bytes_and_fails_missing_writes(
         audit(),
     );
     node.secret_publish(missing.clone()).await.unwrap();
-    node.initialize_secret_versions(false, test_auth())
+    node.initialize_secret_versions(false, revocable::lease())
         .await
         .unwrap();
     let history = node.secret_history("token").await.unwrap();
@@ -393,7 +352,7 @@ async fn pending_recovery_verifies_matching_file_bytes_and_fails_missing_writes(
     assert_eq!(history[1].audit, missing.audit);
     assert_eq!(node.next_secret_version("token").await.unwrap(), 3);
     assert_eq!(
-        node.resolve_secret("token", None, &node.config_now(), test_auth())
+        node.resolve_secret("token", None, &node.config_now(), revocable::lease())
             .await
             .unwrap()
             .unwrap()
@@ -512,7 +471,7 @@ async fn mutation_is_owned_after_the_waiting_request_is_cancelled() {
                 b"owned-after-disconnect".to_vec(),
                 &audit(),
                 false,
-                test_auth(),
+                revocable::lease(),
             )
             .await
     });
@@ -537,7 +496,7 @@ async fn mutation_is_owned_after_the_waiting_request_is_cancelled() {
         .await
         .unwrap();
     assert_eq!(
-        node.resolve_secret("token", None, &node.config_now(), test_auth())
+        node.resolve_secret("token", None, &node.config_now(), revocable::lease())
             .await
             .unwrap()
             .unwrap()
@@ -556,7 +515,7 @@ async fn dry_run_consumes_no_version_and_fills_no_value_cache() {
             b"not-published".to_vec(),
             &audit(),
             true,
-            test_auth()
+            revocable::lease()
         )
         .await
         .unwrap()
@@ -901,7 +860,7 @@ async fn a_failed_inline_refresh_does_not_end_the_wait_for_the_inventory() {
     assert!(!runtime.cache.complete(node.epoch()));
     // The waiter is stepped by hand, so that what it does between two events
     // is the only thing that decides what a step finds.
-    let mut waiter = Box::pin(node.wait_secret_inventory(test_auth()));
+    let mut waiter = Box::pin(node.wait_secret_inventory(revocable::lease()));
     let step = std::future::poll_fn(|cx| std::task::Poll::Ready(waiter.as_mut().poll(cx))).await;
     assert!(step.is_pending(), "{step:?}");
     // The cycle, woken by the waiter, makes a pass for its revision and
@@ -949,7 +908,9 @@ async fn the_cycle_is_settled_between_passes_with_a_certified_inventory_and_not_
     // rebuild installs one.
     runtime.cache.clear_coverage();
     assert!(within(Duration::from_millis(100)).await.is_err());
-    node.refresh_secret_inventory(test_auth()).await.unwrap();
+    node.refresh_secret_inventory(revocable::lease())
+        .await
+        .unwrap();
     within(Duration::from_secs(60)).await.unwrap();
 }
 
@@ -1004,7 +965,7 @@ async fn a_configuration_change_that_restores_the_certificate_does_not_wake_the_
         kronik_effects::InForks::Recorded,
         audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
@@ -1034,7 +995,7 @@ async fn a_configuration_change_that_cannot_restore_the_certificate_wakes_the_cy
         kronik_effects::InForks::Recorded,
         audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
@@ -1100,28 +1061,30 @@ async fn deletion_keeps_only_scrub_authority_and_missing_retained_values_fail_in
         b"retained-secret-before-delete".to_vec(),
         &audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
     assert_eq!(
-        node.secret_delete("token", &audit(), false, test_auth())
+        node.secret_delete("token", &audit(), false, revocable::lease())
             .await
             .unwrap(),
         1
     );
     assert!(
-        node.resolve_secret("token", None, &node.config_now(), test_auth())
+        node.resolve_secret("token", None, &node.config_now(), revocable::lease())
             .await
             .unwrap()
             .is_none()
     );
     assert!(
-        node.resolve_secret("token", Some(1), &node.config_now(), test_auth())
+        node.resolve_secret("token", Some(1), &node.config_now(), revocable::lease())
             .await
             .is_err()
     );
-    node.refresh_secret_inventory(test_auth()).await.unwrap();
+    node.refresh_secret_inventory(revocable::lease())
+        .await
+        .unwrap();
     assert!(
         node.secret_values()
             .unwrap()
@@ -1136,7 +1099,9 @@ async fn deletion_keeps_only_scrub_authority_and_missing_retained_values_fail_in
         state.values.clear();
         state.bytes = 0;
     }
-    node.refresh_secret_inventory(test_auth()).await.unwrap();
+    node.refresh_secret_inventory(revocable::lease())
+        .await
+        .unwrap();
     assert!(
         node.secret_values()
             .unwrap()
@@ -1511,7 +1476,14 @@ async fn assert_ref_not_fetched(node: &Node, bao: &Bao, name: &str, reference: &
     let calls = bao.calls.load(Ordering::SeqCst);
     for dry_run in [false, true] {
         let error = node
-            .secret_link(name, "bao", reference, &audit(), dry_run, test_auth())
+            .secret_link(
+                name,
+                "bao",
+                reference,
+                &audit(),
+                dry_run,
+                revocable::lease(),
+            )
             .await
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::SecretRefNotAllowed, "{reference}");
@@ -1535,7 +1507,7 @@ async fn assert_ref_not_fetched(node: &Node, bao: &Bao, name: &str, reference: &
         audit: Some(audit()),
     }));
     let error = node
-        .resolve_secret(name, None, &config, test_auth())
+        .resolve_secret(name, None, &config, revocable::lease())
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::SecretVersionGone, "{reference}");
@@ -1561,7 +1533,7 @@ async fn a_ref_outside_allowed_refs_is_refused_without_a_fetch() {
             "secret/payments/first#token",
             &audit(),
             false,
-            test_auth(),
+            revocable::lease(),
         )
         .await
         .unwrap();
@@ -1569,7 +1541,7 @@ async fn a_ref_outside_allowed_refs_is_refused_without_a_fetch() {
     assert!(lsn.is_some());
     assert!(bao.calls.load(Ordering::SeqCst) > calls);
     assert_eq!(
-        node.resolve_secret("token", None, &node.config_now(), test_auth())
+        node.resolve_secret("token", None, &node.config_now(), revocable::lease())
             .await
             .unwrap()
             .unwrap()
@@ -1593,7 +1565,7 @@ async fn metadata_list_has_no_provider_or_ledger_effect_and_preserves_unobserved
             b"local-credential".to_vec(),
             &audit(),
             false,
-            test_auth(),
+            revocable::lease(),
         )
         .await
         .unwrap()
@@ -1605,7 +1577,7 @@ async fn metadata_list_has_no_provider_or_ledger_effect_and_preserves_unobserved
             "secret/first#token",
             &audit(),
             false,
-            test_auth(),
+            revocable::lease(),
         )
         .await
         .unwrap();
@@ -1613,7 +1585,7 @@ async fn metadata_list_has_no_provider_or_ledger_effect_and_preserves_unobserved
     // cold resolve publishes the durable ledger row (the link itself has no
     // provider or ledger effect) and the refresh certifies it. The outage
     // below must not change what was certified here.
-    node.resolve_secret("token", None, &node.config_now(), test_auth())
+    node.resolve_secret("token", None, &node.config_now(), revocable::lease())
         .await
         .unwrap()
         .unwrap();
@@ -1630,7 +1602,7 @@ async fn metadata_list_has_no_provider_or_ledger_effect_and_preserves_unobserved
     // The link was certified while the provider was up; the later outage
     // does not un-certify it, and the list must not touch the provider.
     let token = node
-        .resolve_secret("token", None, &node.config_now(), test_auth())
+        .resolve_secret("token", None, &node.config_now(), revocable::lease())
         .await
         .unwrap()
         .unwrap()
@@ -1643,7 +1615,7 @@ async fn metadata_list_has_no_provider_or_ledger_effect_and_preserves_unobserved
 
     bao.status.store(200, Ordering::SeqCst);
     let first = node
-        .secret_refresh("token", &audit(), false, test_auth())
+        .secret_refresh("token", &audit(), false, revocable::lease())
         .await
         .unwrap()
         .unwrap();
@@ -1659,7 +1631,7 @@ async fn metadata_list_has_no_provider_or_ledger_effect_and_preserves_unobserved
     assert_eq!(bao.calls.load(Ordering::SeqCst), calls);
     assert_eq!(node.applied_lsn(), before);
     let second = node
-        .secret_refresh("token", &audit(), false, test_auth())
+        .secret_refresh("token", &audit(), false, revocable::lease())
         .await
         .unwrap()
         .unwrap();
@@ -1669,7 +1641,7 @@ async fn metadata_list_has_no_provider_or_ledger_effect_and_preserves_unobserved
             "token",
             Some(first.version),
             &node.config_now(),
-            test_auth(),
+            revocable::lease(),
         )
         .await
         .unwrap()
@@ -1689,7 +1661,7 @@ async fn actual_provider_initialization_is_offline_and_cold_io_follows_begin_whi
         "secret/first#token",
         &audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
@@ -1697,14 +1669,14 @@ async fn actual_provider_initialization_is_offline_and_cold_io_follows_begin_whi
     bao.require_begin.store(true, Ordering::SeqCst);
     let config = node.config_now();
     let cold = node
-        .resolve_secret("token", None, &config, test_auth())
+        .resolve_secret("token", None, &config, revocable::lease())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(cold.value, b"first-credential-1");
     let calls = bao.calls.load(Ordering::SeqCst);
     let warm = node
-        .resolve_secret("token", None, &config, test_auth())
+        .resolve_secret("token", None, &config, revocable::lease())
         .await
         .unwrap()
         .unwrap();
@@ -1728,7 +1700,7 @@ async fn relinking_does_not_redirect_admitted_old_generations_with_the_same_prov
         "secret/first#token",
         &audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
@@ -1739,18 +1711,18 @@ async fn relinking_does_not_redirect_admitted_old_generations_with_the_same_prov
         "secret/second#token",
         &audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
     let new_config = node.config_now();
     let old = node
-        .resolve_secret("token", None, &old_config, test_auth())
+        .resolve_secret("token", None, &old_config, revocable::lease())
         .await
         .unwrap()
         .unwrap();
     let new = node
-        .resolve_secret("token", None, &new_config, test_auth())
+        .resolve_secret("token", None, &new_config, revocable::lease())
         .await
         .unwrap()
         .unwrap();
@@ -1758,16 +1730,26 @@ async fn relinking_does_not_redirect_admitted_old_generations_with_the_same_prov
     assert_eq!(new.value, b"second-credential-1");
     assert_ne!(old.meta.version, new.meta.version);
     assert!(
-        node.resolve_secret("token", Some(old.meta.version), &new_config, test_auth())
-            .await
-            .is_err()
+        node.resolve_secret(
+            "token",
+            Some(old.meta.version),
+            &new_config,
+            revocable::lease()
+        )
+        .await
+        .is_err()
     );
     assert_eq!(
-        node.resolve_secret("token", Some(old.meta.version), &old_config, test_auth())
-            .await
-            .unwrap()
-            .unwrap()
-            .value,
+        node.resolve_secret(
+            "token",
+            Some(old.meta.version),
+            &old_config,
+            revocable::lease()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .value,
         old.value
     );
     let history = node.secret_history("token").await.unwrap();
@@ -1801,7 +1783,7 @@ async fn provider_listing_denial_is_incomplete_and_old_required_versions_cannot_
         "secret/first#token",
         &audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
@@ -1813,18 +1795,22 @@ async fn provider_listing_denial_is_incomplete_and_old_required_versions_cannot_
         kronik_effects::InForks::Recorded,
         audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
-    node.resolve_secret("token", None, &node.config_now(), test_auth())
+    node.resolve_secret("token", None, &node.config_now(), revocable::lease())
         .await
         .unwrap();
     bao.catalogue_status.store(403, Ordering::SeqCst);
     // Drive the recertification once: the denied listing must fail the mode
     // (an incomplete catalogue is never published) and record the link's
     // negative fact, so cached reads fail closed until the provider heals.
-    assert!(node.refresh_secret_inventory(test_auth()).await.is_err());
+    assert!(
+        node.refresh_secret_inventory(revocable::lease())
+            .await
+            .is_err()
+    );
     assert!(node.secret_values().is_err());
     assert!(
         node.secret_cache()
@@ -1870,7 +1856,7 @@ async fn immutable_file_source_version_can_differ_from_the_global_alias_after_un
             b"file-before-link".to_vec(),
             &audit(),
             false,
-            test_auth(),
+            revocable::lease(),
         )
         .await
         .unwrap()
@@ -1881,18 +1867,18 @@ async fn immutable_file_source_version_can_differ_from_the_global_alias_after_un
         "secret/first#token",
         &audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
-    node.resolve_secret("token", None, &node.config_now(), test_auth())
+    node.resolve_secret("token", None, &node.config_now(), revocable::lease())
         .await
         .unwrap();
-    node.secret_unlink("token", &audit(), false, test_auth())
+    node.secret_unlink("token", &audit(), false, revocable::lease())
         .await
         .unwrap();
     let alias = node
-        .resolve_secret("token", None, &node.config_now(), test_auth())
+        .resolve_secret("token", None, &node.config_now(), revocable::lease())
         .await
         .unwrap()
         .unwrap();
@@ -1917,7 +1903,7 @@ async fn immutable_file_source_version_can_differ_from_the_global_alias_after_un
 #[tokio::test]
 async fn revocation_during_dependency_wait_prevents_reservation_and_file_mutation() {
     let (_data, node) = node().await;
-    let authority = Arc::new(TestAuthority::default());
+    let authority = revocable::Revocable::new();
     let guard = node
         .runtime()
         .unwrap()
@@ -1925,7 +1911,7 @@ async fn revocation_during_dependency_wait_prevents_reservation_and_file_mutatio
         .lock_owned()
         .await;
     let request_node = node.clone();
-    let request_authority = authority.clone();
+    let request_authority = authority.lease();
     let request = tokio::spawn(async move {
         request_node
             .secret_set(
@@ -1959,7 +1945,7 @@ async fn revocation_during_dependency_wait_prevents_reservation_and_file_mutatio
 #[tokio::test]
 async fn admitted_exact_reservation_finishes_after_revocation_without_changing_original_identity() {
     let (_data, node) = node().await;
-    let authority = Arc::new(TestAuthority::default());
+    let authority = revocable::Revocable::new();
     let runtime = node.runtime().unwrap();
     let value = b"already-admitted-file-write";
     let hash = runtime.file.version_hash("token", 1, value).unwrap();
@@ -1972,7 +1958,7 @@ async fn admitted_exact_reservation_finishes_after_revocation_without_changing_o
         audit(),
     );
     let admitted = node
-        .admit_secret(reserved.clone(), authority.clone())
+        .admit_secret(reserved.clone(), authority.lease())
         .await
         .unwrap();
     authority.revoke();
@@ -2031,7 +2017,7 @@ async fn failed_orphan_file_rows_are_scrub_only_and_never_operational_current() 
         b"acknowledged-current".to_vec(),
         &audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
@@ -2054,7 +2040,7 @@ async fn failed_orphan_file_rows_are_scrub_only_and_never_operational_current() 
             b"acknowledged-successor".to_vec(),
             &audit(),
             false,
-            test_auth(),
+            revocable::lease(),
         )
         .await
         .unwrap()
@@ -2065,7 +2051,9 @@ async fn failed_orphan_file_rows_are_scrub_only_and_never_operational_current() 
         .await
         .unwrap();
     assert_eq!(identity.source_version, "3");
-    node.refresh_secret_inventory(test_auth()).await.unwrap();
+    node.refresh_secret_inventory(revocable::lease())
+        .await
+        .unwrap();
     // The orphan's bytes stay scrub-only: the certified inventory keeps
     // them as needles (bytes that physically exist must stay scrubbable),
     // while operationally the acknowledged successor is current and no
@@ -2074,7 +2062,7 @@ async fn failed_orphan_file_rows_are_scrub_only_and_never_operational_current() 
         |(name, value)| name == "token" && value.as_slice() == b"unacknowledged-retained-value"
     ));
     assert_eq!(
-        node.resolve_secret("token", None, &node.config_now(), test_auth())
+        node.resolve_secret("token", None, &node.config_now(), revocable::lease())
             .await
             .unwrap()
             .unwrap()
@@ -2108,7 +2096,7 @@ async fn cancelled_fetch_retains_singleflight_until_old_generation_publication_f
         "secret/first#token",
         &audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
@@ -2139,7 +2127,7 @@ async fn cancelled_fetch_retains_singleflight_until_old_generation_publication_f
     let request_node = node.clone();
     let request = tokio::spawn(async move {
         request_node
-            .resolve_secret("token", None, &old_config, test_auth())
+            .resolve_secret("token", None, &old_config, revocable::lease())
             .await
     });
     bao.started.acquire().await.unwrap().forget();
@@ -2153,7 +2141,7 @@ async fn cancelled_fetch_retains_singleflight_until_old_generation_publication_f
                 "secret/second#token",
                 &audit(),
                 false,
-                test_auth(),
+                revocable::lease(),
             )
             .await
     });
@@ -2220,7 +2208,7 @@ async fn cancelled_fetch_retains_singleflight_until_old_generation_publication_f
         assert_eq!(value.value, b"second-credential-1");
     }
     let current = node
-        .resolve_secret("token", None, &config, test_auth())
+        .resolve_secret("token", None, &config, revocable::lease())
         .await
         .unwrap()
         .unwrap();
@@ -2238,17 +2226,17 @@ async fn explicit_refresh_deduplicates_source_identity_and_has_one_owned_intent_
         "secret/first#token",
         &audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
     let observed = node
-        .resolve_secret("token", None, &node.config_now(), test_auth())
+        .resolve_secret("token", None, &node.config_now(), revocable::lease())
         .await
         .unwrap()
         .unwrap();
     let refreshed = node
-        .secret_refresh("token", &audit(), false, test_auth())
+        .secret_refresh("token", &audit(), false, revocable::lease())
         .await
         .unwrap()
         .unwrap();
@@ -2256,7 +2244,7 @@ async fn explicit_refresh_deduplicates_source_identity_and_has_one_owned_intent_
     assert_eq!(node.secret_history("token").await.unwrap().len(), 1);
     bao.status.store(503, Ordering::SeqCst);
     assert_eq!(
-        node.secret_refresh("token", &audit(), false, test_auth())
+        node.secret_refresh("token", &audit(), false, revocable::lease())
             .await
             .unwrap_err()
             .code,
@@ -2300,7 +2288,7 @@ async fn refresh_intent_does_not_authorize_a_later_unknown_version_after_revocat
         "secret/first#token",
         &audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
@@ -2314,9 +2302,9 @@ async fn refresh_intent_does_not_authorize_a_later_unknown_version_after_revocat
     }
     let blocked = Arc::new(Semaphore::new(0));
     *lock(&bao.block) = Some(blocked.clone());
-    let authority = Arc::new(TestAuthority::default());
+    let authority = revocable::Revocable::new();
     let request_node = node.clone();
-    let request_authority = authority.clone();
+    let request_authority = authority.lease();
     let request = tokio::spawn(async move {
         request_node
             .secret_refresh("token", &audit(), false, request_authority)
@@ -2347,12 +2335,12 @@ async fn unchanged_refresh_does_not_renew_cached_authority_after_request_revocat
         "secret/first#token",
         &audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
     let first = node
-        .resolve_secret("token", None, &node.config_now(), test_auth())
+        .resolve_secret("token", None, &node.config_now(), revocable::lease())
         .await
         .unwrap()
         .unwrap();
@@ -2361,9 +2349,9 @@ async fn unchanged_refresh_does_not_renew_cached_authority_after_request_revocat
     }
     let blocked = Arc::new(Semaphore::new(0));
     *lock(&bao.block) = Some(blocked.clone());
-    let authority = Arc::new(TestAuthority::default());
+    let authority = revocable::Revocable::new();
     let request_node = node.clone();
-    let request_authority = authority.clone();
+    let request_authority = authority.lease();
     let request = tokio::spawn(async move {
         request_node
             .secret_refresh("token", &audit(), false, request_authority)
@@ -2521,7 +2509,11 @@ async fn values_until_complete(node: &Arc<Node>) -> Vec<(String, Arc<Zeroizing<V
 async fn refresh_until_complete(node: &Arc<Node>) {
     node.env
         .timeout(Duration::from_secs(5), async {
-            while node.refresh_secret_inventory(test_auth()).await.is_err() {
+            while node
+                .refresh_secret_inventory(revocable::lease())
+                .await
+                .is_err()
+            {
                 node.env.clock.sleep(Duration::from_millis(1)).await;
             }
         })
@@ -2554,9 +2546,16 @@ async fn aws_catalogue_node(cycle: bool) -> (tempfile::TempDir, Arc<Node>, Arc<A
     let node = crate::start_local(environment, data.path(), config)
         .await
         .unwrap();
-    node.secret_link("token", "aws-test", "token", &audit(), false, test_auth())
-        .await
-        .unwrap();
+    node.secret_link(
+        "token",
+        "aws-test",
+        "token",
+        &audit(),
+        false,
+        revocable::lease(),
+    )
+    .await
+    .unwrap();
     node.grant(
         "test",
         "secret-reveal:token",
@@ -2565,7 +2564,7 @@ async fn aws_catalogue_node(cycle: bool) -> (tempfile::TempDir, Arc<Node>, Arc<A
         kronik_effects::InForks::Recorded,
         audit(),
         false,
-        test_auth(),
+        revocable::lease(),
     )
     .await
     .unwrap();
@@ -2577,7 +2576,11 @@ async fn aws_catalogue_node(cycle: bool) -> (tempfile::TempDir, Arc<Node>, Arc<A
 async fn actual_aws_multi_page_cycle_never_publishes_complete_inventory() {
     let (_data, node, pages) = aws_catalogue_node(true).await;
     let before = pages.pages.load(Ordering::SeqCst);
-    assert!(node.refresh_secret_inventory(test_auth()).await.is_err());
+    assert!(
+        node.refresh_secret_inventory(revocable::lease())
+            .await
+            .is_err()
+    );
     // The client stops at the token it was given before: the third page.
     let fetched = pages.pages.load(Ordering::SeqCst) - before;
     assert_eq!(fetched, 3, "the refresh listed {fetched} pages");
@@ -2588,7 +2591,11 @@ async fn actual_aws_multi_page_cycle_never_publishes_complete_inventory() {
 async fn actual_aws_unending_catalogue_stops_at_the_page_budget_without_claiming_completeness() {
     let (_data, node, pages) = aws_catalogue_node(false).await;
     let before = pages.pages.load(Ordering::SeqCst);
-    assert!(node.refresh_secret_inventory(test_auth()).await.is_err());
+    assert!(
+        node.refresh_secret_inventory(revocable::lease())
+            .await
+            .is_err()
+    );
     assert_eq!(
         pages.pages.load(Ordering::SeqCst) - before,
         MAX_CATALOGUE_PAGES
@@ -2764,7 +2771,7 @@ async fn a_secret_mutation_that_begins_in_a_rebuild_window_waits_and_records_the
                 b"first-credential".to_vec(),
                 &audit(),
                 false,
-                test_auth(),
+                revocable::lease(),
             )
             .await
         })
@@ -2832,7 +2839,7 @@ async fn a_secret_mutation_whose_wait_for_the_inventory_runs_out_records_the_pla
             b"first-credential".to_vec(),
             &audit(),
             false,
-            test_auth(),
+            revocable::lease(),
         )
         .await;
     let waited = node.env.clock.monotonic().saturating_sub(started);
@@ -2878,7 +2885,7 @@ async fn a_secret_mutation_does_not_wait_for_a_rebuild_that_is_failing() {
             b"first-credential".to_vec(),
             &audit(),
             false,
-            test_auth(),
+            revocable::lease(),
         )
         .await;
     let waited = node.env.clock.monotonic().saturating_sub(started);
