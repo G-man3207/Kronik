@@ -8,17 +8,20 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use common::{request, store};
 use kronik_core::env::BoxFuture;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::{
-    BlobHost, BlobHostError, CallOutcome, CodeStore, CryptoAlgorithm, CryptoOutcome, EffectGate,
-    FetchBody, FetchOutcome, FetchRequest, FetchResponse, FetchResponseBody, GateError, PoolSize,
-    Program, StateView, TurnLimits, TurnOutput, TurnRequest, build_engine,
+    BlobHost, BlobHostError, CallOutcome, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchBody,
+    FetchOutcome, FetchRequest, FetchResponse, FetchResponseBody, GateError, Program, StateView,
+    TurnLimits, TurnOutput, TurnRequest,
 };
 
 const MEDIA: &[u8] = include_bytes!("../../../tests/guests/media.wasm");
@@ -205,7 +208,7 @@ fn fnv(bytes: &[u8]) -> String {
 }
 
 fn world() -> World {
-    let code = CodeStore::new(build_engine(PoolSize { concurrency: 2 }).unwrap(), None).unwrap();
+    let code = store();
     let (_, program) = code.add(MEDIA).unwrap();
     let blobs = Arc::new(MemBlobs::default());
     let document = blobs.store((0..300_000u64).map(|i| (i % 7) as u8).collect());
@@ -251,13 +254,8 @@ impl World {
         self.program
             .run_with_blobs(
                 TurnRequest {
-                    actor: ActorRef::parse("media/a").unwrap(),
-                    causal_key: kronik_core::causal::root("r".into()),
-                    logical_time_ms: 1_761_300_000_000,
-                    seed: [7; 32],
-                    input,
                     limits,
-                    subject: None,
+                    ..request("media/a", input)
                 },
                 self.state.clone(),
                 None,
@@ -321,7 +319,7 @@ fn blob_answer(out: &TurnOutput) -> pb::BlobRef {
 async fn a_component_that_imports_blobs_reads_blobs() {
     let w = world();
     assert!(w.program.reads_blobs());
-    let code = CodeStore::new(build_engine(PoolSize { concurrency: 2 }).unwrap(), None).unwrap();
+    let code = store();
     let (_, counter) = code.add(COUNTER).unwrap();
     assert!(!counter.reads_blobs());
 }

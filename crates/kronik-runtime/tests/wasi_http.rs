@@ -7,38 +7,24 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::{Map, message, request, store};
 use kronik_core::env::BoxFuture;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::{
-    BlobHost, BlobHostError, CallOutcome, CodeStore, CryptoAlgorithm, CryptoOutcome, EffectGate,
-    FetchBody, FetchHeader, FetchOutcome, FetchRequest, FetchResponse, FetchResponseBody,
-    GateError, PoolSize, Program, StateView, TurnLimits, TurnRequest, build_engine,
+    BlobHost, BlobHostError, CallOutcome, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchBody,
+    FetchHeader, FetchOutcome, FetchRequest, FetchResponse, FetchResponseBody, GateError, Program,
+    TurnLimits, TurnRequest,
 };
 
 const GUEST: &[u8] = include_bytes!("../../../tests/guests/counter-wasi-http.wasm");
-
-struct Empty;
-
-impl StateView for Empty {
-    fn get(&self, _: &str) -> Result<Option<Vec<u8>>, String> {
-        Ok(None)
-    }
-    fn keys(&self, _: &str) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
-    }
-    fn timer_pending(&self, _: u64) -> Result<bool, String> {
-        Ok(false)
-    }
-    fn connection(&self, _: &str) -> Result<Option<kronik_runtime::ConnectionView>, String> {
-        Ok(None)
-    }
-}
 
 /// Logs each effect (ordinal and request) and echoes it, after 0 to 3 ms.
 struct Gate {
@@ -124,8 +110,7 @@ impl EffectGate for Gate {
 }
 
 fn program() -> Arc<Program> {
-    let engine = build_engine(PoolSize { concurrency: 2 }).unwrap();
-    let code = CodeStore::new(engine, None).unwrap();
+    let code = store();
     code.add(GUEST).unwrap().1
 }
 
@@ -139,35 +124,15 @@ struct Run {
 
 async fn run(program: &Program, op: &str, body: &str, seed: u64) -> Run {
     let gate = Gate::new(seed);
-    let input = pb::Input {
-        kind: Some(pb::input::Kind::Message(pb::MessageInput {
-            source: pb::MessageSource::Operator as i32,
-            msg: Some(pb::Message {
-                name: op.into(),
-                content_type: "text/plain".into(),
-                body: Some(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-                }),
-                blobs: vec![],
-                retained_compensation_source: None,
-            }),
-            message_id: "m".into(),
-            ..Default::default()
-        })),
-    };
+    let input = message(op, body.as_bytes());
     let out = program
         .run(
             TurnRequest {
-                actor: ActorRef::parse("counter/a").unwrap(),
                 causal_key: kronik_core::causal::root("root".to_string()),
-                logical_time_ms: 1_761_300_000_000,
                 seed: [3; 32],
-                input,
-                limits: TurnLimits::default(),
-                subject: None,
+                ..request("counter/a", input)
             },
-            Arc::new(Empty),
+            Arc::new(Map::default()),
             None,
             Some(gate.clone()),
         )
@@ -606,8 +571,7 @@ impl EffectGate for BlobGate {
 }
 
 fn blob_program() -> Arc<Program> {
-    let engine = build_engine(PoolSize { concurrency: 2 }).unwrap();
-    let code = CodeStore::new(engine, None).unwrap();
+    let code = store();
     code.add(BLOB_GUEST).unwrap().1
 }
 
@@ -647,36 +611,17 @@ async fn run_blobs(
         log: Mutex::new(Vec::new()),
         jitter: AtomicU64::new(seed | 1),
     });
-    let input = pb::Input {
-        kind: Some(pb::input::Kind::Message(pb::MessageInput {
-            source: pb::MessageSource::Operator as i32,
-            msg: Some(pb::Message {
-                name: op.into(),
-                content_type: "text/plain".into(),
-                body: Some(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(text.as_bytes().to_vec())),
-                }),
-                blobs: vec![],
-                retained_compensation_source: None,
-            }),
-            message_id: "m".into(),
-            ..Default::default()
-        })),
-    };
+    let input = message(op, text.as_bytes());
     let host = blobs.then(|| store.clone() as Arc<dyn BlobHost>);
     let out = program
         .run_with_blobs(
             TurnRequest {
-                actor: ActorRef::parse("counter/a").unwrap(),
                 causal_key: kronik_core::causal::root("root".to_string()),
-                logical_time_ms: 1_761_300_000_000,
                 seed: [3; 32],
-                input,
                 limits,
-                subject: None,
+                ..request("counter/a", input)
             },
-            Arc::new(Empty),
+            Arc::new(Map::default()),
             None,
             Some(gate.clone()),
             host,
