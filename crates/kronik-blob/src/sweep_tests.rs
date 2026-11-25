@@ -67,6 +67,39 @@ fn exists(store: &BlobStore, id: &BlobId) -> bool {
     store.object_path(&Space::Main, id).exists()
 }
 
+/// One pass over main with `roots`.
+async fn sweep(store: &BlobStore, roots: &mut dyn Roots, options: SweepOptions) -> SweepReport {
+    store.sweep(&Space::Main, roots, options).await.unwrap()
+}
+
+fn immediate() -> SweepOptions {
+    SweepOptions {
+        immediate: true,
+        ..Default::default()
+    }
+}
+
+fn dry_run() -> SweepOptions {
+    SweepOptions {
+        dry_run: true,
+        ..Default::default()
+    }
+}
+
+/// Roots without blobs that, before they answer the first shard, run
+/// `task` to its end on a plain thread while the pass waits.
+fn during_task(task: impl Future<Output = ()> + Send + 'static) -> During<impl FnOnce() + Send> {
+    let rt = tokio::runtime::Handle::current();
+    During(
+        BTreeSet::new(),
+        Some(move || {
+            std::thread::spawn(move || rt.block_on(task))
+                .join()
+                .unwrap()
+        }),
+    )
+}
+
 /// A file without a root goes in the second pass that finds it without
 /// one, not in the first; a rooted or leased file stays; `immediate` skips
 /// the grace; a dry run lists and deletes nothing.
@@ -80,17 +113,7 @@ async fn a_file_without_roots_goes_in_the_second_pass() {
     let leased = put(&store, b"kept by a lease", lease.clone()).await;
     let mut roots = Fixed([kept.id].into());
 
-    let dry = store
-        .sweep(
-            &Space::Main,
-            &mut roots,
-            SweepOptions {
-                dry_run: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let dry = sweep(&store, &mut roots, dry_run()).await;
     assert_eq!(dry.objects, 3);
     assert_eq!(
         dry.unrooted.iter().map(|u| u.id).collect::<Vec<_>>(),
@@ -98,30 +121,14 @@ async fn a_file_without_roots_goes_in_the_second_pass() {
     );
     assert!(!dry.unrooted[0].candidate);
 
-    let first = store
-        .sweep(&Space::Main, &mut roots, SweepOptions::default())
-        .await
-        .unwrap();
+    let first = sweep(&store, &mut roots, SweepOptions::default()).await;
     assert_eq!((first.deleted, first.candidates), (0, 1));
     assert!(exists(&store, &loose.id));
     // The dry run now marks it as the next pass's.
-    let dry = store
-        .sweep(
-            &Space::Main,
-            &mut roots,
-            SweepOptions {
-                dry_run: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let dry = sweep(&store, &mut roots, dry_run()).await;
     assert!(dry.unrooted[0].candidate);
 
-    let second = store
-        .sweep(&Space::Main, &mut roots, SweepOptions::default())
-        .await
-        .unwrap();
+    let second = sweep(&store, &mut roots, SweepOptions::default()).await;
     assert_eq!(second.deleted, 1);
     assert_eq!(second.objects, 2);
     assert!(!exists(&store, &loose.id));
@@ -129,17 +136,7 @@ async fn a_file_without_roots_goes_in_the_second_pass() {
 
     // The lease ends: `immediate` deletes at once.
     drop(lease);
-    let now = store
-        .sweep(
-            &Space::Main,
-            &mut roots,
-            SweepOptions {
-                immediate: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let now = sweep(&store, &mut roots, immediate()).await;
     assert_eq!((now.deleted, now.objects), (1, 1));
     assert!(!exists(&store, &leased.id) && exists(&store, &kept.id));
 }
@@ -154,53 +151,19 @@ async fn a_claim_after_the_pass_began_keeps_the_file() {
     let store = open(dir.path()).await;
     let first = put(&store, b"twice", store.leases().take("t")).await;
     let mut nothing = Fixed(BTreeSet::new());
-    store
-        .sweep(&Space::Main, &mut nothing, SweepOptions::default())
-        .await
-        .unwrap();
+    sweep(&store, &mut nothing, SweepOptions::default()).await;
     // It is a candidate. While the next pass runs, a turn writes the same
     // content (a claim), and its lease ends before the pass looks.
     let claimer = store.clone();
-    let rt = tokio::runtime::Handle::current();
-    let mut during = During(
-        BTreeSet::new(),
-        Some(move || {
-            let store = claimer.clone();
-            std::thread::spawn(move || {
-                rt.block_on(async {
-                    let lease = store.leases().take("t");
-                    put(&store, b"twice", lease).await;
-                })
-            })
-            .join()
-            .unwrap();
-        }),
-    );
-    let report = store
-        .sweep(
-            &Space::Main,
-            &mut during,
-            SweepOptions {
-                immediate: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let mut during = during_task(async move {
+        let lease = claimer.leases().take("t");
+        put(&claimer, b"twice", lease).await;
+    });
+    let report = sweep(&store, &mut during, immediate()).await;
     assert_eq!(report.deleted, 0, "{report:?}");
     assert!(exists(&store, &first.id));
     // The pass after that deletes it: nothing has touched it since.
-    let report = store
-        .sweep(
-            &Space::Main,
-            &mut nothing,
-            SweepOptions {
-                immediate: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let report = sweep(&store, &mut nothing, immediate()).await;
     assert_eq!(report.deleted, 1);
 }
 
@@ -215,17 +178,7 @@ async fn a_lease_live_at_the_start_keeps_the_file_for_the_pass() {
     let meta = put(&store, b"leased at the start", lease.clone()).await;
     // The lease ends while the pass runs, after it began.
     let mut during = During(BTreeSet::new(), Some(move || drop(lease)));
-    let report = store
-        .sweep(
-            &Space::Main,
-            &mut during,
-            SweepOptions {
-                immediate: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let report = sweep(&store, &mut during, immediate()).await;
     assert_eq!(report.deleted, 0);
     assert!(exists(&store, &meta.id));
 }
@@ -237,17 +190,7 @@ async fn other_files_are_left_alone() {
     let store = open(dir.path()).await;
     let stray = dir.path().join("blobs/objects/00/notes.txt");
     std::fs::write(&stray, b"not a blob").unwrap();
-    let report = store
-        .sweep(
-            &Space::Main,
-            &mut Fixed(BTreeSet::new()),
-            SweepOptions {
-                immediate: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let report = sweep(&store, &mut Fixed(BTreeSet::new()), immediate()).await;
     assert_eq!((report.objects, report.deleted), (0, 0));
     assert!(stray.exists());
 }
@@ -262,36 +205,15 @@ async fn an_import_that_claims_a_file_during_a_pass_keeps_it() {
     let meta = put(&store, b"main has it already", store.leases().take("t")).await;
     let claimer = store.clone();
     let claimed = meta.clone();
-    let rt = tokio::runtime::Handle::current();
-    let mut during = During(
-        BTreeSet::new(),
-        Some(move || {
-            let store = claimer.clone();
-            std::thread::spawn(move || {
-                rt.block_on(async {
-                    let lease = store.leases().take("rebase");
-                    // Not in the fork's space: claimed in main.
-                    store
-                        .import(&Space::Fork("f".into()), &Space::Main, &claimed, &lease)
-                        .await
-                        .unwrap();
-                })
-            })
-            .join()
+    let mut during = during_task(async move {
+        let lease = claimer.leases().take("rebase");
+        // Not in the fork's space: claimed in main.
+        claimer
+            .import(&Space::Fork("f".into()), &Space::Main, &claimed, &lease)
+            .await
             .unwrap();
-        }),
-    );
-    let report = store
-        .sweep(
-            &Space::Main,
-            &mut during,
-            SweepOptions {
-                immediate: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    });
+    let report = sweep(&store, &mut during, immediate()).await;
     assert_eq!(report.deleted, 0, "{report:?}");
     assert!(exists(&store, &meta.id));
 }
