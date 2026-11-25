@@ -39,10 +39,6 @@ fn try_propose(p: &Proc, props: &Arc<Proposals>, guests: &[&str]) -> Result<Prop
         .map(|(prop, _)| prop)
 }
 
-fn diff(p: &Proc, props: &Proposals, id: &str) -> Value {
-    serde_json::from_slice(&p.rt.block_on(props.diff(id, false, false)).unwrap()).unwrap()
-}
-
 /// The diff's entry for `kind`.
 fn kind<'a>(d: &'a Value, kind: &str) -> &'a Value {
     d["kinds"]
@@ -93,7 +89,7 @@ fn a_caller_and_its_new_callee_verify_together_and_fail_apart() {
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
 
     let together = try_propose(&p, &props, &["counter-calls-tally", "notes-tally"]).unwrap();
-    let d = diff(&p, &props, &together.id);
+    let d = diff_json(&p, &props, &together.id);
     assert_eq!(together.status, "evaluated", "{}", together.policy);
     assert_eq!(together.policy["outcome"], "allow", "{}", together.policy);
     assert_eq!(d["errors"]["introduced"], 0, "{d}");
@@ -150,7 +146,7 @@ fn a_caller_and_its_new_callee_verify_together_and_fail_apart() {
     // The same changes proposed apart: the caller alone calls a message
     // the running notes code does not serve.
     let caller = try_propose(&p, &props, &["counter-calls-tally"]).unwrap();
-    let dc = diff(&p, &props, &caller.id);
+    let dc = diff_json(&p, &props, &caller.id);
     assert_eq!(caller.status, "rejected", "{}", caller.policy);
     assert_eq!(caller.policy["outcome"], "deny");
     assert_eq!(caller.policy["fired"][0]["name"], "no-new-errors");
@@ -165,7 +161,7 @@ fn a_caller_and_its_new_callee_verify_together_and_fail_apart() {
     assert!(kind(&dc, "notes")["errors"]["introduced"].as_u64() > Some(0));
     assert_eq!(kind(&dc, "notes")["code"], "unchanged");
     let callee = try_propose(&p, &props, &["notes-tally"]).unwrap();
-    let dn = diff(&p, &props, &callee.id);
+    let dn = diff_json(&p, &props, &callee.id);
     assert_eq!(dn["errors"]["introduced"], 0, "{dn}");
     assert_eq!(
         kind(&dn, "notes")["divergent_turns"],
@@ -209,7 +205,7 @@ fn unchanged_components_are_skipped_and_nothing_changed_is_refused() {
         err.message.contains("notes-tally and notes-route-tally"),
         "{err}"
     );
-    let d = diff(&p, &props, &prop.id);
+    let d = diff_json(&p, &props, &prop.id);
     assert_eq!(kind(&d, "counter")["code"], "changed");
     assert_eq!(kind(&d, "notes")["code"], "unchanged");
 
@@ -246,7 +242,7 @@ fn a_component_promoted_inside_the_window_is_not_skipped() {
     let set = try_propose(&p, &props, &["counter-calls-tally", "notes-tally"]).unwrap();
     assert!(set.unchanged.is_empty(), "notes-tally was skipped");
     assert_eq!(set.kinds.len(), 2);
-    let d = diff(&p, &props, &set.id);
+    let d = diff_json(&p, &props, &set.id);
     assert_eq!(kind(&d, "notes")["code"], "changed", "{}", d["code"]);
     assert_eq!(d["errors"]["introduced"], 0, "{d}");
     assert_eq!(set.policy["outcome"], "allow", "{}", set.policy);
@@ -563,7 +559,10 @@ fn rolling_back_a_set_that_added_a_kind_is_refused() {
     }
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     let prop = try_propose(&p, &props, &["counter-step2", "notes"]).unwrap();
-    assert_eq!(kind(&diff(&p, &props, &prop.id), "notes")["code"], "new");
+    assert_eq!(
+        kind(&diff_json(&p, &props, &prop.id), "notes")["code"],
+        "new"
+    );
     let promoted =
         p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap();

@@ -77,18 +77,7 @@ fn overrides(
 /// A fork of the fetch-extra build (it also GETs `<url>/extra`, never
 /// recorded) at `fork_lsn`.
 fn fork(p: &Proc, props: &Arc<Proposals>, name: &str, fork_lsn: u64) {
-    p.rt.block_on(props.create_fork(
-        Some(name.into()),
-        fork_lsn,
-        false,
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
-    let bytes = std::fs::read(guest("counter-fetch-extra")).unwrap();
-    p.rt.block_on(props.fork_deploy(name, &bytes, false, p.owner()))
-        .unwrap();
+    new_fork(p, props, name, fork_lsn, false, Some("counter-fetch-extra"));
 }
 
 /// Replays the fork over everything so far; the diff's bytes.
@@ -98,27 +87,7 @@ fn replay(p: &Proc, props: &Arc<Proposals>, name: &str) -> Vec<u8> {
 
 fn replay_with(p: &Proc, props: &Arc<Proposals>, name: &str, options: DiffOptions) -> Vec<u8> {
     p.settle();
-    // A replay verifies the recorded operation against the certified source;
-    // the daemon answers the documented fail-closed 503 SECRET_UNAVAILABLE
-    // while its certificate is retired (ADR 0108), so await that window
-    // (bounded) instead of racing it.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        match p
-            .rt
-            .block_on(props.fork_replay(name, None, options.clone(), Some(2), p.owner()))
-        {
-            Ok(_) => break,
-            Err(error)
-                if error.code == ErrorCode::SecretUnavailable
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(error) => panic!("fork replay of {name}: {error}"),
-        }
-    }
-    p.rt.block_on(props.diff(name, false, false)).unwrap()
+    replay_fork(p, props, name, options, Some(2))
 }
 
 fn extra_items(d: &Value) -> Vec<&Value> {
@@ -324,8 +293,7 @@ fn simulator_configuration_is_taken_at_the_fork_point() {
     let to = p.node.applied_lsn();
     p.rt.block_on(props.fork_replay("try", Some(to), DiffOptions::default(), Some(2), p.owner()))
         .unwrap();
-    let d: Value =
-        serde_json::from_slice(&p.rt.block_on(props.diff("try", false, false)).unwrap()).unwrap();
+    let d: Value = diff_json(&p, &props, "try");
     assert_eq!(
         d["summary"]["synthetic_by"],
         json!({"fail-closed": 3}),
@@ -776,8 +744,7 @@ fn fork_call_replies_keep_their_subject() {
     p.http("caller", "call", "counter/callee subject");
     p.settle();
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
-    p.rt.block_on(props.create_fork(Some("f".into()), fork_lsn, false, audit(), false, p.owner()))
-        .unwrap();
+    new_fork(&p, &props, "f", fork_lsn, false, None);
     let options = DiffOptions {
         mode: kronik_fork::diff::Mode::Continuous,
         ..DiffOptions::default()
@@ -1211,35 +1178,27 @@ fn standard_fetch_is_matched_in_replay_and_meets_the_simulators() {
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
 
     // The same code: every request matches its recording.
-    p.rt.block_on(props.create_fork(
-        Some("same".into()),
+    new_fork(
+        &p,
+        &props,
+        "same",
         fork_lsn,
         false,
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
-    let bytes = std::fs::read(guest("counter-wasi-http")).unwrap();
-    p.rt.block_on(props.fork_deploy("same", &bytes, false, p.owner()))
-        .unwrap();
+        Some("counter-wasi-http"),
+    );
     let d: Value = serde_json::from_slice(&replay(&p, &props, "same")).unwrap();
     assert_eq!(d["summary"]["changed"], false, "{d}");
     assert_eq!(d["summary"]["exact"], 3, "{d}");
 
     // A build that also GETs <url>/extra: a target stub answers those.
-    p.rt.block_on(props.create_fork(
-        Some("extra".into()),
+    new_fork(
+        &p,
+        &props,
+        "extra",
         fork_lsn,
         false,
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
-    let bytes = std::fs::read(guest("counter-wasi-http-extra")).unwrap();
-    p.rt.block_on(props.fork_deploy("extra", &bytes, false, p.owner()))
-        .unwrap();
+        Some("counter-wasi-http-extra"),
+    );
     let stub = StubRule {
         method: Some("GET".into()),
         url_prefix: format!("http://{addr}/v1/charges/"),

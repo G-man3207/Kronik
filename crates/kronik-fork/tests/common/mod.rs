@@ -13,7 +13,10 @@ use std::time::Duration;
 
 use kronik_core::authority::AuthLease;
 use kronik_core::env::{BoxFuture, Clock, EntropySource, Env};
+use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
+use kronik_fork::diff::DiffOptions;
+use kronik_fork::proposal::Proposals;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Ingress, Node, NodeConfig, TurnResult, start_local};
@@ -40,6 +43,63 @@ pub fn hash(name: &str) -> Vec<u8> {
     CodeHash::of(&std::fs::read(guest(name)).unwrap())
         .0
         .to_vec()
+}
+
+/// Creates fork `name` at `at` and, when `code` is given, deploys that
+/// test guest on it.
+pub fn new_fork(
+    p: &Proc,
+    props: &Arc<Proposals>,
+    name: &str,
+    at: Lsn,
+    no_pii: bool,
+    code: Option<&str>,
+) {
+    p.rt.block_on(props.create_fork(Some(name.into()), at, no_pii, audit(), false, p.owner()))
+        .unwrap();
+    if let Some(code) = code {
+        let wasm = std::fs::read(guest(code)).unwrap();
+        p.rt.block_on(props.fork_deploy(name, &wasm, false, p.owner()))
+            .unwrap();
+    }
+}
+
+/// Replays fork `name` up to main's head with `options` on `workers`,
+/// waiting out the fail-closed SECRET_UNAVAILABLE window (ADR 0108) for
+/// at most 30 s, and returns its diff's JSON bytes.
+pub fn replay_fork(
+    p: &Proc,
+    props: &Arc<Proposals>,
+    name: &str,
+    options: DiffOptions,
+    workers: Option<usize>,
+) -> Vec<u8> {
+    // A replay verifies the recorded operation against the certified source;
+    // the daemon answers the documented fail-closed 503 SECRET_UNAVAILABLE
+    // while its certificate is retired (ADR 0108), so await that window
+    // (bounded) instead of racing it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match p
+            .rt
+            .block_on(props.fork_replay(name, None, options.clone(), workers, p.owner()))
+        {
+            Ok(_) => break,
+            Err(error)
+                if error.code == ErrorCode::SecretUnavailable
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("fork replay of {name}: {error}"),
+        }
+    }
+    p.rt.block_on(props.diff(name, false, false)).unwrap()
+}
+
+/// Fork or proposal `id`'s diff as JSON.
+pub fn diff_json(p: &Proc, props: &Proposals, id: &str) -> serde_json::Value {
+    serde_json::from_slice(&p.rt.block_on(props.diff(id, false, false)).unwrap()).unwrap()
 }
 
 /// Fails the next generated proposal/preview's atomic metadata rename,

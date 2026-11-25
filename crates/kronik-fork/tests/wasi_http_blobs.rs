@@ -116,29 +116,18 @@ fn a_fork_replays_a_wasi_http_exchange_of_blob_bodies_without_divergence() {
 
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     for (name, mode) in [("both", Mode::Both), ("isolated", Mode::Isolated)] {
-        p.rt.block_on(props.create_fork(
-            Some(name.into()),
-            fork_at,
-            false,
-            audit(),
-            false,
-            p.owner(),
-        ))
-        .unwrap();
-        p.rt.block_on(props.fork_replay(
+        new_fork(&p, &props, name, fork_at, false, None);
+        let diff = serde_json::from_slice::<serde_json::Value>(&replay_fork(
+            &p,
+            &props,
             name,
-            None,
             DiffOptions {
                 mode,
                 ..DiffOptions::default()
             },
             None,
-            p.owner(),
         ))
         .unwrap();
-        let diff: serde_json::Value =
-            serde_json::from_slice(&p.rt.block_on(props.diff(name, false, false)).unwrap())
-                .unwrap();
         let summary = &diff["summary"];
         assert_eq!(summary["changed"], false, "{name}: {diff:#}");
         assert_eq!(summary["divergent_turns"], 0, "{name}: {diff:#}");
