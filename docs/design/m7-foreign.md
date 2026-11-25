@@ -475,10 +475,11 @@ decimals (`0.5`). `--json` prints the response body unchanged.
   the empty netns, not the filter); `remove` stops the sandbox
   and deletes its namespace and cgroup; `POST /exit` restarts it with
   backoff; a secret reaches the program's environment and never the log.
-- **Registry fetch**: `kronik-foreign`'s ignored `pull_smoke` test against a
-  local `registry:2` container (skopeo pushes the layout); `kronik serve
-  --test-insecure-registry <host:port>` (hidden) lets a daemon test pull
-  over plain HTTP.
+- **Registry fetch**: `crates/kronik/tests/foreign.rs`'s
+  `foreign_add_from_a_registry_and_by_ref_name` adds a foreign actor from a
+  local `registry:2` container (skopeo pushes the layout) and runs in the
+  `foreign` step; `kronik serve --test-insecure-registry <host:port>`
+  (hidden) lets a daemon test pull over plain HTTP.
 
 ## 18. As built
 
