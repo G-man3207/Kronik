@@ -416,15 +416,16 @@ impl BlobStore {
         })
     }
 
-    /// Names a finished part file as `meta`'s object, or claims an existing
-    /// object of the same identity, under the directory's claim lock; either
-    /// way the blob joins `lease` before the lock is released (ADR 0117 §6).
-    async fn install(
+    /// Claims an object of `space` equal to `meta` for `lease`, under its
+    /// directory's claim lock (ADR 0117 §6, ADR 0120 §5). Without one, names
+    /// `part` as the object and adds it to `lease`; with no `part`, claims
+    /// nothing and answers false. True when an existing object was claimed.
+    async fn install_or_claim(
         &self,
         space: &Space,
-        part: &Path,
         meta: &BlobMeta,
         sealed: bool,
+        part: Option<&Path>,
         lease: &Lease,
     ) -> Result<bool, BlobError> {
         let object = self.object_path(space, &meta.id);
@@ -440,20 +441,24 @@ impl BlobStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(BlobError::io("opening a blob", e)),
         };
-        if claimable {
-            match fs.remove_file(part.to_path_buf()).await {
+        match (claimable, part) {
+            (true, Some(part)) => match fs.remove_file(part.to_path_buf()).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => tracing::warn!(error = %e, "could not delete a duplicate blob write"),
+            },
+            (true, None) => {}
+            (false, Some(part)) => {
+                fs.rename(part.to_path_buf(), object.clone())
+                    .await
+                    .map_err(|e| BlobError::io("naming a blob", e))?;
+                let mut gens = lock(&dir.gens);
+                gens.renamed += 1;
+                let generation = gens.renamed;
+                gens.pending.insert(meta.id.file_name(), generation);
             }
-        } else {
-            fs.rename(part.to_path_buf(), object.clone())
-                .await
-                .map_err(|e| BlobError::io("naming a blob", e))?;
-            let mut gens = lock(&dir.gens);
-            gens.renamed += 1;
-            let generation = gens.renamed;
-            gens.pending.insert(meta.id.file_name(), generation);
+            // Nothing to claim and nothing to name.
+            (false, None) => return Ok(false),
         }
         // Named or claimed now, under the claim lock: a collector pass that
         // began before does not delete it (ADR 0120 §5).
@@ -516,7 +521,7 @@ impl BlobStore {
             Ok(file) => file,
             // Not in `from`: a blob of `to` the turns received there.
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return if self.claim_existing(to, meta, lease).await? {
+                return if self.install_or_claim(to, meta, false, None, lease).await? {
                     Ok(())
                 } else {
                     Err(BlobError::NotFound(meta.id))
@@ -575,44 +580,14 @@ impl BlobStore {
                 .sync_data()
                 .await
                 .map_err(|e| BlobError::io("syncing a blob", e))?;
-            self.install(to, &part, meta, header.sealed, lease).await
+            self.install_or_claim(to, meta, header.sealed, Some(&part), lease)
+                .await
         }
         .await;
         if copied.is_err() {
             let _ = fs.remove_file(part).await;
         }
         copied.map(|_claimed| ())
-    }
-
-    /// Claims an object of `space` equal to `meta` for `lease`, under its
-    /// directory's claim lock, as [`BlobStore::install`] does; false when
-    /// there is none.
-    async fn claim_existing(
-        &self,
-        space: &Space,
-        meta: &BlobMeta,
-        lease: &Lease,
-    ) -> Result<bool, BlobError> {
-        let object = self.object_path(space, &meta.id);
-        let dir_path = object
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| BlobError::Invalid("an object path without a directory".into()))?;
-        let dir = self.dir(&dir_path);
-        let _claim = dir.claim.lock().await;
-        let claimable = match self.env.fs.open(object, OpenMode::Read).await {
-            Ok(file) => existing_matches(&*file, meta, false).await,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-            Err(e) => return Err(BlobError::io("opening a blob", e)),
-        };
-        if claimable {
-            // Claimed under the claim lock, as install's claim: a collector
-            // pass that began before does not delete it (ADR 0120 §5).
-            let touched = self.touch_seq.fetch_add(1, Ordering::AcqRel) + 1;
-            lock(&dir.gens).touched.insert(meta.id.file_name(), touched);
-            lease.add(meta.id);
-        }
-        Ok(claimable)
     }
 
     /// Makes the names of `ids` in `space` durable: one `sync_dir` per
@@ -918,7 +893,7 @@ impl BlobWriter {
             .ok_or_else(|| BlobError::Invalid("a finished writer".into()))?;
         let claimed = self
             .store
-            .install(&self.space, &part, &meta, sealed, &self.lease)
+            .install_or_claim(&self.space, &meta, sealed, Some(&part), &self.lease)
             .await?;
         self.part = None;
         // A new object keeps what it took from the budget; an object that
@@ -1144,12 +1119,8 @@ impl BlobReader {
         Ok(Bytes::from(out))
     }
 
-    /// The plaintext of frame `index`, checked (sequential readers: the
-    /// gateway, the shipper, the API).
-    pub async fn frame(&self, index: u64) -> Result<Bytes, BlobError> {
-        if index >= self.header.frames() {
-            return Ok(Bytes::new());
-        }
+    /// The stored (sealed or plain) bytes of frame `index`, whole.
+    async fn stored_frame(&self, index: u64) -> Result<Vec<u8>, BlobError> {
         let start = self.header.frame_offset(index);
         let stored_len = self.header.frame_plain_len(index) + self.header.overhead();
         let raw = self
@@ -1160,6 +1131,16 @@ impl BlobReader {
         if raw.len() != stored_len {
             return Err(self.corrupt("the file ends early".into()));
         }
+        Ok(raw.to_vec())
+    }
+
+    /// The plaintext of frame `index`, checked (sequential readers: the
+    /// gateway, the shipper, the API).
+    pub async fn frame(&self, index: u64) -> Result<Bytes, BlobError> {
+        if index >= self.header.frames() {
+            return Ok(Bytes::new());
+        }
+        let raw = self.stored_frame(index).await?;
         self.open_frame(index, &raw).map(Bytes::from)
     }
 
@@ -1184,16 +1165,7 @@ impl BlobReader {
             _ => Some(blake3::Hasher::new()),
         };
         for index in 0..self.header.frames() {
-            let start = self.header.frame_offset(index);
-            let stored_len = self.header.frame_plain_len(index) + self.header.overhead();
-            let raw = self
-                .file
-                .read_at(start, stored_len)
-                .await
-                .map_err(|e| BlobError::io("reading a blob", e))?;
-            if raw.len() != stored_len {
-                return Err(self.corrupt("the file ends early".into()));
-            }
+            let raw = self.stored_frame(index).await?;
             body.update(&raw);
             let plain = self.open_frame(index, &raw)?;
             if let Some(h) = identity.as_mut() {
