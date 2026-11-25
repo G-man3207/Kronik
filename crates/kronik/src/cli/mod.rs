@@ -970,6 +970,21 @@ impl Ctx {
         let _ = out.flush();
     }
 
+    /// Prints the API's body for `--json`, else parses it for `render`.
+    fn show<T: DeserializeOwned>(
+        &self,
+        body: &[u8],
+        render: impl FnOnce(T) -> String,
+    ) -> Result<ExitCode, Error> {
+        if self.json {
+            self.print_raw(body);
+        } else {
+            let r: T = self.decode(body)?;
+            self.print(&render(r));
+        }
+        Ok(ExitCode::SUCCESS)
+    }
+
     /// Reports an error: the error JSON on stdout with `--json`, otherwise
     /// code, message, hint and docs on stderr. As under `Next`, when the
     /// command was given `--url` and the hint names a command, a reminder
@@ -1237,13 +1252,7 @@ pub enum DeploymentsCommand {
 
 fn deployments(ctx: &Ctx) -> Result<ExitCode, Error> {
     let body = ctx.get("/v1/deployments")?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: DeploymentsResponse = ctx.decode(&body)?;
-    ctx.print(&render::deployments(&r));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: DeploymentsResponse| render::deployments(&r))
 }
 
 fn deploy(ctx: &Ctx, a: DeployArgs) -> Result<ExitCode, Error> {
@@ -1266,18 +1275,14 @@ fn deploy(ctx: &Ctx, a: DeployArgs) -> Result<ExitCode, Error> {
             dry_run: a.mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: DeployResponse = ctx.decode(&body)?;
-    let rerun = format!(
-        "kronik deploy {} --reason {}",
-        shell_quote(&a.wasm.to_string_lossy()),
-        shell_quote(reason)
-    );
-    ctx.print(&render::deploy(&r, &rerun, &gateway(ctx)));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: DeployResponse| {
+        let rerun = format!(
+            "kronik deploy {} --reason {}",
+            shell_quote(&a.wasm.to_string_lossy()),
+            shell_quote(reason)
+        );
+        render::deploy(&r, &rerun, &gateway(ctx))
+    })
 }
 
 fn send(ctx: &Ctx, a: SendArgs) -> Result<ExitCode, Error> {
@@ -1365,13 +1370,7 @@ fn send(ctx: &Ctx, a: SendArgs) -> Result<ExitCode, Error> {
 
 fn trace(ctx: &Ctx, turn_id: &str) -> Result<ExitCode, Error> {
     let body = ctx.get(&format!("/v1/turns/{}/trace", percent_encode(turn_id)))?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: TraceResponse = ctx.decode(&body)?;
-    ctx.print(&render::trace(&r));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: TraceResponse| render::trace(&r))
 }
 
 fn actors(ctx: &Ctx, a: ListActorsArgs) -> Result<ExitCode, Error> {
@@ -1383,32 +1382,22 @@ fn actors(ctx: &Ctx, a: ListActorsArgs) -> Result<ExitCode, Error> {
             ("limit", a.limit.map(|l| l.to_string())),
         ])
     ))?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: ActorsResponse = ctx.decode(&body)?;
-    let mut more = String::from("kronik actors list");
-    if let Some(k) = &a.kind {
-        more.push_str(&format!(" --kind {}", shell_quote(k)));
-    }
-    if let Some(l) = a.limit {
-        more.push_str(&format!(" --limit {l}"));
-    }
-    ctx.print(&render::actors(&r, &more));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: ActorsResponse| {
+        let mut more = String::from("kronik actors list");
+        if let Some(k) = &a.kind {
+            more.push_str(&format!(" --kind {}", shell_quote(k)));
+        }
+        if let Some(l) = a.limit {
+            more.push_str(&format!(" --limit {l}"));
+        }
+        render::actors(&r, &more)
+    })
 }
 
 fn inspect(ctx: &Ctx, actor: &str) -> Result<ExitCode, Error> {
     let actor = actor_ref(actor)?;
     let body = ctx.get(&actor_path(&actor))?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: InspectResponse = ctx.decode(&body)?;
-    ctx.print(&render::inspect(&r));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: InspectResponse| render::inspect(&r))
 }
 
 fn history(ctx: &Ctx, a: HistoryArgs) -> Result<ExitCode, Error> {
@@ -1422,17 +1411,13 @@ fn history(ctx: &Ctx, a: HistoryArgs) -> Result<ExitCode, Error> {
             ("limit", a.limit.map(|l| l.to_string())),
         ])
     ))?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: HistoryResponse = ctx.decode(&body)?;
-    let mut listed = actor.to_string();
-    if let Some(c) = &a.connection {
-        let _ = write!(listed, " --connection {c}");
-    }
-    ctx.print(&render::history(&listed, &r, a.limit));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: HistoryResponse| {
+        let mut listed = actor.to_string();
+        if let Some(c) = &a.connection {
+            let _ = write!(listed, " --connection {c}");
+        }
+        render::history(&listed, &r, a.limit)
+    })
 }
 
 fn connections_list(
@@ -1454,34 +1439,24 @@ fn connections_list(
             ("limit", limit.map(|l| l.to_string())),
         ])
     ))?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: ConnectionsResponse = ctx.decode(&body)?;
-    // The same filters for the next page.
-    let mut again = String::from("kronik connections list");
-    for (flag, value) in [("--actor", &actor), ("--kind", &kind), ("--state", &state)] {
-        if let Some(v) = value {
-            let _ = write!(again, " {flag} {}", shell_quote(v));
+    ctx.show(&body, |r: ConnectionsResponse| {
+        // The same filters for the next page.
+        let mut again = String::from("kronik connections list");
+        for (flag, value) in [("--actor", &actor), ("--kind", &kind), ("--state", &state)] {
+            if let Some(v) = value {
+                let _ = write!(again, " {flag} {}", shell_quote(v));
+            }
         }
-    }
-    if let Some(l) = limit {
-        let _ = write!(again, " --limit {l}");
-    }
-    ctx.print(&render::connections(&r, &again));
-    Ok(ExitCode::SUCCESS)
+        if let Some(l) = limit {
+            let _ = write!(again, " --limit {l}");
+        }
+        render::connections(&r, &again)
+    })
 }
 
 fn connection_inspect(ctx: &Ctx, id: &str) -> Result<ExitCode, Error> {
     let body = ctx.get(&format!("/v1/connections/{}", percent_encode(id)))?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let c: Connection = ctx.decode(&body)?;
-    ctx.print(&render::connection(&c));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |c: Connection| render::connection(&c))
 }
 
 fn connection_close(
@@ -1501,13 +1476,9 @@ fn connection_close(
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&raw);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: ConnectionCloseResponse = ctx.decode(&raw)?;
-    ctx.print(&render::connection_close(&r, code.unwrap_or(1008)));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&raw, |r: ConnectionCloseResponse| {
+        render::connection_close(&r, code.unwrap_or(1008))
+    })
 }
 
 fn orphans(ctx: &Ctx, all: bool) -> Result<ExitCode, Error> {
@@ -1515,25 +1486,15 @@ fn orphans(ctx: &Ctx, all: bool) -> Result<ExitCode, Error> {
         "/v1/orphans{}",
         query(&[("all", all.then(|| "true".to_owned()))])
     ))?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: OrphansResponse = ctx.decode(&body)?;
-    ctx.print(&render::orphans(&r, all));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: OrphansResponse| render::orphans(&r, all))
 }
 
 fn timers(ctx: &Ctx, actor: &str) -> Result<ExitCode, Error> {
     let actor = actor_ref(actor)?;
     let body = ctx.get(&format!("{}/timers", actor_path(&actor)))?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: TimersResponse = ctx.decode(&body)?;
-    ctx.print(&render::timers(&actor.to_string(), &r));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: TimersResponse| {
+        render::timers(&actor.to_string(), &r)
+    })
 }
 
 fn dead_letters(ctx: &Ctx, after: Option<String>, limit: Option<u32>) -> Result<ExitCode, Error> {
@@ -1541,15 +1502,11 @@ fn dead_letters(ctx: &Ctx, after: Option<String>, limit: Option<u32>) -> Result<
         "/v1/dead-letters{}",
         query(&[("after", after), ("limit", limit.map(|l| l.to_string())),])
     ))?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: DeadLettersResponse = ctx.decode(&body)?;
-    // The API returns at most 100 by default; a full page may have more.
-    let full = r.dead_letters.len() == limit.map_or(100, |l| l as usize);
-    ctx.print(&render::dead_letters(&r, full.then_some(limit)));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: DeadLettersResponse| {
+        // The API returns at most 100 by default; a full page may have more.
+        let full = r.dead_letters.len() == limit.map_or(100, |l| l as usize);
+        render::dead_letters(&r, full.then_some(limit))
+    })
 }
 
 fn resend(ctx: &Ctx, id: &str, mutation: Mutation) -> Result<ExitCode, Error> {
@@ -1595,28 +1552,24 @@ fn grant(ctx: &Ctx, a: GrantArgs) -> Result<ExitCode, Error> {
             dry_run: a.mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: GrantResponse = ctx.decode(&body)?;
-    let mut rerun = format!(
-        "kronik grant {} {}",
-        shell_quote(&a.kind),
-        shell_quote(&a.capability)
-    );
-    if let Some(d) = a.delivery {
-        rerun.push_str(&format!(" --delivery {}", arg_value(d)));
-    }
-    if let Some(rate) = &a.rate {
-        rerun.push_str(&format!(" --rate {}", shell_quote(rate)));
-    }
-    if a.in_forks == InForks::Compute {
-        rerun.push_str(" --in-forks compute");
-    }
-    rerun.push_str(&format!(" --reason {}", shell_quote(reason)));
-    ctx.print(&render::grant(&r, &rerun));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: GrantResponse| {
+        let mut rerun = format!(
+            "kronik grant {} {}",
+            shell_quote(&a.kind),
+            shell_quote(&a.capability)
+        );
+        if let Some(d) = a.delivery {
+            rerun.push_str(&format!(" --delivery {}", arg_value(d)));
+        }
+        if let Some(rate) = &a.rate {
+            rerun.push_str(&format!(" --rate {}", shell_quote(rate)));
+        }
+        if a.in_forks == InForks::Compute {
+            rerun.push_str(" --in-forks compute");
+        }
+        rerun.push_str(&format!(" --reason {}", shell_quote(reason)));
+        render::grant(&r, &rerun)
+    })
 }
 
 fn revoke(ctx: &Ctx, a: RevokeArgs) -> Result<ExitCode, Error> {
@@ -1630,30 +1583,20 @@ fn revoke(ctx: &Ctx, a: RevokeArgs) -> Result<ExitCode, Error> {
             dry_run: a.mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: RevokeResponse = ctx.decode(&body)?;
-    let rerun = format!(
-        "kronik revoke {} {} --reason {}",
-        shell_quote(&a.kind),
-        shell_quote(&a.capability),
-        shell_quote(reason)
-    );
-    ctx.print(&render::revoke(&r, &rerun));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: RevokeResponse| {
+        let rerun = format!(
+            "kronik revoke {} {} --reason {}",
+            shell_quote(&a.kind),
+            shell_quote(&a.capability),
+            shell_quote(reason)
+        );
+        render::revoke(&r, &rerun)
+    })
 }
 
 fn grants(ctx: &Ctx, kind: Option<String>) -> Result<ExitCode, Error> {
     let body = ctx.get(&format!("/v1/grants{}", query(&[("kind", kind)])))?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: GrantsResponse = ctx.decode(&body)?;
-    ctx.print(&render::grants(&r));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: GrantsResponse| render::grants(&r))
 }
 
 fn limits_set(ctx: &Ctx, a: LimitsSetArgs) -> Result<ExitCode, Error> {
@@ -1691,63 +1634,53 @@ fn limits_set(ctx: &Ctx, a: LimitsSetArgs) -> Result<ExitCode, Error> {
             dry_run: a.mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: LimitsResponse = ctx.decode(&body)?;
-    let mut rerun = format!("kronik limits set {}", shell_quote(&a.kind));
-    for (flag, value) in [
-        ("--fuel", a.fuel.map(|n| n.to_string())),
-        ("--memory", a.memory.map(units::size_flag)),
-        ("--message-size", a.message_size.map(units::size_flag)),
-        (
-            "--state-value-size",
-            a.state_value_size.map(units::size_flag),
-        ),
-        ("--sql-size", a.sql_size.map(units::size_flag)),
-        ("--effect-timeout", a.effect_timeout.map(units::duration)),
-        (
-            "--effect-response-size",
-            a.effect_response_size.map(units::size_flag),
-        ),
-        (
-            "--fingerprint-exclude-header",
-            exclude_headers.map(|names| shell_quote(&names.join(","))),
-        ),
-        (
-            "--fingerprint-exclude-query",
-            exclude_query.map(|names| shell_quote(&names.join(","))),
-        ),
-        ("--blob-threshold", a.blob_threshold.map(units::size_flag)),
-        ("--upload-size", a.upload_size.map(units::size_flag)),
-        (
-            "--blob-size-per-actor",
-            a.blob_size_per_actor.map(units::size_flag),
-        ),
-        (
-            "--effect-bytes-per-turn",
-            a.effect_bytes_per_turn.map(units::size_flag),
-        ),
-    ] {
-        if let Some(v) = value {
-            rerun.push_str(&format!(" {flag} {v}"));
+    ctx.show(&body, |r: LimitsResponse| {
+        let mut rerun = format!("kronik limits set {}", shell_quote(&a.kind));
+        for (flag, value) in [
+            ("--fuel", a.fuel.map(|n| n.to_string())),
+            ("--memory", a.memory.map(units::size_flag)),
+            ("--message-size", a.message_size.map(units::size_flag)),
+            (
+                "--state-value-size",
+                a.state_value_size.map(units::size_flag),
+            ),
+            ("--sql-size", a.sql_size.map(units::size_flag)),
+            ("--effect-timeout", a.effect_timeout.map(units::duration)),
+            (
+                "--effect-response-size",
+                a.effect_response_size.map(units::size_flag),
+            ),
+            (
+                "--fingerprint-exclude-header",
+                exclude_headers.map(|names| shell_quote(&names.join(","))),
+            ),
+            (
+                "--fingerprint-exclude-query",
+                exclude_query.map(|names| shell_quote(&names.join(","))),
+            ),
+            ("--blob-threshold", a.blob_threshold.map(units::size_flag)),
+            ("--upload-size", a.upload_size.map(units::size_flag)),
+            (
+                "--blob-size-per-actor",
+                a.blob_size_per_actor.map(units::size_flag),
+            ),
+            (
+                "--effect-bytes-per-turn",
+                a.effect_bytes_per_turn.map(units::size_flag),
+            ),
+        ] {
+            if let Some(v) = value {
+                rerun.push_str(&format!(" {flag} {v}"));
+            }
         }
-    }
-    rerun.push_str(&format!(" --reason {}", shell_quote(reason)));
-    ctx.print(&render::limits_set(&r, &rerun));
-    Ok(ExitCode::SUCCESS)
+        rerun.push_str(&format!(" --reason {}", shell_quote(reason)));
+        render::limits_set(&r, &rerun)
+    })
 }
 
 fn limits_show(ctx: &Ctx, kind: Option<String>) -> Result<ExitCode, Error> {
     let body = ctx.get(&format!("/v1/limits{}", query(&[("kind", kind)])))?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: LimitsListResponse = ctx.decode(&body)?;
-    ctx.print(&render::limits(&r));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: LimitsListResponse| render::limits(&r))
 }
 
 fn secret_path(name: &str) -> String {
@@ -1769,29 +1702,19 @@ fn secret_set(ctx: &Ctx, name: &str, mutation: Mutation) -> Result<ExitCode, Err
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: SecretResponse = ctx.decode(&body)?;
-    let rerun = format!(
-        "kronik secret set {} --reason {}",
-        shell_quote(name),
-        shell_quote(reason)
-    );
-    ctx.print(&render::secret_set(name, &r, &rerun));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: SecretResponse| {
+        let rerun = format!(
+            "kronik secret set {} --reason {}",
+            shell_quote(name),
+            shell_quote(reason)
+        );
+        render::secret_set(name, &r, &rerun)
+    })
 }
 
 fn secrets(ctx: &Ctx) -> Result<ExitCode, Error> {
     let body = ctx.get("/v1/secrets")?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: SecretsResponse = ctx.decode(&body)?;
-    ctx.print(&render::secrets(&r));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: SecretsResponse| render::secrets(&r))
 }
 
 fn secret_delete(ctx: &Ctx, name: &str, mutation: Mutation) -> Result<ExitCode, Error> {
@@ -1804,18 +1727,14 @@ fn secret_delete(ctx: &Ctx, name: &str, mutation: Mutation) -> Result<ExitCode, 
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: SecretDeleteResponse = ctx.decode(&body)?;
-    let rerun = format!(
-        "kronik secret delete {} --reason {}",
-        shell_quote(name),
-        shell_quote(reason)
-    );
-    ctx.print(&render::secret_deleted(&r, &rerun));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: SecretDeleteResponse| {
+        let rerun = format!(
+            "kronik secret delete {} --reason {}",
+            shell_quote(name),
+            shell_quote(reason)
+        );
+        render::secret_deleted(&r, &rerun)
+    })
 }
 
 fn secret_link(
@@ -1835,19 +1754,15 @@ fn secret_link(
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let response: SecretLinkResponse = ctx.decode(&body)?;
-    let rerun = format!(
-        "kronik secret link {} --backend {} --ref {} --reason \"...\"",
-        shell_quote(name),
-        shell_quote(backend),
-        shell_quote(reference)
-    );
-    ctx.print(&render::secret_link(&response, &rerun));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |response: SecretLinkResponse| {
+        let rerun = format!(
+            "kronik secret link {} --backend {} --ref {} --reason \"...\"",
+            shell_quote(name),
+            shell_quote(backend),
+            shell_quote(reference)
+        );
+        render::secret_link(&response, &rerun)
+    })
 }
 
 fn secret_unlink(ctx: &Ctx, name: &str, mutation: Mutation) -> Result<ExitCode, Error> {
@@ -1859,17 +1774,13 @@ fn secret_unlink(ctx: &Ctx, name: &str, mutation: Mutation) -> Result<ExitCode, 
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let response: SecretLinkResponse = ctx.decode(&body)?;
-    let rerun = format!(
-        "kronik secret unlink {} --reason \"...\"",
-        shell_quote(name)
-    );
-    ctx.print(&render::secret_link(&response, &rerun));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |response: SecretLinkResponse| {
+        let rerun = format!(
+            "kronik secret unlink {} --reason \"...\"",
+            shell_quote(name)
+        );
+        render::secret_link(&response, &rerun)
+    })
 }
 
 fn secret_refresh(ctx: &Ctx, name: &str, mutation: Mutation) -> Result<ExitCode, Error> {
@@ -1881,39 +1792,27 @@ fn secret_refresh(ctx: &Ctx, name: &str, mutation: Mutation) -> Result<ExitCode,
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let response: SecretResponse = ctx.decode(&body)?;
-    let rerun = format!(
-        "kronik secret refresh {} --reason \"...\"",
-        shell_quote(name)
-    );
-    ctx.print(&render::secret_refreshed(name, &response, &rerun));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |response: SecretResponse| {
+        let rerun = format!(
+            "kronik secret refresh {} --reason \"...\"",
+            shell_quote(name)
+        );
+        render::secret_refreshed(name, &response, &rerun)
+    })
 }
 
 fn secret_history(ctx: &Ctx, name: &str) -> Result<ExitCode, Error> {
     let body = ctx.get(&format!("{}/history", secret_path(name)))?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let response: SecretHistoryResponse = ctx.decode(&body)?;
-    ctx.print(&render::secret_history(&response));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |response: SecretHistoryResponse| {
+        render::secret_history(&response)
+    })
 }
 
 fn secret_backends(ctx: &Ctx) -> Result<ExitCode, Error> {
     let body = ctx.get("/v1/secrets/backends")?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let response: SecretBackendsResponse = ctx.decode(&body)?;
-    ctx.print(&render::secret_backends(&response));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |response: SecretBackendsResponse| {
+        render::secret_backends(&response)
+    })
 }
 
 /// Reads a secret's value from stdin, never from the command line: one line
