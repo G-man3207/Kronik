@@ -23,7 +23,9 @@ pub const DEFAULT_MEMORY_BYTES: usize = 64 << 20;
 /// Hard ceiling for one linear memory in the pooling allocator; per-kind
 /// limits can be raised up to this.
 pub const POOL_MAX_MEMORY_BYTES: usize = 1 << 30;
-include!(concat!(env!("OUT_DIR"), "/linear_memory_keep_resident.rs"));
+/// Bytes of each linear memory that the pooling allocator keeps resident for
+/// reuse (Wasmtime's `linear_memory_keep_resident`, ADR 0140, `docs/perf.md`).
+pub const LINEAR_MEMORY_KEEP_RESIDENT_BYTES: usize = 2 << 20;
 /// Fuel between cooperative yields of a running turn, so one CPU-heavy turn
 /// cannot starve an executor thread. Deterministic because fuel is.
 pub const FUEL_YIELD_INTERVAL: u64 = 1_000_000;
@@ -408,11 +410,6 @@ mod tests {
             .collect();
         names.sort();
         names
-    }
-
-    #[test]
-    fn default_linear_memory_keep_resident_is_two_mebibytes() {
-        assert_eq!(LINEAR_MEMORY_KEEP_RESIDENT_BYTES, 2 << 20);
     }
 
     #[test]
