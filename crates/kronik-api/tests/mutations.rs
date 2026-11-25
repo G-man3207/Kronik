@@ -12,9 +12,15 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
+#[path = "common/oidc_provider.rs"]
+mod oidc_provider;
+
 use std::sync::Arc;
 
 use base64::Engine as _;
+use common::{GUESTS, call, wasm};
 use kronik_api::openapi::OPERATIONS;
 use kronik_api::{Api, ApiRequest};
 use kronik_core::env::Env;
@@ -22,14 +28,6 @@ use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
-
-#[path = "common/oidc_provider.rs"]
-mod oidc_provider;
-
-const COUNTER: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/guests/counter.wasm"
-);
 
 /// Writes nothing. Not a mutation.
 const NOT_A_MUTATION: &[(&str, &str)] = &[("POST", "/v1/policy/test")];
@@ -55,13 +53,13 @@ struct Case {
 }
 
 fn cases() -> Vec<Case> {
-    let wasm = base64::engine::general_purpose::STANDARD.encode(std::fs::read(COUNTER).unwrap());
+    let counter = wasm("counter");
     vec![
         Case {
             method: "POST",
             path: "/v1/deployments",
             writes: &["Deployment"],
-            extra: json!({"wasm_base64": wasm.clone()}),
+            extra: json!({"wasm_base64": counter.clone()}),
         },
         Case {
             method: "POST",
@@ -178,7 +176,7 @@ fn cases() -> Vec<Case> {
             method: "POST",
             path: "/v1/forks/{name}/deployments",
             writes: &["fork.deploy"],
-            extra: json!({"wasm_base64": wasm.clone()}),
+            extra: json!({"wasm_base64": counter.clone()}),
         },
         Case {
             method: "POST",
@@ -202,7 +200,7 @@ fn cases() -> Vec<Case> {
             method: "POST",
             path: "/v1/proposals",
             writes: &["proposal.create"],
-            extra: json!({"wasm_base64": [wasm]}),
+            extra: json!({"wasm_base64": [counter]}),
         },
         Case {
             method: "POST",
@@ -351,20 +349,6 @@ fn with_reason(extra: &Value, reason: &str, dry_run: bool) -> Value {
     body["reason"] = json!(reason);
     body["dry_run"] = json!(dry_run);
     body
-}
-
-async fn call(api: &Api, method: &str, path: &str, body: Value) -> (u16, Value) {
-    let r = api
-        .handle(ApiRequest {
-            method: method.into(),
-            path: path.into(),
-            query: String::new(),
-            body: body.to_string().into_bytes(),
-            token_id: "unix:uid=0".into(),
-            bearer: None,
-        })
-        .await;
-    (r.status, serde_json::from_slice(&r.body).unwrap())
 }
 
 struct BrowserSession {
@@ -727,17 +711,12 @@ async fn a_dry_run_deploy_writes_nothing_and_the_real_one_still_does() {
     .await
     .unwrap();
     let api = Arc::new(Api::new(node));
-    let b64 = |p: &str| base64::engine::general_purpose::STANDARD.encode(std::fs::read(p).unwrap());
-    let v2 = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/guests/counter-body-v2.wasm"
-    );
 
     let (s, v) = call(
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": b64(COUNTER), "reason": "fixture"}),
+        json!({"wasm_base64": wasm("counter"), "reason": "fixture"}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
@@ -747,7 +726,7 @@ async fn a_dry_run_deploy_writes_nothing_and_the_real_one_still_does() {
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": b64(v2), "reason": "validate", "dry_run": true}),
+        json!({"wasm_base64": wasm("counter-body-v2"), "reason": "validate", "dry_run": true}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
@@ -770,15 +749,11 @@ async fn a_dry_run_deploy_writes_nothing_and_the_real_one_still_does() {
     );
 
     // Compiles, then is refused because a connection route lacks the export.
-    let room_bare = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/guests/room-bare.wasm"
-    );
     let (s, v) = call(
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": b64(room_bare), "reason": "validate", "dry_run": true}),
+        json!({"wasm_base64": wasm("room-bare"), "reason": "validate", "dry_run": true}),
     )
     .await;
     assert_eq!(
@@ -796,7 +771,7 @@ async fn a_dry_run_deploy_writes_nothing_and_the_real_one_still_does() {
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": b64(v2), "reason": "deploy"}),
+        json!({"wasm_base64": wasm("counter-body-v2"), "reason": "deploy"}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
@@ -869,12 +844,11 @@ async fn a_fork_message_rejects_dry_run_and_writes_nothing() {
     let proposals =
         kronik_fork::proposal::Proposals::open(node.clone(), dir.path().to_path_buf()).unwrap();
     let api = Arc::new(Api::new(node).with_proposals(Arc::new(proposals)));
-    let wasm = base64::engine::general_purpose::STANDARD.encode(std::fs::read(COUNTER).unwrap());
     let (s, v) = call(
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm, "reason": "r"}),
+        json!({"wasm_base64": wasm("counter"), "reason": "r"}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
@@ -1048,11 +1022,7 @@ async fn every_mutation_writes_its_audited_record() {
             cursors,
         )]);
     let (api, browser) = browser_fixture(api, &node, Arc::new(tokens)).await;
-    let b64 = |p: &str| base64::engine::general_purpose::STANDARD.encode(std::fs::read(p).unwrap());
-    let step2 = b64(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/guests/counter-step2.wasm"
-    ));
+    let step2 = wasm("counter-step2");
     let mut writes: std::collections::BTreeMap<(&str, &str), &'static [&'static str]> = cases()
         .iter()
         .map(|c| ((c.method, c.path), c.writes))
@@ -1066,7 +1036,7 @@ async fn every_mutation_writes_its_audited_record() {
             "POST",
             "/v1/deployments",
             "/v1/deployments",
-            json!({"wasm_base64": b64(COUNTER)}),
+            json!({"wasm_base64": wasm("counter")}),
         ),
         // A failing turn, so that there is a dead letter to resend.
         (
@@ -1551,16 +1521,6 @@ async fn events_of(node: &kronik_sched::Node, action: &str) -> Vec<(u64, pb::Aud
     out
 }
 
-fn guest(name: &str) -> String {
-    base64::engine::general_purpose::STANDARD.encode(
-        std::fs::read(format!(
-            "{}/../../tests/guests/{name}.wasm",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .unwrap(),
-    )
-}
-
 /// Perf review P3: a synchronous watch writes `watch.start` before it
 /// waits, so the event precedes the rollback its guard makes (and a caller
 /// that stops waiting cannot lose it).
@@ -1596,7 +1556,7 @@ async fn a_synchronous_watch_is_audited_before_its_guard_rolls_back() {
             v
         }
     };
-    post("/v1/deployments", json!({"wasm_base64": guest("counter")})).await;
+    post("/v1/deployments", json!({"wasm_base64": wasm("counter")})).await;
     for _ in 0..20 {
         post(
             "/v1/actors/counter/a/messages",
@@ -1606,7 +1566,7 @@ async fn a_synchronous_watch_is_audited_before_its_guard_rolls_back() {
     }
     let v = post(
         "/v1/proposals",
-        json!({"wasm_base64": [guest("counter-fail-get")]}),
+        json!({"wasm_base64": [wasm("counter-fail-get")]}),
     )
     .await;
     let id = v["proposal"]["id"].as_str().unwrap().to_owned();
@@ -1667,7 +1627,7 @@ async fn a_synchronous_propose_dropped_while_waiting_is_still_audited() {
     );
     let api = Api::new(node.clone()).with_proposals(proposals.clone());
     for (path, body) in [
-        ("/v1/deployments", json!({"wasm_base64": guest("counter")})),
+        ("/v1/deployments", json!({"wasm_base64": wasm("counter")})),
         (
             "/v1/actors/counter/a/messages",
             json!({"name": "increment"}),
@@ -1676,11 +1636,7 @@ async fn a_synchronous_propose_dropped_while_waiting_is_still_audited() {
         let (s, v) = call(&api, "POST", path, with_reason(&body, "r", false)).await;
         assert_eq!(s, 200, "{path}: {v}");
     }
-    let body = with_reason(
-        &json!({"wasm_base64": [guest("counter-step2")]}),
-        "r",
-        false,
-    );
+    let body = with_reason(&json!({"wasm_base64": [wasm("counter-step2")]}), "r", false);
     let id = {
         let request = call(&api, "POST", "/v1/proposals", body);
         tokio::pin!(request);
@@ -1732,7 +1688,7 @@ async fn a_proposal_dropped_during_its_audit_apply_still_starts() {
     );
     let api = Api::new(node.clone()).with_proposals(proposals.clone());
     for (path, body) in [
-        ("/v1/deployments", json!({"wasm_base64": guest("counter")})),
+        ("/v1/deployments", json!({"wasm_base64": wasm("counter")})),
         (
             "/v1/actors/counter/a/messages",
             json!({"name": "increment"}),
@@ -1746,7 +1702,7 @@ async fn a_proposal_dropped_during_its_audit_apply_still_starts() {
     let state = rusqlite::Connection::open(dir.path().join("branches/main/state.db")).unwrap();
     state.execute_batch("BEGIN IMMEDIATE").unwrap();
     let body = with_reason(
-        &json!({"wasm_base64": [guest("counter-step2")]}),
+        &json!({"wasm_base64": [wasm("counter-step2")]}),
         "cancel during apply",
         false,
     );
@@ -1826,7 +1782,7 @@ async fn lifecycle_audit_failure_prevents_publication_stop_and_job_spawn() {
         };
         let deployed = node
             .deploy(
-                &std::fs::read(COUNTER).unwrap(),
+                &std::fs::read(format!("{GUESTS}/counter.wasm")).unwrap(),
                 audit.clone(),
                 false,
                 node.local_operator_authority().unwrap(),
@@ -1873,7 +1829,7 @@ async fn lifecycle_audit_failure_prevents_publication_stop_and_job_spawn() {
             "proposal.create" => (
                 "POST",
                 "/v1/proposals".into(),
-                json!({"wasm_base64": [guest("counter-step2")], "async": true}),
+                json!({"wasm_base64": [wasm("counter-step2")], "async": true}),
                 None,
             ),
             _ => {
@@ -1882,7 +1838,7 @@ async fn lifecycle_audit_failure_prevents_publication_stop_and_job_spawn() {
                     "POST",
                     "/v1/proposals",
                     with_reason(
-                        &json!({"wasm_base64": [guest("counter-step2")]}),
+                        &json!({"wasm_base64": [wasm("counter-step2")]}),
                         "prepare",
                         false,
                     ),

@@ -12,43 +12,20 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::BTreeSet;
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 
-use base64::Engine as _;
-use kronik_api::auth::{Authenticator, Caller, Scope};
+use common::{Reader, wasm};
 use kronik_api::{Api, ApiRequest};
 use kronik_core::env::Env;
-use kronik_core::error::ApiError;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{Node, NodeConfig, start_local};
+use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
 
-const ROOM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/room.wasm");
-
 const TOKEN: &str = "bearer.tok-7c1f0e6a5b2d4c39";
-
-/// A caller with `read` only: no `pii:read`.
-struct Reader(Arc<Node>);
-
-impl Authenticator for Reader {
-    fn caller(&self, _req: &ApiRequest) -> Result<Caller, ApiError> {
-        Ok(Caller {
-            token_id: "token:reader".into(),
-            scopes: BTreeSet::from([Scope::Read]),
-        })
-    }
-
-    fn authority(
-        &self,
-        _req: &ApiRequest,
-        _required: Scope,
-    ) -> Result<kronik_core::authority::AuthLease, ApiError> {
-        self.0.local_operator_authority()
-    }
-}
 
 async fn call(api: &Api, method: &str, path: &str, body: Value, reader: bool) -> Value {
     let (path, query) = path.split_once('?').unwrap_or((path, ""));
@@ -119,12 +96,11 @@ async fn a_token_in_the_subprotocols_stays_sealed_and_redacted() {
         false,
     )
     .await;
-    let wasm = base64::engine::general_purpose::STANDARD.encode(std::fs::read(ROOM).unwrap());
     call(
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm, "reason": "deploy"}),
+        json!({"wasm_base64": wasm("room"), "reason": "deploy"}),
         false,
     )
     .await;

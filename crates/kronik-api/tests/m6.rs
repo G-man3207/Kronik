@@ -2,37 +2,15 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::sync::Arc;
 
-use base64::Engine as _;
-use kronik_api::{Api, ApiRequest};
+use common::{call, wasm};
+use kronik_api::Api;
 use kronik_core::env::Env;
 use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
-
-const COUNTER: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/guests/counter.wasm"
-);
-
-async fn call(api: &Api, method: &str, path: &str, body: Value) -> (u16, Value) {
-    let (path, query) = path.split_once('?').unwrap_or((path, ""));
-    let r = api
-        .handle(ApiRequest {
-            method: method.into(),
-            path: path.into(),
-            query: query.into(),
-            body: if body.is_null() {
-                vec![]
-            } else {
-                body.to_string().into_bytes()
-            },
-            token_id: "unix:uid=0".into(),
-            bearer: None,
-        })
-        .await;
-    (r.status, serde_json::from_slice(&r.body).unwrap())
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshots_and_integrity() {
@@ -45,12 +23,11 @@ async fn snapshots_and_integrity() {
         .await
         .unwrap();
     let api = Arc::new(Api::new(node.clone()));
-    let wasm = base64::engine::general_purpose::STANDARD.encode(std::fs::read(COUNTER).unwrap());
     let (s, v) = call(
         &api,
         "POST",
         "/v1/deployments",
-        json!({"wasm_base64": wasm, "reason": "r"}),
+        json!({"wasm_base64": wasm("counter"), "reason": "r"}),
     )
     .await;
     assert_eq!(s, 200, "{v}");
