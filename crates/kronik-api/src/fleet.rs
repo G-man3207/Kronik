@@ -1507,8 +1507,90 @@ mod tests {
         .authority
     }
 
-    async fn setup() -> (tempfile::TempDir, Arc<Fleet>, Network, Arc<AtomicUsize>) {
+    fn controller_ca(
+        dir: &std::path::Path,
+        network: &Network,
+        seed: u8,
+    ) -> (rcgen::Certificate, std::path::PathBuf) {
         use std::io::Write as _;
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let key = kronik_fleet::identity::ed25519_key(&[seed; 32]).unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        *network.issuer.lock().unwrap() = Some(rcgen::Issuer::new(params, key));
+        let mut protected = tempfile::NamedTempFile::new_in(dir).unwrap();
+        protected.write_all(certificate.pem().as_bytes()).unwrap();
+        let path = dir.join("ca.pem");
+        protected.persist(&path).unwrap();
+        (certificate, path)
+    }
+
+    fn server_certificate(network: &Network, seed: u8) -> (rcgen::KeyPair, rcgen::Certificate) {
+        let key = kronik_fleet::identity::ed25519_key(&[seed; 32]).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let certificate = params
+            .signed_by(&key, network.issuer.lock().unwrap().as_ref().unwrap())
+            .unwrap();
+        (key, certificate)
+    }
+
+    fn bound_tokens(
+        node: &kronik_sched::Node,
+        keys: &std::path::Path,
+    ) -> (Arc<TokenStore>, kronik_core::authority::AuthLease) {
+        let mut tokens = TokenStore::open_file(&keys.join("tokens.db")).unwrap();
+        tokens
+            .bind_before_any_issuer(node.publication_domain())
+            .unwrap();
+        let startup_original = node.local_operator_authority().unwrap();
+        tokens
+            .bind_execution_before_any_issuer(&node.publication_domain(), startup_original.clone())
+            .unwrap();
+        (Arc::new(tokens), startup_original)
+    }
+
+    async fn assert_no_activation_until_next_record(
+        fleet: &Arc<Fleet>,
+        fenced: u64,
+        target: &str,
+        reason: &str,
+    ) {
+        let following = fleet
+            .node
+            .record_audit_event_authorized(
+                "test.following",
+                target,
+                Default::default(),
+                fleet.audit("unix:uid=0", reason),
+                authority(fleet),
+            )
+            .await
+            .unwrap();
+        let mut following_seen = false;
+        fleet
+            .node
+            .reader()
+            .read(fenced + 1, following, |committed| {
+                if let kronik_proto::Record::AuditEvent(event) = committed.record {
+                    assert!(!matches!(event.operation,
+                    Some(pb::audit_event::Operation::FleetState(pb::FleetState { phase, .. }))
+                        if phase == pb::fleet_state::Phase::Active as i32));
+                    following_seen |=
+                        committed.lsn == following && event.action == "test.following";
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(following_seen);
+    }
+
+    async fn setup() -> (tempfile::TempDir, Arc<Fleet>, Network, Arc<AtomicUsize>) {
         let dir = tempfile::tempdir().unwrap();
         let network = Network::default();
         let mut env = Env::real(tokio::runtime::Handle::current());
@@ -1526,29 +1608,9 @@ mod tests {
         })
         .await
         .unwrap();
-        let mut root_params = rcgen::CertificateParams::default();
-        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        root_params.key_usages = vec![
-            rcgen::KeyUsagePurpose::KeyCertSign,
-            rcgen::KeyUsagePurpose::CrlSign,
-        ];
-        let root_key = kronik_fleet::identity::ed25519_key(&[31; 32]).unwrap();
-        let root = root_params.self_signed(&root_key).unwrap();
-        *network.issuer.lock().unwrap() = Some(rcgen::Issuer::new(root_params, root_key));
-        let mut ca = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
-        ca.write_all(root.pem().as_bytes()).unwrap();
-        let ca_path = dir.path().join("ca.pem");
-        ca.persist(&ca_path).unwrap();
+        let (_, ca_path) = controller_ca(dir.path(), &network, 31);
         let keys = dir.path().join("keys");
-        let mut tokens = TokenStore::open_file(&keys.join("tokens.db")).unwrap();
-        tokens
-            .bind_before_any_issuer(node.publication_domain())
-            .unwrap();
-        let startup_original = node.local_operator_authority().unwrap();
-        tokens
-            .bind_execution_before_any_issuer(&node.publication_domain(), startup_original.clone())
-            .unwrap();
-        let tokens = Arc::new(tokens);
+        let (tokens, startup_original) = bound_tokens(&node, &keys);
         let config = FleetConfig {
             controller: ControllerConfig {
                 url: "https://controller.test".into(),
@@ -2414,7 +2476,7 @@ mod tests {
 
     #[tokio::test]
     async fn reenrollment_uses_latest_operator_ca_and_fences_the_old_epoch() {
-        let (_dir, fleet, network, _entropy) = setup().await;
+        let (dir, fleet, network, _entropy) = setup().await;
         network.reply.store(true, Ordering::SeqCst);
         let old = fleet
             .enroll(
@@ -2436,16 +2498,7 @@ mod tests {
             }),
         );
         let old_bearer = fleet.bearer(&old).await.unwrap();
-        let mut root_params = rcgen::CertificateParams::default();
-        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        root_params.key_usages = vec![
-            rcgen::KeyUsagePurpose::KeyCertSign,
-            rcgen::KeyUsagePurpose::CrlSign,
-        ];
-        let root_key = kronik_fleet::identity::ed25519_key(&[32; 32]).unwrap();
-        let root = root_params.self_signed(&root_key).unwrap();
-        std::fs::write(&fleet.config.controller.ca_file, root.pem()).unwrap();
-        *network.issuer.lock().unwrap() = Some(rcgen::Issuer::new(root_params, root_key));
+        controller_ca(dir.path(), &network, 32);
         let next = fleet
             .enroll(
                 "unix:uid=0",
@@ -3206,25 +3259,8 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let url = format!("https://{}", listener.local_addr().unwrap());
         let issuer = Network::default();
-        let mut ca_params = rcgen::CertificateParams::default();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params.key_usages = vec![
-            rcgen::KeyUsagePurpose::KeyCertSign,
-            rcgen::KeyUsagePurpose::CrlSign,
-        ];
-        let ca_key = kronik_fleet::identity::ed25519_key(&[31; 32]).unwrap();
-        let ca = ca_params.self_signed(&ca_key).unwrap();
-        *issuer.issuer.lock().unwrap() = Some(rcgen::Issuer::new(ca_params, ca_key));
-        let mut protected_ca = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
-        protected_ca.write_all(ca.pem().as_bytes()).unwrap();
-        let ca_file = directory.path().join("ca.pem");
-        protected_ca.persist(&ca_file).unwrap();
-        let server_key = kronik_fleet::identity::ed25519_key(&[32; 32]).unwrap();
-        let mut server_params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
-        server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
-        let server_cert = server_params
-            .signed_by(&server_key, issuer.issuer.lock().unwrap().as_ref().unwrap())
-            .unwrap();
+        let (_, ca_file) = controller_ca(directory.path(), &issuer, 31);
+        let (server_key, server_cert) = server_certificate(&issuer, 32);
         let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -3337,15 +3373,7 @@ mod tests {
             .mode(0o700)
             .create(keys.join("fleet"))
             .unwrap();
-        let mut store = TokenStore::open_file(&keys.join("tokens.db")).unwrap();
-        store
-            .bind_before_any_issuer(node.publication_domain())
-            .unwrap();
-        let startup_original = node.local_operator_authority().unwrap();
-        store
-            .bind_execution_before_any_issuer(&node.publication_domain(), startup_original.clone())
-            .unwrap();
-        let tokens = Arc::new(store);
+        let (tokens, startup_original) = bound_tokens(&node, &keys);
         let api = crate::Api::new(node.clone())
             .with_tokens(tokens.clone())
             .unwrap();
@@ -3570,31 +3598,13 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(completed);
-        let following = node
-            .record_audit_event_authorized(
-                "test.following",
-                "after-real-tls-enroller-fence",
-                Default::default(),
-                fleet.audit("unix:uid=0", "observe completed real TLS response"),
-                authority(&fleet),
-            )
-            .await
-            .unwrap();
-        let mut following_seen = false;
-        node.reader()
-            .read(fenced + 1, following, |committed| {
-                if let kronik_proto::Record::AuditEvent(event) = committed.record {
-                    assert!(!matches!(event.operation,
-                    Some(pb::audit_event::Operation::FleetState(pb::FleetState { phase, .. }))
-                        if phase == pb::fleet_state::Phase::Active as i32));
-                    following_seen |=
-                        committed.lsn == following && event.action == "test.following";
-                }
-                Ok(())
-            })
-            .await
-            .unwrap();
-        assert!(following_seen);
+        assert_no_activation_until_next_record(
+            &fleet,
+            fenced,
+            "after-real-tls-enroller-fence",
+            "observe completed real TLS response",
+        )
+        .await;
         assert_eq!(observed.lock().unwrap().len(), 2);
         assert_eq!(fleet.record().unwrap().unwrap(), requested);
         assert!(!fleet.status().unwrap().admitting);
@@ -3715,34 +3725,13 @@ mod tests {
         );
         assert_eq!(fleet.enrollment_http.available_permits(), 0);
         drop(held);
-        let following = fleet
-            .node
-            .record_audit_event_authorized(
-                "test.following",
-                "after-capacity-enroller-fence",
-                Default::default(),
-                fleet.audit("unix:uid=0", "observe bounded cancellation"),
-                authority(&fleet),
-            )
-            .await
-            .unwrap();
-        let mut following_seen = false;
-        fleet
-            .node
-            .reader()
-            .read(fenced + 1, following, |committed| {
-                if let kronik_proto::Record::AuditEvent(event) = committed.record {
-                    assert!(!matches!(event.operation,
-                    Some(pb::audit_event::Operation::FleetState(pb::FleetState { phase, .. }))
-                        if phase == pb::fleet_state::Phase::Active as i32));
-                    following_seen |=
-                        committed.lsn == following && event.action == "test.following";
-                }
-                Ok(())
-            })
-            .await
-            .unwrap();
-        assert!(following_seen);
+        assert_no_activation_until_next_record(
+            &fleet,
+            fenced,
+            "after-capacity-enroller-fence",
+            "observe bounded cancellation",
+        )
+        .await;
         assert!(network.requests.lock().unwrap().is_empty());
         assert_eq!(
             fleet.record().unwrap().unwrap().phase,
@@ -3834,34 +3823,13 @@ mod tests {
             "durable request metadata must not replace the revoked ordinary caller"
         );
         hold.add_permits(1);
-        let following = fleet
-            .node
-            .record_audit_event_authorized(
-                "test.following",
-                "after-enroller-fence",
-                Default::default(),
-                fleet.audit("unix:uid=0", "observe the next actual record"),
-                authority(&fleet),
-            )
-            .await
-            .unwrap();
-        let mut following_seen = false;
-        fleet
-            .node
-            .reader()
-            .read(fenced + 1, following, |committed| {
-                if let kronik_proto::Record::AuditEvent(event) = committed.record {
-                    assert!(!matches!(event.operation,
-                    Some(pb::audit_event::Operation::FleetState(pb::FleetState { phase, .. }))
-                        if phase == pb::fleet_state::Phase::Active as i32));
-                    following_seen |=
-                        committed.lsn == following && event.action == "test.following";
-                }
-                Ok(())
-            })
-            .await
-            .unwrap();
-        assert!(following_seen);
+        assert_no_activation_until_next_record(
+            &fleet,
+            fenced,
+            "after-enroller-fence",
+            "observe the next actual record",
+        )
+        .await;
         assert_eq!(
             fleet.record().unwrap().unwrap().phase,
             EnrollmentPhase::Requested
