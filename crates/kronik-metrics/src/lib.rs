@@ -278,17 +278,6 @@ pub const BUCKETS: [f64; 14] = [
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
-#[derive(Debug, Clone)]
-enum Value {
-    Counter(u64),
-    Gauge(f64),
-    Histogram {
-        buckets: [u64; BUCKETS.len()],
-        sum: f64,
-        count: u64,
-    },
-}
-
 /// One recorded series: a catalog entry with one label set.
 #[derive(Debug, Clone)]
 struct Series {
@@ -296,7 +285,7 @@ struct Series {
     hash: u64,
     /// Sorted by name.
     labels: Vec<(&'static str, String)>,
-    value: Value,
+    value: SampleValue,
 }
 
 /// A catalog entry's series, behind a lock of their own and on a cache
@@ -331,8 +320,8 @@ impl Series {
 fn update(
     name: &'static str,
     labels: &[(&'static str, &str)],
-    f: impl FnOnce(&mut Value),
-    new: Value,
+    f: impl FnOnce(&mut SampleValue),
+    new: SampleValue,
 ) {
     let Some(metric) = METRICS.iter().position(|d| d.name == name) else {
         return;
@@ -349,8 +338,8 @@ fn record(
     series: &mut Vec<Series>,
     hash: u64,
     labels: &[(&'static str, &str)],
-    f: impl FnOnce(&mut Value),
-    new: Value,
+    f: impl FnOnce(&mut SampleValue),
+    new: SampleValue,
 ) {
     let mut at = series.partition_point(|s| s.hash < hash);
     // Another label set with this hash (a collision) is passed over.
@@ -390,11 +379,11 @@ pub fn add(name: &'static str, labels: &[(&'static str, &str)], n: u64) {
         name,
         labels,
         |v| {
-            if let Value::Counter(c) = v {
+            if let SampleValue::Counter(c) = v {
                 *c += n;
             }
         },
-        Value::Counter(0),
+        SampleValue::Counter(0),
     );
 }
 
@@ -409,11 +398,11 @@ pub fn set(name: &'static str, labels: &[(&'static str, &str)], value: f64) {
         name,
         labels,
         |v| {
-            if let Value::Gauge(g) = v {
+            if let SampleValue::Gauge(g) = v {
                 *g = value;
             }
         },
-        Value::Gauge(0.0),
+        SampleValue::Gauge(0.0),
     );
 }
 
@@ -424,7 +413,7 @@ pub fn observe(name: &'static str, labels: &[(&'static str, &str)], duration: Du
         name,
         labels,
         |v| {
-            if let Value::Histogram {
+            if let SampleValue::Histogram {
                 buckets,
                 sum,
                 count,
@@ -439,7 +428,7 @@ pub fn observe(name: &'static str, labels: &[(&'static str, &str)], duration: Du
                 *count += 1;
             }
         },
-        Value::Histogram {
+        SampleValue::Histogram {
             buckets: [0; BUCKETS.len()],
             sum: 0.0,
             count: 0,
@@ -532,13 +521,13 @@ pub fn render() -> String {
         );
         for s in &series {
             match &s.value {
-                Value::Counter(c) => {
+                SampleValue::Counter(c) => {
                     let _ = writeln!(out, "{}{} {c}", def.name, labels(&s.labels, None));
                 }
-                Value::Gauge(g) => {
+                SampleValue::Gauge(g) => {
                     let _ = writeln!(out, "{}{} {g}", def.name, labels(&s.labels, None));
                 }
-                Value::Histogram {
+                SampleValue::Histogram {
                     buckets,
                     sum,
                     count,
@@ -599,19 +588,7 @@ pub fn snapshot() -> Vec<Sample> {
             series.into_iter().map(move |s| Sample {
                 def,
                 labels: s.labels,
-                value: match s.value {
-                    Value::Counter(c) => SampleValue::Counter(c),
-                    Value::Gauge(g) => SampleValue::Gauge(g),
-                    Value::Histogram {
-                        buckets,
-                        sum,
-                        count,
-                    } => SampleValue::Histogram {
-                        buckets,
-                        sum,
-                        count,
-                    },
-                },
+                value: s.value,
             })
         })
         .collect()
@@ -722,7 +699,7 @@ mod tests {
         let series = Series {
             hash: 0,
             labels: [("a", "1".into()), ("b", "2".into())].into(),
-            value: Value::Counter(0),
+            value: SampleValue::Counter(0),
         };
         assert!(series.has(&[("a", "1"), ("b", "2")]));
         assert!(series.has(&[("b", "2"), ("a", "1")]));
@@ -745,21 +722,27 @@ mod tests {
         let series = |kind: &str| Series {
             hash: 7,
             labels: [("kind", kind.into())].into(),
-            value: Value::Counter(0),
+            value: SampleValue::Counter(0),
         };
         let mut all = vec![series("a"), series("c")];
-        let bump = |v: &mut Value| {
-            if let Value::Counter(c) = v {
+        let bump = |v: &mut SampleValue| {
+            if let SampleValue::Counter(c) = v {
                 *c += 1;
             }
         };
         for kind in ["c", "b", "a", "c"] {
-            record(&mut all, 7, &[("kind", kind)], bump, Value::Counter(0));
+            record(
+                &mut all,
+                7,
+                &[("kind", kind)],
+                bump,
+                SampleValue::Counter(0),
+            );
         }
         let counts: Vec<(String, u64)> = all
             .iter()
             .map(|s| match &s.value {
-                Value::Counter(c) => (s.labels[0].1.clone(), *c),
+                SampleValue::Counter(c) => (s.labels[0].1.clone(), *c),
                 _ => panic!("{:?}", s.value),
             })
             .collect();
