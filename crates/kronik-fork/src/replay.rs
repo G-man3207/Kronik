@@ -1779,6 +1779,18 @@ fn inline_request_body(body: &FetchBody) -> Result<&[u8], GateError> {
     }
 }
 
+/// The headers a fork sends itself: the text ones (a fork never sends a
+/// secret value).
+fn text_headers(headers: &[(String, FetchHeader)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| match value {
+            FetchHeader::Text(text) => Some((name.clone(), text.clone())),
+            FetchHeader::Secret { .. } => None,
+        })
+        .collect()
+}
+
 /// A fork turn's blob host (M25 §9): new blobs go to the fork's space,
 /// and reads find main's blobs too. Writes are scrubbed of the secret
 /// values the fork turn used, as its outputs are.
@@ -2351,6 +2363,22 @@ impl ReplayGate {
             .charge(kronik_sched::record_budget::effect_bytes(&rec));
         state.records.push(rec);
         Ok(())
+    }
+
+    /// Records `msg` as the compensation of the call at `ordinal` to `to`,
+    /// charged to the turn's record budget.
+    fn push_compensation(&self, ordinal: u32, to: &ActorRef, msg: pb::Message) {
+        let key = causal::compensation(&self.key, &self.actor, ordinal, to);
+        let mut compensation = pb::OutboundMessage {
+            to: Some(to.to_pb()),
+            msg: Some(msg),
+            ordinal,
+            message_id: causal::causal_id(&key),
+        };
+        let cost = kronik_sched::record_budget::message_cost(&mut compensation);
+        let mut state = lock(&self.state);
+        state.budget.charge(cost);
+        state.compensations.push(compensation);
     }
 
     /// What is left of the turn's effect bytes (ADR 0145).
@@ -3105,14 +3133,7 @@ impl ReplayGate {
             self.refuse_effect_bytes(ordinal, "foreign.http", cap, fp, pb::EffectStatus::TooLarge)?;
             return Ok(FetchOutcome::TooLarge);
         }
-        let headers = req
-            .headers
-            .iter()
-            .filter_map(|(n, v)| match v {
-                FetchHeader::Text(t) => Some((n.clone(), t.clone())),
-                FetchHeader::Secret { .. } => None,
-            })
-            .collect();
+        let headers = text_headers(&req.headers);
         let call = copy.http(kronik_core::env::HttpRequest {
             method: req.method,
             url: req.url,
@@ -3128,7 +3149,7 @@ impl ReplayGate {
             self.push(rec)?;
             return out;
         }
-        let mut rec = pb::EffectRecord {
+        let rec = pb::EffectRecord {
             ordinal,
             kind: "foreign.http".into(),
             target: cap,
@@ -3137,6 +3158,65 @@ impl ReplayGate {
             grounding: pb::Grounding::Forked as i32,
             ..Default::default()
         };
+        self.finish_fetch(rec, answer, &req.subject, cap_bytes, &limits, matcher)
+    }
+
+    /// A live GET from a fork (`[fork] live_allowlist`), grounding `live`.
+    /// `delivery` is the grant's effective class, `replay-safe` by admission.
+    // One live fetch's admission: ordinal, capability, body and scrubber.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_live(
+        &self,
+        ordinal: u32,
+        cap: String,
+        fp: Vec<u8>,
+        encoded: Option<pb::Sealable>,
+        req: FetchRequest,
+        delivery: Delivery,
+        env: Env,
+        matcher: &CompiledScrubber<'_>,
+    ) -> Result<FetchOutcome, GateError> {
+        let limits = self.config().limits(&self.actor.kind);
+        let cap_bytes = self.response_cap(encoded.as_ref(), limits.effect_response_bytes);
+        let headers = text_headers(&req.headers);
+        let rec = pb::EffectRecord {
+            ordinal,
+            kind: "http.fetch".into(),
+            target: cap,
+            fingerprint: fp,
+            request: encoded,
+            delivery: delivery.as_str().into(),
+            grounding: pb::Grounding::Live as i32,
+            ..Default::default()
+        };
+        let call = env.net.http_authorized(
+            kronik_core::env::HttpRequest {
+                method: req.method,
+                url: req.url,
+                headers,
+                body: inline_request_body(&req.body)?.to_vec().into(),
+                max_response_bytes: cap_bytes.0,
+            },
+            self.original()?.clone(),
+        );
+        let answer = env.timeout(limits.effect_timeout, call).await;
+        self.finish_fetch(rec, answer, &req.subject, cap_bytes, &limits, matcher)
+    }
+
+    /// Records the answer to a request the fork sent itself in `rec`, as
+    /// production records a fetch, and pushes it.
+    fn finish_fetch(
+        &self,
+        mut rec: pb::EffectRecord,
+        answer: Result<
+            Result<kronik_core::env::HttpResponse, kronik_core::env::NetError>,
+            kronik_core::env::Elapsed,
+        >,
+        subject: &Option<String>,
+        cap_bytes: (u64, bool),
+        limits: &kronik_effects::KindLimits,
+        matcher: &CompiledScrubber<'_>,
+    ) -> Result<FetchOutcome, GateError> {
         rec.status = match answer {
             Err(_) => {
                 rec.error = format!(
@@ -3166,99 +3246,7 @@ impl ReplayGate {
                 };
                 let out = kronik_sched::effects::prepare_inline_fetch_response(
                     &mut rec,
-                    &req.subject,
-                    response,
-                    matcher,
-                    usize::try_from(limits.effect_response_bytes)
-                        .unwrap_or(usize::MAX)
-                        .min(kronik_log::MAX_RECORD as usize),
-                );
-                let out = self.fit_fetch(&mut rec, out);
-                self.push(rec)?;
-                return out;
-            }
-        } as i32;
-        let out = self.prepare_http_record(&mut rec, matcher);
-        let out = self.fit_fetch(&mut rec, out);
-        self.push(rec)?;
-        out
-    }
-
-    /// A live GET from a fork (`[fork] live_allowlist`), grounding `live`.
-    /// `delivery` is the grant's effective class, `replay-safe` by admission.
-    // One live fetch's admission: ordinal, capability, body and scrubber.
-    #[allow(clippy::too_many_arguments)]
-    async fn fetch_live(
-        &self,
-        ordinal: u32,
-        cap: String,
-        fp: Vec<u8>,
-        encoded: Option<pb::Sealable>,
-        req: FetchRequest,
-        delivery: Delivery,
-        env: Env,
-        matcher: &CompiledScrubber<'_>,
-    ) -> Result<FetchOutcome, GateError> {
-        let limits = self.config().limits(&self.actor.kind);
-        let cap_bytes = self.response_cap(encoded.as_ref(), limits.effect_response_bytes);
-        let headers = req
-            .headers
-            .iter()
-            .filter_map(|(n, v)| match v {
-                FetchHeader::Text(t) => Some((n.clone(), t.clone())),
-                FetchHeader::Secret { .. } => None,
-            })
-            .collect();
-        let mut rec = pb::EffectRecord {
-            ordinal,
-            kind: "http.fetch".into(),
-            target: cap,
-            fingerprint: fp,
-            request: encoded,
-            delivery: delivery.as_str().into(),
-            grounding: pb::Grounding::Live as i32,
-            ..Default::default()
-        };
-        let call = env.net.http_authorized(
-            kronik_core::env::HttpRequest {
-                method: req.method,
-                url: req.url,
-                headers,
-                body: inline_request_body(&req.body)?.to_vec().into(),
-                max_response_bytes: cap_bytes.0,
-            },
-            self.original()?.clone(),
-        );
-        rec.status = match env.timeout(limits.effect_timeout, call).await {
-            Err(_) => {
-                rec.error = format!(
-                    "no response within {} ms",
-                    limits.effect_timeout.as_millis()
-                );
-                pb::EffectStatus::Timeout
-            }
-            Ok(Err(kronik_core::env::NetError::TooLarge)) => {
-                rec.error = self.too_large_error(cap_bytes, limits.effect_response_bytes);
-                pb::EffectStatus::TooLarge
-            }
-            Ok(Err(kronik_core::env::NetError::Connect(e) | kronik_core::env::NetError::Io(e))) => {
-                rec.error = e;
-                pb::EffectStatus::Network
-            }
-            Ok(Ok(resp)) => {
-                let response = pb::HttpEffectResponse {
-                    status: u32::from(resp.status),
-                    headers: resp
-                        .headers
-                        .into_iter()
-                        .map(|(name, value)| pb::HeaderPair { name, value })
-                        .collect(),
-                    body: resp.body.to_vec(),
-                    body_blob: None,
-                };
-                let out = kronik_sched::effects::prepare_inline_fetch_response(
-                    &mut rec,
-                    &req.subject,
+                    subject,
                     response,
                     matcher,
                     usize::try_from(limits.effect_response_bytes)
@@ -3412,36 +3400,23 @@ impl ReplayGate {
                     ..Default::default()
                 })),
             };
+            let callee = Pending {
+                actor: to.clone(),
+                input,
+                key,
+                time: self.time,
+                subject,
+                sql: false,
+                personal: self.saw_personal(),
+                unverified: self.unverified_so_far(),
+            };
             if let Some(recorded) = recorded_timeout {
-                let callee = Pending {
-                    actor: to.clone(),
-                    input,
-                    key,
-                    time: self.time,
-                    subject,
-                    sql: false,
-                    personal: self.saw_personal(),
-                    unverified: self.unverified_so_far(),
-                };
                 return self.served_timeout(recorded, &message_id, callee, order, compensate);
             }
             let mut turn = self
                 .runner
                 .clone()
-                .run(
-                    Pending {
-                        actor: to.clone(),
-                        input,
-                        key,
-                        time: self.time,
-                        subject,
-                        sql: false,
-                        personal: self.saw_personal(),
-                        unverified: self.unverified_so_far(),
-                    },
-                    order,
-                    self.dispatch.clone(),
-                )
+                .run(callee, order, self.dispatch.clone())
                 .await
                 .map_err(|e| {
                     // A callee that could not run: neither can its caller,
@@ -3516,17 +3491,7 @@ impl ReplayGate {
         if rec.successful_call()
             && let Some(c) = compensate
         {
-            let key = causal::compensation(&self.key, &self.actor, ordinal, &to);
-            let mut compensation = pb::OutboundMessage {
-                to: Some(to.to_pb()),
-                msg: Some(c),
-                ordinal,
-                message_id: causal::causal_id(&key),
-            };
-            let cost = kronik_sched::record_budget::message_cost(&mut compensation);
-            let mut state = lock(&self.state);
-            state.budget.charge(cost);
-            state.compensations.push(compensation);
+            self.push_compensation(ordinal, &to, c);
         }
         self.push(rec)?;
         out
@@ -3576,17 +3541,7 @@ impl ReplayGate {
             self.runner.push(order, callee);
         }
         if let Some(c) = compensate {
-            let key = causal::compensation(&self.key, &self.actor, ordinal, &to);
-            let mut compensation = pb::OutboundMessage {
-                to: Some(to.to_pb()),
-                msg: Some(c),
-                ordinal,
-                message_id: causal::causal_id(&key),
-            };
-            let cost = kronik_sched::record_budget::message_cost(&mut compensation);
-            let mut state = lock(&self.state);
-            state.budget.charge(cost);
-            state.compensations.push(compensation);
+            self.push_compensation(ordinal, &to, c);
         }
         recorded.grounding = pb::Grounding::Exact as i32;
         self.push(recorded)?;
