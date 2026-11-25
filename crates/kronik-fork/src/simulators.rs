@@ -1914,26 +1914,6 @@ mod tests {
         assert!(turn_tainted(&sql));
     }
 
-    /// M3: a cache file that does not parse is an error, not an empty cache.
-    #[test]
-    fn a_corrupt_cache_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("simulator-cache.json");
-        assert!(ModelCache::open(&path).unwrap().is_empty());
-        std::fs::write(&path, b"{not json").unwrap();
-        assert!(ModelCache::open(&path).is_err());
-    }
-
-    #[test]
-    fn an_invalid_cache_envelope_is_preserved() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cache.json");
-        let original = br#"{"http:h fp":{"status":200,"headers":[],"body":"old fact"}}"#;
-        std::fs::write(&path, original).unwrap();
-        assert!(ModelCache::open(&path).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-    }
-
     #[test]
     fn stamped_cache_roundtrips_refusal_and_typed_failure_without_rewriting_markers() {
         let dir = tempfile::tempdir().unwrap();

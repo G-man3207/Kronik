@@ -199,25 +199,45 @@ fn prepared(
     (request, target, references, fingerprint)
 }
 
+/// `access.answer` for the `http:h.invalid` target, without examples.
+async fn ask(
+    access: &ModelAccess,
+    fingerprint: &[u8],
+    request: &pb::HttpEffectRequest,
+    target: &Target,
+    scope: Option<&[pb::SecretRef]>,
+    original: &AuthLease,
+) -> Result<Option<ModelAnswer>, ApiError> {
+    access
+        .answer(
+            "http:h.invalid",
+            fingerprint,
+            request,
+            target,
+            scope,
+            |_, _| vec![],
+            original,
+        )
+        .await
+}
+
 #[tokio::test]
 async fn actual_model_capture_preserves_prepared_markers_and_recorded_cache_mode() {
     let (data, node, original) = native().await;
     let mut provider = endpoint(false, None).await;
     let access = access(&node, &provider.url, &data.path().join("model-cache.json"));
     let (request, target, scope, fingerprint) = prepared(&access);
-    let answer = access
-        .answer(
-            "http:h.invalid",
-            &fingerprint,
-            &request,
-            &target,
-            Some(&scope),
-            |_, _| vec![],
-            &original,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+    let answer = ask(
+        &access,
+        &fingerprint,
+        &request,
+        &target,
+        Some(&scope),
+        &original,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!((answer.status, answer.body.as_str()), (201, "OK"));
     let captured: serde_json::Value = serde_json::from_slice(&provider.captured().await).unwrap();
     let content: serde_json::Value =
@@ -239,33 +259,29 @@ async fn actual_model_capture_preserves_prepared_markers_and_recorded_cache_mode
         Some(answer.clone())
     );
     assert_eq!(
-        recorded
-            .answer(
-                "http:h.invalid",
-                &fingerprint,
-                &request,
-                &target,
-                Some(&scope),
-                |_, _| vec![],
-                &original
-            )
-            .await
-            .unwrap(),
+        ask(
+            &recorded,
+            &fingerprint,
+            &request,
+            &target,
+            Some(&scope),
+            &original
+        )
+        .await
+        .unwrap(),
         Some(answer)
     );
     assert!(
-        recorded
-            .answer(
-                "http:h.invalid",
-                &[99; 32],
-                &request,
-                &target,
-                Some(&scope),
-                |_, _| vec![],
-                &original
-            )
-            .await
-            .is_err()
+        ask(
+            &recorded,
+            &[99; 32],
+            &request,
+            &target,
+            Some(&scope),
+            &original
+        )
+        .await
+        .is_err()
     );
     access.cache.save().unwrap();
     assert_eq!(
@@ -295,17 +311,15 @@ async fn actual_model_source_retirement_never_caches_refusal_or_poison_new_opera
             let original = original.clone();
             let fingerprint = fingerprint.clone();
             tokio::spawn(async move {
-                access
-                    .answer(
-                        "http:h.invalid",
-                        &fingerprint,
-                        &request,
-                        &target,
-                        Some(&scope),
-                        |_, _| vec![],
-                        &original,
-                    )
-                    .await
+                ask(
+                    &access,
+                    &fingerprint,
+                    &request,
+                    &target,
+                    Some(&scope),
+                    &original,
+                )
+                .await
             })
         };
         provider.captured().await;
@@ -346,19 +360,17 @@ async fn actual_model_source_retirement_never_caches_refusal_or_poison_new_opera
         );
         let (request, target, scope, fingerprint) = prepared(&access);
         let next_original = node.local_operator_authority().unwrap();
-        let answer = access
-            .answer(
-                "http:h.invalid",
-                &fingerprint,
-                &request,
-                &target,
-                Some(&scope),
-                |_, _| vec![],
-                &next_original,
-            )
-            .await
-            .unwrap()
-            .unwrap();
+        let answer = ask(
+            &access,
+            &fingerprint,
+            &request,
+            &target,
+            Some(&scope),
+            &next_original,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
             answer.body,
             if same_fingerprint {
@@ -434,16 +446,7 @@ async fn actual_legacy_known_sensitive_refusal_is_private_and_safe_zero_is_not_a
     let target = parse_url(&request.url).unwrap();
     let fingerprint = kronik_effects::http::fingerprint(&request).unwrap();
     assert_eq!(
-        access
-            .answer(
-                "http:h.invalid",
-                &fingerprint,
-                &request,
-                &target,
-                None,
-                |_, _| vec![],
-                &original
-            )
+        ask(&access, &fingerprint, &request, &target, None, &original)
             .await
             .unwrap(),
         None
@@ -451,16 +454,7 @@ async fn actual_legacy_known_sensitive_refusal_is_private_and_safe_zero_is_not_a
     request.body = b"OK".to_vec();
     let fingerprint = kronik_effects::http::fingerprint(&request).unwrap();
     assert_eq!(
-        access
-            .answer(
-                "http:h.invalid",
-                &fingerprint,
-                &request,
-                &target,
-                None,
-                |_, _| vec![],
-                &original
-            )
+        ask(&access, &fingerprint, &request, &target, None, &original)
             .await
             .unwrap_err()
             .code,
@@ -501,18 +495,16 @@ async fn actual_new_identity_ambiguity_never_reaches_the_model_provider() {
     node.refresh_secret_inventory(original.clone())
         .await
         .unwrap();
-    let error = access
-        .answer(
-            "http:h.invalid",
-            &fingerprint,
-            &request,
-            &target,
-            Some(&scope),
-            |_, _| vec![],
-            &original,
-        )
-        .await
-        .unwrap_err();
+    let error = ask(
+        &access,
+        &fingerprint,
+        &request,
+        &target,
+        Some(&scope),
+        &original,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.code, ErrorCode::SecretUnavailable);
     assert_eq!(
         request, original_request,
@@ -572,18 +564,16 @@ async fn actual_model_failures_leave_no_fact_and_a_new_operation_can_succeed() {
         let (request, target, scope, fingerprint) = prepared(&access);
         access.cache.save().unwrap();
         let before = std::fs::read(data.path().join("model-cache.json")).unwrap();
-        let error = access
-            .answer(
-                "http:h.invalid",
-                &fingerprint,
-                &request,
-                &target,
-                Some(&scope),
-                |_, _| vec![],
-                &original,
-            )
-            .await
-            .unwrap_err();
+        let error = ask(
+            &access,
+            &fingerprint,
+            &request,
+            &target,
+            Some(&scope),
+            &original,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.code, expected);
         provider.captured().await;
         access.cache.save().unwrap();
@@ -593,19 +583,17 @@ async fn actual_model_failures_leave_no_fact_and_a_new_operation_can_succeed() {
             "a failed physical request or invalid model protocol is not an immutable refusal/error"
         );
         let next_original = node.local_operator_authority().unwrap();
-        let answer = access
-            .answer(
-                "http:h.invalid",
-                &fingerprint,
-                &request,
-                &target,
-                Some(&scope),
-                |_, _| vec![],
-                &next_original,
-            )
-            .await
-            .unwrap()
-            .unwrap();
+        let answer = ask(
+            &access,
+            &fingerprint,
+            &request,
+            &target,
+            Some(&scope),
+            &next_original,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!((answer.status, answer.body.as_str()), (201, "OK"));
         provider.captured().await;
         assert_eq!(provider.connections.load(Ordering::SeqCst), 2);
@@ -629,17 +617,15 @@ async fn actual_model_deadline_does_not_become_a_cached_refusal() {
         let scope = scope.clone();
         let fingerprint = fingerprint.clone();
         tokio::spawn(async move {
-            access
-                .answer(
-                    "http:h.invalid",
-                    &fingerprint,
-                    &request,
-                    &target,
-                    Some(&scope),
-                    |_, _| vec![],
-                    &original,
-                )
-                .await
+            ask(
+                &access,
+                &fingerprint,
+                &request,
+                &target,
+                Some(&scope),
+                &original,
+            )
+            .await
         })
     };
     provider.captured().await;
@@ -657,19 +643,17 @@ async fn actual_model_deadline_does_not_become_a_cached_refusal() {
     provider.release();
     access.config.timeout = Duration::from_secs(3);
     let next_original = node.local_operator_authority().unwrap();
-    let answer = access
-        .answer(
-            "http:h.invalid",
-            &fingerprint,
-            &request,
-            &target,
-            Some(&scope),
-            |_, _| vec![],
-            &next_original,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+    let answer = ask(
+        &access,
+        &fingerprint,
+        &request,
+        &target,
+        Some(&scope),
+        &next_original,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!((answer.status, answer.body.as_str()), (201, "OK"));
     provider.captured().await;
     assert_eq!(provider.connections.load(Ordering::SeqCst), 2);
@@ -899,19 +883,17 @@ async fn a_genuine_new_fact_preserves_old_cache_keys_values_and_unknown_provenan
     );
     let model = access(&node, &provider.url, &path);
     let (request, target, scope, fingerprint) = prepared(&model);
-    let answer = model
-        .answer(
-            "http:h.invalid",
-            &fingerprint,
-            &request,
-            &target,
-            Some(&scope),
-            |_, _| vec![],
-            &original,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+    let answer = ask(
+        &model,
+        &fingerprint,
+        &request,
+        &target,
+        Some(&scope),
+        &original,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!((answer.status, answer.body.as_str()), (201, "OK"));
     provider.captured().await;
     model.cache.save().unwrap();
@@ -1007,19 +989,17 @@ async fn actual_multi_answer_cache_crosses_the_old_aggregate_bound_without_losin
     let mut certified = recertify(&node, &original).await;
     let (request, target, scope, fingerprint) = prepared(&model);
     assert!(
-        model
-            .answer(
-                "http:h.invalid",
-                &fingerprint,
-                &request,
-                &target,
-                Some(&scope),
-                |_, _| vec![],
-                &original
-            )
-            .await
-            .unwrap()
-            .is_some()
+        ask(
+            &model,
+            &fingerprint,
+            &request,
+            &target,
+            Some(&scope),
+            &original
+        )
+        .await
+        .unwrap()
+        .is_some()
     );
     provider.captured().await;
     model.cache.save().unwrap();
@@ -1055,19 +1035,17 @@ async fn failed_cache_persistence_retains_the_new_fact_for_the_next_real_save() 
     let path = data.path().join("missing-parent").join("model-cache.json");
     let model = access(&node, &provider.url, &path);
     let (request, target, scope, fingerprint) = prepared(&model);
-    let answer = model
-        .answer(
-            "http:h.invalid",
-            &fingerprint,
-            &request,
-            &target,
-            Some(&scope),
-            |_, _| vec![],
-            &original,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+    let answer = ask(
+        &model,
+        &fingerprint,
+        &request,
+        &target,
+        Some(&scope),
+        &original,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     provider.captured().await;
     assert!(model.cache.save().is_err());
     std::fs::create_dir(path.parent().unwrap()).unwrap();
@@ -1088,11 +1066,14 @@ async fn failed_cache_persistence_retains_the_new_fact_for_the_next_real_save() 
 fn malformed_versioned_cache_metadata_never_becomes_legacy_proof_or_rewrites_the_file() {
     let data = tempfile::tempdir().unwrap();
     let path = data.path().join("cache.json");
+    assert!(ModelCache::open(&path).unwrap().is_empty());
     for original in [
+        b"{not json".as_slice(),
         b"{\"version\":2,\"answers\":{\"k\":{\"answer\":{\"Ok\":null}}}}".as_slice(),
         b"{\"version\":2,\"answers\":{\"k\":null}}".as_slice(),
         b"{\"version\":7,\"answers\":{}}".as_slice(),
         b"{\"answers\":{\"k\":{\"source_fingerprint\":null,\"answer\":{\"Ok\":null}}}}".as_slice(),
+        br#"{"http:h fp":{"status":200,"headers":[],"body":"old fact"}}"#.as_slice(),
     ] {
         std::fs::write(&path, original).unwrap();
         assert!(ModelCache::open(&path).is_err());
@@ -1275,19 +1256,17 @@ async fn actual_new_model_output_hides_unknown_credentials_without_changing_lite
     );
     let (request, target, scope, fingerprint) = prepared(&model);
     assert_eq!(request.body, b"e");
-    let answer = model
-        .answer(
-            "http:h.invalid",
-            &fingerprint,
-            &request,
-            &target,
-            Some(&scope),
-            |_, _| vec![],
-            &original,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+    let answer = ask(
+        &model,
+        &fingerprint,
+        &request,
+        &target,
+        Some(&scope),
+        &original,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(answer.status, 201);
     assert_eq!(answer.body, "left|[secret:token]|right");
     assert_eq!(answer.headers, vec![("x".into(), "[secret:token]".into())]);

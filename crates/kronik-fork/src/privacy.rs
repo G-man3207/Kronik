@@ -363,6 +363,37 @@ mod tests {
 
     const SHAPED: &[u8] = b"pii:0123456789ab";
 
+    /// A committed HTTP turn of `kind`/`key`, the root of `root`.
+    fn http_turn(kind: &str, key: &str, root: String) -> pb::TurnRecord {
+        pb::TurnRecord {
+            actor: Some(pb::ActorRef {
+                kind: kind.into(),
+                key: key.into(),
+            }),
+            causal_key: Some(kronik_core::causal::root(root)),
+            input: Some(pb::Input {
+                kind: Some(pb::input::Kind::Http(pb::HttpInput::default())),
+            }),
+            outcome: Some(pb::Outcome {
+                kind: pb::OutcomeKind::Committed as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// `record` committed at `lsn`.
+    fn committed(lsn: u64, record: pb::TurnRecord) -> kronik_log::Committed {
+        kronik_log::Committed {
+            lsn,
+            pos: kronik_log::Position {
+                segment: 0,
+                offset: 0,
+            },
+            record: kronik_proto::Record::TurnRecord(record),
+        }
+    }
+
     /// Issue #69: a production value that has the shape of a pseudonym is
     /// still production data. A `--no-pii` fork replaces it like any other
     /// tagged value, in records and in SQL cells; only what the fork itself
@@ -396,29 +427,11 @@ mod tests {
     /// replaced; one the replay wrote is the fork's and is read back as is.
     #[test]
     fn state_reads_replace_production_values_by_provenance() {
-        use kronik_log::{Committed, Position};
-        use kronik_proto::Record;
         let store = kronik_store::Store::memory().unwrap();
         store
-            .apply(&[Committed {
-                lsn: 1,
-                pos: Position {
-                    segment: 0,
-                    offset: 0,
-                },
-                record: Record::TurnRecord(pb::TurnRecord {
-                    actor: Some(pb::ActorRef {
-                        kind: "counter".into(),
-                        key: "a".into(),
-                    }),
-                    causal_key: Some(kronik_core::causal::root("r1".to_owned())),
-                    input: Some(pb::Input {
-                        kind: Some(pb::input::Kind::Http(pb::HttpInput::default())),
-                    }),
-                    outcome: Some(pb::Outcome {
-                        kind: pb::OutcomeKind::Committed as i32,
-                        ..Default::default()
-                    }),
+            .apply(&[committed(
+                1,
+                pb::TurnRecord {
                     writes: vec![pb::StateWrite {
                         key: "k".into(),
                         op: pb::StateOp::Set as i32,
@@ -427,9 +440,9 @@ mod tests {
                             value: Some(pb::sealable::Value::Plain(SHAPED.to_vec())),
                         }),
                     }],
-                    ..Default::default()
-                }),
-            }])
+                    ..http_turn("counter", "a", "r1".into())
+                },
+            )])
             .unwrap();
         let p = no_pii();
         let actor = ActorRef::parse("counter/a").unwrap();
@@ -472,20 +485,8 @@ mod tests {
             }
         };
         let mut t = pb::TurnRecord {
-            actor: Some(pb::ActorRef {
-                kind: "counter".into(),
-                key: "a".into(),
-            }),
-            causal_key: Some(kronik_core::causal::root("r1".to_owned())),
-            input: Some(pb::Input {
-                kind: Some(pb::input::Kind::Http(pb::HttpInput::default())),
-            }),
-            outcome: Some(pb::Outcome {
-                kind: pb::OutcomeKind::Committed as i32,
-                ..Default::default()
-            }),
             writes: vec![write("s", b"personal")],
-            ..Default::default()
+            ..http_turn("counter", "a", "r1".into())
         };
         sealer.erase("user:1", 2).unwrap();
         assert!(privacy.reveal_turn(&mut t));
@@ -498,16 +499,7 @@ mod tests {
             t.writes[0]
         );
         let store = kronik_store::Store::memory().unwrap();
-        store
-            .apply(&[kronik_log::Committed {
-                lsn: 1,
-                pos: kronik_log::Position {
-                    segment: 0,
-                    offset: 0,
-                },
-                record: kronik_proto::Record::TurnRecord(t),
-            }])
-            .unwrap();
+        store.apply(&[committed(1, t)]).unwrap();
         let actor = ActorRef::parse("counter/a").unwrap();
         let state = ForkState::new(store.clone(), actor.clone(), privacy.clone());
         assert_eq!(
@@ -582,10 +574,8 @@ mod tests {
         use std::collections::BTreeSet;
         use std::sync::Arc;
 
-        use kronik_log::{Committed, Position};
         use kronik_privacy::MasterKey;
         use kronik_privacy::keystore::Pseudonyms;
-        use kronik_proto::Record;
         use kronik_store::sql::{Limits, MemOpener, SqlActor, TurnOpts};
 
         const ROW: &str = "ROW-u1-5e2c";
@@ -631,26 +621,10 @@ mod tests {
             let master = MasterKey::from_bytes([9; 32]).unwrap();
             let sealer =
                 Arc::new(Sealer::plain().with_pseudonyms(Pseudonyms::new(&master).unwrap()));
-            let turn =
-                |lsn: u64, ddl: Vec<String>, changes: Vec<(Option<String>, Vec<u8>)>| Committed {
+            let turn = |lsn: u64, ddl: Vec<String>, changes: Vec<(Option<String>, Vec<u8>)>| {
+                committed(
                     lsn,
-                    pos: Position {
-                        segment: 0,
-                        offset: 0,
-                    },
-                    record: Record::TurnRecord(pb::TurnRecord {
-                        actor: Some(pb::ActorRef {
-                            kind: "notes".into(),
-                            key: "n".into(),
-                        }),
-                        causal_key: Some(kronik_core::causal::root(format!("r{lsn}"))),
-                        input: Some(pb::Input {
-                            kind: Some(pb::input::Kind::Http(pb::HttpInput::default())),
-                        }),
-                        outcome: Some(pb::Outcome {
-                            kind: pb::OutcomeKind::Committed as i32,
-                            ..Default::default()
-                        }),
+                    pb::TurnRecord {
                         sql_schema: ddl
                             .into_iter()
                             .map(|statement| pb::SqlSchemaChange { statement })
@@ -664,9 +638,10 @@ mod tests {
                                 }),
                             })
                             .collect(),
-                        ..Default::default()
-                    }),
-                };
+                        ..http_turn("notes", "n", format!("r{lsn}"))
+                    },
+                )
+            };
             let records = vec![
                 turn(1, vec![SCHEMA.into()], Vec::new()),
                 turn(2, Vec::new(), dml.changesets.clone()),
@@ -727,10 +702,8 @@ mod tests {
         use std::collections::BTreeSet;
         use std::sync::Arc;
 
-        use kronik_log::{Committed, Position};
         use kronik_privacy::MasterKey;
         use kronik_privacy::keystore::{Keystore, Pseudonyms};
-        use kronik_proto::Record;
         use kronik_store::sql::{Limits, MemOpener, SqlActor, TurnOpts};
 
         const MINE: &str = "ROW-u1-3b7d";
@@ -789,34 +762,20 @@ mod tests {
                 }
             })
             .collect();
-        let turn = |lsn: u64, ddl: &[String], sql_changes: Vec<pb::SqlChangeset>| Committed {
-            lsn,
-            pos: Position {
-                segment: 0,
-                offset: 0,
-            },
-            record: Record::TurnRecord(pb::TurnRecord {
-                actor: Some(pb::ActorRef {
-                    kind: "notes".into(),
-                    key: "n".into(),
-                }),
-                causal_key: Some(kronik_core::causal::root(format!("r{lsn}"))),
-                input: Some(pb::Input {
-                    kind: Some(pb::input::Kind::Http(pb::HttpInput::default())),
-                }),
-                outcome: Some(pb::Outcome {
-                    kind: pb::OutcomeKind::Committed as i32,
-                    ..Default::default()
-                }),
-                sql_schema: ddl
-                    .iter()
-                    .map(|statement| pb::SqlSchemaChange {
-                        statement: statement.clone(),
-                    })
-                    .collect(),
-                sql_changes,
-                ..Default::default()
-            }),
+        let turn = |lsn: u64, ddl: &[String], sql_changes: Vec<pb::SqlChangeset>| {
+            committed(
+                lsn,
+                pb::TurnRecord {
+                    sql_schema: ddl
+                        .iter()
+                        .map(|statement| pb::SqlSchemaChange {
+                            statement: statement.clone(),
+                        })
+                        .collect(),
+                    sql_changes,
+                    ..http_turn("notes", "n", format!("r{lsn}"))
+                },
+            )
         };
         let replay = |no_pii: bool| {
             let records = vec![
