@@ -473,16 +473,7 @@ enum RootUnit {
 /// the unit is not loaded, runs as a user (the nonroot service, which
 /// `delegate` checks under `--rootless`), or systemd cannot be asked.
 fn root_unit() -> Option<RootUnit> {
-    let output = Command::new("systemctl")
-        .args([
-            "show",
-            "--property=LoadState,User,MainPID,DelegateSubgroup",
-            "kronik.service",
-        ])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())?;
-    let text = String::from_utf8(output.stdout).ok()?;
+    let text = unit_show(&["--property=LoadState,User,MainPID,DelegateSubgroup"])?;
     let pid = main_pid(&text);
     let cgroup = pid
         .filter(|&pid| pid != 0)
@@ -566,18 +557,7 @@ fn microvm_leaf(bundle: bool, unit: Option<RootUnit>) -> Option<Check> {
 /// the devices the service can open.
 fn service_groups(user: &str, gid: u32) -> Vec<u32> {
     let group_file = std::fs::read_to_string("/etc/group").unwrap_or_default();
-    let unit = Command::new("systemctl")
-        .args([
-            "show",
-            "--property=SupplementaryGroups",
-            "--value",
-            "kronik.service",
-        ])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .unwrap_or_default();
+    let unit = unit_show(&["--property=SupplementaryGroups", "--value"]).unwrap_or_default();
     groups_of(&group_file, user, gid, &unit)
 }
 
@@ -967,11 +947,7 @@ fn caps(runsc: &Path, rootless: bool) -> Check {
     if !is_executable(runsc) {
         return check("caps", Status::Warn, "skipped: no runsc").code("RUNSC_MISSING");
     }
-    let unit = Command::new("systemctl")
-        .args(["show", "--property=MainPID", "--value", "kronik.service"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
+    let unit = unit_show(&["--property=MainPID", "--value"])
         .and_then(|s| s.trim().parse::<u32>().ok())
         .filter(|&pid| pid != 0)
         .and_then(|pid| {
@@ -1117,41 +1093,30 @@ fn free_bytes(dir: &Path) -> Option<u64> {
 
 fn disk(data_dir: &Path) -> Check {
     const GIB: u64 = 1 << 30;
-    match free_bytes(data_dir) {
-        Some(free) if free < GIB => failed(
-            "disk",
-            format!(
-                "{:.1} GiB free for {}",
-                free as f64 / GIB as f64,
-                data_dir.display()
-            ),
-            ErrorCode::Unavailable,
-            "the log and snapshots need room: free space or move server.data_dir",
-        ),
-        Some(free) if free < 5 * GIB => check(
-            "disk",
-            Status::Warn,
-            format!(
-                "{:.1} GiB free for {}",
-                free as f64 / GIB as f64,
-                data_dir.display()
-            ),
-        )
-        .hint("history and snapshots grow with traffic; see [retention]"),
-        Some(free) => check(
-            "disk",
-            Status::Pass,
-            format!(
-                "{:.1} GiB free for {}",
-                free as f64 / GIB as f64,
-                data_dir.display()
-            ),
-        ),
-        None => check(
+    let Some(free) = free_bytes(data_dir) else {
+        return check(
             "disk",
             Status::Warn,
             format!("cannot tell the free space for {}", data_dir.display()),
-        ),
+        );
+    };
+    let text = format!(
+        "{:.1} GiB free for {}",
+        free as f64 / GIB as f64,
+        data_dir.display()
+    );
+    if free < GIB {
+        failed(
+            "disk",
+            text,
+            ErrorCode::Unavailable,
+            "the log and snapshots need room: free space or move server.data_dir",
+        )
+    } else if free < 5 * GIB {
+        check("disk", Status::Warn, text)
+            .hint("history and snapshots grow with traffic; see [retention]")
+    } else {
+        check("disk", Status::Pass, text)
     }
 }
 
@@ -1422,13 +1387,19 @@ fn ship_directory(dir: &Path, show: Option<&str>) -> Check {
 /// The properties of `kronik.service` that decide where it may write, from
 /// `systemctl show`; `None` when systemd cannot be asked.
 fn unit_sandbox() -> Option<String> {
+    unit_show(&[
+        "--property=LoadState,ProtectSystem,ProtectHome,PrivateTmp,ReadWritePaths,\
+         StateDirectory,RuntimeDirectory,LogsDirectory,CacheDirectory",
+    ])
+}
+
+/// `systemctl show <args> kronik.service`: its output, or `None` when
+/// systemd cannot be asked.
+fn unit_show(args: &[&str]) -> Option<String> {
     let output = Command::new("systemctl")
-        .args([
-            "show",
-            "--property=LoadState,ProtectSystem,ProtectHome,PrivateTmp,ReadWritePaths,\
-             StateDirectory,RuntimeDirectory,LogsDirectory,CacheDirectory",
-            "kronik.service",
-        ])
+        .arg("show")
+        .args(args)
+        .arg("kronik.service")
         .output()
         .ok()
         .filter(|output| output.status.success())?;
