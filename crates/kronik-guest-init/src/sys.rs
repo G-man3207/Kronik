@@ -237,7 +237,7 @@ fn setup_root() -> io::Result<()> {
     Ok(())
 }
 
-fn loopback_up() -> io::Result<()> {
+pub(super) fn loopback_up() -> io::Result<()> {
     // SAFETY: socket has no pointer parameters.
     let socket = owned(
         unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) },

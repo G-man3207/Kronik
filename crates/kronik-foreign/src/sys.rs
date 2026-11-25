@@ -10,9 +10,9 @@
 //! lives on through its bind mount, a socket keeps the namespace it was
 //! created in.
 
-// Allowlisted: unshare(2), setns(2), mount(2), umount2(2), the interface
-// flag ioctls and geteuid(2) have no safe binding in libc, and adding a
-// crate for five calls is not worth its surface.
+// Allowlisted: unshare(2), setns(2), mount(2), umount2(2) and geteuid(2) have
+// no safe binding in libc, and adding a crate for them is not worth its
+// surface.
 #![allow(unsafe_code)]
 
 use std::ffi::CString;
@@ -89,42 +89,12 @@ pub fn create_netns(path: &Path) -> io::Result<()> {
             },
             "bind-mounting the namespace",
         )?;
-        loopback_up()
+        kronik_guest_init::loopback_up()
     });
     if result.is_err() {
         let _ = delete_netns(path);
     }
     result
-}
-
-/// Sets `lo` up in the calling thread's network namespace.
-fn loopback_up() -> io::Result<()> {
-    // SAFETY: plain socket(2); the descriptor is owned by `sock` below.
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fd is a fresh descriptor that nothing else owns.
-    let sock = unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
-    // SAFETY: ifreq is a plain C struct; all-zero is a valid value.
-    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
-    for (dst, src) in req.ifr_name.iter_mut().zip(b"lo\0") {
-        *dst = *src as libc::c_char;
-    }
-    // SAFETY: SIOCGIFFLAGS reads the flags into `req`, which outlives the
-    // call. The request's type is the platform's (`c_ulong` on glibc,
-    // `c_int` on musl), hence `as _`.
-    check(
-        unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut req) },
-        "reading the flags of lo",
-    )?;
-    // SAFETY: SIOCGIFFLAGS filled the flags member of the union.
-    unsafe { req.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short };
-    // SAFETY: as above; SIOCSIFFLAGS reads `req`.
-    check(
-        unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS as _, &req) },
-        "setting lo up",
-    )
 }
 
 /// Unmounts and removes a namespace file made by [`create_netns`] (or

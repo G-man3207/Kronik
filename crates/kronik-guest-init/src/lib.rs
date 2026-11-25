@@ -184,6 +184,13 @@ pub fn power_off() -> io::Result<()> {
     sys::power_off()
 }
 
+/// Sets `lo` up in the calling thread's network namespace. The guest calls it
+/// at boot; kronik-foreign calls it for the network namespaces it creates on
+/// the host.
+pub fn loopback_up() -> io::Result<()> {
+    sys::loopback_up()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
