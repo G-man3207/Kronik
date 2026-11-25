@@ -1,21 +1,10 @@
 use super::*;
+use crate::committed as at;
 use crate::db::StateDb;
-use kronik_log::{Committed, Position};
 use rusqlite::Connection;
 
 fn db() -> StateDb {
     StateDb::open(Connection::open_in_memory().unwrap()).unwrap()
-}
-
-fn at(lsn: Lsn, record: Record) -> Committed {
-    Committed {
-        lsn,
-        pos: Position {
-            segment: 1,
-            offset: lsn * 100,
-        },
-        record,
-    }
 }
 
 fn blob(n: u8, size: u64) -> pb::BlobRef {
