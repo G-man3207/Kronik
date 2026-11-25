@@ -13,11 +13,12 @@ use std::time::Duration;
 
 use common::{Proc, audit, wait_turn};
 use kronik_core::env::{BoxFuture, Env};
+use kronik_core::error::ApiError;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::snapshots::StorageConfig;
-use kronik_sched::{Ingress, Node, NodeConfig, start_local};
+use kronik_sched::{Ingress, Node, NodeConfig, TurnResult, start_local};
 use kronik_store::Store;
 use kronik_store::sql::{Limits, MemOpener, SqlPool};
 use tokio::runtime::Runtime;
@@ -152,6 +153,29 @@ impl Proc {
     }
 }
 
+/// Spawns `notes/n`'s `add-call` "in the turn" on a fresh lease, and waits
+/// until the callee's turn committed: the caller then parks with its SQL
+/// savepoint open, between its statements.
+fn park_sql_call(p: &Proc) -> tokio::task::JoinHandle<Result<Option<TurnResult>, ApiError>> {
+    let before = p.node.applied_lsn();
+    let node = p.node.clone();
+    let held = p.rt.spawn(async move {
+        let to = ActorRef::parse("notes/n").unwrap();
+        let original = node.local_operator_authority().unwrap();
+        node.send(to, msg("add-call", "in the turn"), audit(), false, original)
+            .await
+    });
+    // The callee's turn commits; the caller then parks with its row open.
+    for _ in 0..500 {
+        if p.node.applied_lsn() > before {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(p.node.applied_lsn() > before, "the call never answered");
+    held
+}
+
 fn tempdir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("snapshots-")
@@ -274,22 +298,7 @@ fn a_snapshot_during_an_open_sql_turn_succeeds() {
             .unwrap();
     }
     p.send("notes/n", "add", "applied");
-    let before = p.node.applied_lsn();
-    let node = p.node.clone();
-    let held = p.rt.spawn(async move {
-        let to = ActorRef::parse("notes/n").unwrap();
-        let original = node.local_operator_authority().unwrap();
-        node.send(to, msg("add-call", "in the turn"), audit(), false, original)
-            .await
-    });
-    // The callee's turn commits; the caller then parks with its row open.
-    for _ in 0..500 {
-        if p.node.applied_lsn() > before {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(p.node.applied_lsn() > before, "the call never answered");
+    let held = park_sql_call(&p);
     let m = p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
     assert_eq!(rebuilt_hash(&p.records(m.lsn)), m.state_hash);
     // The integrity hash (GET /v1/integrity) is the applied state's too
@@ -1728,21 +1737,7 @@ fn a_compaction_waits_for_an_actor_database_a_turn_has_open() {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    let before = p.node.applied_lsn();
-    let node = p.node.clone();
-    let held = p.rt.spawn(async move {
-        let to = ActorRef::parse("notes/n").unwrap();
-        let original = node.local_operator_authority().unwrap();
-        node.send(to, msg("add-call", "in the turn"), audit(), false, original)
-            .await
-    });
-    for _ in 0..500 {
-        if p.node.applied_lsn() > before {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(p.node.applied_lsn() > before, "the call never answered");
+    let held = park_sql_call(&p);
     // Traffic of another actor rolls segments and moves time.
     for i in 0..80 {
         p.send(&format!("counter/k{}", i % 5), "increment", "");

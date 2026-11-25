@@ -227,6 +227,52 @@ impl Proc {
         self.deploy_file(COUNTER);
     }
 
+    /// Counter and the leaky guest deployed, the secret `k1` set to `secret`,
+    /// and `leaky` granted each of `caps`.
+    fn leaky(&self, secret: &str, caps: &[&str]) {
+        self.deploy();
+        self.deploy_file(LEAKY);
+        self.rt
+            .block_on(self.node.secret_set(
+                "k1",
+                secret.as_bytes().to_vec(),
+                &audit(),
+                false,
+                self.owner(),
+            ))
+            .unwrap();
+        for cap in caps {
+            self.rt
+                .block_on(self.node.grant(
+                    "leaky",
+                    cap,
+                    None,
+                    None,
+                    kronik_effects::InForks::Recorded,
+                    audit(),
+                    false,
+                    self.owner(),
+                ))
+                .unwrap();
+        }
+    }
+
+    /// Sets `notes`' SQL bytes per actor.
+    fn sql_limit(&self, bytes: u64) {
+        self.rt
+            .block_on(self.node.set_limits(
+                pb::Limits {
+                    kind: "notes".into(),
+                    sql_bytes_per_actor: Some(bytes),
+                    ..Default::default()
+                },
+                audit(),
+                false,
+                self.owner(),
+            ))
+            .unwrap();
+    }
+
     fn grant(&self, cap: &str, delivery: Option<Delivery>, rate: Option<Rate>) {
         self.rt
             .block_on(self.node.grant(
@@ -1293,22 +1339,9 @@ fn revealed_values_are_scrubbed_from_state_messages_replies_sql_and_files() {
     assert!(leaks.is_empty(), "the revealed value is in {leaks:?}");
 }
 
-#[test]
-fn sql_size_limit_per_kind() {
-    let dir = tempfile::tempdir().unwrap();
-    let p = start(dir.path());
-    p.rt.block_on(
-        p.node
-            .deploy(&std::fs::read(NOTES).unwrap(), audit(), false, p.owner()),
-    )
-    .unwrap();
-    let limits = pb::Limits {
-        kind: "notes".into(),
-        sql_bytes_per_actor: Some(64 << 10),
-        ..Default::default()
-    };
-    p.rt.block_on(p.node.set_limits(limits, audit(), false, p.owner()))
-        .unwrap();
+/// Adds 8 KiB notes until one fails with `TooLarge` after more than two,
+/// raises the limit to 16 MiB and checks that the next note commits.
+fn fill_until_too_large(p: &Proc) {
     let big = "x".repeat(8 << 10);
     let mut failed = None;
     for i in 0..40 {
@@ -1322,14 +1355,21 @@ fn sql_size_limit_per_kind() {
     assert!(n > 2, "failed too early: {n}");
     assert!(why.contains("TooLarge"), "{why}");
     // Raising the limit lets the actor grow again.
-    let limits = pb::Limits {
-        kind: "notes".into(),
-        sql_bytes_per_actor: Some(16 << 20),
-        ..Default::default()
-    };
-    p.rt.block_on(p.node.set_limits(limits, audit(), false, p.owner()))
-        .unwrap();
+    p.sql_limit(16 << 20);
     assert!(p.send("notes/n", msg("add", &big)).committed());
+}
+
+#[test]
+fn sql_size_limit_per_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.rt.block_on(
+        p.node
+            .deploy(&std::fs::read(NOTES).unwrap(), audit(), false, p.owner()),
+    )
+    .unwrap();
+    p.sql_limit(64 << 10);
+    fill_until_too_large(&p);
 }
 
 #[test]
@@ -1348,26 +1388,7 @@ fn sql_size_default_comes_from_the_node_and_limits_set_wins() {
             .deploy(&std::fs::read(NOTES).unwrap(), audit(), false, p.owner()),
     )
     .unwrap();
-    let big = "x".repeat(8 << 10);
-    let mut failed = None;
-    for i in 0..40 {
-        let r = p.send("notes/n", msg("add", &big));
-        if !r.committed() {
-            failed = Some((i, r.outcome.message.clone()));
-            break;
-        }
-    }
-    let (n, why) = failed.expect("the installation 64 KiB limit must stop inserts");
-    assert!(n > 2, "failed too early: {n}");
-    assert!(why.contains("TooLarge"), "{why}");
-    let limits = pb::Limits {
-        kind: "notes".into(),
-        sql_bytes_per_actor: Some(16 << 20),
-        ..Default::default()
-    };
-    p.rt.block_on(p.node.set_limits(limits, audit(), false, p.owner()))
-        .unwrap();
-    assert!(p.send("notes/n", msg("add", &big)).committed());
+    fill_until_too_large(&p);
 }
 
 #[test]
@@ -1500,28 +1521,7 @@ fn an_unsafe_compensation_denies_the_call_and_the_node_restarts() {
     const SECRET: &str = "VALUE-comp-5d1e9a";
     let dir = tempfile::tempdir().unwrap();
     let p = start(dir.path());
-    p.deploy();
-    p.rt.block_on(
-        p.node
-            .deploy(&std::fs::read(LEAKY).unwrap(), audit(), false, p.owner()),
-    )
-    .unwrap();
-    p.rt.block_on(
-        p.node
-            .secret_set("k1", SECRET.as_bytes().to_vec(), &audit(), false, p.owner()),
-    )
-    .unwrap();
-    p.rt.block_on(p.node.grant(
-        "leaky",
-        "secret-reveal:k1",
-        None,
-        None,
-        kronik_effects::InForks::Recorded,
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
+    p.leaky(SECRET, &["secret-reveal:k1"]);
     let r = p.send("leaky/a", msg("reveal-comp", "k1 leaky/b"));
     assert!(!r.committed(), "{r:?}");
     // The call with the unsafe compensation is denied outright; the guest's
@@ -1582,30 +1582,7 @@ fn a_revealed_value_in_a_fetch_is_not_written_anywhere() {
     };
     config.secret_settings.fetch_timeout = Duration::from_secs(30);
     let p = start_with(dir.path(), config);
-    p.deploy();
-    p.rt.block_on(
-        p.node
-            .deploy(&std::fs::read(LEAKY).unwrap(), audit(), false, p.owner()),
-    )
-    .unwrap();
-    p.rt.block_on(
-        p.node
-            .secret_set("k1", SECRET.as_bytes().to_vec(), &audit(), false, p.owner()),
-    )
-    .unwrap();
-    for cap in ["secret-reveal:k1", "http:127.0.0.1"] {
-        p.rt.block_on(p.node.grant(
-            "leaky",
-            cap,
-            None,
-            None,
-            kronik_effects::InForks::Recorded,
-            audit(),
-            false,
-            p.owner(),
-        ))
-        .unwrap();
-    }
+    p.leaky(SECRET, &["secret-reveal:k1", "http:127.0.0.1"]);
     let r = p.send(
         "leaky/a",
         msg("reveal-fetch", &format!("k1 {}", server.url("/echo"))),
@@ -1635,30 +1612,7 @@ fn a_rerun_after_an_echoed_revealed_value_does_not_diverge() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start();
     let p = start(dir.path());
-    p.deploy();
-    p.rt.block_on(
-        p.node
-            .deploy(&std::fs::read(LEAKY).unwrap(), audit(), false, p.owner()),
-    )
-    .unwrap();
-    p.rt.block_on(
-        p.node
-            .secret_set("k1", SECRET.as_bytes().to_vec(), &audit(), false, p.owner()),
-    )
-    .unwrap();
-    for cap in ["secret-reveal:k1", "http:127.0.0.1"] {
-        p.rt.block_on(p.node.grant(
-            "leaky",
-            cap,
-            None,
-            None,
-            kronik_effects::InForks::Recorded,
-            audit(),
-            false,
-            p.owner(),
-        ))
-        .unwrap();
-    }
+    p.leaky(SECRET, &["secret-reveal:k1", "http:127.0.0.1"]);
     p.send_detached(
         "leaky/a",
         msg(
