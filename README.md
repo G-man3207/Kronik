@@ -17,7 +17,7 @@ Rust, Python or Go, or Linux programs from OCI images in gVisor. The CLI, the
 JSON API and the MCP server are the primary interfaces; the embedded admin UI is
 partial and unreleased.
 
-[Website](https://www.kronik.se/) · [Quickstart](docs/guides/quickstart.md) ·
+[Website](https://kronik.se/) · [Quickstart](docs/guides/quickstart.md) ·
 [Documentation](docs/introduction.md) ·
 [Project status](https://github.com/G-man3207/Kronik/wiki/Project-status) ·
 [Build brief](https://github.com/G-man3207/Kronik/wiki/Build-Brief)
