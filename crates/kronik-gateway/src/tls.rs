@@ -2,7 +2,7 @@
 //! from PEM files, reloaded twice a day, or from an ACME CA by TLS-ALPN-01 on
 //! the gateway's own port, renewed 30 days before it expires. ACME state
 //! (the account and the certificates) is cached per CA directory. With a
-//! preview domain and a [`Dns01`] provider, a second ACME certificate,
+//! preview domain and an [`ExecHook`], a second ACME certificate,
 //! `*.<preview domain>`, comes by DNS-01 and is served for the names it
 //! covers (ADR 0026).
 //
@@ -15,8 +15,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
-
-use kronik_core::env::BoxFuture;
 
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount,
@@ -60,25 +58,19 @@ pub struct Acme {
 #[derive(Debug, Clone)]
 pub struct Wildcard {
     pub domain: String,
-    pub dns01: Arc<dyn Dns01>,
+    pub dns01: ExecHook,
     /// How long to wait after publishing a TXT record before the CA checks
     /// it.
     pub propagation: Duration,
 }
 
 /// Publishes and removes the TXT records of DNS-01 challenges (RFC 8555
-/// §8.4). `fqdn` is `_acme-challenge.<domain>.`, with the final dot, and
-/// `value` the record's text.
-pub trait Dns01: Send + Sync + std::fmt::Debug {
-    fn present<'a>(&'a self, fqdn: &'a str, value: &'a str) -> BoxFuture<'a, Result<(), String>>;
-    fn cleanup<'a>(&'a self, fqdn: &'a str, value: &'a str) -> BoxFuture<'a, Result<(), String>>;
-}
-
-/// A [`Dns01`] provider that runs an executable, as `<program> present|cleanup
-/// <fqdn> <value>`, which talks to the DNS provider's API. A non-zero exit, or
-/// no exit within `timeout`, is a failure; its output goes to the log. The
-/// hook inherits the daemon's environment, where its DNS credentials live,
-/// minus [`HOOK_ENV_REMOVED`].
+/// §8.4) by running an executable, as `<program> present|cleanup <fqdn>
+/// <value>`, which talks to the DNS provider's API. `fqdn` is
+/// `_acme-challenge.<domain>.`, with the final dot, and `value` the record's
+/// text. A non-zero exit, or no exit within `timeout`, is a failure; its
+/// output goes to the log. The hook inherits the daemon's environment, where
+/// its DNS credentials live, minus [`HOOK_ENV_REMOVED`].
 #[derive(Debug, Clone)]
 pub struct ExecHook {
     pub program: PathBuf,
@@ -90,13 +82,19 @@ pub struct ExecHook {
 pub const HOOK_ENV_REMOVED: &[&str] = &[kronik_privacy::MASTER_KEY_ENV, "KRONIK_TOKEN"];
 
 impl ExecHook {
-    async fn run(&self, action: &str, fqdn: &str, value: &str) -> Result<(), String> {
-        self.run_with(&[], action, fqdn, value).await
+    /// Publishes the TXT record for `fqdn`.
+    pub async fn present(&self, fqdn: &str, value: &str) -> Result<(), String> {
+        self.run_with(&[], "present", fqdn, value).await
     }
 
-    /// `run`, with `daemon_env` added to the inherited environment before
-    /// the secrets are removed: the seam that lets a test stand in for the
-    /// daemon's environment without changing the test process's.
+    /// Removes the TXT record for `fqdn`.
+    pub async fn cleanup(&self, fqdn: &str, value: &str) -> Result<(), String> {
+        self.run_with(&[], "cleanup", fqdn, value).await
+    }
+
+    /// Runs `action` with `daemon_env` added to the inherited environment
+    /// before the secrets are removed: the seam that lets a test stand in
+    /// for the daemon's environment without changing the test process's.
     async fn run_with(
         &self,
         daemon_env: &[(&str, &str)],
@@ -151,16 +149,6 @@ impl ExecHook {
                 stderr.trim()
             ))
         }
-    }
-}
-
-impl Dns01 for ExecHook {
-    fn present<'a>(&'a self, fqdn: &'a str, value: &'a str) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(self.run("present", fqdn, value))
-    }
-
-    fn cleanup<'a>(&'a self, fqdn: &'a str, value: &'a str) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(self.run("cleanup", fqdn, value))
     }
 }
 
@@ -462,7 +450,7 @@ async fn account(acme: &Acme, dir: &Path) -> Result<Account, String> {
 }
 
 /// Orders a certificate, answering each TLS-ALPN-01 challenge on the
-/// gateway's port, or each DNS-01 challenge through the [`Dns01`] provider;
+/// gateway's port, or each DNS-01 challenge through the [`ExecHook`];
 /// returns the private key and the chain, as PEM.
 async fn order(
     resolver: &Resolver,

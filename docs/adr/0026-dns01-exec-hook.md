@@ -71,3 +71,10 @@ these APIs built in and no way to test against them in CI.
   `preview_domain` is unset (ADR 0025).
 - `scripts/e2e-acme-pebble.sh` covers the flow against Pebble, with a hook
   that sets the TXT records through pebble-challtestsrv's management API.
+
+## Amendment (2026-11-25): no trait until a second provider
+
+The `Dns01` seam was removed (#329). `Wildcard::dns01` is an `ExecHook`, and
+its plain `present` and `cleanup` methods keep the hook contract above. There
+was one implementation, so the trait added only a boxed future at each call.
+Put the trait back when a second DNS provider arrives.
