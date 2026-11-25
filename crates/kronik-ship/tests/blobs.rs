@@ -10,11 +10,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::{audit, guest, rt, s3_url, tempdir};
 use kronik_blob::{BlobId, Space, SweepOptions};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
@@ -26,34 +29,9 @@ use kronik_ship::{
 };
 use tokio::runtime::Runtime;
 
-const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
-
 struct Proc {
     rt: Runtime,
     node: Arc<Node>,
-}
-
-fn rt() -> Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap()
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
-
-fn tempdir(prefix: &str) -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .unwrap()
 }
 
 fn start(dir: &Path) -> Proc {
@@ -86,7 +64,7 @@ impl Proc {
     fn deploy(&self) {
         self.rt
             .block_on(self.node.deploy(
-                &std::fs::read(MEDIA).unwrap(),
+                &guest("media"),
                 audit(),
                 false,
                 self.node.local_operator_authority().unwrap(),
@@ -588,24 +566,6 @@ fn ship_and_restore_blobs_from_a_directory_bucket() {
     let bucket = tempdir("blob-ship-bucket-");
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     ship_and_restore_blobs(&remote);
-}
-
-/// The S3 URL of this run (`scripts/s3.sh` exports it), or `None` to skip.
-/// With `KRONIK_TEST_S3=require` (the `s3` step of `scripts/ci.sh`) a
-/// missing URL fails the test, so that a run never passes by skipping.
-fn s3_url() -> Option<String> {
-    match std::env::var("KRONIK_TEST_S3_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            assert_ne!(
-                std::env::var("KRONIK_TEST_S3").as_deref(),
-                Ok("require"),
-                "KRONIK_TEST_S3=require, but KRONIK_TEST_S3_URL is not set: run this test under scripts/s3.sh"
-            );
-            eprintln!("KRONIK_TEST_S3_URL is not set; run scripts/s3.sh for this test");
-            None
-        }
-    }
 }
 
 #[test]

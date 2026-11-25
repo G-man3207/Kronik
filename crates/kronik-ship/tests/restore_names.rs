@@ -6,14 +6,16 @@
 //! to break each part of these rules.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use common::{audit, guest, message, rt, tempdir};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_privacy::key_source::lock_data;
-use kronik_proto::log::v1 as pb;
 use kronik_sched::snapshots::{Manifest, SnapshotFile, StorageConfig};
 use kronik_sched::{Node, NodeConfig, start_local};
 use kronik_ship::{
@@ -22,50 +24,6 @@ use kronik_ship::{
 };
 use tokio::runtime::Runtime;
 
-fn runtime() -> Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap()
-}
-
-fn tempdir(prefix: &str) -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .unwrap()
-}
-
-fn guest(name: &str) -> Vec<u8> {
-    std::fs::read(format!(
-        "{}/../../tests/guests/{name}.wasm",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap()
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
-
-fn message(name: &str, body: &str) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-        }),
-        blobs: vec![],
-        retained_compensation_source: None,
-    }
-}
-
 /// A node running on `dir`, with the runtime it runs on.
 struct Proc {
     rt: Runtime,
@@ -73,7 +31,7 @@ struct Proc {
 }
 
 fn start(dir: &Path) -> Proc {
-    let rt = runtime();
+    let rt = rt();
     let node = rt.block_on(async {
         let mut storage = StorageConfig::new(dir.to_path_buf());
         storage.snapshots_kept = 2;
@@ -174,7 +132,7 @@ fn shipped(flow: Flow) -> Shipped {
     let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
     drop(p);
 
-    let rt = runtime();
+    let rt = rt();
     let (_, snapshots) = rt.block_on(remote.list("main/snapshots")).unwrap();
     assert_eq!(snapshots.len(), 1, "{snapshots:?}");
     let base = format!("main/snapshots/{}", snapshots[0]);
@@ -825,7 +783,7 @@ fn a_deployment_after_the_snapshot_names_its_component_from_the_segment(flow: Fl
     let notes = format!("{}.wasm", blake3::hash(&guest("notes")).to_hex());
 
     // The whole set: the snapshot names counter, the segments name notes.
-    let rt = runtime();
+    let rt = rt();
     let (_area, data) = destination_of(&key);
     let report = restore_in(flow, &rt, &remote, &data, false).unwrap();
     assert_eq!(report.components, 2, "{report:?}");
