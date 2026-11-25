@@ -581,3 +581,149 @@ fn bounded_writer_refuses_growth_before_allocation_and_does_not_lose_accepted_by
     assert_eq!(counted.count(), 2);
     assert!(counted.into_bytes().is_empty());
 }
+
+#[test]
+fn strict_raw_host_no_match_preserves_existing_canonical_v2_bytes_and_fingerprint() {
+    let values = [("unused", b"private-value".as_slice())];
+    let matcher = CompiledScrubber::new(&values, MAX_SECRET_PATTERN_BYTES).unwrap();
+    for (url, canonical_url) in [
+        (
+            "https://MiXeD.example/echo?x=1",
+            "https://mixed.example/echo?x=1",
+        ),
+        ("https://[ABCD:DB8::1]/echo", "https://[abcd:db8::1]/echo"),
+    ] {
+        let source = pb::HttpEffectRequest {
+            method: "GET".into(),
+            url: url.into(),
+            ..Default::default()
+        };
+        let (canonical, raw_host) = parse_request_url(&source.url).unwrap();
+        assert!(
+            !http_url_contains(&canonical, raw_host, &|bytes| matcher.is_match(bytes)).unwrap()
+        );
+        let mut expected = source.clone();
+        expected.url = canonical_url.into();
+        expected.fingerprint_version = 2;
+        let expected_fingerprint = fingerprint_v2(&expected, &canonical).unwrap();
+        let mut prepared = source.clone();
+        let target = http_request(&mut prepared, &canonical, raw_host, &matcher, 4096).unwrap();
+        assert_eq!(prepared.encode_to_vec(), expected.encode_to_vec());
+        assert_eq!(target, canonical);
+        assert_eq!(prepared_target(&prepared).unwrap(), target);
+        assert_eq!(
+            fingerprint_v2(&prepared, &target).unwrap(),
+            expected_fingerprint
+        );
+    }
+}
+
+#[test]
+fn strict_raw_host_and_canonical_fallback_share_match_policy_without_rescanning_marker_names() {
+    for value in [b"ABC".as_slice(), b"abc".as_slice()] {
+        let values = [("CaseNAME", value), ("later", b"CaseNAME".as_slice())];
+        let matcher = CompiledScrubber::new(&values, MAX_SECRET_PATTERN_BYTES).unwrap();
+        let source = pb::HttpEffectRequest {
+            method: "GET".into(),
+            url: "https://ABC.ExAmPlE/echo".into(),
+            ..Default::default()
+        };
+        let (canonical, raw_host) = parse_request_url(&source.url).unwrap();
+        assert!(http_url_contains(&canonical, raw_host, &|bytes| matcher.is_match(bytes)).unwrap());
+        let mut prepared = source.clone();
+        let target = http_request(&mut prepared, &canonical, raw_host, &matcher, 4096).unwrap();
+        assert_eq!(target.host, "%5bsecret%3aCaseNAME%5d.example");
+        assert_eq!(prepared.url, "https://%5bsecret%3aCaseNAME%5d.example/echo");
+        assert!(!prepared.url.contains(std::str::from_utf8(value).unwrap()));
+        assert_eq!(prepared_target(&prepared).unwrap(), target);
+        assert_eq!(target_of(&prepared).unwrap().1, target.host);
+        assert_eq!(
+            fingerprint_v2(&prepared, &target).unwrap(),
+            fingerprint_v2(&prepared, &prepared_target(&prepared).unwrap()).unwrap()
+        );
+    }
+}
+
+#[test]
+fn historical_http_identity_is_inventory_but_not_prepared_coverage() {
+    let reference = pb::SecretRef {
+        name: "old".into(),
+        version: 7,
+        version_hash: vec![7; 16],
+        ..Default::default()
+    };
+    let mut request = pb::HttpEffectRequest {
+        method: "GET".into(),
+        url: "http://h/".into(),
+        headers: vec![pb::HttpEffectHeader {
+            name: "authorization".into(),
+            value: Some(pb::http_effect_header::Value::Secret(reference.clone())),
+        }],
+        ..Default::default()
+    };
+    let input = pb::Input {
+        kind: Some(pb::input::Kind::Migrate(pb::MigrateInput {
+            from_schema_version: 1,
+            to_schema_version: 2,
+        })),
+    };
+    let effect = |kind: &str, bytes: Vec<u8>| pb::EffectRecord {
+        ordinal: 1,
+        kind: kind.into(),
+        status: pb::EffectStatus::Ok as i32,
+        request: Some(pb::Sealable {
+            value: Some(pb::sealable::Value::Plain(bytes)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    // Version-0 identities remain inventory: the prepared prefix rejects them.
+    assert!(
+        original_secret_prefix(
+            &input,
+            std::slice::from_ref(&effect("http.fetch", request.encode_to_vec())),
+            1
+        )
+        .is_none()
+    );
+    request.fingerprint_version = 2;
+    assert_eq!(
+        original_secret_prefix(&input, &[effect("http.fetch", request.encode_to_vec())], 1)
+            .unwrap()
+            .as_ref(),
+        &[reference]
+    );
+    // An unknown fingerprint version never certifies prepared bytes.
+    request.fingerprint_version = 7;
+    assert!(
+        original_secret_prefix(&input, &[effect("http.fetch", request.encode_to_vec())], 1)
+            .is_none()
+    );
+    // A payload that does not decode as its kind contributes no references.
+    assert!(
+        original_secret_prefix(
+            &input,
+            &[effect(
+                "secret.reveal",
+                pb::RevealEffectRequest::default().encode_to_vec()
+            )],
+            1
+        )
+        .is_none()
+    );
+    assert!(
+        original_secret_prefix(
+            &input,
+            &[effect(
+                "crypto.hmac-sha256",
+                pb::CryptoEffectRequest::default().encode_to_vec()
+            )],
+            1
+        )
+        .is_none()
+    );
+    assert!(
+        original_secret_prefix(&input, &[effect("http.fetch", b"\x22\x05ab".to_vec())], 1)
+            .is_none()
+    );
+}
