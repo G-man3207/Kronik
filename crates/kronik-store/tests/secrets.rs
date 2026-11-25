@@ -235,7 +235,11 @@ fn links_are_configuration_barriers_with_monotone_history_and_bound_provenance()
     apply(&mut db, Record::SecretLink(first.clone())).unwrap();
     assert_eq!(db.config_epoch().unwrap(), 1);
     assert_eq!(
-        db.config_records().unwrap(),
+        db.config_records()
+            .unwrap()
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect::<Vec<_>>(),
         vec![Record::SecretLink(first.clone())]
     );
     for bad in [link(1, 2), link(2, 1)] {

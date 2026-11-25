@@ -9,6 +9,7 @@ use kronik_core::ids::{ActorRef, Lsn};
 use kronik_log::{Committed, LogError, LogReader};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
+use kronik_store::StateDb;
 
 /// A root input of the window.
 #[derive(Debug, Clone)]
@@ -88,39 +89,15 @@ impl Base {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .map_err(|e| e.to_string())?;
-        let mut config: Vec<(Lsn, Record)> = Vec::new();
-        let mut st = conn
-            .prepare("SELECT lsn, record FROM deployments ORDER BY epoch")
-            .map_err(|e| e.to_string())?;
-        let rows = st
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
-            .map_err(|e| e.to_string())?;
-        for row in rows {
-            let (l, b) = row.map_err(|e| e.to_string())?;
-            let d = <pb::Deployment as prost::Message>::decode(b.as_slice())
-                .map_err(|e| e.to_string())?;
-            config.push((l as Lsn, Record::Deployment(d)));
-        }
-        let mut st = conn
-            .prepare("SELECT lsn, kind, record FROM config_records ORDER BY lsn")
-            .map_err(|e| e.to_string())?;
-        let rows = st
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, Vec<u8>>(2)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        for row in rows {
-            let (l, k, b) = row.map_err(|e| e.to_string())?;
-            config.push((
-                l as Lsn,
-                Record::decode(k as u8, &b).map_err(|e| e.to_string())?,
-            ));
-        }
-        config.sort_by_key(|(l, _)| *l);
+        let db = StateDb::read_only(conn).map_err(|e| e.to_string())?;
+        let mut config: Vec<(Lsn, Record)> = db
+            .deployments()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(lsn, deployment)| (lsn, Record::Deployment(deployment)))
+            .collect();
+        config.extend(db.config_records().map_err(|e| e.to_string())?);
+        config.sort_by_key(|(lsn, _)| *lsn);
         Ok(Base { lsn, dir, config })
     }
 }

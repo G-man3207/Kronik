@@ -891,7 +891,7 @@ impl Node {
             .collect();
         let erasure_marks = crate::erasure::Marks::load(erasures, unrecorded);
         let mut history = ConfigHistory::default().with_sql_default(config.sql_bytes_per_actor);
-        for r in config_records {
+        for (_, r) in config_records {
             history.push(r);
         }
         let mut reruns = Vec::new();

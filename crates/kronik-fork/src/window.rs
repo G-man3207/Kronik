@@ -35,19 +35,9 @@ pub fn read_segments(state_db: &Path) -> Result<Vec<(Lsn, Lsn, u64)>, String> {
     let conn =
         rusqlite::Connection::open_with_flags(state_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| e.to_string())?;
-    let mut st = conn
-        .prepare("SELECT start, last_lsn, last_time_ms FROM segments ORDER BY start")
-        .map_err(|e| e.to_string())?;
-    let rows = st
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)? as Lsn,
-                r.get::<_, i64>(1)? as Lsn,
-                r.get::<_, i64>(2)? as u64,
-            ))
-        })
-        .map_err(|e| e.to_string())?;
-    rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+    kronik_store::StateDb::read_only(conn)
+        .and_then(|db| db.segments())
+        .map_err(|e| e.to_string())
 }
 
 /// Roots in `(newest logical time - window_ms, head]`, without reading
