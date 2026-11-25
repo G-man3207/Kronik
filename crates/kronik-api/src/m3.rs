@@ -612,20 +612,7 @@ impl Api {
             ));
         }
         let body = r.body.to_bytes().map_err(bad)?;
-        let msg = pb::Message {
-            name: r.name,
-            content_type: if r.content_type.is_empty() {
-                "application/octet-stream".into()
-            } else {
-                r.content_type
-            },
-            body: Some(pb::Sealable {
-                subject: r.subject,
-                value: Some(pb::sealable::Value::Plain(body)),
-            }),
-            blobs: Vec::new(),
-            retained_compensation_source: None,
-        };
+        let msg = crate::send_message(r.name, r.content_type, r.subject, body);
         // The actor is plain here; the audit export hashes it (M28 §3.5).
         let details = [
             ("actor", format!("{}/{}", actor.kind, actor.key)),
