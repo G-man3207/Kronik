@@ -364,13 +364,11 @@ impl ProcessRunner for RealProcs {
 /// are `NetError::Connect`; anything later is `NetError::Io` (the request may
 /// have been delivered, I17).
 pub struct RealNet {
-    client: Result<HttpClient, String>,
     connector: Result<Connector, String>,
     tls: Result<Arc<rustls::ClientConfig>, String>,
 }
 
 type Connector = hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>;
-type HttpClient = hyper_util::client::legacy::Client<Connector, http_body_util::Full<Bytes>>;
 
 impl RealNet {
     pub fn new() -> RealNet {
@@ -386,15 +384,7 @@ impl RealNet {
                 .enable_http1()
                 .build()
         });
-        let client = connector.clone().map(|connector| {
-            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-                .build(connector)
-        });
-        RealNet {
-            client,
-            connector,
-            tls,
-        }
+        RealNet { connector, tls }
     }
     fn scoped(tls: crate::env::TlsConfig, pinned: bool) -> Result<Self, NetError> {
         let bad = |_| NetError::Connect("invalid provider TLS configuration".into());
@@ -432,11 +422,7 @@ impl RealNet {
             .https_or_http()
             .enable_http1()
             .build();
-        let client =
-            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-                .build(connector.clone());
         Ok(RealNet {
-            client: Ok(client),
             connector: Ok(connector),
             tls: Ok(Arc::new(config)),
         })
@@ -482,57 +468,7 @@ impl Net for RealNet {
     }
 
     fn http(&self, req: HttpRequest) -> BoxFuture<'static, Result<HttpResponse, NetError>> {
-        let client = self.client.clone();
-        Box::pin(async move {
-            use http_body_util::BodyExt as _;
-            let client = client.map_err(NetError::Connect)?;
-            let mut b = hyper::Request::builder()
-                .method(req.method.as_str())
-                .uri(req.url.as_str());
-            for (n, v) in &req.headers {
-                b = b.header(n.as_str(), v.as_str());
-            }
-            let request = b
-                .body(http_body_util::Full::new(req.body))
-                .map_err(|e| NetError::Connect(format!("invalid request: {e}")))?;
-            let resp = client.request(request).await.map_err(|e| {
-                if e.is_connect() {
-                    NetError::Connect(e.to_string())
-                } else {
-                    NetError::Io(e.to_string())
-                }
-            })?;
-            let status = resp.status().as_u16();
-            let headers = resp
-                .headers()
-                .iter()
-                .map(|(n, v)| {
-                    (
-                        n.as_str().to_owned(),
-                        String::from_utf8_lossy(v.as_bytes()).into_owned(),
-                    )
-                })
-                .collect();
-            let limit = usize::try_from(req.max_response_bytes).unwrap_or(usize::MAX);
-            let body = http_body_util::Limited::new(resp.into_body(), limit)
-                .collect()
-                .await
-                .map_err(|e| {
-                    if e.downcast_ref::<http_body_util::LengthLimitError>()
-                        .is_some()
-                    {
-                        NetError::TooLarge
-                    } else {
-                        NetError::Io(e.to_string())
-                    }
-                })?
-                .to_bytes();
-            Ok(HttpResponse {
-                status,
-                headers,
-                body,
-            })
-        })
+        authorized::send(self.connector.clone(), req, Arc::new(authorized::Unscoped))
     }
 }
 
