@@ -95,9 +95,27 @@ fn with_sealed(mut effect: pb::EffectRecord, sealed: pb::Sealed) -> pb::EffectRe
     effect
 }
 
-/// A finished turn of one effect; returns the LSN of its record. The turns
-/// are told apart by `id`.
-async fn finished(node: &Node, id: u32, effect: pb::EffectRecord) -> u64 {
+/// A request of `subject` sealed as a reseal leaves an erased value: an empty
+/// ciphertext under `key_version`.
+fn tombstone(subject: &str, key_version: u32) -> pb::EffectRecord {
+    with_sealed(
+        fetch(Some(subject), None),
+        pb::Sealed {
+            key_version,
+            nonce: vec![0; 24],
+            ciphertext: Vec::new(),
+        },
+    )
+}
+
+/// A finished turn with `effects` and `writes`; returns the LSN of its record.
+/// The turns are told apart by `id`.
+async fn finished_turn(
+    node: &Node,
+    id: u32,
+    effects: Vec<pb::EffectRecord>,
+    writes: Vec<pb::StateWrite>,
+) -> u64 {
     let mut begin = begin(node);
     begin.execution_id = format!("{id:032x}");
     node.commit(Record::TurnBegin(begin.clone())).await.unwrap();
@@ -110,7 +128,8 @@ async fn finished(node: &Node, id: u32, effect: pb::EffectRecord) -> u64 {
         logical_time_ms: begin.logical_time_ms,
         random_seed: begin.random_seed,
         input: begin.input,
-        effects: vec![effect],
+        effects,
+        writes,
         outcome: Some(pb::Outcome {
             kind: pb::OutcomeKind::Committed as i32,
             ..Default::default()
@@ -120,6 +139,12 @@ async fn finished(node: &Node, id: u32, effect: pb::EffectRecord) -> u64 {
     }))
     .await
     .unwrap()
+}
+
+/// A finished turn of one effect; returns the LSN of its record. The turns
+/// are told apart by `id`.
+async fn finished(node: &Node, id: u32, effect: pb::EffectRecord) -> u64 {
+    finished_turn(node, id, vec![effect], Vec::new()).await
 }
 
 /// A node with the privacy mode on, certified.
@@ -502,14 +527,7 @@ fn a_sealed_request_the_node_cannot_open_and_did_not_erase_fails_closed() {
 
         // A tombstone of a subject this keystore never erased says nothing it
         // can vouch for: it is not "erased".
-        let forged = with_sealed(
-            fetch(Some("user:8"), None),
-            pb::Sealed {
-                key_version: 1,
-                nonce: vec![0; 24],
-                ciphertext: Vec::new(),
-            },
-        );
+        let forged = tombstone("user:8", 1);
         let error = scan_of(forged).await.unwrap_err();
         assert_eq!(error.code, ErrorCode::SecretUnavailable);
 
@@ -548,19 +566,7 @@ fn a_tombstone_of_a_subject_the_keystore_erased_is_read_as_erased() {
         // The subject has a key, then none: erased through version 1.
         finished(&node, 1, fetch(Some("user:5"), None)).await;
         erase(&node, "user:5").await;
-        finished(
-            &node,
-            2,
-            with_sealed(
-                fetch(Some("user:5"), None),
-                pb::Sealed {
-                    key_version: 1,
-                    nonce: vec![0; 24],
-                    ciphertext: Vec::new(),
-                },
-            ),
-        )
-        .await;
+        finished(&node, 2, tombstone("user:5", 1)).await;
         let found = node.scan_secret_use(1, node.applied_lsn()).await.unwrap();
         assert_eq!(found.erased, 2);
         assert!(found.references.is_empty());
@@ -692,19 +698,11 @@ fn a_reseal_marks_a_segment_durably_before_it_replaces_it() {
 /// A turn of `begin`'s actor that sets `k` to `value`, tagged with `subject`:
 /// plain while the privacy mode is off.
 async fn wrote(node: &Node, id: u32, subject: &str, k: &str, value: &[u8]) -> u64 {
-    let mut begin = begin(node);
-    begin.execution_id = format!("{id:032x}");
-    node.commit(Record::TurnBegin(begin.clone())).await.unwrap();
-    node.commit(Record::TurnRecord(pb::TurnRecord {
-        execution_id: begin.execution_id,
-        actor: begin.actor,
-        code_hash: begin.code_hash,
-        engine_version: begin.engine_version,
-        causal_key: begin.causal_key,
-        logical_time_ms: begin.logical_time_ms,
-        random_seed: begin.random_seed,
-        input: begin.input,
-        writes: vec![pb::StateWrite {
+    finished_turn(
+        node,
+        id,
+        Vec::new(),
+        vec![pb::StateWrite {
             op: pb::StateOp::Set as i32,
             key: k.into(),
             value: Some(pb::Sealable {
@@ -712,15 +710,8 @@ async fn wrote(node: &Node, id: u32, subject: &str, k: &str, value: &[u8]) -> u6
                 value: Some(pb::sealable::Value::Plain(value.to_vec())),
             }),
         }],
-        outcome: Some(pb::Outcome {
-            kind: pb::OutcomeKind::Committed as i32,
-            ..Default::default()
-        }),
-        config_epoch: begin.config_epoch,
-        ..Default::default()
-    }))
+    )
     .await
-    .unwrap()
 }
 
 const PLAIN: &[u8] = b"a value of user:7 written while the privacy mode was off";
@@ -1006,19 +997,7 @@ fn a_tombstone_of_a_subject_erased_without_a_key_is_read_as_erased() {
         let node = private_node(data.path(), env()).await;
         // user:6 never had a key: erased through version 0.
         erase(&node, "user:6").await;
-        finished(
-            &node,
-            1,
-            with_sealed(
-                fetch(Some("user:6"), None),
-                pb::Sealed {
-                    key_version: 0,
-                    nonce: vec![0; 24],
-                    ciphertext: Vec::new(),
-                },
-            ),
-        )
-        .await;
+        finished(&node, 1, tombstone("user:6", 0)).await;
         let found = node.scan_secret_use(1, node.applied_lsn()).await.unwrap();
         assert_eq!(found.erased, 1);
         assert!(found.references.is_empty());
