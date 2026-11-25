@@ -10,110 +10,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::*;
-use kronik_core::ids::Lsn;
 use kronik_fork::diff::{DiffOptions, Mode};
 use kronik_fork::replay::Progress;
 use kronik_fork::{ForkKind, ProductionIndex, ReplayOutput, ReplaySetup, config_at, fork_kinds};
 use kronik_runtime::TurnLimits;
 use serde_json::Value;
-
-fn replay(
-    p: &Proc,
-    wasm: Option<&str>,
-    fork_lsn: Lsn,
-    options: &DiffOptions,
-    workers: usize,
-) -> ReplayOutput {
-    replay_with(p, wasm, fork_lsn, options, workers, None, None)
-}
-
-/// `replay`, reading production from a base snapshot when given and
-/// counting into `progress`.
-fn replay_with(
-    p: &Proc,
-    wasm: Option<&str>,
-    fork_lsn: Lsn,
-    options: &DiffOptions,
-    workers: usize,
-    base: Option<kronik_fork::index::Base>,
-    progress: Option<Arc<Progress>>,
-) -> ReplayOutput {
-    let to = p.settle();
-    let node = p.node.clone();
-    let original = node.local_operator_authority().unwrap();
-    p.rt.block_on(async move {
-        let index = Arc::new(
-            ProductionIndex::load_from(node.reader(), base, fork_lsn, to)
-                .await
-                .unwrap(),
-        );
-        let mut new = Vec::new();
-        if let Some(w) = wasm {
-            let bytes = std::fs::read(guest(w)).unwrap();
-            let (hash, program) = node.code().add(&bytes).unwrap();
-            let m = program.describe(TurnLimits::default()).await.unwrap();
-            new.push((
-                m.kind.clone(),
-                ForkKind {
-                    hash,
-                    program,
-                    schema_version: m.schema_version,
-                },
-            ));
-        }
-        let code = node.code().clone();
-        let fc = fork_kinds(
-            &index,
-            fork_lsn,
-            |h| code.get(h).map_err(|e| e.to_string()),
-            &new,
-        )
-        .unwrap();
-        let config = config_at(&index, fork_lsn);
-        let mut setup = ReplaySetup::new(
-            "f-test".into(),
-            index.clone(),
-            fc.kinds,
-            config,
-            node.secrets().cloned(),
-            original,
-        );
-        // Subject-tagged effect fingerprints are keyed with the node's
-        // sealer, as a real fork's setup is (proposal replay).
-        setup.privacy.sealer = node.sealer().clone();
-        setup.stubs = options.stubs.clone();
-        setup.live = (!options.live_allowlist.is_empty()).then(|| kronik_fork::LiveAccess {
-            hosts: options.live_allowlist.clone(),
-            env: node.env().clone(),
-        });
-        setup.progress = progress;
-        setup.record_limit = node.turn_record_limit();
-        let setup = Arc::new(setup);
-        kronik_fork::run(
-            node.env(),
-            setup,
-            options,
-            workers,
-            None,
-            fc.before,
-            fc.after,
-            &[],
-        )
-        .await
-        .unwrap()
-    })
-}
-
-fn json(out: &ReplayOutput) -> Value {
-    serde_json::from_slice(&out.bytes).unwrap()
-}
-
-fn opts(mode: Mode) -> DiffOptions {
-    DiffOptions {
-        mode,
-        ..DiffOptions::default()
-    }
-}
 
 /// The progress counters of `kronik proposal status` advance in both modes
 /// and end equal to their totals (review L7).

@@ -29,10 +29,9 @@ use std::sync::Arc;
 
 use common::*;
 use kronik_core::ids::{ActorRef, Lsn};
-use kronik_fork::diff::{DiffOptions, FrameInputs, Mode};
-use kronik_fork::{ForkKind, ProductionIndex, ReplayOutput, ReplaySetup, config_at, fork_kinds};
+use kronik_fork::ProductionIndex;
+use kronik_fork::diff::{FrameInputs, Mode};
 use kronik_proto::log::v1 as pb;
-use kronik_runtime::TurnLimits;
 use kronik_sched::NodeConfig;
 use kronik_sched::connections::RecordingTransport;
 use serde_json::Value;
@@ -241,78 +240,6 @@ fn session(dir: &Path) -> (Proc, Lsn, Vec<String>) {
     (p, fork_lsn, ids)
 }
 
-/// A replay of main's window after `fork_lsn`, with the room's code from
-/// `wasm` when given, as `kronik propose` runs it.
-fn replay(
-    p: &Proc,
-    wasm: Option<&str>,
-    fork_lsn: Lsn,
-    options: &DiffOptions,
-    workers: usize,
-) -> ReplayOutput {
-    let to = p.settle();
-    let node = p.node.clone();
-    let original = node.local_operator_authority().unwrap();
-    p.rt.block_on(async move {
-        let index = Arc::new(
-            ProductionIndex::load_from(node.reader(), None, fork_lsn, to)
-                .await
-                .unwrap(),
-        );
-        let mut new = Vec::new();
-        if let Some(w) = wasm {
-            let bytes = std::fs::read(guest(w)).unwrap();
-            let (hash, program) = node.code().add(&bytes).unwrap();
-            let m = program.describe(TurnLimits::default()).await.unwrap();
-            new.push((
-                m.kind.clone(),
-                ForkKind {
-                    hash,
-                    program,
-                    schema_version: m.schema_version,
-                },
-            ));
-        }
-        let code = node.code().clone();
-        let fc = fork_kinds(
-            &index,
-            fork_lsn,
-            |h| code.get(h).map_err(|e| e.to_string()),
-            &new,
-        )
-        .unwrap();
-        let config = config_at(&index, fork_lsn);
-        let mut setup = ReplaySetup::new(
-            "f-test".into(),
-            index.clone(),
-            fc.kinds,
-            config,
-            node.secrets().cloned(),
-            original,
-        );
-        setup.record_limit = node.turn_record_limit();
-        kronik_fork::run(
-            node.env(),
-            Arc::new(setup),
-            options,
-            workers,
-            None,
-            fc.before,
-            fc.after,
-            &[],
-        )
-        .await
-        .unwrap()
-    })
-}
-
-fn opts(mode: Mode) -> DiffOptions {
-    DiffOptions {
-        mode,
-        ..DiffOptions::default()
-    }
-}
-
 /// The root inputs of the window whose turns sent a `message` event: the
 /// ones a changed message format changes.
 fn message_roots(turns: &BTreeMap<Lsn, pb::TurnRecord>) -> BTreeSet<Lsn> {
@@ -352,10 +279,6 @@ fn check_schema(what: &str, v: &Value) {
             serde_json::to_string_pretty(v).unwrap()
         );
     }
-}
-
-fn json(out: &ReplayOutput) -> Value {
-    serde_json::from_slice(&out.bytes).unwrap()
 }
 
 /// §7.6 and criterion 2: identity replay of the session is empty in every
