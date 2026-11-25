@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use kronik_core::authority::AuthLease;
 use kronik_core::env::{BoxFuture, Clock, EntropySource, Env};
-use kronik_core::ids::{ActorRef, Lsn};
+use kronik_core::ids::{ActorRef, CodeHash, Lsn};
+use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Ingress, Node, NodeConfig, TurnResult, start_local};
 use tokio::runtime::Runtime;
@@ -32,6 +33,13 @@ pub fn guest(name: &str) -> String {
         "{}/../../tests/guests/{name}.wasm",
         env!("CARGO_MANIFEST_DIR")
     )
+}
+
+/// The code hash of the test guest `name`.
+pub fn hash(name: &str) -> Vec<u8> {
+    CodeHash::of(&std::fs::read(guest(name)).unwrap())
+        .0
+        .to_vec()
 }
 
 /// Fails the next generated proposal/preview's atomic metadata rename,
@@ -75,9 +83,9 @@ impl EntropySource for ProposalSaveFault {
 
 /// A real clock with a movable wall offset, so a test can let logical time
 /// pass without sleeping. Sleeps and monotonic time stay real.
-struct ShiftedClock {
-    inner: Arc<dyn Clock>,
-    offset_ms: Arc<AtomicU64>,
+pub struct ShiftedClock {
+    pub inner: Arc<dyn Clock>,
+    pub offset_ms: Arc<AtomicU64>,
 }
 
 impl Clock for ShiftedClock {
@@ -149,6 +157,66 @@ pub fn http_body(r: &TurnResult) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// A reply outcome's plain body, or `""` when it has none.
+pub fn reply(outcome: &pb::Outcome) -> String {
+    match &outcome.output {
+        Some(pb::outcome::Output::Reply(m)) => match m.body.as_ref().and_then(|b| b.value.as_ref())
+        {
+            Some(pb::sealable::Value::Plain(b)) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+/// `turn`'s reply body, or `""` when its outcome has no reply.
+pub fn fork_reply(turn: &kronik_fork::ForkTurn) -> String {
+    turn.record.outcome.as_ref().map(reply).unwrap_or_default()
+}
+
+/// Polls `done` until it holds; the limit only turns a hang into a failure.
+pub fn wait_until(what: &str, done: impl Fn() -> bool) {
+    for _ in 0..6000 {
+        if done() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("never: {what}");
+}
+
+/// Every file under `dir` that contains `needle`.
+pub fn files_with(dir: &Path, needle: &[u8]) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if std::fs::read(&path)
+                .is_ok_and(|bytes| bytes.windows(needle.len()).any(|w| w == needle))
+            {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Every turn record in main's log after `after`.
+pub fn turns_after(p: &Proc, after: Lsn) -> Vec<(Lsn, pb::TurnRecord)> {
+    let head = p.settle();
+    (after + 1..=head)
+        .filter_map(
+            |lsn| match p.rt.block_on(p.node.read_record(lsn)).unwrap()?.record {
+                Record::TurnRecord(t) => Some((lsn, t)),
+                _ => None,
+            },
+        )
+        .collect()
 }
 
 impl Proc {

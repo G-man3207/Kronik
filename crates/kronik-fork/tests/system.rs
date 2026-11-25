@@ -7,17 +7,14 @@ mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use common::*;
 use kronik_core::error::{ApiError, ErrorCode};
-use kronik_core::ids::{CodeHash, Lsn};
 use kronik_fork::diff::DiffOptions;
 use kronik_fork::proposal::{Proposal, Proposals, ProposeRequest};
 use kronik_policy::RuleSet;
-use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{NodeConfig, SwitchHold, TurnResult};
+use kronik_sched::{NodeConfig, SwitchHold};
 use serde_json::Value;
 
 fn request(guests: &[&str]) -> ProposeRequest {
@@ -54,23 +51,6 @@ fn kind<'a>(d: &'a Value, kind: &str) -> &'a Value {
         .iter()
         .find(|k| k["kind"] == kind)
         .unwrap_or_else(|| panic!("no kind {kind} in {}", d["kinds"]))
-}
-
-fn reply(r: &TurnResult) -> String {
-    match &r.outcome.output {
-        Some(pb::outcome::Output::Reply(m)) => match m.body.as_ref().and_then(|b| b.value.as_ref())
-        {
-            Some(pb::sealable::Value::Plain(b)) => String::from_utf8_lossy(b).into_owned(),
-            _ => String::new(),
-        },
-        _ => String::new(),
-    }
-}
-
-fn hash(name: &str) -> Vec<u8> {
-    CodeHash::of(&std::fs::read(guest(name)).unwrap())
-        .0
-        .to_vec()
 }
 
 /// main with counter and notes deployed and traffic on both.
@@ -416,32 +396,6 @@ fn a_rerun_across_a_schema_raising_switch_keeps_its_code_version() {
     );
 }
 
-/// Every turn record in main's log after `after`.
-fn turns_after(p: &Proc, after: Lsn) -> Vec<(Lsn, pb::TurnRecord)> {
-    let head = p.settle();
-    (after + 1..=head)
-        .filter_map(|lsn| {
-            let c = p.rt.block_on(p.node.read_record(lsn)).unwrap()?;
-            match c.record {
-                Record::TurnRecord(t) => Some((lsn, t)),
-                _ => None,
-            }
-        })
-        .collect()
-}
-
-/// Polls `done` until it holds; it depends on no timing, the limit only
-/// turns a hang into a failure.
-fn wait_until(what: &str, done: impl Fn() -> bool) {
-    for _ in 0..6000 {
-        if done() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    panic!("never: {what}");
-}
-
 /// Criterion 3: once a set's `Deployment` is in the log, no turn of any
 /// kind in the set starts with the old code. The switch is parked right
 /// after its `Deployment` is applied and before the code is swapped; turns
@@ -554,7 +508,7 @@ fn rolling_back_a_set_restores_every_kind_at_one_lsn() {
     );
     // Both new codes serve: the increment calls notes/tally.
     assert_eq!(http_body(&p.http("a", "increment", "")), "5");
-    assert_eq!(reply(&p.send("notes/tally", "count", "")), "1");
+    assert_eq!(reply(&p.send("notes/tally", "count", "").outcome), "1");
 
     let (epoch, lsn, kinds) =
         p.rt.block_on(props.rollback(promoted.epoch, audit(), false, p.owner()))
@@ -591,7 +545,7 @@ fn rolling_back_a_set_restores_every_kind_at_one_lsn() {
     // Both kinds behave as before the promote again.
     assert_eq!(http_body(&p.http("a", "increment", "")), "6");
     assert_eq!(
-        reply(&p.send("notes/tally", "count", "")),
+        reply(&p.send("notes/tally", "count", "").outcome),
         "1",
         "no new tally"
     );

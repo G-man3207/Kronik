@@ -20,21 +20,6 @@ use prost::Message as _;
 
 const SECRET: &str = "VALUE-fork-8e31d0";
 
-fn scan(dir: &std::path::Path, hits: &mut Vec<String>) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let p = entry.unwrap().path();
-        if p.is_dir() {
-            scan(&p, hits);
-        } else if std::fs::read(&p)
-            .unwrap()
-            .windows(SECRET.len())
-            .any(|w| w == SECRET.as_bytes())
-        {
-            hits.push(p.display().to_string());
-        }
-    }
-}
-
 #[test]
 fn a_fork_reveals_only_the_placeholder_and_writes_no_secret_value() {
     let (addr, _) = server();
@@ -110,8 +95,7 @@ fn a_fork_reveals_only_the_placeholder_and_writes_no_secret_value() {
     }
     drop(props);
     drop(p);
-    let mut hits = Vec::new();
-    scan(dir.path(), &mut hits);
+    let hits = files_with(dir.path(), SECRET.as_bytes());
     assert!(hits.is_empty(), "the secret value is in {hits:?}");
 }
 

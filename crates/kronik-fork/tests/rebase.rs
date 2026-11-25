@@ -16,7 +16,7 @@ use std::time::Duration;
 use common::*;
 use kronik_core::env::{BoxFuture, Clock, Env, File, Fs, OpenMode, Spawner};
 use kronik_core::error::ErrorCode;
-use kronik_core::ids::{ActorRef, CodeHash, Lsn};
+use kronik_core::ids::{ActorRef, Lsn};
 use kronik_fork::diff::{DiffOptions, Mode};
 use kronik_fork::proposal::{Proposals, ProposeRequest, RebaseRequest};
 use kronik_privacy::sealer::Opened;
@@ -35,12 +35,6 @@ fn kv(p: &Proc, key: &str, k: &str) -> Option<String> {
         .kv_get("counter", key, k)
         .unwrap()
         .map(|v| String::from_utf8(v).unwrap())
-}
-
-fn hash(name: &str) -> Vec<u8> {
-    CodeHash::of(&std::fs::read(guest(name)).unwrap())
-        .0
-        .to_vec()
 }
 
 /// An increment of counter/`key` with an idempotency key.
@@ -499,30 +493,6 @@ fn a_switch_that_cannot_pause_in_time_writes_nothing() {
     };
     assert!(done.rebase.is_some());
     assert_eq!(kv(&s.p, "a", "schema"), None);
-}
-
-/// Polls `done` until it holds; the limit only turns a hang into a failure.
-fn wait_until(what: &str, done: impl Fn() -> bool) {
-    for _ in 0..6000 {
-        if done() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    panic!("never: {what}");
-}
-
-/// Every turn record in main's log after `after`.
-fn turns_after(p: &Proc, after: Lsn) -> Vec<(Lsn, pb::TurnRecord)> {
-    let head = p.settle();
-    (after + 1..=head)
-        .filter_map(
-            |lsn| match p.rt.block_on(p.node.read_record(lsn)).unwrap()?.record {
-                Record::TurnRecord(t) => Some((lsn, t)),
-                _ => None,
-            },
-        )
-        .collect()
 }
 
 /// Releases every parked switch when dropped, so a failed assertion does
@@ -1316,22 +1286,8 @@ fn a_rebase_scrubs_revealed_secrets_like_production() {
     let Setup { p, props, .. } = s;
     drop(props);
     drop(p);
-    let mut leaks = Vec::new();
-    scan(dir.path(), SECRET.as_bytes(), &mut leaks);
+    let leaks = files_with(dir.path(), SECRET.as_bytes());
     assert!(leaks.is_empty(), "the revealed value is in {leaks:?}");
-}
-
-fn scan(dir: &std::path::Path, needle: &[u8], hits: &mut Vec<String>) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let p = entry.unwrap().path();
-        if p.is_dir() {
-            scan(&p, needle, hits);
-        } else if let Ok(bytes) = std::fs::read(&p)
-            && bytes.windows(needle.len()).any(|w| w == needle)
-        {
-            hits.push(p.display().to_string());
-        }
-    }
 }
 
 /// H8, L1 (I12): a rebase answers from recordings only, never from the

@@ -541,17 +541,6 @@ fn payments_full_coverage_stops_promote_under_a_sample() {
     assert_eq!(full.policy["outcome"], "allow", "{}", full.policy);
 }
 
-fn reply_text(t: &kronik_fork::ForkTurn) -> String {
-    match t.record.outcome.as_ref().and_then(|o| o.output.as_ref()) {
-        Some(pb::outcome::Output::Reply(m)) => match m.body.as_ref().and_then(|b| b.value.as_ref())
-        {
-            Some(pb::sealable::Value::Plain(b)) => String::from_utf8_lossy(b).into_owned(),
-            _ => String::new(),
-        },
-        _ => String::new(),
-    }
-}
-
 #[test]
 fn messages_into_a_fork_reach_the_network_only_as_allowlisted_gets() {
     let (addr, hits) = server();
@@ -590,9 +579,9 @@ fn messages_into_a_fork_reach_the_network_only_as_allowlisted_gets() {
     // A POST to an allowlisted host stays FailClosed.
     let t = send(format!("POST http://{addr}/charge\n\nx"));
     assert!(
-        reply_text(&t).contains("replay: no recording"),
+        fork_reply(&t).contains("replay: no recording"),
         "{}",
-        reply_text(&t)
+        fork_reply(&t)
     );
     assert_eq!(
         t.record.effects[0].grounding,
@@ -601,7 +590,7 @@ fn messages_into_a_fork_reach_the_network_only_as_allowlisted_gets() {
     assert_eq!(hits.load(Ordering::SeqCst), 0);
     // A GET to it goes out live.
     let t = send(format!("GET http://{addr}/status"));
-    assert_eq!(reply_text(&t), "200 charged 1");
+    assert_eq!(fork_reply(&t), "200 charged 1");
     assert_eq!(t.record.effects[0].grounding, pb::Grounding::Live as i32);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     // Main never saw any of it.

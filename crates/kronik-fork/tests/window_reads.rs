@@ -8,35 +8,15 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use common::{Proc, audit, guest, tempdir};
-use kronik_core::env::{BoxFuture, Clock, File, Fs, OpenMode};
+use common::{Proc, ShiftedClock, audit, guest, tempdir};
+use kronik_core::env::{BoxFuture, File, Fs, OpenMode};
 use kronik_core::ids::Lsn;
 use kronik_fork::ProductionIndex;
 use kronik_fork::diff::DiffOptions;
 use kronik_fork::proposal::{Proposals, ProposeRequest};
 use kronik_sched::NodeConfig;
 use kronik_sched::snapshots::StorageConfig;
-
-struct ShiftedClock {
-    inner: Arc<dyn Clock>,
-    offset_ms: Arc<AtomicU64>,
-}
-
-impl Clock for ShiftedClock {
-    fn wall_ms(&self) -> u64 {
-        self.inner
-            .wall_ms()
-            .saturating_add(self.offset_ms.load(Ordering::SeqCst))
-    }
-    fn monotonic(&self) -> Duration {
-        self.inner.monotonic()
-    }
-    fn sleep(&self, d: Duration) -> BoxFuture<'static, ()> {
-        self.inner.sleep(d)
-    }
-}
 
 struct CountFs {
     inner: Arc<dyn Fs>,

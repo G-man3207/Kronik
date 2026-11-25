@@ -26,13 +26,11 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use common::*;
 use kronik_core::ids::{ActorRef, Lsn};
 use kronik_fork::diff::{DiffOptions, FrameInputs, Mode};
 use kronik_fork::{ForkKind, ProductionIndex, ReplayOutput, ReplaySetup, config_at, fork_kinds};
-use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::TurnLimits;
 use kronik_sched::connections::RecordingTransport;
@@ -87,16 +85,6 @@ fn open_request(key: &str, query: &str, protocol: pb::ConnectionProtocol) -> pb:
         route: route.into(),
         ..Default::default()
     }
-}
-
-fn until(what: &str, f: impl Fn() -> bool) {
-    for _ in 0..1000 {
-        if f() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for {what}");
 }
 
 /// The room's sequence: how many messages it has stored.
@@ -225,7 +213,7 @@ fn session(dir: &Path) -> (Proc, Lsn, Vec<String>) {
         let mut follower = None;
         for i in 0..30u64 {
             frame(&p, clients[i as usize % 3], &format!("say {WORD}-{i}"));
-            until("the message", || room_seq(&p) == i + 1);
+            wait_until("the message", || room_seq(&p) == i + 1);
             // The follower joins with the history so far: its open sends
             // the stored messages.
             if i == 9 {
@@ -235,7 +223,7 @@ fn session(dir: &Path) -> (Proc, Lsn, Vec<String>) {
         let (dee, _td) = follower.unwrap();
         // Three frames with send-now, then a buffered one (criterion 2).
         frame(&p, &ada, "stream 3");
-        until("the stream", || {
+        wait_until("the stream", || {
             ta.recording().frames.iter().any(|(_, f)| {
                 f.data.as_ref().and_then(|d| d.value.as_ref())
                     == Some(&pb::sealable::Value::Plain(b"done 3".to_vec()))
@@ -244,17 +232,17 @@ fn session(dir: &Path) -> (Proc, Lsn, Vec<String>) {
         http_say(&p, "lemur");
         // cid vanishes, ada kicks bob, then says bye.
         tc.client_close(None);
-        until("cid's close", || closed(&p, &cid));
+        wait_until("cid's close", || closed(&p, &cid));
         frame(&p, &ada, &format!("kick {bob}"));
-        until("bob's close", || closed(&p, &bob));
+        wait_until("bob's close", || closed(&p, &bob));
         frame(&p, &ada, "bye");
-        until("ada's close", || closed(&p, &ada));
+        wait_until("ada's close", || closed(&p, &ada));
         p.settle();
         (fork_lsn, vec![ada, bob, cid, dee])
         // The runtime drops here: a crash, with the follower still open.
     };
     let p = Proc::open(dir, config());
-    until("the restart close", || closed(&p, &ids[3]));
+    wait_until("the restart close", || closed(&p, &ids[3]));
     p.settle();
     assert!(p.node.store().db().open_connections().unwrap().is_empty());
     (p, fork_lsn, ids)
@@ -330,19 +318,6 @@ fn opts(mode: Mode) -> DiffOptions {
         mode,
         ..DiffOptions::default()
     }
-}
-
-/// The production turn records of the window, by LSN.
-fn window(p: &Proc, fork_lsn: Lsn) -> BTreeMap<Lsn, pb::TurnRecord> {
-    let to = p.settle();
-    ((fork_lsn + 1)..=to)
-        .filter_map(
-            |lsn| match p.rt.block_on(p.node.read_record(lsn)).unwrap()?.record {
-                Record::TurnRecord(t) => Some((lsn, t)),
-                _ => None,
-            },
-        )
-        .collect()
 }
 
 /// The root inputs of the window whose turns sent a `message` event: the
@@ -482,7 +457,7 @@ fn identity_replay_of_a_recorded_session_is_empty() {
 fn a_changed_message_format_shows_as_changed_outgoing_frames() {
     let dir = tempdir();
     let (p, fork_lsn, ids) = session(dir.path());
-    let turns = window(&p, fork_lsn);
+    let turns: BTreeMap<Lsn, pb::TurnRecord> = turns_after(&p, fork_lsn).into_iter().collect();
     let expected = message_roots(&turns);
     // 30 says, the HTTP say, and the follower's open with the history.
     assert_eq!(expected.len(), 32);
@@ -665,14 +640,14 @@ fn another_rooms_connection_is_dropped_the_same_way_in_replay() {
     }
     // The kitchen closes it, then the lobby tries again.
     frame(&p, &bob, "bye");
-    until("bob's close", || closed(&p, &bob));
+    wait_until("bob's close", || closed(&p, &bob));
     for cmd in [format!("kick {bob}"), format!("send-to {bob} late")] {
         frame(&p, &ada, &cmd);
         p.settle();
     }
     assert!(p.node.store().db().dead_letters(0, 10).unwrap().is_empty());
     assert_eq!(tb.recording().frames.len(), welcome, "{:?}", tb.recording());
-    let turns = window(&p, fork_lsn);
+    let turns: BTreeMap<Lsn, pb::TurnRecord> = turns_after(&p, fork_lsn).into_iter().collect();
     let mut dropped = 0;
     for t in turns.values() {
         let Some(pb::input::Kind::Connection(c)) = t.input.as_ref().and_then(|i| i.kind.as_ref())
