@@ -2224,6 +2224,40 @@ async fn explicit_refresh_deduplicates_source_identity_and_has_one_owned_intent_
     assert_eq!(failed[0].audit.as_ref().unwrap().token_id, "operator");
 }
 
+/// Refreshes `token` under a revocable authority, with the provider blocked at
+/// `bao.started`: runs `while_blocked` once the request waits there, revokes
+/// the authority, and returns what `while_blocked` returned after asserting
+/// that the refresh failed unauthenticated.
+async fn refresh_revoked_at_the_provider<T>(
+    node: &Arc<Node>,
+    bao: &Bao,
+    while_blocked: impl FnOnce() -> T,
+) -> T {
+    while let Ok(permit) = bao.started.try_acquire() {
+        permit.forget();
+    }
+    let blocked = Arc::new(Semaphore::new(0));
+    *lock(&bao.block) = Some(blocked.clone());
+    let authority = revocable::Revocable::new();
+    let request_node = node.clone();
+    let request_authority = authority.lease();
+    let request = tokio::spawn(async move {
+        request_node
+            .secret_refresh("token", &audit(), false, request_authority)
+            .await
+    });
+    bao.started.acquire().await.unwrap().forget();
+    let captured = while_blocked();
+    authority.revoke();
+    *lock(&bao.block) = None;
+    blocked.add_permits(1);
+    assert_eq!(
+        request.await.unwrap().unwrap_err().code,
+        ErrorCode::Unauthenticated
+    );
+    captured
+}
+
 #[tokio::test]
 async fn refresh_intent_does_not_authorize_a_later_unknown_version_after_revocation() {
     let (_data, node, bao) = bao_node().await;
@@ -2242,27 +2276,7 @@ async fn refresh_intent_does_not_authorize_a_later_unknown_version_after_revocat
     let history = node.secret_history("token").await.unwrap();
     let next_version = node.next_secret_version("token").await.unwrap();
     let current = lock(&node.runtime().unwrap().cache.state).current.clone();
-    while let Ok(permit) = bao.started.try_acquire() {
-        permit.forget();
-    }
-    let blocked = Arc::new(Semaphore::new(0));
-    *lock(&bao.block) = Some(blocked.clone());
-    let authority = revocable::Revocable::new();
-    let request_node = node.clone();
-    let request_authority = authority.lease();
-    let request = tokio::spawn(async move {
-        request_node
-            .secret_refresh("token", &audit(), false, request_authority)
-            .await
-    });
-    bao.started.acquire().await.unwrap().forget();
-    authority.revoke();
-    *lock(&bao.block) = None;
-    blocked.add_permits(1);
-    assert_eq!(
-        request.await.unwrap().unwrap_err().code,
-        ErrorCode::Unauthenticated
-    );
+    refresh_revoked_at_the_provider(&node, &bao, || ()).await;
     assert_eq!(node.secret_history("token").await.unwrap(), history);
     assert_eq!(
         node.next_secret_version("token").await.unwrap(),
@@ -2289,34 +2303,16 @@ async fn unchanged_refresh_does_not_renew_cached_authority_after_request_revocat
         .await
         .unwrap()
         .unwrap();
-    while let Ok(permit) = bao.started.try_acquire() {
-        permit.forget();
-    }
-    let blocked = Arc::new(Semaphore::new(0));
-    *lock(&bao.block) = Some(blocked.clone());
-    let authority = revocable::Revocable::new();
-    let request_node = node.clone();
-    let request_authority = authority.lease();
-    let request = tokio::spawn(async move {
-        request_node
-            .secret_refresh("token", &audit(), false, request_authority)
-            .await
-    });
-    bao.started.acquire().await.unwrap().forget();
     // The blocked refresh holds the name lock, so no background refresh can run
     // from here on: the captured renewal stamp is stable across the revocation.
-    let checked = lock(&node.runtime().unwrap().cache.state)
-        .values
-        .get(&("token".into(), first.meta.version))
-        .unwrap()
-        .checked;
-    authority.revoke();
-    *lock(&bao.block) = None;
-    blocked.add_permits(1);
-    assert_eq!(
-        request.await.unwrap().unwrap_err().code,
-        ErrorCode::Unauthenticated
-    );
+    let checked = refresh_revoked_at_the_provider(&node, &bao, || {
+        lock(&node.runtime().unwrap().cache.state)
+            .values
+            .get(&("token".into(), first.meta.version))
+            .unwrap()
+            .checked
+    })
+    .await;
     let state = lock(&node.runtime().unwrap().cache.state);
     assert_eq!(
         state
@@ -2756,8 +2752,10 @@ async fn a_secret_mutation_that_begins_in_a_rebuild_window_waits_and_records_the
     }
 }
 
-#[tokio::test]
-async fn a_secret_mutation_whose_wait_for_the_inventory_runs_out_records_the_placeholder() {
+/// Sets `token` while a secret rebuild window is held and returns how long the
+/// mutation waited. With `failing`, the cycle's last pass is recorded as
+/// failed first.
+async fn set_in_a_held_rebuild_window(failing: bool) -> Duration {
     let data = tempfile::tempdir().unwrap();
     let mut config = crate::NodeConfig {
         group_commit_window: Some(Duration::ZERO),
@@ -2771,83 +2769,58 @@ async fn a_secret_mutation_whose_wait_for_the_inventory_runs_out_records_the_pla
         .timeout(Duration::from_secs(60), node.secret_cycle_settled())
         .await
         .unwrap();
+    let window = node.hold_secret_rebuild_window().await.unwrap();
+    if failing {
+        node.runtime()
+            .unwrap()
+            .certified
+            .send_replace((u64::MAX, false));
+    }
+    let started = node.env.clock.monotonic();
+    let outcome = node
+        .secret_set(
+            "token",
+            b"first-credential".to_vec(),
+            &audit(),
+            false,
+            revocable::lease(),
+        )
+        .await;
+    let waited = node.env.clock.monotonic().saturating_sub(started);
+    assert_eq!(outcome.unwrap_err().code, ErrorCode::SecretUnavailable);
+    drop(window);
+    let rows = node.secret_history("token").await.unwrap();
+    assert!(!rows.is_empty());
+    for row in &rows {
+        assert_eq!(
+            row.audit.as_ref().unwrap().reason,
+            crate::scrub::WITHHELD,
+            "{row:?}"
+        );
+    }
+    waited
+}
+
+#[tokio::test]
+async fn a_secret_mutation_whose_wait_for_the_inventory_runs_out_records_the_placeholder() {
     // The window does not close. The mutation waits for one fetch window and
     // the margin of a rebuild in flight, as an audit event does, and then
     // records the placeholder, never the reason in the clear. The wait for
     // the inventory to be published after it fails as well: the mutation is
     // committed, and says so.
-    let window = node.hold_secret_rebuild_window().await.unwrap();
-    let started = node.env.clock.monotonic();
-    let outcome = node
-        .secret_set(
-            "token",
-            b"first-credential".to_vec(),
-            &audit(),
-            false,
-            revocable::lease(),
-        )
-        .await;
-    let waited = node.env.clock.monotonic().saturating_sub(started);
+    let waited = set_in_a_held_rebuild_window(false).await;
     assert!(waited >= Duration::from_millis(5100), "{waited:?}");
-    assert_eq!(outcome.unwrap_err().code, ErrorCode::SecretUnavailable);
-    drop(window);
-    let rows = node.secret_history("token").await.unwrap();
-    assert!(!rows.is_empty());
-    for row in &rows {
-        assert_eq!(
-            row.audit.as_ref().unwrap().reason,
-            crate::scrub::WITHHELD,
-            "{row:?}"
-        );
-    }
 }
 
 #[tokio::test]
 async fn a_secret_mutation_does_not_wait_for_a_rebuild_that_is_failing() {
-    let data = tempfile::tempdir().unwrap();
-    let mut config = crate::NodeConfig {
-        group_commit_window: Some(Duration::ZERO),
-        ..Default::default()
-    };
-    config.secret_settings.fetch_timeout = Duration::from_millis(100);
-    let node = crate::start_local(env(), data.path(), config)
-        .await
-        .unwrap();
-    let runtime = node.runtime().unwrap();
-    node.env
-        .timeout(Duration::from_secs(60), node.secret_cycle_settled())
-        .await
-        .unwrap();
     // The cycle's last pass failed, as every pass does while a backend is
     // down (I10): the inventory will not come back by waiting, and a wait
     // would add its bound to every mutation for as long as the outage lasts.
-    let window = node.hold_secret_rebuild_window().await.unwrap();
-    runtime.certified.send_replace((u64::MAX, false));
-    let started = node.env.clock.monotonic();
-    let outcome = node
-        .secret_set(
-            "token",
-            b"first-credential".to_vec(),
-            &audit(),
-            false,
-            revocable::lease(),
-        )
-        .await;
-    let waited = node.env.clock.monotonic().saturating_sub(started);
+    let waited = set_in_a_held_rebuild_window(true).await;
     // The mutation was recorded with the placeholder at once. Its wait for
     // the publication of the inventory ended at its fetch timeout.
     assert!(waited < Duration::from_secs(2), "{waited:?}");
-    assert_eq!(outcome.unwrap_err().code, ErrorCode::SecretUnavailable);
-    drop(window);
-    let rows = node.secret_history("token").await.unwrap();
-    assert!(!rows.is_empty());
-    for row in &rows {
-        assert_eq!(
-            row.audit.as_ref().unwrap().reason,
-            crate::scrub::WITHHELD,
-            "{row:?}"
-        );
-    }
 }
 
 /// The node's publication of its current certificate, once the cycle has
