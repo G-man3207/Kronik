@@ -16,18 +16,18 @@
 
 #[path = "support/blob_fixtures.rs"]
 mod blob_fixtures;
+mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
 use blob_fixtures::{hash, pattern};
+use common::Daemon;
 use serde_json::{Value, json};
 
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
@@ -57,107 +57,9 @@ fn media_wasm() -> Vec<u8> {
     std::fs::read(path).unwrap()
 }
 
-struct Daemon {
-    dir: PathBuf,
-    child: Option<Child>,
-    http: String,
-}
-
 impl Daemon {
     fn start(dir: &Path) -> Daemon {
-        let config = dir.join("kronik.toml");
-        std::fs::write(
-            &config,
-            format!("[server]\ndata_dir = {:?}\n", dir.join("data")),
-        )
-        .unwrap();
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("serve.log"))
-            .unwrap();
-        let child = Command::new(kronik_bin())
-            .arg("serve")
-            .env("KRONIK_DISK_RESERVE", "0B")
-            .arg("--config")
-            .arg(&config)
-            .args([
-                "--http-listen",
-                "127.0.0.1:0",
-                "--admin-listen",
-                "127.0.0.1:0",
-                "--api-socket",
-            ])
-            .arg(dir.join("api.sock"))
-            .env("KRONIK_LOG", "info")
-            .env_remove("KRONIK_TOKEN")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        let mut d = Daemon {
-            dir: dir.to_path_buf(),
-            child: Some(child),
-            http: String::new(),
-        };
-        for _ in 0..800 {
-            if let Some((200, v)) = d.try_api("GET", "/v1/health", Value::Null) {
-                d.http = v["http_listen"].as_str().unwrap().to_owned();
-                return d;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        panic!("kronik serve did not start: {}", d.log());
-    }
-
-    fn log(&self) -> String {
-        std::fs::read_to_string(self.dir.join("serve.log")).unwrap_or_default()
-    }
-
-    fn try_api(&self, method: &str, path: &str, body: Value) -> Option<(u16, Value)> {
-        let mut s = UnixStream::connect(self.dir.join("api.sock")).ok()?;
-        let body = if body.is_null() {
-            String::new()
-        } else {
-            body.to_string()
-        };
-        write!(
-            s,
-            "{method} {path} HTTP/1.1\r\nhost: kronik\r\ncontent-length: {}\r\n\
-             connection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .ok()?;
-        let mut r = BufReader::new(s);
-        let mut line = String::new();
-        r.read_line(&mut line).ok()?;
-        let status: u16 = line.split_whitespace().nth(1)?.parse().ok()?;
-        let mut len = 0;
-        loop {
-            let mut h = String::new();
-            r.read_line(&mut h).ok()?;
-            let h = h.trim_end();
-            if h.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = h.split_once(':')
-                && k.eq_ignore_ascii_case("content-length")
-            {
-                len = v.trim().parse().ok()?;
-            }
-        }
-        let mut buf = vec![0; len];
-        r.read_exact(&mut buf).ok()?;
-        Some((status, serde_json::from_slice(&buf).ok()?))
-    }
-
-    fn api(&self, method: &str, path: &str, body: Value) -> Value {
-        let (status, v) = self
-            .try_api(method, path, body)
-            .unwrap_or_else(|| panic!("{method} {path} failed: {}", self.log()));
-        assert_eq!(status, 200, "{method} {path}: {v}");
-        v
+        Daemon::spawn(dir, Daemon::command(kronik_bin(), dir, Some("")))
     }
 
     /// Deploys `media`, with fuel for megabytes of byte-at-a-time work, room
@@ -197,33 +99,6 @@ impl Daemon {
             .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
             .unwrap()
             * 1024
-    }
-
-    /// SIGTERM, then waits for the daemon to exit.
-    fn stop(&mut self) {
-        let mut child = self.child.take().unwrap();
-        Command::new("kill")
-            .arg("-TERM")
-            .arg(child.id().to_string())
-            .status()
-            .unwrap();
-        for _ in 0..400 {
-            if child.try_wait().unwrap().is_some() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        let _ = child.kill();
-        panic!("kronik serve did not stop: {}", self.log());
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 }
 
@@ -642,7 +517,7 @@ fn the_log_holds_only_the_hash_above_the_threshold() {
     assert_eq!(ranges.status, 200, "{}", ranges.text());
     assert_eq!(ranges.text().lines().count(), 3, "{}", ranges.text());
     diff_summary(&d, "ranges", ranges.lsn() - 1);
-    d.stop();
+    d.term();
 
     // No 4 KiB window of a body above the threshold is in the log.
     let log_dir = dir.path().join("data/branches/main/log");

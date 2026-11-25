@@ -1,12 +1,22 @@
-//! Shared by the tests that start `kronik serve` on TCP ports.
+//! Shared helpers of the tests that run the `kronik` binary.
+
+// Each test binary uses only part of this module.
+#![allow(dead_code)]
 
 use std::collections::hash_map::RandomState;
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions, Permissions};
 use std::hash::{BuildHasher, Hasher};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
+
+use serde_json::Value;
 
 /// Where every test process claims the ports it hands out, whatever its
 /// target directory.
@@ -62,4 +72,195 @@ fn below_ephemeral() -> (u16, u16) {
         "the ephemeral port range starts at {start}: no room below it for test ports"
     );
     (start / 2, start)
+}
+
+/// One request to the API on the Unix socket `socket`, as `token` when
+/// given; `Value::Null` sends no body. The status and the JSON body;
+/// `None` when the socket refuses, the answer is cut short or its body
+/// is not JSON.
+pub fn try_api(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    body: &Value,
+    token: Option<&str>,
+) -> Option<(u16, Value)> {
+    let mut s = UnixStream::connect(socket).ok()?;
+    let body = if body.is_null() {
+        String::new()
+    } else {
+        body.to_string()
+    };
+    let auth = token.map_or(String::new(), |t| format!("authorization: Bearer {t}\r\n"));
+    write!(
+        s,
+        "{method} {path} HTTP/1.1\r\nhost: kronik\r\n{auth}content-length: {}\r\n\
+         connection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .ok()?;
+    let mut r = BufReader::new(s);
+    let mut line = String::new();
+    r.read_line(&mut line).ok()?;
+    let status: u16 = line.split_whitespace().nth(1)?.parse().ok()?;
+    let mut len = 0;
+    loop {
+        let mut h = String::new();
+        r.read_line(&mut h).ok()?;
+        let h = h.trim_end();
+        if h.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = h.split_once(':')
+            && k.eq_ignore_ascii_case("content-length")
+        {
+            len = v.trim().parse().ok()?;
+        }
+    }
+    let mut buf = vec![0; len];
+    r.read_exact(&mut buf).ok()?;
+    Some((status, serde_json::from_slice(&buf).ok()?))
+}
+
+/// `kronik serve` as a child process, with its data in `<dir>/data`, its
+/// API socket at `<dir>/api.sock` and its stderr appended to
+/// `<dir>/serve.log`; killed when dropped.
+pub struct Daemon {
+    pub dir: PathBuf,
+    pub child: Option<Child>,
+    /// The gateway's address, from `GET /v1/health`'s `http_listen`.
+    pub http: String,
+}
+
+impl Daemon {
+    /// `<bin> serve` for `dir`. With `Some(config)`: writes
+    /// `<dir>/kronik.toml` as `format!("[server]\ndata_dir = {:?}\n\n{config}", dir.join("data"))`
+    /// and passes `--config` with it; with `None`: `--data-dir <dir>/data`.
+    /// Always: `--http-listen 127.0.0.1:0 --admin-listen 127.0.0.1:0
+    /// --api-socket <dir>/api.sock`, `KRONIK_DISK_RESERVE=0B`,
+    /// `KRONIK_LOG=info`, `KRONIK_TOKEN` removed, stdin and stdout null.
+    /// Callers add arguments or override env before `spawn`.
+    pub fn command(bin: impl AsRef<OsStr>, dir: &Path, config: Option<&str>) -> Command {
+        let mut command = Command::new(bin);
+        command
+            .arg("serve")
+            .env("KRONIK_DISK_RESERVE", "0B")
+            .env("KRONIK_LOG", "info")
+            .env_remove("KRONIK_TOKEN")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        match config {
+            Some(config) => {
+                let path = dir.join("kronik.toml");
+                std::fs::write(
+                    &path,
+                    format!("[server]\ndata_dir = {:?}\n\n{config}", dir.join("data")),
+                )
+                .unwrap();
+                command.arg("--config").arg(path);
+            }
+            None => {
+                command.arg("--data-dir").arg(dir.join("data"));
+            }
+        }
+        command
+            .args([
+                "--http-listen",
+                "127.0.0.1:0",
+                "--admin-listen",
+                "127.0.0.1:0",
+                "--api-socket",
+            ])
+            .arg(dir.join("api.sock"));
+        command
+    }
+
+    /// Spawns `command` with stderr appended to `<dir>/serve.log` and
+    /// waits until `GET /v1/health` answers 200: polls every 25 ms, up to
+    /// 4800 times (120 s, the longest wait any copy uses); panics with the
+    /// log at once if the process exits first, or after the last poll.
+    /// Sets `http` from the answer's `http_listen` (`unwrap_or_default`).
+    pub fn spawn(dir: &Path, mut command: Command) -> Daemon {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("serve.log"))
+            .unwrap();
+        let child = command.stderr(log).spawn().unwrap();
+        let mut d = Daemon {
+            dir: dir.to_path_buf(),
+            child: Some(child),
+            http: String::new(),
+        };
+        for _ in 0..4800 {
+            if let Some((200, v)) = d.try_api("GET", "/v1/health", Value::Null) {
+                d.http = v["http_listen"].as_str().unwrap_or_default().to_owned();
+                return d;
+            }
+            if d.child.as_mut().unwrap().try_wait().unwrap().is_some() {
+                panic!("kronik serve exited: {}", d.log());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("kronik serve did not start: {}", d.log());
+    }
+
+    pub fn socket(&self) -> PathBuf {
+        self.dir.join("api.sock")
+    }
+
+    pub fn data(&self) -> PathBuf {
+        self.dir.join("data")
+    }
+
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.join("serve.log")).unwrap_or_default()
+    }
+
+    pub fn try_api(&self, method: &str, path: &str, body: Value) -> Option<(u16, Value)> {
+        try_api(&self.socket(), method, path, &body, None)
+    }
+
+    pub fn api(&self, method: &str, path: &str, body: Value) -> Value {
+        let (status, v) = self
+            .try_api(method, path, body)
+            .unwrap_or_else(|| panic!("{method} {path} failed: {}", self.log()));
+        assert_eq!(status, 200, "{method} {path}: {v}");
+        v
+    }
+
+    /// SIGKILL and wait; errors ignored; no-op when already stopped.
+    pub fn kill9(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// SIGTERM, then waits up to 10 s for the exit; panics with the log
+    /// if it does not stop.
+    pub fn term(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .status()
+            .unwrap();
+        for _ in 0..400 {
+            if child.try_wait().unwrap().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = child.kill();
+        panic!("kronik serve did not stop: {}", self.log());
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.kill9();
+    }
 }
