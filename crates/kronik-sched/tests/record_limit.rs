@@ -250,6 +250,48 @@ fn turn_record(p: &Proc, r: &TurnResult) -> pb::TurnRecord {
     }
 }
 
+/// Crashes the node: its tasks die with the runtime, and the log stays.
+fn crash(p: Proc) {
+    let Proc { rt, node } = p;
+    drop(node);
+    rt.shutdown_timeout(Duration::from_secs(1));
+}
+
+/// A turn's base cost, before its input: what its budget must hold.
+fn begin_base_cost(begin: &pb::TurnBegin) -> usize {
+    let mut input = begin.input.clone().unwrap();
+    let input_cost = kronik_sched::record_budget::input_cost(&mut input);
+    kronik_sched::record_budget::base_cost(
+        begin.actor.as_ref().unwrap(),
+        &begin.code_hash,
+        begin.causal_key.as_ref().unwrap(),
+        begin.logical_time_ms,
+        &begin.random_seed,
+        input_cost,
+        begin.config_epoch,
+    )
+}
+
+/// The closing `TurnRecord` of `execution_id`, once it is there and the turn
+/// is no longer open.
+fn closing_record(p: &Proc, dir: &Path, execution_id: &str) -> pb::TurnRecord {
+    for _ in 0..600 {
+        let closed = bodies(dir)
+            .into_iter()
+            .find_map(|(_, record, _)| match record {
+                Record::TurnRecord(t) if t.execution_id == execution_id => Some(t),
+                _ => None,
+            });
+        if let Some(t) = closed
+            && p.node.store().db().open_turns().unwrap().is_empty()
+        {
+            return t;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("the open turn was never closed");
+}
+
 impl Proc {
     /// Sets the counter type's effect bytes per turn.
     fn effect_bytes(&self, bytes: u64) {
@@ -446,9 +488,7 @@ fn an_open_turn_whose_input_no_longer_fits_is_closed_not_rerun_for_ever() {
     );
     // A crash: the TurnBegin is durable, the turn's record is never written.
     // The fetch's blocking thread is left to the server's timeout.
-    let Proc { rt, node } = p;
-    drop(node);
-    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    crash(p);
     let begin = bodies(dir.path())
         .into_iter()
         .find_map(|(_, record, _)| match record {
@@ -456,39 +496,14 @@ fn an_open_turn_whose_input_no_longer_fits_is_closed_not_rerun_for_ever() {
             _ => None,
         })
         .expect("the turn began");
-    let base = {
-        let mut input = begin.input.clone().unwrap();
-        let input_cost = kronik_sched::record_budget::input_cost(&mut input);
-        kronik_sched::record_budget::base_cost(
-            begin.actor.as_ref().unwrap(),
-            &begin.code_hash,
-            begin.causal_key.as_ref().unwrap(),
-            begin.logical_time_ms,
-            &begin.random_seed,
-            input_cost,
-            begin.config_epoch,
-        )
-    };
+    let base = begin_base_cost(&begin);
     // A turn's budget is the log's limit less 4 KiB: this limit holds the
     // closing record, and its budget is less than the input needs.
     let limit = u32::try_from(base + 2048).unwrap();
     assert!(base > kronik_sched::record_budget::turn_limit(limit as usize));
 
     let p = start_limit(dir.path(), limit);
-    let mut closed = None;
-    for _ in 0..600 {
-        closed = bodies(dir.path())
-            .into_iter()
-            .find_map(|(_, record, _)| match record {
-                Record::TurnRecord(t) if t.execution_id == begin.execution_id => Some(t),
-                _ => None,
-            });
-        if closed.is_some() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let closed = closed.expect("the open turn was never closed");
+    let closed = closing_record(&p, dir.path(), &begin.execution_id);
     let len = Record::TurnRecord(closed.clone()).encoded_len();
     assert!(len <= limit as usize, "the closing record is {len} bytes");
     assert_eq!(closed.input, begin.input);
@@ -592,9 +607,7 @@ fn an_open_turn_whose_compensations_no_longer_fit_is_closed_not_rerun_for_ever()
 
     // A crash: the TurnBegin and the call result are durable, the TurnRecord
     // is never written.
-    let Proc { rt, node } = p;
-    drop(node);
-    rt.shutdown_timeout(Duration::from_secs(1));
+    crash(p);
     let begin = bodies(dir.path())
         .into_iter()
         .find_map(|(_, record, _)| match record {
@@ -602,19 +615,7 @@ fn an_open_turn_whose_compensations_no_longer_fit_is_closed_not_rerun_for_ever()
             _ => None,
         })
         .expect("the caller's turn began");
-    let base = {
-        let mut input = begin.input.clone().unwrap();
-        let input_cost = kronik_sched::record_budget::input_cost(&mut input);
-        kronik_sched::record_budget::base_cost(
-            begin.actor.as_ref().unwrap(),
-            &begin.code_hash,
-            begin.causal_key.as_ref().unwrap(),
-            begin.logical_time_ms,
-            &begin.random_seed,
-            input_cost,
-            begin.config_epoch,
-        )
-    };
+    let base = begin_base_cost(&begin);
     // A turn's budget is the log's limit less 4 KiB: this limit lets the
     // guest re-run under the budget (the input and a short outcome fit) and
     // holds the closing record once its recorded compensation is left out.
@@ -622,20 +623,7 @@ fn an_open_turn_whose_compensations_no_longer_fit_is_closed_not_rerun_for_ever()
     assert!(base <= kronik_sched::record_budget::turn_limit(limit as usize));
 
     let p = start_with(dir.path(), limit, None, Some(storage.clone()), Some(4096));
-    let mut closed = None;
-    for _ in 0..600 {
-        closed = bodies(dir.path())
-            .into_iter()
-            .find_map(|(_, record, _)| match record {
-                Record::TurnRecord(t) if t.execution_id == execution_id => Some(t),
-                _ => None,
-            });
-        if closed.is_some() && p.node.store().db().open_turns().unwrap().is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let closed = closed.expect("the open turn was never closed");
+    let closed = closing_record(&p, dir.path(), &execution_id);
     let len = Record::TurnRecord(closed.clone()).encoded_len();
     assert!(len <= limit as usize, "the closing record is {len} bytes");
     assert_eq!(closed.input, begin.input);
