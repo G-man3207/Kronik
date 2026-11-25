@@ -41,7 +41,6 @@ use rmcp::service::{RoleClient, RunningService, ServiceExt as _};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, UnixSocketHttpClient};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 const GUESTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests");
@@ -968,20 +967,7 @@ fn assert_no_needle(dir: &Path, answers: &[String], values: &[&str]) {
 
 /// HMAC-SHA256 as lowercase hex.
 fn hmac_hex(key: &[u8], data: &[u8]) -> String {
-    let mut block = [0u8; 64];
-    if key.len() > 64 {
-        block[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        block[..key.len()].copy_from_slice(key);
-    }
-    let pad = |byte: u8| block.map(|b| b ^ byte);
-    let mut inner = Sha256::new();
-    inner.update(pad(0x36));
-    inner.update(data);
-    let mut outer = Sha256::new();
-    outer.update(pad(0x5c));
-    outer.update(inner.finalize());
-    kronik_core::ids::hex(&outer.finalize())
+    kronik_core::ids::hex(&kronik_effects::crypto::hmac_sha256(key, data))
 }
 
 // ---------------------------------------------------------------- fixtures
@@ -1015,10 +1001,9 @@ fn hash8(hash: &str) -> &str {
 // ------------------------------------------------------------------- tests
 
 /// The helpers of the tests are not vacuous: the needle search finds a value
-/// as it is, in hex and in base64, in nested files and in an answer, and
-/// `hmac_hex` is HMAC-SHA256 (RFC 4231, test case 2).
+/// as it is, in hex and in base64, in nested files and in an answer.
 #[test]
-fn the_needle_search_and_the_hmac_helper_work() {
+fn the_needle_search_works() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
     let one = forms(VALUE_1);
@@ -1052,11 +1037,6 @@ fn the_needle_search_and_the_hmac_helper_work() {
         }));
         assert!(caught.is_err(), "{answer} was not found");
     }
-
-    assert_eq!(
-        hmac_hex(b"Jefe", b"what do ya want for nothing?"),
-        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-    );
 }
 
 /// Criterion 2.

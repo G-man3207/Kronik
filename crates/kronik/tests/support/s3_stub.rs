@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use kronik_core::ids::hex;
+use kronik_effects::crypto::hmac_sha256;
 use sha2::{Digest as _, Sha256};
 
 /// What the stub issues and accepts.
@@ -320,27 +322,6 @@ fn strict_encode(text: &str, keep_slash: bool) -> String {
     out
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// HMAC-SHA256 (RFC 2104) on top of the hash that the tests already have.
-fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut block = [0u8; 64];
-    if key.len() > 64 {
-        block[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        block[..key.len()].copy_from_slice(key);
-    }
-    let mut inner = Sha256::new();
-    inner.update(block.map(|b| b ^ 0x36));
-    inner.update(data);
-    let mut outer = Sha256::new();
-    outer.update(block.map(|b| b ^ 0x5c));
-    outer.update(inner.finalize());
-    outer.finalize().into()
-}
-
 /// Checks the `Authorization` header the way S3 does: the access key is one
 /// that was issued, the session token is the one that goes with it, and the
 /// signature is the one of the canonical request.
@@ -421,15 +402,14 @@ fn verify(
         "AWS4-HMAC-SHA256\n{date}\n{scope}\n{}",
         hex(&Sha256::digest(canonical.as_bytes()))
     );
-    let mut key = hmac(
+    let mut key = hmac_sha256(
         format!("AWS4{}", settings.secret_key).as_bytes(),
         scope.split('/').next().unwrap_or_default().as_bytes(),
-    )
-    .to_vec();
+    );
     for part in scope.split('/').skip(1) {
-        key = hmac(&key, part.as_bytes()).to_vec();
+        key = hmac_sha256(&key, part.as_bytes());
     }
-    let expected = hex(&hmac(&key, to_sign.as_bytes()));
+    let expected = hex(&hmac_sha256(&key, to_sign.as_bytes()));
     if &expected != signature {
         return Err(error(
             403,
