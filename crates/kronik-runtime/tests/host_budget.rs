@@ -6,35 +6,18 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::sync::Arc;
 
-use kronik_core::ids::ActorRef;
+use common::{Map, message, request, store};
 use kronik_proto::log::v1 as pb;
-use kronik_runtime::{
-    CodeStore, PoolSize, Program, StateView, TurnLimits, TurnOutput, TurnRequest, build_engine,
-};
+use kronik_runtime::{Program, TurnLimits, TurnOutput, TurnRequest};
 
 const COUNTER_BUDGET: &[u8] = include_bytes!("../../../tests/guests/counter-budget.wasm");
 
-struct Empty;
-
-impl StateView for Empty {
-    fn get(&self, _: &str) -> Result<Option<Vec<u8>>, String> {
-        Ok(None)
-    }
-    fn keys(&self, _: &str) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
-    }
-    fn timer_pending(&self, _: u64) -> Result<bool, String> {
-        Ok(false)
-    }
-    fn connection(&self, _: &str) -> Result<Option<kronik_runtime::ConnectionView>, String> {
-        Ok(None)
-    }
-}
-
 fn program() -> Arc<Program> {
-    let code = CodeStore::new(build_engine(PoolSize { concurrency: 2 }).unwrap(), None).unwrap();
+    let code = store();
     code.add(COUNTER_BUDGET).unwrap().1
 }
 
@@ -49,35 +32,14 @@ async fn run_body(program: &Program, body: &str, host_bytes: usize) -> TurnOutpu
         host_bytes,
         ..TurnLimits::default()
     };
-    let input = pb::Input {
-        kind: Some(pb::input::Kind::Message(pb::MessageInput {
-            source: pb::MessageSource::Operator as i32,
-            msg: Some(pb::Message {
-                name: "budget".into(),
-                content_type: "text/plain".into(),
-                body: Some(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-                }),
-                blobs: vec![],
-                retained_compensation_source: None,
-            }),
-            message_id: "m".into(),
-            ..Default::default()
-        })),
-    };
+    let input = message("budget", body.as_bytes());
     program
         .run(
             TurnRequest {
-                actor: ActorRef::parse("counter/a").unwrap(),
-                causal_key: kronik_core::causal::root("r".into()),
-                logical_time_ms: 1_761_300_000_000,
-                seed: [7; 32],
-                input,
                 limits,
-                subject: None,
+                ..request("counter/a", input)
             },
-            Arc::new(Empty),
+            Arc::new(Map::default()),
             None,
             None,
         )

@@ -6,41 +6,22 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use common::{Map, store};
 use kronik_core::env::BoxFuture;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::{
     CallOutcome, CodeStore, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchOutcome, FetchRequest,
-    GateError, PoolSize, Program, StateView, TurnLimits, TurnRequest, build_engine,
+    GateError, PoolSize, Program, TurnLimits, TurnRequest, build_engine,
 };
 use prost::Message as _;
 
 const COUNTER: &[u8] = include_bytes!("../../../tests/guests/counter.wasm");
-
-struct Map(BTreeMap<String, Vec<u8>>);
-
-impl StateView for Map {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
-        Ok(self.0.get(key).cloned())
-    }
-    fn keys(&self, prefix: &str) -> Result<Vec<String>, String> {
-        Ok(self
-            .0
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect())
-    }
-    fn timer_pending(&self, _id: u64) -> Result<bool, String> {
-        Ok(false)
-    }
-    fn connection(&self, _: &str) -> Result<Option<kronik_runtime::ConnectionView>, String> {
-        Ok(None)
-    }
-}
 
 fn message(name: &str, body: &[u8]) -> pb::Input {
     pb::Input {
@@ -121,8 +102,7 @@ async fn same_input_twice_gives_byte_identical_outcomes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn outcomes_classify_failures() {
-    let engine = build_engine(PoolSize { concurrency: 2 }).unwrap();
-    let code = CodeStore::new(engine, None).unwrap();
+    let code = store();
     let (_, program) = code.add(COUNTER).unwrap();
     let state = Arc::new(Map(BTreeMap::new()));
     let limits = TurnLimits {

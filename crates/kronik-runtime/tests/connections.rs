@@ -6,87 +6,20 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use kronik_core::ids::ActorRef;
+use common::{Map, message, request, store};
 use kronik_proto::log::v1 as pb;
-use kronik_runtime::{
-    CodeStore, PoolSize, Program, StateView, TurnLimits, TurnRequest, build_engine,
-};
+use kronik_runtime::{Program, StateView, TurnLimits, TurnRequest};
 
 const COUNTER: &[u8] = include_bytes!("../../../tests/guests/counter.wasm");
 const NOTES: &[u8] = include_bytes!("../../../tests/guests/notes.wasm");
 const ROOM: &[u8] = include_bytes!("../../../tests/guests/room.wasm");
 const ROOM_FMT2: &[u8] = include_bytes!("../../../tests/guests/room-fmt2.wasm");
-
-struct Map(BTreeMap<String, Vec<u8>>);
-
-impl StateView for Map {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
-        Ok(self.0.get(key).cloned())
-    }
-    fn keys(&self, prefix: &str) -> Result<Vec<String>, String> {
-        Ok(self
-            .0
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect())
-    }
-    fn timer_pending(&self, _id: u64) -> Result<bool, String> {
-        Ok(false)
-    }
-    fn connection(&self, _: &str) -> Result<Option<kronik_runtime::ConnectionView>, String> {
-        Ok(None)
-    }
-}
-
-fn store() -> CodeStore {
-    CodeStore::new(build_engine(PoolSize { concurrency: 2 }).unwrap(), None).unwrap()
-}
-
-fn message(name: &str, body: &[u8]) -> pb::Input {
-    pb::Input {
-        kind: Some(pb::input::Kind::Message(pb::MessageInput {
-            source: pb::MessageSource::Operator as i32,
-            msg: Some(pb::Message {
-                name: name.into(),
-                content_type: "text/plain".into(),
-                body: Some(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(body.to_vec())),
-                }),
-                blobs: vec![],
-                retained_compensation_source: None,
-            }),
-            message_id: "m".into(),
-            ..Default::default()
-        })),
-    }
-}
-
-async fn run(program: &Program, actor: &str, input: pb::Input) -> pb::Outcome {
-    let out = program
-        .run(
-            TurnRequest {
-                actor: ActorRef::parse(actor).unwrap(),
-                causal_key: kronik_core::causal::root("r".into()),
-                logical_time_ms: 1_761_300_000_000,
-                seed: [7; 32],
-                input,
-                limits: TurnLimits::default(),
-                subject: None,
-            },
-            Arc::new(Map(BTreeMap::new())),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-    out.outcome
-}
 
 fn reply(outcome: &pb::Outcome) -> String {
     match &outcome.output {
@@ -111,7 +44,9 @@ async fn components_with_and_without_the_connection_export_run() {
         counter.describe(TurnLimits::default()).await.unwrap().kind,
         "counter"
     );
-    let outcome = run(&counter, "counter/a", message("increment", b"")).await;
+    let outcome = run_full(&counter, "counter/a", message("increment", b""))
+        .await
+        .outcome;
     assert_eq!(reply(&outcome), "1");
 
     for bytes in [ROOM, ROOM_FMT2] {
@@ -122,7 +57,9 @@ async fn components_with_and_without_the_connection_export_run() {
         let methods: Vec<&str> = manifest.routes.iter().map(|r| r.method.as_str()).collect();
         assert_eq!(methods, ["WEBSOCKET", "SSE", "GET", "POST"]);
         assert_eq!(manifest.capabilities, ["connection:send-now"]);
-        let outcome = run(&room, "room/a", message("ping", b"")).await;
+        let outcome = run_full(&room, "room/a", message("ping", b""))
+            .await
+            .outcome;
         assert_eq!(reply(&outcome), "pong");
     }
 }
@@ -176,20 +113,7 @@ fn open(query: &str, subprotocols: &[&str]) -> pb::Input {
 
 async fn run_full(program: &Program, actor: &str, input: pb::Input) -> kronik_runtime::TurnOutput {
     program
-        .run(
-            TurnRequest {
-                actor: ActorRef::parse(actor).unwrap(),
-                causal_key: kronik_core::causal::root("r".into()),
-                logical_time_ms: 1_761_300_000_000,
-                seed: [7; 32],
-                input,
-                limits: TurnLimits::default(),
-                subject: None,
-            },
-            Arc::new(Map(BTreeMap::new())),
-            None,
-            None,
-        )
+        .run(request(actor, input), Arc::new(Map::default()), None, None)
         .await
         .unwrap()
 }
@@ -224,15 +148,7 @@ impl StateView for Live {
 async fn run_with(program: &Program, input: pb::Input, live: &Live) -> kronik_runtime::TurnOutput {
     program
         .run(
-            TurnRequest {
-                actor: ActorRef::parse("room/a").unwrap(),
-                causal_key: kronik_core::causal::root("r".into()),
-                logical_time_ms: 1_761_300_000_000,
-                seed: [7; 32],
-                input,
-                limits: TurnLimits::default(),
-                subject: None,
-            },
+            request("room/a", input),
             Arc::new(Live(live.0.clone())),
             None,
             None,
@@ -412,7 +328,9 @@ async fn released_components_link_and_run_under_the_new_bindings() {
         match manifest.kind.as_str() {
             "counter" => {
                 assert!(!program.handles_connections(), "{file}");
-                let outcome = run(&program, "counter/released", message("increment", b"")).await;
+                let outcome = run_full(&program, "counter/released", message("increment", b""))
+                    .await
+                    .outcome;
                 assert_eq!(reply(&outcome), "1", "{file}");
             }
             "notes" | "media" => assert!(!program.handles_connections(), "{file}"),
@@ -473,16 +391,11 @@ async fn a_broadcast_past_the_target_limit_traps_before_any_lookup() {
     let out = room
         .run(
             TurnRequest {
-                actor: ActorRef::parse("room/a").unwrap(),
-                causal_key: kronik_core::causal::root("r".into()),
-                logical_time_ms: 1_761_300_000_000,
-                seed: [7; 32],
-                input: message("spray", b"100001"),
                 limits: TurnLimits {
                     fuel: 5_000_000_000,
                     ..TurnLimits::default()
                 },
-                subject: None,
+                ..request("room/a", message("spray", b"100001"))
             },
             view.clone(),
             None,
