@@ -5288,65 +5288,47 @@ mod tests {
     /// HTTP turns) with normal-path batches (a message turn, a turn with
     /// an effect) must leave `applied_lsn` at the highest applied LSN,
     /// not rewind it to where the window started, and the store must
-    /// accept the next consecutive batch afterwards.
+    /// accept the next consecutive batch afterwards. On an in-memory
+    /// database the catch-up path defers all writes until
+    /// `end_bulk_replay`, and the window covers the same records.
     #[test]
     fn bulk_replay_keeps_applied_lsn_monotonic_across_mixed_batches() {
         let dir = tempfile::tempdir().unwrap();
-        let conn = Connection::open(dir.path().join("state.db")).unwrap();
-        let mut db = StateDb::open(conn).unwrap();
-        db.begin_bulk_replay().unwrap();
-        // Simple batch: the counter-style catch-up path advances only
-        // `catchup_lsn` (plus, on a file-backed database, the meta).
-        db.apply(&[
-            committed(1, begin("e1", "r1", http_input())),
-            committed(2, turn("e1", "r1", http_input())),
-        ])
-        .unwrap();
-        // Non-simple batch: a message-input turn and a turn with an
-        // effect take the normal apply path.
-        db.apply(&[
-            committed(3, begin("e2", "r2", message_input())),
-            committed(4, turn("e2", "r2", message_input())),
-            committed(5, begin("e3", "r3", http_input())),
-            committed(6, turn_with_effects("e3", "r3")),
-        ])
-        .unwrap();
-        db.end_bulk_replay().unwrap();
-        assert_eq!(db.applied_lsn().unwrap(), 6);
-        // The next consecutive batch applies after the window.
-        db.apply(&[
-            committed(7, begin("e4", "r4", http_input())),
-            committed(8, turn("e4", "r4", http_input())),
-        ])
-        .unwrap();
-        assert_eq!(db.applied_lsn().unwrap(), 8);
-    }
-
-    /// The same mixed window on an in-memory database, where the
-    /// catch-up path defers all writes until `end_bulk_replay`.
-    #[test]
-    fn bulk_replay_memory_keeps_applied_lsn_monotonic() {
-        let conn = Connection::open_in_memory().unwrap();
-        let mut db = StateDb::open(conn).unwrap();
-        db.begin_bulk_replay().unwrap();
-        db.apply(&[
-            committed(1, begin("e1", "r1", http_input())),
-            committed(2, turn("e1", "r1", http_input())),
-        ])
-        .unwrap();
-        db.apply(&[
-            committed(3, begin("e2", "r2", message_input())),
-            committed(4, turn("e2", "r2", message_input())),
-        ])
-        .unwrap();
-        db.end_bulk_replay().unwrap();
-        assert_eq!(db.applied_lsn().unwrap(), 4);
-        db.apply(&[
-            committed(5, begin("e3", "r3", http_input())),
-            committed(6, turn("e3", "r3", http_input())),
-        ])
-        .unwrap();
-        assert_eq!(db.applied_lsn().unwrap(), 6);
+        for (kind, conn) in [
+            (
+                "file",
+                Connection::open(dir.path().join("state.db")).unwrap(),
+            ),
+            ("memory", Connection::open_in_memory().unwrap()),
+        ] {
+            let mut db = StateDb::open(conn).unwrap();
+            db.begin_bulk_replay().unwrap();
+            // Simple batch: the counter-style catch-up path advances only
+            // `catchup_lsn` (plus, on a file-backed database, the meta).
+            db.apply(&[
+                committed(1, begin("e1", "r1", http_input())),
+                committed(2, turn("e1", "r1", http_input())),
+            ])
+            .unwrap();
+            // Non-simple batch: a message-input turn and a turn with an
+            // effect take the normal apply path.
+            db.apply(&[
+                committed(3, begin("e2", "r2", message_input())),
+                committed(4, turn("e2", "r2", message_input())),
+                committed(5, begin("e3", "r3", http_input())),
+                committed(6, turn_with_effects("e3", "r3")),
+            ])
+            .unwrap();
+            db.end_bulk_replay().unwrap();
+            assert_eq!(db.applied_lsn().unwrap(), 6, "{kind}");
+            // The next consecutive batch applies after the window.
+            db.apply(&[
+                committed(7, begin("e4", "r4", http_input())),
+                committed(8, turn("e4", "r4", http_input())),
+            ])
+            .unwrap();
+            assert_eq!(db.applied_lsn().unwrap(), 8, "{kind}");
+        }
     }
 
     /// Chaos at cc2cd52: a bulk replay whose batch ends between a turn's
