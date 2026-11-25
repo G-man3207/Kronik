@@ -13,7 +13,7 @@ mod common;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{Proc, audit, start_proc, wait_turn};
+use common::{Proc, audit, slow_server, start_proc, wait_turn};
 use kronik_blob::{Space, SweepOptions};
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
@@ -348,31 +348,6 @@ fn a_fork_keeps_its_base_and_the_records_after_its_point() {
     });
     assert_eq!(gone.report.deleted, 2, "{gone:?}");
     assert!(!p.exists(&base) && !p.exists(&after));
-}
-
-/// Answers each request `delay` after it read the request.
-#[allow(clippy::disallowed_methods)]
-fn slow_server(delay: Duration) -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        use std::io::{Read as _, Write as _};
-        for mut stream in listener.incoming().flatten() {
-            stream
-                .set_read_timeout(Some(Duration::from_millis(300)))
-                .unwrap();
-            let mut buf = vec![0u8; 64 << 10];
-            while let Ok(n) = stream.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-            }
-            std::thread::sleep(delay);
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        }
-    });
-    addr
 }
 
 /// Review R-2 (erasure), the collector's side: an upload whose turn waits

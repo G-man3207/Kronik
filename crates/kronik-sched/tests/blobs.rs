@@ -10,7 +10,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::{Proc, audit, start_proc, wait_turn};
+use common::{Proc, audit, slow_server, start_proc, wait_turn};
 use kronik_blob::{BlobMeta, BlobStore, NoKeys, Space, StoreConfig};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
@@ -1123,32 +1123,6 @@ fn a_reply_carries_only_the_turns_references() {
         answer(&p.ingress(http("info", "", inline(b"yz")))),
         "inline 2"
     );
-}
-
-/// Serves one request after reading its body, `delay` later.
-#[allow(clippy::disallowed_methods)]
-fn slow_server(delay: std::time::Duration) -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        use std::io::{Read as _, Write as _};
-        for stream in listener.incoming().flatten() {
-            let mut stream = stream;
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_millis(300)))
-                .unwrap();
-            let mut buf = vec![0u8; 64 << 10];
-            while let Ok(n) = stream.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-            }
-            std::thread::sleep(delay);
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        }
-    });
-    addr
 }
 
 /// Review R-2 (erasure): a turn's lease held only the blobs it wrote, so
