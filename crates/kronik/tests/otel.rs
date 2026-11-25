@@ -9,6 +9,8 @@
 // hyper server on a runtime of its own (a test harness, ADR 0004 §3).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -18,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use common::free_port;
 use http_body_util::{BodyExt as _, Full};
 use kronik_core::ids::hex;
 use kronik_otel::otlp::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -34,14 +37,6 @@ const COUNTER: &str = concat!(
     "/../../tests/guests/counter.wasm"
 );
 const TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 // ---- the receiver ----
 
