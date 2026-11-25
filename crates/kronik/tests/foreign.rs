@@ -10,7 +10,9 @@
 // Test harness code: unwraps, std threads and std time are fine here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
-use std::io::{BufRead, BufReader, Read, Write};
+mod common;
+
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -145,39 +147,7 @@ impl Daemon {
     }
 
     fn try_api(&self, method: &str, path: &str, body: Value) -> Option<(u16, Value)> {
-        let mut s = UnixStream::connect(self.dir.join("api.sock")).ok()?;
-        let body = if body.is_null() {
-            String::new()
-        } else {
-            body.to_string()
-        };
-        write!(
-            s,
-            "{method} {path} HTTP/1.1\r\nhost: kronik\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .ok()?;
-        let mut r = BufReader::new(s);
-        let mut line = String::new();
-        r.read_line(&mut line).ok()?;
-        let status: u16 = line.split_whitespace().nth(1)?.parse().ok()?;
-        let mut len = 0;
-        loop {
-            let mut h = String::new();
-            r.read_line(&mut h).ok()?;
-            let h = h.trim_end();
-            if h.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = h.split_once(':')
-                && k.eq_ignore_ascii_case("content-length")
-            {
-                len = v.trim().parse().ok()?;
-            }
-        }
-        let mut buf = vec![0; len];
-        r.read_exact(&mut buf).ok()?;
-        Some((status, serde_json::from_slice(&buf).ok()?))
+        common::try_api(&self.dir.join("api.sock"), method, path, &body, None)
     }
 
     fn api(&self, method: &str, path: &str, body: Value) -> (u16, Value) {

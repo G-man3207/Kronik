@@ -12,10 +12,10 @@
 
 #[path = "support/blob_fixtures.rs"]
 mod blob_fixtures;
+mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -137,22 +137,7 @@ impl Daemon {
         body: Value,
         token: Option<&str>,
     ) -> Option<(u16, Value)> {
-        let mut s = UnixStream::connect(self.socket()).ok()?;
-        let body = if body.is_null() {
-            String::new()
-        } else {
-            body.to_string()
-        };
-        let auth = token.map_or(String::new(), |t| format!("authorization: Bearer {t}\r\n"));
-        write!(
-            s,
-            "{method} {path} HTTP/1.1\r\nhost: kronik\r\n{auth}content-length: {}\r\n\
-             connection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .ok()?;
-        let r = read_response(s).ok()?;
-        Some((r.status, serde_json::from_slice(&r.body).ok()?))
+        common::try_api(&self.socket(), method, path, &body, token)
     }
 
     /// An API request that must answer 200. A request can meet the

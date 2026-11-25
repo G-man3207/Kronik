@@ -7,8 +7,8 @@
 // Test harness code: unwraps, std threads and std time are fine here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -110,7 +110,9 @@ impl Daemon {
                     std::fs::read_to_string(&log).unwrap_or_default()
                 ));
             }
-            if let Some((200, _)) = call(&socket, "GET", "/v1/health", Value::Null) {
+            if let Some((200, _)) =
+                common::try_api(&socket, "GET", "/v1/health", &Value::Null, None)
+            {
                 return Ok(Daemon {
                     child: Some(child),
                     socket,
@@ -131,12 +133,13 @@ impl Daemon {
     }
 
     fn api(&self, method: &str, path: &str, body: Value) -> Value {
-        let (s, v) = call(&self.socket, method, path, body).unwrap_or_else(|| {
-            panic!(
-                "{method} {path}: no answer\n{}",
-                std::fs::read_to_string(&self.log).unwrap_or_default()
-            )
-        });
+        let (s, v) =
+            common::try_api(&self.socket, method, path, &body, None).unwrap_or_else(|| {
+                panic!(
+                    "{method} {path}: no answer\n{}",
+                    std::fs::read_to_string(&self.log).unwrap_or_default()
+                )
+            });
         assert_eq!(s, 200, "{method} {path}: {v}");
         v
     }
@@ -185,42 +188,6 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-fn call(socket: &Path, method: &str, path: &str, body: Value) -> Option<(u16, Value)> {
-    let mut s = UnixStream::connect(socket).ok()?;
-    let body = if body.is_null() {
-        String::new()
-    } else {
-        body.to_string()
-    };
-    write!(
-        s,
-        "{method} {path} HTTP/1.1\r\nhost: kronik\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    )
-    .ok()?;
-    let mut r = BufReader::new(s);
-    let mut line = String::new();
-    r.read_line(&mut line).ok()?;
-    let status: u16 = line.split_whitespace().nth(1)?.parse().ok()?;
-    let mut len = 0;
-    loop {
-        let mut h = String::new();
-        r.read_line(&mut h).ok()?;
-        let h = h.trim_end();
-        if h.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = h.split_once(':')
-            && k.eq_ignore_ascii_case("content-length")
-        {
-            len = v.trim().parse().ok()?;
-        }
-    }
-    let mut buf = vec![0; len];
-    r.read_exact(&mut buf).ok()?;
-    Some((status, serde_json::from_slice(&buf).ok()?))
 }
 
 /// Polls `f` for up to `secs` seconds.
