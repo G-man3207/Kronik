@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{audit, guest, rt, tempdir};
+use common::{audit, destination, guest, rt, tempdir};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
@@ -123,9 +123,7 @@ fn a_restored_blob_reference_needs_its_subjects_key() {
     drop(node);
 
     let restore_into = |mode: KeystoreMode| {
-        let dst = tempdir("blob-keys-dst-");
-        std::fs::create_dir_all(dst.path().join("keys")).unwrap();
-        std::fs::write(dst.path().join("keys/master.key"), &key).unwrap();
+        let dst = destination("blob-keys-dst-", &key);
         let restorer = crate::rt();
         let r = restorer.block_on(restore(
             &remote,

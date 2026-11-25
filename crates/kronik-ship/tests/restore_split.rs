@@ -170,10 +170,7 @@ impl Shipped {
     }
 
     fn destination(&self) -> tempfile::TempDir {
-        let dst = tempdir("split-dst-");
-        std::fs::create_dir_all(dst.path().join("keys")).unwrap();
-        std::fs::write(dst.path().join("keys/master.key"), &self.key).unwrap();
-        dst
+        common::destination("split-dst-", &self.key)
     }
 }
 

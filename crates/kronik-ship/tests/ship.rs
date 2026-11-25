@@ -10,13 +10,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{audit, guest, message, rt, s3_url, tempdir};
+use common::{audit, destination, guest, message, restore_main, rt, s3_url, tempdir};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::snapshots::StorageConfig;
 use kronik_sched::{Node, NodeConfig, start_local};
-use kronik_ship::{KeystoreMode, RESTORE_MARKER, Remote, ShipState, restore, ship_once};
+use kronik_ship::{KeystoreMode, RESTORE_MARKER, Remote, ShipState, ship_once};
 use tokio::runtime::Runtime;
 
 struct Proc {
@@ -93,6 +93,26 @@ impl Proc {
             .block_on(ship_once(remote, dir, "main", &mut st))
             .unwrap()
     }
+
+    fn deploy(&self, name: &str) {
+        self.rt
+            .block_on(self.node.deploy(
+                &guest(name),
+                audit(),
+                false,
+                self.node.local_operator_authority().unwrap(),
+            ))
+            .unwrap();
+    }
+
+    fn snapshot(&self) -> kronik_sched::snapshots::Manifest {
+        self.rt
+            .block_on(
+                self.node
+                    .snapshot("manual", self.node.local_operator_authority().unwrap()),
+            )
+            .unwrap()
+    }
 }
 
 /// Ships a node's data, destroys it, restores into an empty directory and
@@ -100,30 +120,13 @@ impl Proc {
 fn ship_and_restore(remote: &Remote) {
     let src = tempdir("ship-src-");
     let p = start(src.path(), None);
-    p.rt.block_on(p.node.deploy(
-        &guest("counter"),
-        audit(),
-        false,
-        p.node.local_operator_authority().unwrap(),
-    ))
-    .unwrap();
-    p.rt.block_on(p.node.deploy(
-        &guest("notes"),
-        audit(),
-        false,
-        p.node.local_operator_authority().unwrap(),
-    ))
-    .unwrap();
+    p.deploy("counter");
+    p.deploy("notes");
     for i in 0..30 {
         p.send(&format!("counter/c{}", i % 4), "increment", "");
         p.send(&format!("notes/n{}", i % 3), "add", &format!("note {i}"));
     }
-    let m =
-        p.rt.block_on(
-            p.node
-                .snapshot("manual", p.node.local_operator_authority().unwrap()),
-        )
-        .unwrap();
+    let m = p.snapshot();
     let first = p.ship(remote, src.path());
     assert!(first.objects > 3, "{first:?}");
     // Records after the snapshot travel in the active segment.
@@ -141,42 +144,14 @@ fn ship_and_restore(remote: &Remote) {
     drop(p);
     drop(src);
 
-    let dst = tempdir("ship-dst-");
-    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
-    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
-    let rt = rt();
-    let r = rt
-        .block_on(restore(
-            remote,
-            dst.path(),
-            "main",
-            false,
-            &Env::real(rt.handle().clone()),
-            &Default::default(),
-            KeystoreMode::Require,
-            false,
-            &|_| Ok(()),
-        ))
-        .unwrap();
+    let dst = destination("ship-dst-", &key);
+    let r = restore_main(remote, dst.path()).unwrap();
     assert_eq!(r.snapshot_lsn, m.lsn);
     assert_eq!(r.state_hash, m.state_hash);
     assert!(r.components >= 2, "{r:?}");
     // A second restore over the restored state is refused without force.
-    let err = rt
-        .block_on(restore(
-            remote,
-            dst.path(),
-            "main",
-            false,
-            &Env::real(rt.handle().clone()),
-            &Default::default(),
-            KeystoreMode::Require,
-            false,
-            &|_| Ok(()),
-        ))
-        .unwrap_err();
+    let err = restore_main(remote, dst.path()).unwrap_err();
     assert!(err.to_string().contains("--force"), "{err}");
-    drop(rt);
 
     let q = start(dst.path(), None);
     assert_eq!(q.node.applied_lsn(), applied);
@@ -217,23 +192,12 @@ fn restore_keeps_the_snapshot_the_bucket_log_reaches() {
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     let src = tempdir("ship-covered-src-");
     let p = start(src.path(), None);
-    p.rt.block_on(p.node.deploy(
-        &guest("counter"),
-        audit(),
-        false,
-        p.node.local_operator_authority().unwrap(),
-    ))
-    .unwrap();
+    p.deploy("counter");
     let mut count = 0;
     for _ in 0..3 {
         count = p.send("counter/a", "increment", "").parse().unwrap();
     }
-    let old =
-        p.rt.block_on(
-            p.node
-                .snapshot("manual", p.node.local_operator_authority().unwrap()),
-        )
-        .unwrap();
+    let old = p.snapshot();
     p.ship(&remote, src.path());
 
     // Roll the log into a segment after the snapshot's marker: that segment
@@ -251,12 +215,7 @@ fn restore_keeps_the_snapshot_the_bucket_log_reaches() {
         sent += 1;
         assert!(sent < 1000, "the log never rolled past lsn {}", old.lsn);
     }
-    let new =
-        p.rt.block_on(
-            p.node
-                .snapshot("manual", p.node.local_operator_authority().unwrap()),
-        )
-        .unwrap();
+    let new = p.snapshot();
     p.ship(&remote, src.path());
     let starts = bucket_starts(&p.rt, &remote);
     let next = starts
@@ -282,28 +241,12 @@ fn restore_keeps_the_snapshot_the_bucket_log_reaches() {
     let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
     drop(p);
 
-    let dst = tempdir("ship-covered-dst-");
-    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
-    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
-    let rt = rt();
-    let report = rt
-        .block_on(restore(
-            &remote,
-            dst.path(),
-            "main",
-            false,
-            &Env::real(rt.handle().clone()),
-            &Default::default(),
-            KeystoreMode::Require,
-            false,
-            &|_| Ok(()),
-        ))
-        .unwrap();
+    let dst = destination("ship-covered-dst-", &key);
+    let report = restore_main(&remote, dst.path()).unwrap();
     assert_eq!(report.snapshot_lsn, old.lsn, "{report:?}");
     assert_eq!(report.log_last_lsn, through, "{report:?}");
     assert_eq!(report.snapshots_skipped, vec![new.lsn], "{report:?}");
     assert_eq!(report.log_first_lsn, starts[0], "{report:?}");
-    drop(rt);
 
     // The installation is one the daemon starts, and it applied exactly the
     // log the bucket held (the turn that rolled the segment is in the log the
@@ -325,30 +268,14 @@ fn restore_fails_when_a_listed_manifest_cannot_be_read() {
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     let src = tempdir("ship-corrupt-src-");
     let p = start(src.path(), None);
-    p.rt.block_on(p.node.deploy(
-        &guest("counter"),
-        audit(),
-        false,
-        p.node.local_operator_authority().unwrap(),
-    ))
-    .unwrap();
+    p.deploy("counter");
     for _ in 0..3 {
         p.send("counter/a", "increment", "");
     }
-    let old =
-        p.rt.block_on(
-            p.node
-                .snapshot("manual", p.node.local_operator_authority().unwrap()),
-        )
-        .unwrap();
+    let old = p.snapshot();
     p.ship(&remote, src.path());
     p.send("counter/a", "increment", "");
-    let new =
-        p.rt.block_on(
-            p.node
-                .snapshot("manual", p.node.local_operator_authority().unwrap()),
-        )
-        .unwrap();
+    let new = p.snapshot();
     p.ship(&remote, src.path());
     // The newest manifest is present and listed, but corrupt.
     p.rt.block_on(remote.put(
@@ -359,23 +286,8 @@ fn restore_fails_when_a_listed_manifest_cannot_be_read() {
     let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
     drop(p);
 
-    let dst = tempdir("ship-corrupt-dst-");
-    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
-    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
-    let rt = rt();
-    let e = rt
-        .block_on(restore(
-            &remote,
-            dst.path(),
-            "main",
-            false,
-            &Env::real(rt.handle().clone()),
-            &Default::default(),
-            KeystoreMode::Require,
-            false,
-            &|_| Ok(()),
-        ))
-        .unwrap_err();
+    let dst = destination("ship-corrupt-dst-", &key);
+    let e = restore_main(&remote, dst.path()).unwrap_err();
     assert!(
         e.to_string()
             .contains(&format!("the manifest of snapshot {:020}", new.lsn)),
@@ -384,7 +296,6 @@ fn restore_fails_when_a_listed_manifest_cannot_be_read() {
     assert!(new.lsn > old.lsn);
     // The refusal wrote nothing.
     assert!(!dst.path().join("branches").exists());
-    drop(rt);
 }
 
 /// A manifest the listing names but the store no longer holds is skipped as
@@ -397,30 +308,14 @@ fn restore_proceeds_when_the_newest_manifest_is_gone() {
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     let src = tempdir("ship-gone-src-");
     let p = start(src.path(), None);
-    p.rt.block_on(p.node.deploy(
-        &guest("counter"),
-        audit(),
-        false,
-        p.node.local_operator_authority().unwrap(),
-    ))
-    .unwrap();
+    p.deploy("counter");
     for _ in 0..3 {
         p.send("counter/a", "increment", "");
     }
-    let old =
-        p.rt.block_on(
-            p.node
-                .snapshot("manual", p.node.local_operator_authority().unwrap()),
-        )
-        .unwrap();
+    let old = p.snapshot();
     p.ship(&remote, src.path());
     let count: u64 = p.send("counter/a", "increment", "").parse().unwrap();
-    let new =
-        p.rt.block_on(
-            p.node
-                .snapshot("manual", p.node.local_operator_authority().unwrap()),
-        )
-        .unwrap();
+    let new = p.snapshot();
     p.ship(&remote, src.path());
     // Retention's order: the manifest goes first, the files follow.
     p.rt.block_on(remote.delete_object(&format!("main/snapshots/{:020}/manifest.json", new.lsn)))
@@ -428,26 +323,10 @@ fn restore_proceeds_when_the_newest_manifest_is_gone() {
     let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
     drop(p);
 
-    let dst = tempdir("ship-gone-dst-");
-    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
-    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
-    let rt = rt();
-    let report = rt
-        .block_on(restore(
-            &remote,
-            dst.path(),
-            "main",
-            false,
-            &Env::real(rt.handle().clone()),
-            &Default::default(),
-            KeystoreMode::Require,
-            false,
-            &|_| Ok(()),
-        ))
-        .unwrap();
+    let dst = destination("ship-gone-dst-", &key);
+    let report = restore_main(&remote, dst.path()).unwrap();
     assert_eq!(report.snapshot_lsn, old.lsn, "{report:?}");
     assert!(report.snapshots_skipped.is_empty(), "{report:?}");
-    drop(rt);
 
     // The log is complete, so the daemon starts and replays past the
     // snapshot the restore could not use.
@@ -468,20 +347,9 @@ fn restore_refuses_a_bucket_whose_log_reaches_no_snapshot() {
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     let src = tempdir("ship-uncovered-src-");
     let p = start(src.path(), None);
-    p.rt.block_on(p.node.deploy(
-        &guest("counter"),
-        audit(),
-        false,
-        p.node.local_operator_authority().unwrap(),
-    ))
-    .unwrap();
+    p.deploy("counter");
     p.send("counter/a", "increment", "");
-    let only =
-        p.rt.block_on(
-            p.node
-                .snapshot("manual", p.node.local_operator_authority().unwrap()),
-        )
-        .unwrap();
+    let only = p.snapshot();
     p.ship(&remote, src.path());
     for s in bucket_starts(&p.rt, &remote) {
         p.rt.block_on(remote.delete_object(&format!(
@@ -493,23 +361,8 @@ fn restore_refuses_a_bucket_whose_log_reaches_no_snapshot() {
     let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
     drop(p);
 
-    let dst = tempdir("ship-uncovered-dst-");
-    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
-    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
-    let rt = rt();
-    let err = rt
-        .block_on(restore(
-            &remote,
-            dst.path(),
-            "main",
-            false,
-            &Env::real(rt.handle().clone()),
-            &Default::default(),
-            KeystoreMode::Require,
-            false,
-            &|_| Ok(()),
-        ))
-        .unwrap_err();
+    let dst = destination("ship-uncovered-dst-", &key);
+    let err = restore_main(&remote, dst.path()).unwrap_err();
     let text = err.to_string();
     assert!(text.contains("lsn 0"), "{text}");
     assert!(text.contains(&only.lsn.to_string()), "{text}");
@@ -530,27 +383,15 @@ fn an_interrupted_restore_leaves_a_consistent_directory() {
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     let src = tempdir("ship-int-src-");
     let p = start(src.path(), None);
-    p.rt.block_on(p.node.deploy(
-        &guest("counter"),
-        audit(),
-        false,
-        p.node.local_operator_authority().unwrap(),
-    ))
-    .unwrap();
+    p.deploy("counter");
     p.send("counter/a", "increment", "");
-    p.rt.block_on(
-        p.node
-            .snapshot("manual", p.node.local_operator_authority().unwrap()),
-    )
-    .unwrap();
+    p.snapshot();
     p.ship(&remote, src.path());
     let hash = p.node.store().state_hash().unwrap();
     let key = std::fs::read(src.path().join("keys/master.key")).unwrap();
     drop(p);
 
-    let dst = tempdir("ship-int-dst-");
-    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
-    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
+    let dst = destination("ship-int-dst-", &key);
     let rt = rt();
     let run = |force: bool, at: Option<&'static str>| {
         rt.block_on(kronik_ship::restore(
@@ -632,13 +473,7 @@ fn retention_deletes_remote_segments_and_snapshots() {
     let bucket = tempdir("ship-ret-bucket-");
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     let p = start(src.path(), Some(Duration::ZERO));
-    p.rt.block_on(p.node.deploy(
-        &guest("counter"),
-        audit(),
-        false,
-        p.node.local_operator_authority().unwrap(),
-    ))
-    .unwrap();
+    p.deploy("counter");
     for i in 0..80 {
         p.send(&format!("counter/k{}", i % 5), "increment", "");
     }
@@ -653,11 +488,7 @@ fn retention_deletes_remote_segments_and_snapshots() {
     // Snapshots compact the log (history zero) and prune to two kept.
     for _ in 0..3 {
         p.send("counter/k0", "increment", "");
-        p.rt.block_on(
-            p.node
-                .snapshot("manual", p.node.local_operator_authority().unwrap()),
-        )
-        .unwrap();
+        p.snapshot();
     }
     let report = p.ship(&remote, src.path());
     assert!(report.deleted > 0, "{report:?}");
@@ -702,13 +533,7 @@ fn compacted_node_shipped(
 ) -> (u64, u64, u64, String, Vec<u8>) {
     let p = start(src, Some(Duration::ZERO));
     for g in ["counter", "notes"] {
-        p.rt.block_on(p.node.deploy(
-            &guest(g),
-            audit(),
-            false,
-            p.node.local_operator_authority().unwrap(),
-        ))
-        .unwrap();
+        p.deploy(g);
     }
     p.send("notes/n", "add", "hello");
     let note = p
@@ -737,11 +562,7 @@ fn compacted_node_shipped(
     }
     // Once the snapshot is the window's base, a retention pass compacts the
     // log.
-    p.rt.block_on(
-        p.node
-            .snapshot("manual", p.node.local_operator_authority().unwrap()),
-    )
-    .unwrap();
+    p.snapshot();
     p.age_and_compact();
     let storage = p.node.storage_config().unwrap().clone();
     let first = p.node.log_first(&storage).unwrap();
@@ -785,24 +606,8 @@ fn restore_compacted_log_with_an_idle_sql_actor(ship_early: bool) {
     // The bucket's log starts mid-way, after the actor's last change.
     assert_eq!(bucket_first(bucket.path()), first);
 
-    let dst = tempdir("ship-idle-dst-");
-    std::fs::create_dir_all(dst.path().join("keys")).unwrap();
-    std::fs::write(dst.path().join("keys/master.key"), key).unwrap();
-    let rt = rt();
-    let report = rt
-        .block_on(restore(
-            &remote,
-            dst.path(),
-            "main",
-            false,
-            &Env::real(rt.handle().clone()),
-            &Default::default(),
-            KeystoreMode::Require,
-            false,
-            &|_| Ok(()),
-        ))
-        .unwrap();
-    drop(rt);
+    let dst = destination("ship-idle-dst-", &key);
+    let report = restore_main(&remote, dst.path()).unwrap();
     assert!(report.snapshot_lsn + 1 >= first, "{report:?}");
 
     // The scenario is the one it claims to be: the restored actor database
@@ -868,13 +673,7 @@ fn active_segment_deleted_before_it_was_closed(
     remote: &Remote,
     bucket: &Path,
 ) -> (u64, u64) {
-    p.rt.block_on(p.node.deploy(
-        &guest("counter"),
-        audit(),
-        false,
-        p.node.local_operator_authority().unwrap(),
-    ))
-    .unwrap();
+    p.deploy("counter");
     for i in 0..80 {
         p.send(&format!("counter/k{}", i % 5), "increment", "");
         if i % 20 == 19 {
@@ -892,11 +691,7 @@ fn active_segment_deleted_before_it_was_closed(
     // The bucket is out of reach for longer than `history`: once the
     // snapshot is the window's base, a retention pass deletes the segment
     // locally.
-    p.rt.block_on(
-        p.node
-            .snapshot("manual", p.node.local_operator_authority().unwrap()),
-    )
-    .unwrap();
+    p.snapshot();
     p.age_and_compact();
     let first = p
         .node
@@ -973,13 +768,7 @@ fn a_retention_pruned_segment_that_is_gone_from_the_bucket_does_not_stop_shippin
     let bucket = tempdir("ship-seg-gone-bucket-");
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     let p = start(src.path(), Some(Duration::ZERO));
-    p.rt.block_on(p.node.deploy(
-        &guest("counter"),
-        audit(),
-        false,
-        p.node.local_operator_authority().unwrap(),
-    ))
-    .unwrap();
+    p.deploy("counter");
     for i in 0..80 {
         p.send(&format!("counter/k{}", i % 5), "increment", "");
     }
@@ -994,11 +783,7 @@ fn a_retention_pruned_segment_that_is_gone_from_the_bucket_does_not_stop_shippin
     // Retention drops it locally, so the next round prunes it remotely.
     for _ in 0..3 {
         p.send("counter/k0", "increment", "");
-        p.rt.block_on(
-            p.node
-                .snapshot("manual", p.node.local_operator_authority().unwrap()),
-        )
-        .unwrap();
+        p.snapshot();
     }
     let report = p.ship(&remote, src.path());
     assert!(report.deleted > 0, "{report:?}");
@@ -1021,22 +806,9 @@ fn a_round_stopped_after_a_snapshot_manifest_delete_does_not_wedge_the_next() {
     let bucket = tempdir("ship-man-bucket-");
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
     let p = start(src.path(), Some(Duration::ZERO));
-    p.rt.block_on(p.node.deploy(
-        &guest("counter"),
-        audit(),
-        false,
-        p.node.local_operator_authority().unwrap(),
-    ))
-    .unwrap();
-    let snap = |p: &Proc| {
-        p.rt.block_on(
-            p.node
-                .snapshot("manual", p.node.local_operator_authority().unwrap()),
-        )
-        .unwrap();
-    };
+    p.deploy("counter");
     p.send("counter/k0", "increment", "");
-    snap(&p);
+    p.snapshot();
     p.ship(&remote, src.path());
     let shipped = *ShipState::load(src.path())
         .unwrap()
@@ -1046,7 +818,7 @@ fn a_round_stopped_after_a_snapshot_manifest_delete_does_not_wedge_the_next() {
     // Snapshots kept are two: three more push the shipped one out locally.
     for _ in 0..3 {
         p.send("counter/k0", "increment", "");
-        snap(&p);
+        p.snapshot();
     }
     let mut st = ShipState::load(src.path()).unwrap();
     let faulted = p.rt.block_on(kronik_ship::ship_once_with_fault(
