@@ -453,21 +453,6 @@ fn proposal_path(id: &str) -> String {
     format!("/v1/proposals/{}", percent_encode(id))
 }
 
-/// Prints the API's body for `--json`, else parses it for `render`.
-fn show<T: serde::de::DeserializeOwned>(
-    ctx: &Ctx,
-    body: &[u8],
-    render: impl FnOnce(T) -> String,
-) -> Result<ExitCode, Error> {
-    if ctx.json {
-        ctx.print_raw(body);
-    } else {
-        let r: T = ctx.decode(body)?;
-        ctx.print(&render(r));
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
 fn create(ctx: &Ctx, a: ForkCreateArgs) -> Result<ExitCode, Error> {
     let reason = reason(&a.mutation)?;
     let at =
@@ -491,7 +476,7 @@ fn create(ctx: &Ctx, a: ForkCreateArgs) -> Result<ExitCode, Error> {
         rerun.push_str(" --no-pii");
     }
     let _ = write!(rerun, " --reason {}", shell_quote(reason));
-    show(ctx, &body, |r: ForkCreateResponse| {
+    ctx.show(&body, |r: ForkCreateResponse| {
         let f = &r.fork;
         let mut out = String::new();
         if r.dry_run {
@@ -515,7 +500,7 @@ fn create(ctx: &Ctx, a: ForkCreateArgs) -> Result<ExitCode, Error> {
 
 fn list(ctx: &Ctx) -> Result<ExitCode, Error> {
     let body = ctx.get("/v1/forks")?;
-    show(ctx, &body, |r: ForksResponse| {
+    ctx.show(&body, |r: ForksResponse| {
         let Some(first) = r.forks.first() else {
             let mut out = String::from("No forks.\n");
             out.push_str(&next(&[
@@ -565,7 +550,7 @@ fn deploy(ctx: &Ctx, fork: &str, wasm: &Path, m: &Mutation) -> Result<ExitCode, 
         shell_quote(&wasm.to_string_lossy()),
         shell_quote(reason)
     );
-    show(ctx, &body, |r: ForkDeployResponse| {
+    ctx.show(&body, |r: ForkDeployResponse| {
         let d = &r.deployment;
         let mut out = String::new();
         if r.dry_run {
@@ -605,7 +590,7 @@ fn delete(ctx: &Ctx, fork: &str, m: &Mutation) -> Result<ExitCode, Error> {
         shell_quote(fork),
         shell_quote(reason)
     );
-    show(ctx, &body, |r: ForkDeleteResponse| {
+    ctx.show(&body, |r: ForkDeleteResponse| {
         let mut out = String::new();
         if r.dry_run {
             let _ = writeln!(
@@ -682,19 +667,15 @@ pub fn diff(ctx: &Ctx, c: DiffCommand) -> Result<ExitCode, Error> {
         return Ok(ExitCode::SUCCESS);
     }
     let body = ctx.get(&format!("{}/diff", fork_path(&name)))?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let d: Value = ctx.decode(&body)?;
-    let mut out = diff_header(&d);
-    out.push_str(&diff_block(&d));
-    out.push_str(&next(&[format!(
-        "kronik diff show {} --md",
-        shell_quote(&name)
-    )]));
-    ctx.print(&out);
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |d: Value| {
+        let mut out = diff_header(&d);
+        out.push_str(&diff_block(&d));
+        out.push_str(&next(&[format!(
+            "kronik diff show {} --md",
+            shell_quote(&name)
+        )]));
+        out
+    })
 }
 
 /// The components to propose: each file as given, and the `.wasm` files
@@ -1071,7 +1052,7 @@ pub fn proposals(ctx: &Ctx, c: ProposalsCommand) -> Result<ExitCode, Error> {
     match c {
         ProposalsCommand::List => {
             let body = ctx.get("/v1/proposals")?;
-            show(ctx, &body, |r: ProposalsResponse| {
+            ctx.show(&body, |r: ProposalsResponse| {
                 let Some(first) = r.proposals.first() else {
                     let mut out = String::from("No proposals.\n");
                     out.push_str(&next(
@@ -1553,7 +1534,7 @@ pub fn approve(ctx: &Ctx, a: ProposalArgs) -> Result<ExitCode, Error> {
     )?;
     let id = shell_quote(&a.proposal);
     let rerun = format!("kronik approve {id} --reason {}", shell_quote(reason));
-    show(ctx, &body, |r: ApproveResponse| {
+    ctx.show(&body, |r: ApproveResponse| {
         let ap = &r.approval;
         let mut out = String::new();
         if r.dry_run {
@@ -1599,7 +1580,7 @@ pub fn promote(ctx: &Ctx, a: ProposalArgs) -> Result<ExitCode, Error> {
         shell_quote(&a.proposal),
         shell_quote(reason)
     );
-    show(ctx, &body, |r: PromoteResponse| {
+    ctx.show(&body, |r: PromoteResponse| {
         let d = &r.deployment;
         let mut out = String::new();
         if r.dry_run {
@@ -1775,7 +1756,7 @@ pub fn rollback(ctx: &Ctx, a: RollbackArgs) -> Result<ExitCode, Error> {
         a.epoch,
         shell_quote(reason)
     );
-    show(ctx, &body, |r: RollbackResponse| {
+    ctx.show(&body, |r: RollbackResponse| {
         let d = &r.deployment;
         let mut out = String::new();
         if r.dry_run {
@@ -1826,7 +1807,7 @@ pub fn watch(ctx: &Ctx, a: WatchArgs) -> Result<ExitCode, Error> {
             units::duration(a.for_ms),
             shell_quote(reason)
         );
-        return show(ctx, &body, |r: WatchResponse| {
+        return ctx.show(&body, |r: WatchResponse| {
             let w = &r.watch;
             if r.dry_run {
                 let mut out = format!(
@@ -1996,7 +1977,7 @@ pub fn watches(ctx: &Ctx, c: WatchesCommand) -> Result<ExitCode, Error> {
     match c {
         WatchesCommand::List => {
             let body = ctx.get("/v1/watches")?;
-            show(ctx, &body, |r: WatchesResponse| {
+            ctx.show(&body, |r: WatchesResponse| {
                 if r.watches.is_empty() {
                     return format!(
                         "No watches\n{}",
@@ -2047,7 +2028,7 @@ pub fn watches(ctx: &Ctx, c: WatchesCommand) -> Result<ExitCode, Error> {
                 },
             )?;
             let rerun = format!("kronik watches stop {id} --reason {}", shell_quote(reason));
-            show(ctx, &body, |r: WatchResponse| {
+            ctx.show(&body, |r: WatchResponse| {
                 if r.dry_run {
                     format!(
                         "Dry run: watch {id} of epoch {} can be stopped; nothing was written\n{}",
@@ -2155,7 +2136,7 @@ pub fn policy(ctx: &Ctx, c: PolicyCommand) -> Result<ExitCode, Error> {
     match c {
         PolicyCommand::Show => {
             let body = ctx.get("/v1/policy")?;
-            show(ctx, &body, |r: PolicyResponse| {
+            ctx.show(&body, |r: PolicyResponse| {
                 let mut out = if r.default {
                     String::from("The default policy rules (no policy has been set):\n\n")
                 } else {
@@ -2204,7 +2185,7 @@ pub fn policy(ctx: &Ctx, c: PolicyCommand) -> Result<ExitCode, Error> {
                 shell_quote(&file.to_string_lossy()),
                 shell_quote(reason)
             );
-            show(ctx, &body, |r: PolicySetResponse| {
+            ctx.show(&body, |r: PolicySetResponse| {
                 let mut out = String::new();
                 if r.dry_run {
                     let _ = writeln!(
@@ -2229,7 +2210,7 @@ pub fn policy(ctx: &Ctx, c: PolicyCommand) -> Result<ExitCode, Error> {
                     proposal: proposal.clone(),
                 },
             )?;
-            show(ctx, &body, |v: Value| {
+            ctx.show(&body, |v: Value| {
                 let mut out = String::new();
                 let _ = writeln!(
                     out,
