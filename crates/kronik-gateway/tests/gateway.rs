@@ -4,10 +4,13 @@
 // a request on the test runtime.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use kronik_core::env::{BoxFuture, Env};
+use common::{code, header};
+use kronik_core::env::BoxFuture;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, TurnId};
 use kronik_gateway::subject::SubjectFrom;
@@ -15,7 +18,7 @@ use kronik_gateway::{
     Gateway, GatewayConfig, HttpRequest, HttpResponse, PreviewRouter, TURN_ID_HEADER,
 };
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{Node, NodeConfig, RouteEntry, TurnResult, start_local};
+use kronik_sched::{Node, NodeConfig, RouteEntry, TurnResult};
 
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -23,26 +26,7 @@ const COUNTER: &str = concat!(
 );
 
 async fn node(dir: &std::path::Path) -> Arc<Node> {
-    node_with_guest(dir, COUNTER).await
-}
-
-async fn node_with_guest(dir: &std::path::Path, guest: &str) -> Arc<Node> {
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(env, dir, NodeConfig::default()).await.unwrap();
-    let audit = pb::Audit {
-        token_id: "t".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    };
-    node.deploy(
-        &std::fs::read(guest).unwrap(),
-        audit,
-        false,
-        node.local_operator_authority().unwrap(),
-    )
-    .await
-    .unwrap();
-    node
+    common::deployed(dir, COUNTER, NodeConfig::default()).await
 }
 
 fn post(path: &str, key: Option<&str>, body: &[u8]) -> HttpRequest {
@@ -56,18 +40,6 @@ fn post(path: &str, key: Option<&str>, body: &[u8]) -> HttpRequest {
         body: body.to_vec(),
         peer: None,
     }
-}
-
-fn header<'a>(r: &'a HttpResponse, name: &str) -> Option<&'a str> {
-    r.headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
-}
-
-fn code(r: &HttpResponse) -> String {
-    let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
-    v["error"]["code"].as_str().unwrap().to_owned()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -178,12 +150,13 @@ async fn admin_cookies_never_reach_the_guest_input_or_wal() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guest_admin_cookie_assignments_are_filtered_on_fresh_and_cached_responses() {
     let dir = tempfile::tempdir().unwrap();
-    let node = node_with_guest(
+    let node = common::deployed(
         dir.path(),
         concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/guests/counter-respond.wasm"
         ),
+        NodeConfig::default(),
     )
     .await;
     let gw = Gateway::new(node.clone(), GatewayConfig::default());

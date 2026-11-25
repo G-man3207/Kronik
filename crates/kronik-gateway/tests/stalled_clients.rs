@@ -12,17 +12,18 @@
 // drivers on the tokio runtime directly.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
-use std::sync::Arc;
+mod common;
+
 use std::time::Duration;
 
+use common::{ask, room_node};
 use futures_util::{SinkExt as _, StreamExt as _};
 use hyper_util::rt::TokioIo;
-use kronik_core::env::Env;
 use kronik_gateway::connections::Limits;
 use kronik_gateway::{Gateway, GatewayConfig, HttpRequest};
 use kronik_proto::log::v1 as pb;
+use kronik_sched::Node;
 use kronik_sched::connections::ConnectionsConfig;
-use kronik_sched::{Node, NodeConfig, start_local};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio_tungstenite::WebSocketStream;
@@ -30,38 +31,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
-const ROOM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/room.wasm");
-
 const SHORT: Duration = Duration::from_millis(300);
-
-async fn node(connections: ConnectionsConfig) -> (tempfile::TempDir, Arc<Node>) {
-    let dir = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(
-        env,
-        dir.path(),
-        NodeConfig {
-            connections,
-            ..NodeConfig::default()
-        },
-    )
-    .await
-    .unwrap();
-    let audit = pb::Audit {
-        token_id: "t".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    };
-    node.deploy(
-        &std::fs::read(ROOM).unwrap(),
-        audit,
-        false,
-        node.local_operator_authority().unwrap(),
-    )
-    .await
-    .unwrap();
-    (dir, node)
-}
 
 /// Short timeouts, and reads that are not paced, for a quick test.
 fn quick() -> ConnectionsConfig {
@@ -128,41 +98,6 @@ async fn say(node: &Node, text: &str) {
     ask(node, "say", text.as_bytes()).await;
 }
 
-/// A message to room/lobby; its reply's text.
-async fn ask(node: &Node, name: &str, body: &[u8]) -> String {
-    let r = node
-        .send(
-            kronik_core::ids::ActorRef::parse("room/lobby").unwrap(),
-            pb::Message {
-                name: name.into(),
-                content_type: "text/plain".into(),
-                body: Some(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(body.to_vec())),
-                }),
-                blobs: vec![],
-                retained_compensation_source: None,
-            },
-            pb::Audit {
-                token_id: "t".into(),
-                reason: "test".into(),
-                wall_time_ms: 0,
-            },
-            false,
-            node.local_operator_authority().unwrap(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    match r.outcome.output {
-        Some(pb::outcome::Output::Reply(m)) => match m.body.and_then(|b| b.value) {
-            Some(pb::sealable::Value::Plain(b)) => String::from_utf8(b).unwrap(),
-            _ => String::new(),
-        },
-        _ => String::new(),
-    }
-}
-
 /// S1: a WebSocket client that stops reading. The driver's writes stall;
 /// the first one that the client does not take within the ping timeout
 /// closes the connection as a slow consumer, the socket is dropped and the
@@ -170,7 +105,7 @@ async fn ask(node: &Node, name: &str, body: &[u8]) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_websocket_client_that_stops_reading_is_closed_and_freed() {
     let cfg = quick();
-    let (_dir, node) = node(cfg.clone()).await;
+    let (_dir, node) = room_node(cfg.clone()).await;
     let gw = Gateway::new(node.clone(), GatewayConfig::default());
     let answer = gw
         .open_connection(request("/room/lobby/ws?user=ada", true))
@@ -221,7 +156,7 @@ async fn a_websocket_client_that_stops_reading_is_closed_and_freed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_sse_client_that_stops_reading_is_closed_and_freed() {
     let cfg = quick();
-    let (_dir, node) = node(cfg.clone()).await;
+    let (_dir, node) = room_node(cfg.clone()).await;
     for text in ["one", "two", "three"] {
         say(&node, text).await;
     }
@@ -258,7 +193,7 @@ async fn an_sse_client_that_stops_reading_is_closed_and_freed() {
 /// request's future). The accept that then commits is abandoned at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_open_whose_client_left_is_abandoned() {
-    let (_dir, node) = node(quick()).await;
+    let (_dir, node) = room_node(quick()).await;
     let gw = Gateway::new(node.clone(), GatewayConfig::default());
     let mut open = Box::pin(gw.open_connection(request("/room/lobby/ws?user=ada", true)));
     // One poll admits the open; then the client is gone.
@@ -287,7 +222,7 @@ async fn an_open_whose_client_left_is_abandoned() {
 /// close is recorded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_accepted_connection_without_a_transport_is_freed() {
-    let (_dir, node) = node(ConnectionsConfig {
+    let (_dir, node) = room_node(ConnectionsConfig {
         attach_timeout: Duration::from_millis(500),
         ..quick()
     })
@@ -298,42 +233,11 @@ async fn an_accepted_connection_without_a_transport_is_freed() {
         .await;
     let conn = answer.connection.unwrap();
     // Nobody attaches. The actor closes it.
-    node.send(
-        kronik_core::ids::ActorRef::parse("room/lobby").unwrap(),
-        pb::Message {
-            name: "kick".into(),
-            content_type: "text/plain".into(),
-            body: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(conn.as_bytes().to_vec())),
-            }),
-            blobs: vec![],
-            retained_compensation_source: None,
-        },
-        pb::Audit {
-            token_id: "t".into(),
-            reason: "test".into(),
-            wall_time_ms: 0,
-        },
-        false,
-        node.local_operator_authority().unwrap(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    ask(&node, "kick", conn.as_bytes()).await;
     let row = closed(&node, &conn).await;
     assert_eq!(row.cause, Some(pb::CloseCause::Actor as i32), "{row:?}");
     assert_eq!(row.code, Some(4000));
     assert_eq!(node.hub().live(), 0);
-}
-
-/// The gateway's hyper server on a free port.
-async fn serve(node: &Arc<Node>) -> std::net::SocketAddr {
-    let gw = Arc::new(Gateway::new(node.clone(), GatewayConfig::default()));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(kronik_gateway::server::serve(listener, gw, 64));
-    addr
 }
 
 /// A TCP connection with a tiny receive buffer: the server's writes back up
@@ -375,14 +279,14 @@ const UPGRADE: &str = "GET /room/lobby/ws?user=ghost HTTP/1.1\r\nHost: 127.0.0.1
 /// notice first, is closed as a slow consumer and freed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_websocket_client_over_tcp_that_stops_reading_is_freed() {
-    let (_dir, node) = node(ConnectionsConfig {
+    let (_dir, node) = room_node(ConnectionsConfig {
         ping_interval: Duration::from_secs(5),
         ping_timeout: Duration::from_secs(5),
         close_timeout: Duration::from_secs(1),
         ..ConnectionsConfig::default()
     })
     .await;
-    let addr = serve(&node).await;
+    let addr = common::serve(&node, 64).await.0;
     let req = format!("ws://{addr}/room/lobby/ws?user=slow")
         .into_client_request()
         .unwrap();
@@ -401,14 +305,14 @@ async fn a_websocket_client_over_tcp_that_stops_reading_is_freed() {
 /// as a slow consumer and freed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_sse_client_over_tcp_that_stops_reading_is_freed() {
-    let (_dir, node) = node(ConnectionsConfig {
+    let (_dir, node) = room_node(ConnectionsConfig {
         sse_heartbeat: Duration::from_secs(1),
         close_timeout: Duration::from_secs(1),
         outbound_queue_bytes: 64 << 10,
         ..ConnectionsConfig::default()
     })
     .await;
-    let addr = serve(&node).await;
+    let addr = common::serve(&node, 64).await.0;
     let mut stream = tiny_socket(addr).await;
     stream
         .write_all(
@@ -432,8 +336,8 @@ async fn an_sse_client_over_tcp_that_stops_reading_is_freed() {
 /// behind: the accept is abandoned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_over_tcp_that_leaves_mid_open_is_freed() {
-    let (_dir, node) = node(ConnectionsConfig::default()).await;
-    let addr = serve(&node).await;
+    let (_dir, node) = room_node(ConnectionsConfig::default()).await;
+    let addr = common::serve(&node, 64).await.0;
     for query in ["user=ghost", "user=ghost&call=1"] {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
@@ -485,7 +389,7 @@ async fn a_reader_kronik_paused_is_no_ping_timeout() {
         inbound_rate: 1,
         ..ConnectionsConfig::default()
     };
-    let (_dir, node) = node(cfg.clone()).await;
+    let (_dir, node) = room_node(cfg.clone()).await;
     let gw = Gateway::new(node.clone(), GatewayConfig::default());
     let answer = gw
         .open_connection(request("/room/lobby/ws?user=ada", true))
@@ -531,7 +435,7 @@ async fn a_long_burst_does_not_starve_the_reader() {
         ping_timeout: Duration::from_secs(5),
         ..quick()
     };
-    let (_dir, node) = node(cfg.clone()).await;
+    let (_dir, node) = room_node(cfg.clone()).await;
     let gw = Gateway::new(node.clone(), GatewayConfig::default());
     let answer = gw
         .open_connection(request("/room/lobby/ws?user=ada", true))
@@ -573,11 +477,8 @@ async fn a_long_burst_does_not_starve_the_reader() {
 /// HTTP requests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sse_streams_do_not_hold_http_slots() {
-    let (_dir, node) = node(ConnectionsConfig::default()).await;
-    let gw = Arc::new(Gateway::new(node.clone(), GatewayConfig::default()));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(kronik_gateway::server::serve(listener, gw, 4));
+    let (_dir, node) = room_node(ConnectionsConfig::default()).await;
+    let (addr, _) = common::serve(&node, 4).await;
     let mut streams = Vec::new();
     for i in 0..4 {
         let mut s = TcpStream::connect(addr).await.unwrap();
@@ -614,7 +515,7 @@ async fn sse_streams_do_not_hold_http_slots() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_sse_host_close_counts_every_frame_hyper_took() {
     let cfg = quick();
-    let (_dir, node) = node(cfg.clone()).await;
+    let (_dir, node) = room_node(cfg.clone()).await;
     for text in ["one", "two", "three"] {
         say(&node, text).await;
     }

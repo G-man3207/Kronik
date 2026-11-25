@@ -7,11 +7,14 @@
 //! runs through the hyper server (the `server` feature).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use common::{audit, code};
 use kronik_core::env::{BodySource, BoxFuture, Env};
 use kronik_gateway::{
     Gateway, GatewayConfig, HttpRequest, HttpResponse, RequestBody, ResponseBody,
@@ -22,29 +25,16 @@ use kronik_sched::{BlobsConfig, Node, NodeConfig, start_local};
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
 const MIB: usize = 1 << 20;
 
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "t".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
-
 async fn media_node(dir: &Path) -> Arc<Node> {
-    let env = Env::real(tokio::runtime::Handle::current());
-    let config = NodeConfig {
-        blobs: Some(BlobsConfig::default()),
-        ..NodeConfig::default()
-    };
-    let node = start_local(env, dir, config).await.unwrap();
-    node.deploy(
-        &std::fs::read(MEDIA).unwrap(),
-        audit(),
-        false,
-        node.local_operator_authority().unwrap(),
+    let node = common::deployed(
+        dir,
+        MEDIA,
+        NodeConfig {
+            blobs: Some(BlobsConfig::default()),
+            ..NodeConfig::default()
+        },
     )
-    .await
-    .unwrap();
+    .await;
     // The guest checksums and writes megabytes a byte at a time.
     set_limits(
         &node,
@@ -146,11 +136,6 @@ impl BodySource for Chunks {
 
 fn text(r: &HttpResponse) -> String {
     String::from_utf8_lossy(&r.body).into_owned()
-}
-
-fn code(r: &HttpResponse) -> String {
-    let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
-    v["error"]["code"].as_str().unwrap_or_default().to_owned()
 }
 
 fn files(dir: &Path) -> Vec<PathBuf> {
@@ -345,10 +330,7 @@ async fn the_server_streams_uploads_and_blob_responses() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let dir = tempfile::tempdir().unwrap();
     let node = media_node(dir.path()).await;
-    let gw = Arc::new(Gateway::new(node.clone(), GatewayConfig::default()));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(kronik_gateway::server::serve(listener, gw, 16));
+    let (addr, _) = common::serve(&node, 16).await;
     let upload = data(3 * MIB);
     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
     s.write_all(

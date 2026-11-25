@@ -8,50 +8,18 @@
 // test runtime's clock.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
-use std::sync::Arc;
+mod common;
 
-use kronik_core::env::Env;
-use kronik_gateway::{
-    Gateway, GatewayConfig, HttpRequest, HttpResponse, RequestKind, TURN_ID_HEADER,
-};
+use std::time::Duration;
+
+use common::{code, header, room_node, until};
+use kronik_gateway::{Gateway, GatewayConfig, HttpRequest, RequestKind, TURN_ID_HEADER};
 use kronik_proto::log::v1 as pb;
 use kronik_sched::connections::{ConnectionsConfig, RecordingTransport};
-use kronik_sched::{Node, NodeConfig, start_local};
-
-const ROOM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/room.wasm");
 
 /// RFC 6455 §1.3's example key and the accept it gives.
 const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 const ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
-
-async fn node(connections: ConnectionsConfig) -> (tempfile::TempDir, Arc<Node>) {
-    let dir = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(
-        env,
-        dir.path(),
-        NodeConfig {
-            connections,
-            ..NodeConfig::default()
-        },
-    )
-    .await
-    .unwrap();
-    let audit = pb::Audit {
-        token_id: "t".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    };
-    node.deploy(
-        &std::fs::read(ROOM).unwrap(),
-        audit,
-        false,
-        node.local_operator_authority().unwrap(),
-    )
-    .await
-    .unwrap();
-    (dir, node)
-}
 
 fn upgrade(path_and_query: &str, extra: &[(&str, &str)]) -> HttpRequest {
     let (path, query) = path_and_query
@@ -94,35 +62,13 @@ fn get(path_and_query: &str) -> HttpRequest {
     }
 }
 
-fn header<'a>(r: &'a HttpResponse, name: &str) -> Option<&'a str> {
-    r.headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
-}
-
-fn code(r: &HttpResponse) -> String {
-    let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
-    v["error"]["code"].as_str().unwrap().to_owned()
-}
-
-async fn until(what: &str, f: impl Fn() -> bool) {
-    for _ in 0..500 {
-        if f() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("timed out waiting for {what}");
-}
-
 /// §5.3: an accepted WebSocket answers 101 with the handshake, the
 /// selected subprotocol (the recorded position in the offered list), the
 /// actor's headers and the turn id; the frames of the open turn wait for
 /// the transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_accepted_websocket_answers_101() {
-    let (_dir, node) = node(ConnectionsConfig::default()).await;
+    let (_dir, node) = room_node(ConnectionsConfig::default()).await;
     let gw = Gateway::new(node.clone(), GatewayConfig::default());
     let req = upgrade(
         "/room/lobby/ws?user=ada",
@@ -141,7 +87,10 @@ async fn an_accepted_websocket_answers_101() {
     assert_eq!(answer.protocol, Some(pb::ConnectionProtocol::Websocket));
     let conn = answer.connection.unwrap();
     let t = RecordingTransport::attach(node.hub(), &conn).unwrap();
-    until("the welcome", || t.recording().frames.len() == 1).await;
+    until("the welcome", Duration::from_secs(10), async || {
+        t.recording().frames.len() == 1
+    })
+    .await;
     // The connection holds a subject from the accept.
     let row = node.store().db().connection(&conn).unwrap().unwrap();
     assert_eq!(row.subject.as_deref(), Some("user:ada"));
@@ -160,7 +109,7 @@ async fn an_accepted_websocket_answers_101() {
 /// and a non-GET are refused before any turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refusals_failures_and_bad_requests() {
-    let (_dir, node) = node(ConnectionsConfig::default()).await;
+    let (_dir, node) = room_node(ConnectionsConfig::default()).await;
     let gw = Gateway::new(node.clone(), GatewayConfig::default());
     let answer = gw
         .open_connection(upgrade("/room/lobby/ws?user=eve&deny=1", &[]))
@@ -221,7 +170,7 @@ async fn refusals_failures_and_bad_requests() {
 /// headers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn classification_and_the_service_function() {
-    let (_dir, node) = node(ConnectionsConfig::default()).await;
+    let (_dir, node) = room_node(ConnectionsConfig::default()).await;
     let gw = Gateway::new(node.clone(), GatewayConfig::default());
     assert_eq!(gw.classify(&get("/room/lobby/events")), RequestKind::Sse);
     assert_eq!(gw.classify(&get("/room/lobby/members")), RequestKind::Http);
@@ -245,7 +194,7 @@ async fn classification_and_the_service_function() {
 /// turn; a closed connection gives its slot back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_caps_answer_connection_limit() {
-    let (_dir, node) = node(ConnectionsConfig {
+    let (_dir, node) = room_node(ConnectionsConfig {
         max_per_actor: 1,
         ..ConnectionsConfig::default()
     })
@@ -272,7 +221,10 @@ async fn the_caps_answer_connection_limit() {
     node.hub().abandon(&other.connection.unwrap());
     // The first closes: its slot is free again.
     t.client_close(Some((1000, String::new())));
-    until("the slot", || node.hub().live() <= 1).await;
+    until("the slot", Duration::from_secs(10), async || {
+        node.hub().live() <= 1
+    })
+    .await;
     let third = gw
         .open_connection(upgrade("/room/lobby/ws?user=cid", &[]))
         .await;
@@ -285,7 +237,7 @@ async fn the_caps_answer_connection_limit() {
 /// count per /64; a trusted proxy that forwards nothing is exempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_per_client_cap_counts_the_forwarded_client() {
-    let (_dir, node) = node(ConnectionsConfig {
+    let (_dir, node) = room_node(ConnectionsConfig {
         max_per_client: 1,
         ..ConnectionsConfig::default()
     })
