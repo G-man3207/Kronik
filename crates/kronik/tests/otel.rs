@@ -132,7 +132,7 @@ fn receiver() -> Receiver {
                                     .status(status)
                                     .header("content-type", "application/x-protobuf")
                                     .header("retry-after", "1")
-                                    .body(Full::new(bytes::Bytes::new()))
+                                    .body(Full::new(hyper::body::Bytes::new()))
                                     .unwrap(),
                             )
                         }

@@ -1340,7 +1340,7 @@ async fn scoped_provider_tls_does_not_change_guest_trust_or_identity() {
                 method: "GET".into(),
                 url,
                 headers: vec![],
-                body: bytes::Bytes::new(),
+                body: hyper::body::Bytes::new(),
                 max_response_bytes: 64,
             }),
         )
