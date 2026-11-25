@@ -34,9 +34,12 @@ pub mod microvm_assets;
 mod microvm_checkpoint;
 mod microvm_sys;
 mod runtime;
+mod supervisor;
+
+#[cfg(test)]
+mod test_support;
 
 pub use runtime::container_id;
-mod supervisor;
 
 pub use checkpoint::Copy;
 pub use image::{ImageError, ImageRef};

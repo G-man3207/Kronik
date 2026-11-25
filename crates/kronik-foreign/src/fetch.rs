@@ -679,13 +679,7 @@ mod tests {
         Image, ImageSpec, LayerSource, MEDIA_CONFIG, MEDIA_INDEX, MEDIA_LAYER_GZIP, MEDIA_MANIFEST,
         host_arch, pack,
     };
-
-    fn temp_dir() -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix("km7-fetch-")
-            .tempdir_in("/var/tmp")
-            .unwrap()
-    }
+    use crate::test_support::{names, temp_dir};
 
     fn packed(tmp: &tempfile::TempDir, name: &str, content: &str) -> (std::path::PathBuf, String) {
         let src = tmp.path().join(format!("src-{name}"));
@@ -801,9 +795,8 @@ mod tests {
             digest: layer.to_string(),
             size: 0,
         }));
-        let left: Vec<_> = fs::read_dir(store.dir())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        let left: Vec<_> = names(&store.dir())
+            .into_iter()
             .filter(|n| n.starts_with(".tmp"))
             .collect();
         assert!(left.is_empty(), "{left:?}");
@@ -845,10 +838,7 @@ mod tests {
                 .is_err(),
             "the registry never answers"
         );
-        let left: Vec<_> = fs::read_dir(store.dir())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        let left = names(&store.dir());
         assert!(left.is_empty(), "{left:?}");
     }
 
@@ -1030,17 +1020,6 @@ mod tests {
         .await
     }
 
-    fn store_names(store: &BlobStore) -> Vec<String> {
-        let Ok(entries) = fs::read_dir(store.dir()) else {
-            return Vec::new();
-        };
-        let mut names: Vec<_> = entries
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    }
-
     #[tokio::test]
     async fn pull_refuses_a_manifest_that_does_not_match_the_pinned_digest() {
         let tmp = temp_dir();
@@ -1054,7 +1033,7 @@ mod tests {
         let store = BlobStore::new(tmp.path().join("blobs"));
         let err = pull_pin(&store, &registry, &pinned).await.unwrap_err();
         assert!(err.to_string().contains("digest"), "{err}");
-        let names = store_names(&store);
+        let names = names(&store.dir());
         assert!(names.is_empty(), "{names:?}");
     }
 
@@ -1079,7 +1058,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("digest"), "{err}");
-        let names = store_names(&store);
+        let names = names(&store.dir());
         assert!(
             !names
                 .iter()
@@ -1156,7 +1135,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("descriptor says"), "{err}");
-        let names = store_names(&store);
+        let names = names(&store.dir());
         assert!(
             !names.iter().any(|n| n == &image.manifest_digest[7..]),
             "{names:?}"
@@ -1181,7 +1160,7 @@ mod tests {
         let store = BlobStore::new(tmp.path().join("blobs"));
         let err = pull_pin(&store, &registry, &pinned).await.unwrap_err();
         assert!(err.to_string().contains("descriptor says"), "{err}");
-        let names = store_names(&store);
+        let names = names(&store.dir());
         assert!(
             !names
                 .iter()

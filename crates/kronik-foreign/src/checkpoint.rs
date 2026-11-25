@@ -758,12 +758,7 @@ mod tests {
         }
         std::fs::create_dir(dir.path().join(".tmp-x")).unwrap();
         prune(dir.path(), 2);
-        let mut left: Vec<String> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
+        let left = crate::test_support::names(dir.path());
         assert_eq!(left, [".tmp-x", &dir_name(40), &dir_name(300)]);
     }
 }

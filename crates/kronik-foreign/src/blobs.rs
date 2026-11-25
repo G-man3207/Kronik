@@ -371,6 +371,7 @@ pub(crate) fn check(desc: &Descriptor, size: u64, digest: &str) -> Result<(), Im
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::names;
 
     fn store() -> (tempfile::TempDir, BlobStore) {
         let dir = tempfile::Builder::new()
@@ -389,13 +390,6 @@ mod tests {
         }
     }
 
-    fn leftovers(store: &BlobStore) -> Vec<String> {
-        fs::read_dir(store.root().join("sha256"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect()
-    }
-
     #[test]
     fn put_verifies_and_keeps_good_blobs() {
         let (_dir, store) = store();
@@ -406,7 +400,7 @@ mod tests {
         assert_eq!(store.read_small(&d, 100).unwrap(), b"hello");
         assert_eq!(store.read_digest(&d.digest, 100).unwrap(), b"hello");
         store.verify(&d).unwrap();
-        assert_eq!(leftovers(&store), [&d.digest[7..]]);
+        assert_eq!(names(&store.dir()), [&d.digest[7..]]);
     }
 
     #[test]
@@ -422,7 +416,7 @@ mod tests {
         assert!(store.has(&a) && !store.has(&b));
         fs::write(store.dir().join(".tmp-1-2"), b"partial").unwrap();
         assert_eq!(store.remove_temps(), 1);
-        assert_eq!(leftovers(&store), [&a.digest[7..]]);
+        assert_eq!(names(&store.dir()), [&a.digest[7..]]);
     }
 
     #[test]
@@ -433,7 +427,7 @@ mod tests {
         assert!(store.put(&d, &b"hello!"[..]).is_err());
         assert!(store.put(&d, &b"hell"[..]).is_err());
         assert!(!store.has(&d));
-        assert!(leftovers(&store).is_empty());
+        assert!(names(&store.dir()).is_empty());
     }
 
     #[test]

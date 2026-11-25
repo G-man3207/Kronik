@@ -2664,6 +2664,7 @@ fn validate_child_cgroup(parent: &str, child: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::child_text;
 
     #[test]
     fn malformed_maps_never_validate_a_prefix() {
@@ -2914,11 +2915,7 @@ mod tests {
             .env(PIN_REHEARSAL_DIR, dir.path())
             .output()
             .unwrap();
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let text = child_text(&out);
         assert!(
             out.status.success() && text.contains("pin rehearsal ok"),
             "{text}"
@@ -3225,11 +3222,7 @@ mod tests {
                 .env(REHEARSAL_CASE, case)
                 .output()
                 .unwrap();
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
+            let text = child_text(&out);
             assert!(
                 out.status.success() && text.contains("jail rehearsal ok"),
                 "{case}: {text}"
@@ -3713,11 +3706,7 @@ int main(void) {
             command.env(URING_STUB, &stub);
         }
         let out = command.output().unwrap();
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let text = child_text(&out);
         if out.status.code() == Some(URING_UNAVAILABLE) {
             eprintln!("skipped: {text}");
             return;
@@ -3858,12 +3847,7 @@ int main(void) {
                 .env(DESCRIPTOR_CHILD, mode)
                 .output()
                 .unwrap();
-            assert!(
-                out.status.success(),
-                "{mode}: {}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
+            assert!(out.status.success(), "{mode}: {}", child_text(&out));
         }
     }
 

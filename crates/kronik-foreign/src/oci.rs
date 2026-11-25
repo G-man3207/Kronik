@@ -1465,22 +1465,7 @@ pub fn pack(out: &Path, layers: &[LayerSource], spec: &ImageSpec) -> Result<Stri
 mod tests {
     use super::*;
     use crate::fetch::{ImportLimits, import_layout_limited};
-
-    fn temp_dir() -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix("km7-oci-")
-            .tempdir_in("/var/tmp")
-            .unwrap()
-    }
-
-    fn is_root() -> bool {
-        fs::read_to_string("/proc/self/status")
-            .unwrap_or_default()
-            .lines()
-            .find_map(|l| l.strip_prefix("Uid:"))
-            .and_then(|l| l.split_whitespace().next().map(|u| u == "0"))
-            .unwrap_or(false)
-    }
+    use crate::test_support::{names, temp_dir};
 
     fn no_owners() -> UnpackLimits {
         UnpackLimits {
@@ -1572,15 +1557,6 @@ mod tests {
         )
     }
 
-    fn listing(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    }
-
     #[test]
     fn whiteout_hides_lower_layer_entries_only() {
         let tmp = temp_dir();
@@ -1606,7 +1582,7 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(listing(&root.join("etc")), ["new"]);
+        assert_eq!(names(&root.join("etc")), ["new"]);
     }
 
     #[test]
@@ -1619,7 +1595,7 @@ mod tests {
             let err = apply(root, &[E::Raw(bad)]).unwrap_err().to_string();
             assert!(err.contains("hides no valid name"), "{bad}: {err}");
         }
-        assert_eq!(listing(&root.join("etc")), ["keep"]);
+        assert_eq!(names(&root.join("etc")), ["keep"]);
     }
 
     #[test]
@@ -1646,7 +1622,7 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(listing(&root.join("srv/old")), ["c", "d"]);
+        assert_eq!(names(&root.join("srv/old")), ["c", "d"]);
     }
 
     #[test]
@@ -1699,7 +1675,7 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(listing(&outside).is_empty());
+        assert!(names(&outside).is_empty());
         assert!(!tmp.path().join("marker-2").exists());
         assert!(
             root.join(outside.strip_prefix("/").unwrap())
@@ -1781,7 +1757,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stats.skipped, 1);
-        assert_eq!(listing(tmp.path()), ["f"]);
+        assert_eq!(names(tmp.path()), ["f"]);
     }
 
     #[test]
@@ -1800,7 +1776,7 @@ mod tests {
 
     #[test]
     fn owners_come_from_the_headers_but_setid_bits_do_not() {
-        if !is_root() {
+        if !crate::sys::is_root() {
             eprintln!("skipped: chown needs root");
             return;
         }
@@ -2054,7 +2030,7 @@ mod tests {
         let stats = unpack(&store, &image, &rootfs, &no_owners()).unwrap();
         assert_eq!(stats.layers, 5);
         assert_eq!(
-            listing(&rootfs.join("a")),
+            names(&rootfs.join("a")),
             ["docker", "gz", "nondist", "tar", "zst"]
         );
         assert_eq!(fs::read_to_string(rootfs.join("a/zst")).unwrap(), "z");
@@ -2124,7 +2100,7 @@ mod tests {
         assert!(matches!(err, ImageError::Invalid(_)), "{err}");
         assert!(err.to_string().contains("descriptor says"), "{err}");
         // Nothing from the layer was applied.
-        assert!(listing(&rootfs).is_empty());
+        assert!(names(&rootfs).is_empty());
     }
 
     #[test]
