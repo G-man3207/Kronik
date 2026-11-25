@@ -665,14 +665,16 @@ fn a_turn_that_fills_the_store_itself_stops_waiting() {
     assert!(record.effects.is_empty());
 }
 
-/// Real files; records the blob store's renames into `objects/` and its
-/// directory syncs, in order, with the events of the test's peer.
-struct OrderFs {
+/// Real files. Renames into `objects/` (naming a blob) fail with an I/O
+/// error while `fail` is set; otherwise they, and the syncs of `objects/`
+/// directories, are recorded in `events` in order.
+struct ObjectsFs {
     inner: Arc<dyn kronik_core::env::Fs>,
     events: Arc<std::sync::Mutex<Vec<String>>>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl kronik_core::env::Fs for OrderFs {
+impl kronik_core::env::Fs for ObjectsFs {
     fn create_dir_all(
         &self,
         path: std::path::PathBuf,
@@ -705,6 +707,9 @@ impl kronik_core::env::Fs for OrderFs {
         to: std::path::PathBuf,
     ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
         if to.components().any(|c| c.as_os_str() == "objects") {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async { Err(std::io::Error::other("injected EIO")) });
+            }
             self.events
                 .lock()
                 .unwrap()
@@ -732,6 +737,36 @@ impl kronik_core::env::Fs for OrderFs {
     }
 }
 
+/// A node with blobs whose files go through [`ObjectsFs`]; `media` deployed.
+fn start_on_objects_fs(
+    dir: &Path,
+    events: Arc<std::sync::Mutex<Vec<String>>>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+) -> Proc {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let node = rt.block_on(async {
+        let mut env = Env::real(tokio::runtime::Handle::current());
+        env.fs = Arc::new(ObjectsFs {
+            inner: env.fs.clone(),
+            events,
+            fail,
+        });
+        let config = NodeConfig {
+            concurrency: 8,
+            blobs: Some(BlobsConfig::default()),
+            ..NodeConfig::default()
+        };
+        start_local(env, dir, config).await.unwrap()
+    });
+    let p = Proc { rt, node };
+    p.deploy_file(MEDIA);
+    p
+}
+
 /// ADR 0117 §4: an effect's record never precedes its blobs. A turn that
 /// writes a blob and POSTs it in the same turn has the blob's name synced
 /// before the request leaves (so before its effect is recorded), not only
@@ -741,33 +776,8 @@ impl kronik_core::env::Fs for OrderFs {
 fn a_blob_the_turn_wrote_is_durable_before_it_is_sent() {
     let dir = tempfile::tempdir().unwrap();
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let mut env = Env::real(tokio::runtime::Handle::current());
-        env.fs = Arc::new(OrderFs {
-            inner: env.fs.clone(),
-            events: events.clone(),
-        });
-        let config = NodeConfig {
-            concurrency: 8,
-            blobs: Some(BlobsConfig::default()),
-            ..NodeConfig::default()
-        };
-        start_local(env, dir.path(), config).await.unwrap()
-    });
-    let p = Proc { rt, node };
+    let p = start_on_objects_fs(dir.path(), events.clone(), Arc::default());
     let owner = p.node.local_operator_authority().unwrap();
-    p.rt.block_on(p.node.deploy(
-        &std::fs::read(MEDIA).unwrap(),
-        audit(),
-        false,
-        owner.clone(),
-    ))
-    .unwrap();
     p.rt.block_on(p.node.grant(
         "media",
         "http:127.0.0.1",
@@ -1019,66 +1029,6 @@ fn the_body_policy_follows_the_kinds_code_and_the_store() {
     assert_eq!(p.node.body_policy("media"), BodyPolicy::Inline);
 }
 
-/// Real files, except that naming a blob (the rename into `objects/`)
-/// fails with an I/O error while `fail` is set.
-struct FailingFs {
-    inner: Arc<dyn kronik_core::env::Fs>,
-    fail: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl kronik_core::env::Fs for FailingFs {
-    fn create_dir_all(
-        &self,
-        path: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
-        self.inner.create_dir_all(path)
-    }
-    fn open(
-        &self,
-        path: std::path::PathBuf,
-        mode: kronik_core::env::OpenMode,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<Arc<dyn kronik_core::env::File>>>
-    {
-        self.inner.open(path, mode)
-    }
-    fn exists(
-        &self,
-        path: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<bool>> {
-        self.inner.exists(path)
-    }
-    fn read_dir(
-        &self,
-        dir: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<Vec<String>>> {
-        self.inner.read_dir(dir)
-    }
-    fn rename(
-        &self,
-        from: std::path::PathBuf,
-        to: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
-        if self.fail.load(std::sync::atomic::Ordering::SeqCst)
-            && to.components().any(|c| c.as_os_str() == "objects")
-        {
-            return Box::pin(async { Err(std::io::Error::other("injected EIO")) });
-        }
-        self.inner.rename(from, to)
-    }
-    fn remove_file(
-        &self,
-        path: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
-        self.inner.remove_file(path)
-    }
-    fn sync_dir(
-        &self,
-        dir: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
-        self.inner.sync_dir(dir)
-    }
-}
-
 /// Found by the blob simulation (B17): the blob store's disk failing in a
 /// turn that already recorded an effect abandoned the turn while the node
 /// kept running, so a retry under the same key started a second execution.
@@ -1089,31 +1039,7 @@ impl kronik_core::env::Fs for FailingFs {
 fn a_blob_store_io_failure_stops_the_node_and_the_turn_runs_again() {
     let dir = tempfile::tempdir().unwrap();
     let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let mut env = Env::real(tokio::runtime::Handle::current());
-        env.fs = Arc::new(FailingFs {
-            inner: env.fs.clone(),
-            fail: fail.clone(),
-        });
-        let config = NodeConfig {
-            concurrency: 8,
-            blobs: Some(BlobsConfig::default()),
-            ..NodeConfig::default()
-        };
-        start_local(env, dir.path(), config).await.unwrap()
-    });
-    let p = Proc { rt, node };
-    let owner = p.node.local_operator_authority().unwrap();
-    p.rt.block_on(
-        p.node
-            .deploy(&std::fs::read(MEDIA).unwrap(), audit(), false, owner),
-    )
-    .unwrap();
+    let p = start_on_objects_fs(dir.path(), Arc::default(), fail.clone());
     p.effect_setup(1 << 20, None);
     let (addr, requests) = counting_server();
     let keyed = || {
