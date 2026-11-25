@@ -4,10 +4,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use common::rt;
 use kronik_core::env::Env;
 use kronik_privacy::MasterKey;
 use kronik_privacy::keystore::{KeyLookup, Keystore};
@@ -18,15 +21,6 @@ use kronik_ship::{
     KeystoreMode, Remote, ShipError, ShipState, current_keystore_revision, restore, ship_keystore,
     ship_once,
 };
-use tokio::runtime::Runtime;
-
-fn rt() -> Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap()
-}
 
 #[test]
 fn a_keystore_change_is_shipped_pruned_and_restored() {

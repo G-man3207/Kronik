@@ -6,9 +6,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use common::{audit, guest, message, rt, tempdir};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_privacy::key_source::{Keys, lock_data};
@@ -19,51 +22,6 @@ use kronik_ship::{
     KeystoreMode, Remote, RestoreReport, ShipError, ShipState, restore, restore_as_owner,
     root_phase, ship_keystore, ship_once,
 };
-use tokio::runtime::Runtime;
-
-fn guest(name: &str) -> Vec<u8> {
-    std::fs::read(format!(
-        "{}/../../tests/guests/{name}.wasm",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap()
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
-
-fn message(name: &str) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(Vec::new())),
-        }),
-        blobs: vec![],
-        retained_compensation_source: None,
-    }
-}
-
-fn rt() -> Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap()
-}
-
-fn tempdir(prefix: &str) -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .unwrap()
-}
 
 /// A bucket that a node shipped into: a snapshot, the log and, if asked, a
 /// keystore backup. The node's master key is kept aside, as an operator does.
@@ -110,7 +68,7 @@ fn shipped_with(keystore_backup: bool, late_subject: bool) -> Shipped {
         let reply = rt
             .block_on(node.send(
                 ActorRef::parse(&format!("counter/c{}", i % 2)).unwrap(),
-                message("increment"),
+                message("increment", ""),
                 audit(),
                 false,
                 node.local_operator_authority().unwrap(),
@@ -154,7 +112,7 @@ fn shipped_with(keystore_backup: bool, late_subject: bool) -> Shipped {
         let reply = rt
             .block_on(node.send(
                 ActorRef::parse("counter/on").unwrap(),
-                message("subject"),
+                message("subject", ""),
                 audit(),
                 false,
                 node.local_operator_authority().unwrap(),

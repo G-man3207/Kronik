@@ -8,10 +8,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::{audit, guest, rt, tempdir};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
@@ -19,31 +22,6 @@ use kronik_sched::snapshots::StorageConfig;
 use kronik_sched::{BlobsConfig, Ingress, Node, NodeConfig, start_local};
 use kronik_ship::{KeystoreMode, Remote, ShipError, ShipState, restore, ship_keystore, ship_once};
 use tokio::runtime::Runtime;
-
-const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
-
-fn rt() -> Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap()
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
-
-fn tempdir(prefix: &str) -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .unwrap()
-}
 
 fn start(rt: &Runtime, dir: &Path) -> Arc<Node> {
     rt.block_on(async {
@@ -115,7 +93,7 @@ fn a_restored_blob_reference_needs_its_subjects_key() {
     let rt = rt();
     let node = start(&rt, src.path());
     rt.block_on(node.deploy(
-        &std::fs::read(MEDIA).unwrap(),
+        &guest("media"),
         audit(),
         false,
         node.local_operator_authority().unwrap(),

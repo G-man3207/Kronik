@@ -4,10 +4,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::{audit, guest, message, rt, s3_url, tempdir};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
@@ -16,46 +19,9 @@ use kronik_sched::{Node, NodeConfig, start_local};
 use kronik_ship::{KeystoreMode, RESTORE_MARKER, Remote, ShipState, restore, ship_once};
 use tokio::runtime::Runtime;
 
-fn guest(name: &str) -> Vec<u8> {
-    std::fs::read(format!(
-        "{}/../../tests/guests/{name}.wasm",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap()
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
-
-fn msg(name: &str, body: &str) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-        }),
-        blobs: vec![],
-        retained_compensation_source: None,
-    }
-}
-
 struct Proc {
     rt: Runtime,
     node: Arc<Node>,
-}
-
-fn rt() -> Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap()
 }
 
 fn start(dir: &Path, history: Option<Duration>) -> Proc {
@@ -87,7 +53,7 @@ impl Proc {
             .rt
             .block_on(self.node.send(
                 ActorRef::parse(actor).unwrap(),
-                msg(name, body),
+                message(name, body),
                 audit(),
                 false,
                 self.node.local_operator_authority().unwrap(),
@@ -127,13 +93,6 @@ impl Proc {
             .block_on(ship_once(remote, dir, "main", &mut st))
             .unwrap()
     }
-}
-
-fn tempdir(prefix: &str) -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .unwrap()
 }
 
 /// Ships a node's data, destroys it, restores into an empty directory and
@@ -655,24 +614,6 @@ fn an_interrupted_restore_leaves_a_consistent_directory() {
     let q = start(dst.path(), None);
     assert_eq!(q.node.store().state_hash().unwrap(), hash);
     assert_eq!(q.send("counter/a", "increment", ""), "2");
-}
-
-/// The S3 URL of this run (`scripts/s3.sh` exports it), or `None` to skip.
-/// With `KRONIK_TEST_S3=require` (the `s3` step of `scripts/ci.sh`) a
-/// missing URL fails the test, so that a run never passes by skipping.
-fn s3_url() -> Option<String> {
-    match std::env::var("KRONIK_TEST_S3_URL") {
-        Ok(url) => Some(url),
-        Err(_) => {
-            assert_ne!(
-                std::env::var("KRONIK_TEST_S3").as_deref(),
-                Ok("require"),
-                "KRONIK_TEST_S3=require, but KRONIK_TEST_S3_URL is not set: run this test under scripts/s3.sh"
-            );
-            eprintln!("KRONIK_TEST_S3_URL is not set; run scripts/s3.sh for this test");
-            None
-        }
-    }
 }
 
 #[test]
