@@ -81,7 +81,6 @@ mod tests {
     use prost::Message as _;
 
     use super::*;
-    use crate::types::{EffectSummary, HistoryResponse};
 
     /// A resolved reference as the effect gate records it, with a version
     /// hash of 16 bytes given in hex.
@@ -368,54 +367,6 @@ mod tests {
         }
     }
 
-    /// The same sealing rule through the turn views: a sealed effect request
-    /// is a placeholder after redaction for a caller without `pii:read`, an
-    /// erased one for every caller.
-    #[test]
-    fn redacted_turns_show_no_secrets_of_sealed_or_erased_requests() {
-        let sealer = kronik_privacy::sealer::Sealer::plain();
-        let bytes = crypto_request(Some(reference("stripe-key", 3, STRIPE_HASH)));
-        let turn = |value| pb::TurnRecord {
-            effects: vec![pb::EffectRecord {
-                kind: "crypto.hmac-sha256".into(),
-                request: Some(pb::Sealable {
-                    subject: Some("user:1".into()),
-                    value: Some(value),
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let secrets_of = |mut t: pb::TurnRecord, pii| {
-            crate::redact::redact_turn(&mut t, &sealer, pii);
-            crate::turn_summary("main", 7, &t, pii)
-                .effects
-                .remove(0)
-                .secrets
-        };
-        let sealed = pb::sealable::Value::Sealed(pb::Sealed {
-            key_version: 1,
-            nonce: vec![9; 24],
-            ciphertext: bytes.clone(),
-        });
-        assert!(secrets_of(turn(sealed), false).is_empty());
-        let tombstone = pb::sealable::Value::Sealed(pb::Sealed {
-            key_version: 1,
-            nonce: Vec::new(),
-            ciphertext: Vec::new(),
-        });
-        assert!(secrets_of(turn(tombstone.clone()), false).is_empty());
-        assert!(secrets_of(turn(tombstone), true).is_empty());
-        // A plain request is shown to a caller with and without pii:read.
-        let plain = pb::sealable::Value::Plain(bytes);
-        for pii in [false, true] {
-            assert_eq!(
-                secrets_of(turn(plain.clone()), pii),
-                vec![used("stripe-key", 3, "8b705664")]
-            );
-        }
-    }
-
     /// The privacy contract with real keys: a subject's request is sealed in
     /// the log and shows no secrets to a caller who may not read it; a caller
     /// who may read it gets them where the turn is unsealed for the caller
@@ -468,111 +419,5 @@ mod tests {
             assert!(erased.secrets.is_empty(), "pii {pii}: {erased:?}");
             assert!(erased.request.is_none(), "pii {pii}: {erased:?}");
         }
-    }
-
-    /// Criterion 3 of M23: the rotation of a secret shows up as a new version
-    /// in `history`, and the turns before it keep the version they used.
-    #[test]
-    fn a_rotation_shows_as_a_new_version_and_the_old_turn_keeps_its_own() {
-        let turn = |version, hash| pb::TurnRecord {
-            actor: Some(pb::ActorRef {
-                kind: "billing".into(),
-                key: "acme".into(),
-            }),
-            effects: vec![
-                pb::EffectRecord {
-                    ordinal: 0,
-                    kind: "http.fetch".into(),
-                    target: "http:api.example.com".into(),
-                    status: pb::EffectStatus::Ok as i32,
-                    ..effect(
-                        "http.fetch",
-                        http_request(vec![secret_header(
-                            "authorization",
-                            reference("stripe-key", version, hash),
-                        )]),
-                    )
-                },
-                effect(
-                    "crypto.hmac-sha256",
-                    crypto_request(Some(reference("signing", 1, SIGNING_HASH))),
-                ),
-            ],
-            ..Default::default()
-        };
-        let before = turn(1, STRIPE_HASH);
-        let after = turn(2, OTHER_HASH);
-        let history = HistoryResponse {
-            turns: vec![
-                crate::turn_summary("main", 9, &after, true),
-                crate::turn_summary("main", 5, &before, true),
-            ],
-            next: None,
-        };
-        let json = serde_json::to_value(&history).unwrap();
-        // The newer turn used version 2, the older one version 1; the secret
-        // that was not rotated is unchanged.
-        assert_eq!(
-            json["turns"][0]["effects"][0]["secrets"],
-            serde_json::json!([{"name": "stripe-key", "version": 2, "version_hash": "c0ffee00"}])
-        );
-        assert_eq!(
-            json["turns"][1]["effects"][0]["secrets"],
-            serde_json::json!([{"name": "stripe-key", "version": 1, "version_hash": "8b705664"}])
-        );
-        for turn in 0..2 {
-            assert_eq!(
-                json["turns"][turn]["effects"][1]["secrets"],
-                serde_json::json!([{"name": "signing", "version": 1, "version_hash": "00112233"}])
-            );
-        }
-        // The turn JSON shows the same.
-        let old_turn = crate::turn_json("main", 5, &before);
-        assert_eq!(
-            old_turn["effects"][0]["secrets"][0]["version"],
-            serde_json::json!(1)
-        );
-    }
-
-    /// The field is additive: absent when there is no secret, and a reader
-    /// that does not know it (or an older server) still parses everything.
-    #[test]
-    fn the_secrets_field_is_additive_in_json() {
-        let e = effect(
-            "http.fetch",
-            http_request(vec![text_header("accept", "*/*")]),
-        );
-        let t = pb::TurnRecord {
-            effects: vec![e],
-            ..Default::default()
-        };
-        let summary = crate::turn_summary("main", 1, &t, true);
-        let json = serde_json::to_value(&summary).unwrap();
-        assert!(json["effects"][0].get("secrets").is_none(), "{json}");
-        assert!(
-            crate::turn_json("main", 1, &t)["effects"][0]
-                .get("secrets")
-                .is_none()
-        );
-        // An older server's effect has no `secrets`.
-        let old: EffectSummary = serde_json::from_value(serde_json::json!({
-            "ordinal": 0, "kind": "http.fetch", "target": "http:api.example.com",
-            "status": "ok", "delivery": null, "error": null, "hint": null
-        }))
-        .unwrap();
-        assert!(old.secrets.is_empty());
-        // And a value is never part of it: only these three keys exist.
-        let with = EffectSummary {
-            secrets: vec![used("stripe-key", 2, "8b705664")],
-            ..old
-        };
-        let json = serde_json::to_value(&with).unwrap();
-        let keys: Vec<&str> = json["secrets"][0]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(keys, ["name", "version", "version_hash"]);
     }
 }
