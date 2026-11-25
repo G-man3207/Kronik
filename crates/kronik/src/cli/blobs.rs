@@ -97,13 +97,7 @@ fn segment(hash: &str) -> String {
 
 fn status(ctx: &Ctx) -> Result<ExitCode, Error> {
     let body = ctx.get("/v1/blobs")?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: BlobsStatusResponse = ctx.decode(&body)?;
-    ctx.print(&render_status(&r));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: BlobsStatusResponse| render_status(&r))
 }
 
 fn render_status(r: &BlobsStatusResponse) -> String {
@@ -318,13 +312,7 @@ fn list(ctx: &Ctx, a: ListArgs) -> Result<ExitCode, Error> {
         ])
     );
     let body = ctx.get(&path)?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: ActorBlobsResponse = ctx.decode(&body)?;
-    ctx.print(&render_list(&a.actor, &r));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: ActorBlobsResponse| render_list(&a.actor, &r))
 }
 
 fn render_list(actor: &str, r: &ActorBlobsResponse) -> String {
@@ -398,35 +386,31 @@ fn gc(ctx: &Ctx, a: GcArgs) -> Result<ExitCode, Error> {
             immediate: a.immediate,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: BlobGcResponse = ctx.decode(&body)?;
-    let mut out = String::new();
-    if !r.enabled {
-        out.push_str("This node has no blob store: nothing to collect.\n");
-    } else if r.dry_run {
-        let _ = writeln!(
-            out,
-            "Dry run: a pass now would delete {} files ({}) and keep {} candidates for the next one.",
-            r.deleted,
-            units::rounded_size(r.bytes),
-            r.candidates
-        );
-    } else {
-        let _ = writeln!(
-            out,
-            "Deleted {} files ({}); {} candidates for the next pass; {} files left.",
-            r.deleted,
-            units::rounded_size(r.bytes),
-            r.candidates,
-            r.objects
-        );
-    }
-    out.push_str(&next(&["kronik blobs status".to_owned()]));
-    ctx.print(&out);
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: BlobGcResponse| {
+        let mut out = String::new();
+        if !r.enabled {
+            out.push_str("This node has no blob store: nothing to collect.\n");
+        } else if r.dry_run {
+            let _ = writeln!(
+                out,
+                "Dry run: a pass now would delete {} files ({}) and keep {} candidates for the next one.",
+                r.deleted,
+                units::rounded_size(r.bytes),
+                r.candidates
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "Deleted {} files ({}); {} candidates for the next pass; {} files left.",
+                r.deleted,
+                units::rounded_size(r.bytes),
+                r.candidates,
+                r.objects
+            );
+        }
+        out.push_str(&next(&["kronik blobs status".to_owned()]));
+        out
+    })
 }
 
 fn render_drift(r: &BlobGcPlanResponse, out: &mut String) {

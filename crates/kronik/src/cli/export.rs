@@ -51,49 +51,39 @@ fn rewind(ctx: &Ctx, stream: &str, to: u64, m: Mutation) -> Result<ExitCode, Err
             dry_run: m.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: ExportRewindResponse = ctx.decode(&body)?;
-    let mut out = String::new();
-    if r.dry_run {
-        let _ = writeln!(
-            out,
-            "Dry run: {} would resend from LSN {} (its cursor is {}); nothing was written",
-            r.stream,
-            r.to + 1,
-            r.from
-        );
-        out.push_str(&next(&[format!(
-            "kronik export rewind {} --to {} --reason {}",
-            shell_quote(&r.stream),
-            r.to,
-            shell_quote(why)
-        )]));
-    } else {
-        let _ = writeln!(
-            out,
-            "{} resends from LSN {} (its cursor was {})",
-            r.stream,
-            r.to + 1,
-            r.from
-        );
-        out.push_str(&next(&["kronik export status".to_owned()]));
-    }
-    ctx.print(&out);
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: ExportRewindResponse| {
+        let mut out = String::new();
+        if r.dry_run {
+            let _ = writeln!(
+                out,
+                "Dry run: {} would resend from LSN {} (its cursor is {}); nothing was written",
+                r.stream,
+                r.to + 1,
+                r.from
+            );
+            out.push_str(&next(&[format!(
+                "kronik export rewind {} --to {} --reason {}",
+                shell_quote(&r.stream),
+                r.to,
+                shell_quote(why)
+            )]));
+        } else {
+            let _ = writeln!(
+                out,
+                "{} resends from LSN {} (its cursor was {})",
+                r.stream,
+                r.to + 1,
+                r.from
+            );
+            out.push_str(&next(&["kronik export status".to_owned()]));
+        }
+        out
+    })
 }
 
 fn status(ctx: &Ctx) -> Result<ExitCode, Error> {
     let body = ctx.get("/v1/export")?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: ExportStatusResponse = ctx.decode(&body)?;
-    ctx.print(&render(&r));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: ExportStatusResponse| render(&r))
 }
 
 fn render(r: &ExportStatusResponse) -> String {

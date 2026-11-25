@@ -75,46 +75,42 @@ fn create(
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: PreviewCreateResponse = ctx.decode(&body)?;
-    let p = &r.preview;
-    let mut out = String::new();
-    if r.dry_run {
-        let mut rerun = format!("kronik preview create {}", shell_quote(proposal));
-        if let Some(ttl) = ttl {
-            let _ = write!(rerun, " --ttl {}", units::duration(ttl));
+    ctx.show(&body, |r: PreviewCreateResponse| {
+        let p = &r.preview;
+        let mut out = String::new();
+        if r.dry_run {
+            let mut rerun = format!("kronik preview create {}", shell_quote(proposal));
+            if let Some(ttl) = ttl {
+                let _ = write!(rerun, " --ttl {}", units::duration(ttl));
+            }
+            if no_pii {
+                rerun.push_str(" --no-pii");
+            }
+            let _ = write!(rerun, " --reason {}", shell_quote(reason));
+            let _ = writeln!(
+                out,
+                "Dry run: proposal {} can be previewed at lsn {}; nothing was written",
+                p.proposal, p.fork_lsn
+            );
+            out.push_str(&next(&[rerun]));
+        } else {
+            let _ = writeln!(
+                out,
+                "Preview {} of proposal {} at lsn {}",
+                p.id, p.proposal, p.fork_lsn
+            );
+            details(&mut out, p);
+            out.push_str(&next(&[
+                format!("curl {}", shell_quote(&p.url)),
+                format!("kronik diff show {} --md", shell_quote(&p.id)),
+                format!(
+                    "kronik preview delete {} --reason \"...\"",
+                    shell_quote(&p.id)
+                ),
+            ]));
         }
-        if no_pii {
-            rerun.push_str(" --no-pii");
-        }
-        let _ = write!(rerun, " --reason {}", shell_quote(reason));
-        let _ = writeln!(
-            out,
-            "Dry run: proposal {} can be previewed at lsn {}; nothing was written",
-            p.proposal, p.fork_lsn
-        );
-        out.push_str(&next(&[rerun]));
-    } else {
-        let _ = writeln!(
-            out,
-            "Preview {} of proposal {} at lsn {}",
-            p.id, p.proposal, p.fork_lsn
-        );
-        details(&mut out, p);
-        out.push_str(&next(&[
-            format!("curl {}", shell_quote(&p.url)),
-            format!("kronik diff show {} --md", shell_quote(&p.id)),
-            format!(
-                "kronik preview delete {} --reason \"...\"",
-                shell_quote(&p.id)
-            ),
-        ]));
-    }
-    ctx.print(&out);
-    Ok(ExitCode::SUCCESS)
+        out
+    })
 }
 
 fn details(out: &mut String, p: &PreviewInfo) {
@@ -133,39 +129,34 @@ fn details(out: &mut String, p: &PreviewInfo) {
 
 fn list(ctx: &Ctx) -> Result<ExitCode, Error> {
     let body = ctx.get("/v1/previews")?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: PreviewsResponse = ctx.decode(&body)?;
-    let mut out = String::new();
-    let Some(first) = r.previews.first() else {
-        out.push_str("No previews.\n");
-        out.push_str(&next(&[
-            "kronik preview create <proposal> --reason \"...\"".to_owned(),
-        ]));
-        ctx.print(&out);
-        return Ok(ExitCode::SUCCESS);
-    };
-    let rows = r
-        .previews
-        .iter()
-        .map(|p| {
-            vec![
-                p.id.clone(),
-                p.proposal.clone(),
-                units::utc(p.expires_ms),
-                p.url.clone(),
-            ]
-        })
-        .collect();
-    out.push_str(&table(&["PREVIEW", "PROPOSAL", "EXPIRES", "URL"], rows));
-    out.push_str(&next(&[format!(
-        "kronik diff show {} --md",
-        shell_quote(&first.id)
-    )]));
-    ctx.print(&out);
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: PreviewsResponse| {
+        let mut out = String::new();
+        let Some(first) = r.previews.first() else {
+            out.push_str("No previews.\n");
+            out.push_str(&next(&[
+                "kronik preview create <proposal> --reason \"...\"".to_owned(),
+            ]));
+            return out;
+        };
+        let rows = r
+            .previews
+            .iter()
+            .map(|p| {
+                vec![
+                    p.id.clone(),
+                    p.proposal.clone(),
+                    units::utc(p.expires_ms),
+                    p.url.clone(),
+                ]
+            })
+            .collect();
+        out.push_str(&table(&["PREVIEW", "PROPOSAL", "EXPIRES", "URL"], rows));
+        out.push_str(&next(&[format!(
+            "kronik diff show {} --md",
+            shell_quote(&first.id)
+        )]));
+        out
+    })
 }
 
 fn delete(ctx: &Ctx, id: &str, mutation: &Mutation) -> Result<ExitCode, Error> {
@@ -178,27 +169,23 @@ fn delete(ctx: &Ctx, id: &str, mutation: &Mutation) -> Result<ExitCode, Error> {
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: PreviewDeleteResponse = ctx.decode(&body)?;
-    let mut out = String::new();
-    if r.dry_run {
-        let _ = writeln!(
-            out,
-            "Dry run: preview {} can be deleted; nothing was written",
-            r.deleted
-        );
-        out.push_str(&next(&[format!(
-            "kronik preview delete {} --reason {}",
-            shell_quote(id),
-            shell_quote(reason)
-        )]));
-    } else {
-        let _ = writeln!(out, "Deleted preview {}", r.deleted);
-        out.push_str(&next(&["kronik preview list".to_owned()]));
-    }
-    ctx.print(&out);
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: PreviewDeleteResponse| {
+        let mut out = String::new();
+        if r.dry_run {
+            let _ = writeln!(
+                out,
+                "Dry run: preview {} can be deleted; nothing was written",
+                r.deleted
+            );
+            out.push_str(&next(&[format!(
+                "kronik preview delete {} --reason {}",
+                shell_quote(id),
+                shell_quote(reason)
+            )]));
+        } else {
+            let _ = writeln!(out, "Deleted preview {}", r.deleted);
+            out.push_str(&next(&["kronik preview list".to_owned()]));
+        }
+        out
+    })
 }
