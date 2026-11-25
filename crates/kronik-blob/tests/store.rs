@@ -4,102 +4,16 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::{TestKeys, content, derived, object, open, open_with, put, put_in};
 use kronik_blob::format::{self, FRAME_SIZE, FrameKey, HEADER_LEN, Header, SEALED_OVERHEAD};
-use kronik_blob::{
-    BlobError, BlobKeys, BlobMeta, BlobStore, KeyAccess, KeyAnswer, NoKeys, Space, StoreConfig,
-};
+use kronik_blob::{BlobError, BlobMeta, BlobStore, NoKeys, Space, StoreConfig};
 use kronik_core::env::{BoxFuture, Env, File, Fs, OpenMode};
-use zeroize::Zeroizing;
-
-fn content(seed: u64, len: usize) -> Vec<u8> {
-    let mut out = vec![0u8; len];
-    let mut h = blake3::Hasher::new();
-    h.update(&seed.to_le_bytes());
-    h.finalize_xof().fill(&mut out);
-    out
-}
-
-/// Test keys: a frame key and an identity key per (subject, version), and a
-/// set of erased subjects.
-#[derive(Default)]
-struct TestKeys {
-    erased: Mutex<Vec<String>>,
-}
-
-fn derived(label: &str, subject: &str, version: u32) -> Zeroizing<[u8; 32]> {
-    let mut h = blake3::Hasher::new_derive_key(label);
-    h.update(subject.as_bytes());
-    h.update(&version.to_le_bytes());
-    Zeroizing::new(*h.finalize().as_bytes())
-}
-
-impl TestKeys {
-    fn keys(&self, subject: &str, version: u32, sealed: bool) -> BlobKeys {
-        BlobKeys {
-            subject: subject.into(),
-            key_version: version,
-            identity: derived("test identity", subject, version),
-            seal: sealed.then(|| derived("test seal", subject, version)),
-        }
-    }
-}
-
-impl KeyAccess for TestKeys {
-    fn seal_key(&self, subject: &str, version: u32) -> KeyAnswer {
-        if self.erased.lock().unwrap().iter().any(|s| s == subject) {
-            return KeyAnswer::Erased;
-        }
-        KeyAnswer::Found(derived("test seal", subject, version))
-    }
-    fn identity_key(&self, subject: &str, version: u32) -> KeyAnswer {
-        if self.erased.lock().unwrap().iter().any(|s| s == subject) {
-            return KeyAnswer::Erased;
-        }
-        KeyAnswer::Found(derived("test identity", subject, version))
-    }
-}
-
-async fn open(dir: &Path) -> Arc<BlobStore> {
-    BlobStore::open(
-        Env::real(tokio::runtime::Handle::current()),
-        dir,
-        StoreConfig::default(),
-    )
-    .await
-    .unwrap()
-}
-
-async fn put(
-    store: &Arc<BlobStore>,
-    keys: Option<BlobKeys>,
-    data: &[u8],
-    chunk: usize,
-) -> BlobMeta {
-    let lease = store.leases().take("test");
-    let mut w = store
-        .writer(Space::Main, keys, u64::MAX, lease)
-        .await
-        .unwrap();
-    for c in data.chunks(chunk.max(1)) {
-        w.write(c).await.unwrap();
-    }
-    let meta = w.finish().await.unwrap();
-    store
-        .ensure_durable(&Space::Main, &[meta.id])
-        .await
-        .unwrap();
-    meta
-}
-
-fn object(dir: &Path, meta: &BlobMeta) -> PathBuf {
-    dir.join("blobs/objects")
-        .join(meta.id.shard())
-        .join(meta.id.file_name())
-}
 
 const SIZES: [usize; 8] = [
     0,
@@ -245,7 +159,7 @@ async fn a_subjects_blob_is_keyed_and_sealed() {
         store.reader(&Space::Main, &sealed, &NoKeys).await,
         Err(BlobError::KeyMissing(s)) if s == "user:1"
     ));
-    keys.erased.lock().unwrap().push("user:1".into());
+    keys.erase("user:1");
     assert!(matches!(
         store.reader(&Space::Main, &sealed, &keys).await,
         Err(BlobError::Erased)
@@ -446,16 +360,14 @@ async fn damage_fails_only_the_frames_it_touches() {
 #[tokio::test(flavor = "multi_thread")]
 async fn limits_the_reserve_and_aborts_leave_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let store = BlobStore::open(
-        Env::real(tokio::runtime::Handle::current()),
+    let store = open_with(
         dir.path(),
         StoreConfig {
             reserve: 1 << 20,
             ..StoreConfig::default()
         },
     )
-    .await
-    .unwrap();
+    .await;
     let tmp = dir.path().join("blobs/tmp");
     let lease = store.leases().take("test");
 
@@ -716,16 +628,14 @@ async fn a_writer_holds_no_file_until_a_frame_and_buffers_one_frame() {
 #[tokio::test(flavor = "multi_thread")]
 async fn writes_count_against_the_reserve_between_readings() {
     let dir = tempfile::tempdir().unwrap();
-    let store = BlobStore::open(
-        Env::real(tokio::runtime::Handle::current()),
+    let store = open_with(
         dir.path(),
         StoreConfig {
             reserve: 1 << 20,
             ..StoreConfig::default()
         },
     )
-    .await
-    .unwrap();
+    .await;
     // Four frames above the reserve.
     store.set_free((1 << 20) + 4 * FRAME_SIZE as u64);
     let mut w = store
@@ -782,7 +692,7 @@ async fn an_erased_subjects_plain_blob_reads_as_erased() {
     )
     .await;
     store.reader(&Space::Main, &plain, &keys).await.unwrap();
-    keys.erased.lock().unwrap().push("user:6".into());
+    keys.erase("user:6");
     assert!(matches!(
         store.reader(&Space::Main, &plain, &keys).await,
         Err(BlobError::Erased)
@@ -798,17 +708,15 @@ async fn an_erased_subjects_plain_blob_reads_as_erased() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kept_alive_lease_outlives_its_ttl_while_held() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let store = BlobStore::open(
-        env.clone(),
+    let store = open_with(
         dir.path(),
         StoreConfig {
             lease_ttl: Duration::from_millis(80),
             ..StoreConfig::default()
         },
     )
-    .await
-    .unwrap();
+    .await;
+    let env = store.env().clone();
     let meta = put(&store, None, &content(8, 1000), 100).await;
     let plain = store.leases().take("plain");
     plain.add(meta.id);
@@ -834,26 +742,15 @@ async fn import_copies_a_fork_blob_into_main_as_it_is() {
     let store = open(dir.path()).await;
     let keys = TestKeys::default();
     let fork = Space::Fork("r-1".into());
-    let put_in = |space: Space, k: Option<BlobKeys>, data: Vec<u8>| {
-        let store = store.clone();
-        async move {
-            let mut w = store
-                .writer(space.clone(), k, u64::MAX, store.leases().take("t"))
-                .await
-                .unwrap();
-            w.write(&data).await.unwrap();
-            let meta = w.finish().await.unwrap();
-            store.ensure_durable(&space, &[meta.id]).await.unwrap();
-            meta
-        }
-    };
     let plain_data = content(21, 3 * FRAME_SIZE + 9);
     let sealed_data = content(22, FRAME_SIZE + 1);
-    let plain = put_in(fork.clone(), None, plain_data.clone()).await;
+    let plain = put_in(&store, &fork, None, &plain_data, usize::MAX).await;
     let sealed = put_in(
-        fork.clone(),
+        &store,
+        &fork,
         Some(keys.keys("user:4", 1, true)),
-        sealed_data.clone(),
+        &sealed_data,
+        usize::MAX,
     )
     .await;
     for (meta, data) in [(&plain, &plain_data), (&sealed, &sealed_data)] {
@@ -902,7 +799,7 @@ async fn import_copies_a_fork_blob_into_main_as_it_is() {
         .unwrap();
     }
     // Main has it already (and the fork does not): claimed.
-    let only_main = put_in(Space::Main, None, content(23, 500)).await;
+    let only_main = put_in(&store, &Space::Main, None, &content(23, 500), usize::MAX).await;
     let lease = store.leases().take("rebase");
     store
         .import(&fork, &Space::Main, &only_main, &lease)

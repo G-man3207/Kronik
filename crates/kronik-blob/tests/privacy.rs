@@ -4,105 +4,15 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
+use common::{TestKeys, content, object, open, put};
 use kronik_blob::format::{FRAME_SIZE, HEADER_LEN, Header};
-use kronik_blob::{
-    BlobError, BlobKeys, BlobMeta, BlobStore, KeyAccess, KeyAnswer, Resealed, Space, StoreConfig,
-};
-use kronik_core::env::Env;
-use zeroize::Zeroizing;
-
-fn content(seed: u64, len: usize) -> Vec<u8> {
-    let mut out = vec![0u8; len];
-    let mut h = blake3::Hasher::new();
-    h.update(&seed.to_le_bytes());
-    h.finalize_xof().fill(&mut out);
-    out
-}
-
-fn derived(label: &str, subject: &str, version: u32) -> Zeroizing<[u8; 32]> {
-    let mut h = blake3::Hasher::new_derive_key(label);
-    h.update(subject.as_bytes());
-    h.update(&version.to_le_bytes());
-    Zeroizing::new(*h.finalize().as_bytes())
-}
-
-/// Keys per (subject, version), and a set of erased subjects.
-#[derive(Default)]
-struct TestKeys {
-    erased: Mutex<Vec<String>>,
-}
-
-impl TestKeys {
-    /// The keys of a subject's blob written while the mode is off: keyed,
-    /// not sealed.
-    fn plain(&self, subject: &str) -> BlobKeys {
-        BlobKeys {
-            subject: subject.into(),
-            key_version: 1,
-            identity: derived("test identity", subject, 1),
-            seal: None,
-        }
-    }
-
-    fn erase(&self, subject: &str) {
-        self.erased.lock().unwrap().push(subject.into());
-    }
-
-    fn answer(&self, label: &str, subject: &str, version: u32) -> KeyAnswer {
-        if self.erased.lock().unwrap().iter().any(|s| s == subject) {
-            return KeyAnswer::Erased;
-        }
-        KeyAnswer::Found(derived(label, subject, version))
-    }
-}
-
-impl KeyAccess for TestKeys {
-    fn seal_key(&self, subject: &str, version: u32) -> KeyAnswer {
-        self.answer("test seal", subject, version)
-    }
-    fn identity_key(&self, subject: &str, version: u32) -> KeyAnswer {
-        self.answer("test identity", subject, version)
-    }
-}
-
-async fn open(dir: &Path) -> Arc<BlobStore> {
-    BlobStore::open(
-        Env::real(tokio::runtime::Handle::current()),
-        dir,
-        StoreConfig::default(),
-    )
-    .await
-    .unwrap()
-}
-
-async fn put(store: &Arc<BlobStore>, keys: BlobKeys, data: &[u8]) -> BlobMeta {
-    let mut w = store
-        .writer(
-            Space::Main,
-            Some(keys),
-            u64::MAX,
-            store.leases().take("test"),
-        )
-        .await
-        .unwrap();
-    w.write(data).await.unwrap();
-    let meta = w.finish().await.unwrap();
-    store
-        .ensure_durable(&Space::Main, &[meta.id])
-        .await
-        .unwrap();
-    meta
-}
-
-fn object(dir: &Path, meta: &BlobMeta) -> PathBuf {
-    dir.join("blobs/objects")
-        .join(meta.id.shard())
-        .join(meta.id.file_name())
-}
+use kronik_blob::{BlobError, BlobMeta, BlobStore, Resealed, Space};
 
 fn header(path: &Path) -> Header {
     let bytes = std::fs::read(path).unwrap();
@@ -149,7 +59,7 @@ async fn a_plain_subject_file_is_sealed_in_place() {
     .enumerate()
     {
         let data = content(i as u64, size);
-        let meta = put(&store, keys.plain("user:1"), &data).await;
+        let meta = put(&store, Some(keys.plain("user:1")), &data, usize::MAX).await;
         let path = object(dir.path(), &meta);
         assert!(!header(&path).sealed);
         assert_eq!(
@@ -200,7 +110,13 @@ async fn a_damaged_or_erased_file_is_not_sealed() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path()).await;
     let keys = TestKeys::default();
-    let meta = put(&store, keys.plain("user:1"), &content(7, 3 * FRAME_SIZE)).await;
+    let meta = put(
+        &store,
+        Some(keys.plain("user:1")),
+        &content(7, 3 * FRAME_SIZE),
+        usize::MAX,
+    )
+    .await;
     let path = object(dir.path(), &meta);
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[HEADER_LEN + FRAME_SIZE + 10] ^= 1;
@@ -216,7 +132,7 @@ async fn a_damaged_or_erased_file_is_not_sealed() {
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     assert_eq!(tmp_files(dir.path()), 0);
 
-    let other = put(&store, keys.plain("user:2"), b"two").await;
+    let other = put(&store, Some(keys.plain("user:2")), b"two", usize::MAX).await;
     keys.erase("user:2");
     let r = store
         .seal_in_place(&Space::Main, &other.id, &keys, &mark)
@@ -234,8 +150,20 @@ async fn erased_blobs_files_go_and_a_read_says_erased() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path()).await;
     let keys = TestKeys::default();
-    let one = put(&store, keys.plain("user:1"), &content(1, 1000)).await;
-    let two = put(&store, keys.plain("user:2"), &content(2, 1000)).await;
+    let one = put(
+        &store,
+        Some(keys.plain("user:1")),
+        &content(1, 1000),
+        usize::MAX,
+    )
+    .await;
+    let two = put(
+        &store,
+        Some(keys.plain("user:2")),
+        &content(2, 1000),
+        usize::MAX,
+    )
+    .await;
     let (files, bytes) = store.delete_erased(&Space::Main, &[one.id]).await.unwrap();
     assert_eq!(files, 1);
     assert!(bytes > 1000);
@@ -303,9 +231,27 @@ async fn a_pass_for_an_erasure_deletes_the_subjects_loose_files_at_once() {
         .unwrap();
     w.write(&content(1, 70_000)).await.unwrap();
     let held = w.finish().await.unwrap();
-    let loose = put(&store, keys.plain("user:1"), &content(2, 1000)).await;
-    let rooted = put(&store, keys.plain("user:1"), &content(3, 1000)).await;
-    let other = put(&store, keys.plain("user:2"), &content(4, 1000)).await;
+    let loose = put(
+        &store,
+        Some(keys.plain("user:1")),
+        &content(2, 1000),
+        usize::MAX,
+    )
+    .await;
+    let rooted = put(
+        &store,
+        Some(keys.plain("user:1")),
+        &content(3, 1000),
+        usize::MAX,
+    )
+    .await;
+    let other = put(
+        &store,
+        Some(keys.plain("user:2")),
+        &content(4, 1000),
+        usize::MAX,
+    )
+    .await;
     let mut roots = TestRoots {
         kept: [rooted.id].into(),
         erased: vec!["user:1".into()],

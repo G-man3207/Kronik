@@ -9,12 +9,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
-use kronik_blob::{
-    BlobId, BlobKeys, BlobMeta, BlobStore, KeyAccess, KeyAnswer, NoKeys, Space, StoreConfig,
-};
-use kronik_core::env::Env;
+use kronik_blob::{BlobId, BlobKeys, BlobMeta, BlobStore, KeyAccess, KeyAnswer, NoKeys, Space};
 use zeroize::Zeroizing;
 
 const SUBJECT_KEY: [u8; 32] = [7; 32];
@@ -79,13 +78,7 @@ fn fixture(name: &str) -> PathBuf {
 
 async fn write_fixtures() {
     let dir = tempfile::tempdir().unwrap();
-    let store = BlobStore::open(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        StoreConfig::default(),
-    )
-    .await
-    .unwrap();
+    let store = common::open(dir.path()).await;
     let keys = BlobKeys {
         subject: "user:7".into(),
         key_version: 1,
@@ -107,13 +100,7 @@ async fn write_fixtures() {
 /// Installs a fixture file in a fresh store under its object name.
 async fn install(name: &str, meta: &BlobMeta) -> (tempfile::TempDir, std::sync::Arc<BlobStore>) {
     let dir = tempfile::tempdir().unwrap();
-    let store = BlobStore::open(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        StoreConfig::default(),
-    )
-    .await
-    .unwrap();
+    let store = common::open(dir.path()).await;
     std::fs::copy(fixture(name), store.object_path(&Space::Main, &meta.id)).unwrap();
     (dir, store)
 }
