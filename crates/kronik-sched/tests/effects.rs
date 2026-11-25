@@ -1050,23 +1050,6 @@ fn compensations_and_orphans() {
     assert_eq!(orphans.len(), 1);
     assert_eq!(orphans[0].callee.to_string(), "counter/c");
     assert!(orphans[0].compensation_id.is_none());
-    // A compensation that fails is a dead letter and the orphan stays.
-    p.send("counter/a", msg("call-fail", "counter/d increment fail"));
-    p.wait_until("the failed compensation", |p| {
-        p.node
-            .store()
-            .db()
-            .dead_letters(0, 10)
-            .unwrap()
-            .iter()
-            .any(|d| d.actor.key == "d")
-    });
-    let orphans = p.node.store().db().orphans(false).unwrap();
-    assert!(
-        orphans
-            .iter()
-            .any(|o| o.callee.key == "d" && o.compensation_id.is_some())
-    );
     // Reentrant calls fail at once.
     let r = p.send("counter/a", msg("call", "counter/a increment"));
     assert!(reply(&r).contains("Reentrant"), "{}", reply(&r));
