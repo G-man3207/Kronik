@@ -368,6 +368,15 @@ fn blobs_status_inspect_get_and_gc() {
     assert_eq!(inspect["state"], "live", "{inspect}");
     let audit = d.run(&["--json", "audit", "show"]);
     assert!(audit.stdout.contains("blobs.gc"), "{audit:?}");
+
+    // A reasoned dry run goes through the pass's human rendering.
+    let o = d.run(&["blobs", "gc", "--dry-run", "--reason", "check"]);
+    assert_eq!(o.code, 0, "{o:?}");
+    assert!(
+        o.stdout
+            .contains("Dry run: a pass now would delete 0 files (0 bytes)"),
+        "{o:?}"
+    );
 }
 
 #[test]

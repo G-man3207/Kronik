@@ -113,35 +113,31 @@ pub(super) fn stubs(ctx: &Ctx, command: StubsCommand) -> Result<ExitCode, Error>
         &format!("/v1/simulators/{}", percent_encode(&target)),
         &body,
     )?;
-    if ctx.json {
-        ctx.print_raw(&raw);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: SimulatorsSetResponse = ctx.decode(&raw)?;
-    let mut out = if r.dry_run {
-        format!(
-            "Dry run: {} would get {summary} at epoch {}. Nothing was written.\n",
-            r.target, r.epoch
-        )
-    } else {
-        format!(
-            "{} now has {summary} (epoch {}, LSN {}).\n",
-            r.target, r.epoch, r.lsn
-        )
-    };
-    let cmd = if r.dry_run {
-        format!(
-            "kronik stubs set {} {} --reason {}",
-            shell_quote(&r.target),
-            shell_quote(&rules.display().to_string()),
-            shell_quote(reason)
-        )
-    } else {
-        "kronik simulators list".to_owned()
-    };
-    out.push_str(&next(&[cmd]));
-    ctx.print(&out);
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&raw, |r: SimulatorsSetResponse| {
+        let mut out = if r.dry_run {
+            format!(
+                "Dry run: {} would get {summary} at epoch {}. Nothing was written.\n",
+                r.target, r.epoch
+            )
+        } else {
+            format!(
+                "{} now has {summary} (epoch {}, LSN {}).\n",
+                r.target, r.epoch, r.lsn
+            )
+        };
+        let cmd = if r.dry_run {
+            format!(
+                "kronik stubs set {} {} --reason {}",
+                shell_quote(&r.target),
+                shell_quote(&rules.display().to_string()),
+                shell_quote(reason)
+            )
+        } else {
+            "kronik simulators list".to_owned()
+        };
+        out.push_str(&next(&[cmd]));
+        out
+    })
 }
 
 /// `2 stub rules, a contract, neighbor` or `no simulators`.
@@ -173,13 +169,7 @@ fn describe(r: &SimulatorsSetRequest) -> String {
 pub(super) fn simulators(ctx: &Ctx, command: SimulatorsCommand) -> Result<ExitCode, Error> {
     let SimulatorsCommand::List = command;
     let body = ctx.get("/v1/simulators")?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: SimulatorsResponse = ctx.decode(&body)?;
-    ctx.print(&render_list(&r));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: SimulatorsResponse| render_list(&r))
 }
 
 fn render_list(r: &SimulatorsResponse) -> String {

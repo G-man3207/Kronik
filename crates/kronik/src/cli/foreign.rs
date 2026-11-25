@@ -381,13 +381,7 @@ fn add(ctx: &Ctx, a: AddArgs, mutation: &Mutation) -> Result<ExitCode, Error> {
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: ForeignAddResponse = ctx.decode(&body)?;
-    ctx.print(&render_added(&r, &rerun));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: ForeignAddResponse| render_added(&r, &rerun))
 }
 
 fn state(f: &ForeignView) -> String {
@@ -478,13 +472,7 @@ fn render_added(r: &ForeignAddResponse, rerun: &str) -> String {
 
 fn list(ctx: &Ctx) -> Result<ExitCode, Error> {
     let body = ctx.get("/v1/foreign")?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: ForeignListResponse = ctx.decode(&body)?;
-    ctx.print(&render_list(&r));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: ForeignListResponse| render_list(&r))
 }
 
 fn render_list(r: &ForeignListResponse) -> String {
@@ -557,24 +545,20 @@ fn logs(ctx: &Ctx, name: &str, tail: Option<u32>) -> Result<ExitCode, Error> {
         let _ = write!(target, "?tail={t}");
     }
     let body = ctx.get(&target)?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: ForeignLogsResponse = ctx.decode(&body)?;
-    let mut out = String::new();
-    if r.truncated {
-        out.push_str("(earlier lines omitted)\n");
-    }
-    for l in &r.lines {
-        out.push_str(l);
-        out.push('\n');
-    }
-    if r.lines.is_empty() {
-        let _ = writeln!(out, "{} has written nothing yet.", r.name);
-    }
-    ctx.print(&out);
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: ForeignLogsResponse| {
+        let mut out = String::new();
+        if r.truncated {
+            out.push_str("(earlier lines omitted)\n");
+        }
+        for l in &r.lines {
+            out.push_str(l);
+            out.push('\n');
+        }
+        if r.lines.is_empty() {
+            let _ = writeln!(out, "{} has written nothing yet.", r.name);
+        }
+        out
+    })
 }
 
 fn remove(ctx: &Ctx, name: &str, mutation: &Mutation) -> Result<ExitCode, Error> {
@@ -587,37 +571,30 @@ fn remove(ctx: &Ctx, name: &str, mutation: &Mutation) -> Result<ExitCode, Error>
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: ForeignRemoveResponse = ctx.decode(&body)?;
-    let rerun = format!(
-        "kronik foreign remove {} --reason {}",
-        shell_quote(name),
-        shell_quote(reason)
-    );
-    let mut out = String::new();
-    if r.dry_run {
+    ctx.show(&body, |r: ForeignRemoveResponse| {
+        let rerun = format!(
+            "kronik foreign remove {} --reason {}",
+            shell_quote(name),
+            shell_quote(reason)
+        );
+        let mut out = String::new();
+        if r.dry_run {
+            let _ = writeln!(
+                out,
+                "Dry run: foreign actor {} can be removed at epoch {}; nothing was written",
+                r.removed.name, r.removed.epoch
+            );
+            out.push_str(&next(&[rerun]));
+            return out;
+        }
         let _ = writeln!(
             out,
-            "Dry run: foreign actor {} can be removed at epoch {}; nothing was written",
-            r.removed.name, r.removed.epoch
+            "Removed foreign actor {} (epoch {}, main:{}); its sandbox is stopped and foreign/actors/{}/data is kept",
+            r.removed.name, r.removed.epoch, r.removed.lsn, r.removed.name
         );
-        out.push_str(&next(&[rerun]));
-        return Ok({
-            ctx.print(&out);
-            ExitCode::SUCCESS
-        });
-    }
-    let _ = writeln!(
-        out,
-        "Removed foreign actor {} (epoch {}, main:{}); its sandbox is stopped and foreign/actors/{}/data is kept",
-        r.removed.name, r.removed.epoch, r.removed.lsn, r.removed.name
-    );
-    out.push_str(&next(&["kronik foreign list".to_owned()]));
-    ctx.print(&out);
-    Ok(ExitCode::SUCCESS)
+        out.push_str(&next(&["kronik foreign list".to_owned()]));
+        out
+    })
 }
 
 #[cfg(test)]

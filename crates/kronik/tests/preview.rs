@@ -165,6 +165,20 @@ impl Daemon {
         serde_json::from_slice(&out.stdout).unwrap()
     }
 
+    /// The CLI without `--json`: the rendered text.
+    fn cli_text(&self, args: &[&str]) -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_kronik"))
+            .arg("--socket")
+            .arg(self.dir.join("api.sock"))
+            .args(args)
+            .env_remove("KRONIK_TOKEN")
+            .env_remove("KRONIK_API_SOCKET")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    }
+
     fn deploy(&self, guest: &str) {
         self.api(
             "POST",
@@ -283,6 +297,15 @@ fn a_preview_runs_new_requests_on_the_new_code_without_live_effects() {
     let id = v["preview"]["id"].as_str().unwrap().to_owned();
     assert!(id.starts_with("v-") && id.len() == 14, "{v}");
     assert_eq!(v["preview"]["proposal"], proposal.as_str());
+    let dry = d.cli_text(&[
+        "preview",
+        "create",
+        &proposal,
+        "--reason",
+        "try step2",
+        "--dry-run",
+    ]);
+    assert!(dry.contains("Dry run: proposal"), "{dry}");
     let port = d.http.rsplit_once(':').unwrap().1;
     assert_eq!(
         v["preview"]["url"],
@@ -292,6 +315,11 @@ fn a_preview_runs_new_requests_on_the_new_code_without_live_effects() {
         d.cli(&["preview", "list"])["previews"]
             .to_string()
             .contains(&id)
+    );
+    let listed = d.cli_text(&["preview", "list"]);
+    assert!(
+        listed.contains("PREVIEW") && listed.contains(&id),
+        "{listed}"
     );
 
     // The new code (+2) on HEAD's state (1), by host in any case, with a
@@ -405,6 +433,11 @@ fn a_preview_runs_new_requests_on_the_new_code_without_live_effects() {
     );
 
     // Deleting it stops its routes and removes its directory.
+    let dry = d.cli_text(&["preview", "delete", &id, "--reason", "done", "--dry-run"]);
+    assert!(
+        dry.contains(&format!("Dry run: preview {id} can be deleted")),
+        "{dry}"
+    );
     let v = d.cli(&["preview", "delete", &id, "--reason", "done"]);
     assert_eq!(v["deleted"], id.as_str());
     assert!(!d.fork_dir(&id).exists());

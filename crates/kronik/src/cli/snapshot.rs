@@ -96,13 +96,7 @@ pub(super) fn integrity(ctx: &Ctx, a: IntegrityArgs) -> Result<ExitCode, Error> 
 
 fn list(ctx: &Ctx) -> Result<ExitCode, Error> {
     let body = ctx.get("/v1/snapshots")?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: SnapshotsResponse = ctx.decode(&body)?;
-    ctx.print(&render_list(&r));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: SnapshotsResponse| render_list(&r))
 }
 
 fn create(ctx: &Ctx, a: CreateArgs) -> Result<ExitCode, Error> {
@@ -114,14 +108,8 @@ fn create(ctx: &Ctx, a: CreateArgs) -> Result<ExitCode, Error> {
             dry_run: a.mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: SnapshotCreateResponse = ctx.decode(&body)?;
     let rerun = format!("kronik snapshot create --reason {}", shell_quote(why));
-    ctx.print(&render_create(&r, &rerun));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: SnapshotCreateResponse| render_create(&r, &rerun))
 }
 
 fn render_list(r: &SnapshotsResponse) -> String {

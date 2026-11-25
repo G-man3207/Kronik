@@ -81,18 +81,14 @@ fn set_mode(ctx: &Ctx, mode: Mode, mutation: &Mutation) -> Result<ExitCode, Erro
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: PrivacyModeResponse = ctx.decode(&body)?;
-    let rerun = format!(
-        "kronik privacy mode {} --reason {}",
-        name(wanted),
-        shell_quote(reason)
-    );
-    ctx.print(&render_mode(&r, &rerun));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: PrivacyModeResponse| {
+        let rerun = format!(
+            "kronik privacy mode {} --reason {}",
+            name(wanted),
+            shell_quote(reason)
+        );
+        render_mode(&r, &rerun)
+    })
 }
 
 fn epoch(e: Option<u64>) -> String {
@@ -137,60 +133,56 @@ fn render_mode(r: &PrivacyModeResponse, rerun: &str) -> String {
 
 fn status(ctx: &Ctx) -> Result<ExitCode, Error> {
     let body = ctx.get("/v1/privacy")?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let s: PrivacyStatus = ctx.decode(&body)?;
-    let mut out = String::new();
-    field(
-        &mut out,
-        "Mode",
-        &[format!("{} (epoch {})", name(s.mode), epoch(s.epoch))],
-        "",
-    );
-    let keystore = match s.keystore {
-        Some(k) => format!(
-            "{} subjects, {} keys, {} erased",
-            k.subjects, k.keys, k.erased
-        ),
-        None => "none".to_owned(),
-    };
-    field(&mut out, "Keystore", &[keystore], "");
-    field(
-        &mut out,
-        "Erasures",
-        &[format!(
-            "{} still have a plain value in the log, state.db or in flight",
-            s.pending_erasures
-        )],
-        "",
-    );
-    let r = &s.reseal;
-    field(
-        &mut out,
-        "Reseal",
-        &[format!(
-            "{} of {} segments, {} values sealed, {} tombstones, {} blob files sealed",
-            r.segments_done, r.segments_total, r.values_sealed, r.tombstones, r.blobs_sealed
-        )],
-        "",
-    );
-    if r.pending_segments + r.pending_blobs > 0 {
-        let _ = writeln!(
-            out,
-            "The shipped copy still holds the old bytes until the shipper replaces them."
+    ctx.show(&body, |s: PrivacyStatus| {
+        let mut out = String::new();
+        field(
+            &mut out,
+            "Mode",
+            &[format!("{} (epoch {})", name(s.mode), epoch(s.epoch))],
+            "",
         );
-    }
-    let other = match s.mode {
-        PrivacyModeName::On => "off",
-        PrivacyModeName::Off => "on",
-    };
-    out.push_str(&next(&[format!(
-        "kronik privacy mode {other} --reason \"...\""
-    )]));
-    ctx.print(&out);
-    Ok(ExitCode::SUCCESS)
+        let keystore = match s.keystore {
+            Some(k) => format!(
+                "{} subjects, {} keys, {} erased",
+                k.subjects, k.keys, k.erased
+            ),
+            None => "none".to_owned(),
+        };
+        field(&mut out, "Keystore", &[keystore], "");
+        field(
+            &mut out,
+            "Erasures",
+            &[format!(
+                "{} still have a plain value in the log, state.db or in flight",
+                s.pending_erasures
+            )],
+            "",
+        );
+        let r = &s.reseal;
+        field(
+            &mut out,
+            "Reseal",
+            &[format!(
+                "{} of {} segments, {} values sealed, {} tombstones, {} blob files sealed",
+                r.segments_done, r.segments_total, r.values_sealed, r.tombstones, r.blobs_sealed
+            )],
+            "",
+        );
+        if r.pending_segments + r.pending_blobs > 0 {
+            let _ = writeln!(
+                out,
+                "The shipped copy still holds the old bytes until the shipper replaces them."
+            );
+        }
+        let other = match s.mode {
+            PrivacyModeName::On => "off",
+            PrivacyModeName::Off => "on",
+        };
+        out.push_str(&next(&[format!(
+            "kronik privacy mode {other} --reason \"...\""
+        )]));
+        out
+    })
 }
 
 fn erase(ctx: &Ctx, subject: &str, mutation: &Mutation) -> Result<ExitCode, Error> {
@@ -203,18 +195,12 @@ fn erase(ctx: &Ctx, subject: &str, mutation: &Mutation) -> Result<ExitCode, Erro
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: ErasureResponse = ctx.decode(&body)?;
     let rerun = format!(
         "kronik privacy erase {} --reason {}",
         shell_quote(subject),
         shell_quote(reason)
     );
-    ctx.print(&render_erase(&r, &rerun));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: ErasureResponse| render_erase(&r, &rerun))
 }
 
 fn render_erase(r: &ErasureResponse, rerun: &str) -> String {
@@ -281,14 +267,8 @@ fn reseal(ctx: &Ctx, mutation: &Mutation) -> Result<ExitCode, Error> {
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: ResealResponse = ctx.decode(&body)?;
     let rerun = format!("kronik privacy reseal --reason {}", shell_quote(why));
-    ctx.print(&render_reseal(&r, &rerun));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: ResealResponse| render_reseal(&r, &rerun))
 }
 
 fn render_reseal(r: &ResealResponse, rerun: &str) -> String {

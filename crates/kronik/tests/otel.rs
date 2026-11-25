@@ -493,6 +493,37 @@ fn a_call_through_three_actors_reaches_an_otlp_receiver_as_one_trace() {
     let d = Daemon::start(dir.path(), &r.endpoint);
     d.json(&["deploy", COUNTER, "--reason", "otel test"]);
 
+    // Human output renders the streams, and a rewind dry run prints the LSN
+    // it would resend from without moving the cursor.
+    let out = d.cli(&["export", "status"]);
+    assert!(out.status.success(), "{out:?}\n{}", d.log());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("traces") && text.contains(&r.endpoint),
+        "{text}"
+    );
+    let cursor = d.traces_status()["cursor"].as_u64().unwrap();
+    let to = cursor.to_string();
+    let out = d.cli(&[
+        "export",
+        "rewind",
+        "traces",
+        "--to",
+        &to,
+        "--reason",
+        "otel test",
+        "--dry-run",
+    ]);
+    assert!(out.status.success(), "{out:?}\n{}", d.log());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!(
+            "Dry run: traces would resend from LSN {} (its cursor is {cursor})",
+            cursor + 1
+        )),
+        "{text}"
+    );
+
     let plain = d.three_actors(&[]);
     let traced = d.three_actors(&[("traceparent", TRACEPARENT)]);
     let first = trace_of(&r.got, &d, &plain);

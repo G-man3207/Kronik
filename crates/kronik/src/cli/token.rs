@@ -79,24 +79,12 @@ fn create(
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: TokenCreateResponse = ctx.decode(&body)?;
-    ctx.print(&render_created(&r, &rerun));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: TokenCreateResponse| render_created(&r, &rerun))
 }
 
 fn list(ctx: &Ctx) -> Result<ExitCode, Error> {
     let body = ctx.get("/v1/tokens")?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: TokensResponse = ctx.decode(&body)?;
-    ctx.print(&render_list(&r));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: TokensResponse| render_list(&r))
 }
 
 fn revoke(ctx: &Ctx, name: &str, mutation: &Mutation) -> Result<ExitCode, Error> {
@@ -108,18 +96,12 @@ fn revoke(ctx: &Ctx, name: &str, mutation: &Mutation) -> Result<ExitCode, Error>
             dry_run: mutation.dry_run,
         },
     )?;
-    if ctx.json {
-        ctx.print_raw(&body);
-        return Ok(ExitCode::SUCCESS);
-    }
-    let r: TokenRevokeResponse = ctx.decode(&body)?;
     let rerun = format!(
         "kronik token revoke {} --reason {}",
         shell_quote(name),
         shell_quote(reason)
     );
-    ctx.print(&render_revoked(&r, &rerun));
-    Ok(ExitCode::SUCCESS)
+    ctx.show(&body, |r: TokenRevokeResponse| render_revoked(&r, &rerun))
 }
 
 fn render_created(r: &TokenCreateResponse, rerun: &str) -> String {
