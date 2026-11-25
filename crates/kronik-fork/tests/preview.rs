@@ -53,34 +53,8 @@ fn create(p: &Proc, props: &Proposals, proposal: &str) -> String {
         .id
 }
 
-/// `POST /counter/x/<op>` as the gateway builds it.
-fn request(op: &str, body: &str) -> (ActorRef, pb::HttpInput) {
-    let input = pb::HttpInput {
-        method: "POST".into(),
-        path: format!("/counter/x/{op}"),
-        params: vec![
-            pb::Param {
-                name: "key".into(),
-                value: "x".into(),
-                sealed_value: None,
-            },
-            pb::Param {
-                name: "op".into(),
-                value: op.into(),
-                sealed_value: None,
-            },
-        ],
-        body: Some(pb::Body {
-            value: Some(pb::body::Value::Inline(plain(body).unwrap())),
-        }),
-        route: "/counter/{key}/{op}".into(),
-        ..Default::default()
-    };
-    (ActorRef::parse("counter/x").unwrap(), input)
-}
-
 fn send(p: &Proc, props: &Arc<Proposals>, id: &str, op: &str, body: &str) -> TurnResult {
-    let (actor, http) = request(op, body);
+    let (actor, http) = Proc::http_input("x", op, body);
     let original = p.node.local_operator_authority().unwrap();
     p.rt.block_on(PreviewRouter::send(
         props.clone(),
@@ -259,7 +233,7 @@ fn preview_output_is_unavailable_when_retained_secret_loading_fails() {
         .unwrap();
     p.rt.block_on(p.node.refresh_secret_inventory(p.owner()))
         .unwrap_err();
-    let (actor, http) = request("get", "");
+    let (actor, http) = Proc::http_input("x", "get", "");
     let original = p.node.local_operator_authority().unwrap();
     let e =
         p.rt.block_on(PreviewRouter::send(props, id, actor, http, None, original))
@@ -297,7 +271,7 @@ fn a_held_preview_request_blocks_no_operator_command() {
     let proposal = propose_step2(&p, &props);
     let id = create(&p, &props, &proposal);
 
-    let (actor, http) = request("fetch-ok", &format!("GET http://{addr}/ping"));
+    let (actor, http) = Proc::http_input("x", "fetch-ok", &format!("GET http://{addr}/ping"));
     let original = p.node.local_operator_authority().unwrap();
     let held = p.rt.spawn(PreviewRouter::send(
         props.clone(),
@@ -434,7 +408,7 @@ fn a_preview_takes_a_bounded_number_of_requests() {
     let id = create(&p, &props, &proposal);
     send(&p, &props, &id, "increment", "");
     assert_eq!(http_body(&send(&p, &props, &id, "increment", "")), "5");
-    let (actor, http) = request("increment", "");
+    let (actor, http) = Proc::http_input("x", "increment", "");
     let original = p.node.local_operator_authority().unwrap();
     let e =
         p.rt.block_on(PreviewRouter::send(

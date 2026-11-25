@@ -22,7 +22,7 @@ use kronik_fork::diff::{DiffOptions, Mode};
 use kronik_fork::proposal::{Proposals, ProposeRequest};
 use kronik_proto::log::v1 as pb;
 use kronik_sched::snapshots::StorageConfig;
-use kronik_sched::{BlobsConfig, Ingress, NodeConfig, TurnResult};
+use kronik_sched::{BlobsConfig, NodeConfig, TurnResult};
 
 fn http(op: &str, query: &str) -> pb::HttpInput {
     pb::HttpInput {
@@ -41,16 +41,7 @@ fn http(op: &str, query: &str) -> pb::HttpInput {
 }
 
 fn ingress(p: &Proc, input: pb::HttpInput) -> TurnResult {
-    p.rt.block_on(async {
-        match p
-            .node
-            .ingress(ActorRef::parse("media/a").unwrap(), input, None)
-            .unwrap()
-        {
-            Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
-            Ingress::Done(r) => *r,
-        }
-    })
+    p.ingress(ActorRef::parse("media/a").unwrap(), input, None)
 }
 
 /// The text answer of a turn that committed.

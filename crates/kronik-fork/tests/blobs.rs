@@ -17,7 +17,7 @@ use kronik_core::ids::ActorRef;
 use kronik_fork::diff::{DiffOptions, Mode};
 use kronik_fork::proposal::Proposals;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{BlobsConfig, Ingress, NodeConfig, TurnResult};
+use kronik_sched::{BlobsConfig, NodeConfig, TurnResult};
 
 fn pattern(i: u64) -> u8 {
     ((i.wrapping_mul(31) + 7) % 251) as u8
@@ -84,16 +84,7 @@ fn inline(bytes: &[u8]) -> pb::body::Value {
 }
 
 fn ingress(p: &Proc, input: pb::HttpInput) -> TurnResult {
-    p.rt.block_on(async {
-        match p
-            .node
-            .ingress(ActorRef::parse("media/a").unwrap(), input, None)
-            .unwrap()
-        {
-            Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
-            Ingress::Done(r) => *r,
-        }
-    })
+    p.ingress(ActorRef::parse("media/a").unwrap(), input, None)
 }
 
 fn answer(r: &TurnResult) -> String {
@@ -1169,20 +1160,7 @@ fn a_replay_across_an_erasure_decides_the_quota_as_production_did() {
             }),
             ..http("put", &format!("size={size}"), inline(b""))
         };
-        let r = p.rt.block_on(async {
-            match p
-                .node
-                .ingress(
-                    ActorRef::parse("media/a").unwrap(),
-                    input,
-                    Some(subject.into()),
-                )
-                .unwrap()
-            {
-                Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
-                Ingress::Done(r) => *r,
-            }
-        });
+        let r = p.ingress(ActorRef::parse("media/a").unwrap(), input, Some(subject));
         assert!(r.committed(), "{r:?}");
         answer(&r)
     };

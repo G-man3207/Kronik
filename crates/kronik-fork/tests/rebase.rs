@@ -22,7 +22,7 @@ use kronik_fork::proposal::{Proposals, ProposeRequest, RebaseRequest};
 use kronik_privacy::sealer::Opened;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{Ingress, NodeConfig, SwitchHold, TurnResult};
+use kronik_sched::{NodeConfig, SwitchHold, TurnResult};
 use prost::Message as _;
 use serde_json::Value;
 
@@ -44,34 +44,10 @@ fn keyed(p: &Proc, key: &str, idem: &str) -> TurnResult {
 
 /// Operation `op` on counter/`key` with `body` and an idempotency key.
 fn keyed_op(p: &Proc, key: &str, op: &str, body: &str, idem: &str) -> TurnResult {
-    let input = pb::HttpInput {
-        method: "POST".into(),
-        path: format!("/counter/{key}/{op}"),
-        params: vec![
-            pb::Param {
-                name: "key".into(),
-                value: key.into(),
-                sealed_value: None,
-            },
-            pb::Param {
-                name: "op".into(),
-                value: op.into(),
-                sealed_value: None,
-            },
-        ],
-        body: Some(pb::Body {
-            value: Some(pb::body::Value::Inline(plain(body).unwrap())),
-        }),
-        route: "/counter/{key}/{op}".into(),
-        idempotency_key: idem.into(),
-        request_hash: blake3::hash(idem.as_bytes()).as_bytes().to_vec(),
-        ..Default::default()
-    };
-    let actor = ActorRef::parse(&format!("counter/{key}")).unwrap();
-    match p.node.ingress(actor, input, None).unwrap() {
-        Ingress::Started(w) | Ingress::Joined(w) => p.rt.block_on(w.wait()).unwrap(),
-        Ingress::Done(r) => *r,
-    }
+    let (actor, mut input) = Proc::http_input(key, op, body);
+    input.idempotency_key = idem.into();
+    input.request_hash = blake3::hash(idem.as_bytes()).as_bytes().to_vec();
+    p.ingress(actor, input, None)
 }
 
 struct Setup {

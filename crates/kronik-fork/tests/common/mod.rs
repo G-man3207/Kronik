@@ -294,7 +294,7 @@ impl Proc {
             .unwrap();
     }
 
-    fn http_input(key: &str, op: &str, body: &str) -> (ActorRef, pb::HttpInput) {
+    pub fn http_input(key: &str, op: &str, body: &str) -> (ActorRef, pb::HttpInput) {
         let input = pb::HttpInput {
             method: "POST".into(),
             path: format!("/counter/{key}/{op}"),
@@ -319,6 +319,25 @@ impl Proc {
         (ActorRef::parse(&format!("counter/{key}")).unwrap(), input)
     }
 
+    /// Ingress of `input` to `actor`, waited for.
+    pub fn ingress(
+        &self,
+        actor: ActorRef,
+        input: pb::HttpInput,
+        subject: Option<&str>,
+    ) -> TurnResult {
+        self.rt.block_on(async {
+            match self
+                .node
+                .ingress(actor, input, subject.map(str::to_owned))
+                .unwrap()
+            {
+                Ingress::Started(w) | Ingress::Joined(w) => w.wait().await.unwrap(),
+                Ingress::Done(r) => *r,
+            }
+        })
+    }
+
     pub fn http(&self, key: &str, op: &str, body: &str) -> TurnResult {
         self.http_as(key, op, body, None)
     }
@@ -326,14 +345,7 @@ impl Proc {
     /// `http` on behalf of a data subject (privacy mode).
     pub fn http_as(&self, key: &str, op: &str, body: &str, subject: Option<&str>) -> TurnResult {
         let (actor, input) = Proc::http_input(key, op, body);
-        match self
-            .node
-            .ingress(actor, input, subject.map(str::to_owned))
-            .unwrap()
-        {
-            Ingress::Started(w) | Ingress::Joined(w) => self.rt.block_on(w.wait()).unwrap(),
-            Ingress::Done(r) => *r,
-        }
+        self.ingress(actor, input, subject)
     }
 
     /// An HTTP input that is not waited for.
