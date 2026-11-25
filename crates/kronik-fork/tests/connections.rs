@@ -33,8 +33,8 @@ use kronik_fork::diff::{DiffOptions, FrameInputs, Mode};
 use kronik_fork::{ForkKind, ProductionIndex, ReplayOutput, ReplaySetup, config_at, fork_kinds};
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::TurnLimits;
+use kronik_sched::NodeConfig;
 use kronik_sched::connections::RecordingTransport;
-use kronik_sched::{Ingress, NodeConfig};
 use serde_json::Value;
 
 /// The said messages carry this word: a test checks where it may appear.
@@ -176,14 +176,7 @@ fn http_say(p: &Proc, text: &str) {
         route: "/room/{key}/say".into(),
         ..Default::default()
     };
-    let r = match p
-        .node
-        .ingress(ActorRef::parse("room/lobby").unwrap(), input, None)
-        .unwrap()
-    {
-        Ingress::Started(w) | Ingress::Joined(w) => p.rt.block_on(w.wait()).unwrap(),
-        Ingress::Done(r) => *r,
-    };
+    let r = p.ingress(ActorRef::parse("room/lobby").unwrap(), input, None);
     assert!(r.committed(), "{r:?}");
 }
 
