@@ -330,6 +330,47 @@ pub fn files_containing(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
     out
 }
 
+/// Ships the data directory `data` to the bucket `url` once, the way a
+/// node does every few seconds (`kronik_ship::ship_once`), without a
+/// running node.
+pub fn ship_now(data: &Path, url: &str) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let remote = kronik_ship::Remote::open(url, None).unwrap();
+        let mut state = kronik_ship::ShipState::load(data).unwrap();
+        kronik_ship::ship_once(&remote, data, "main", &mut state)
+            .await
+            .unwrap();
+    });
+}
+
+/// Whether the snapshot at `lsn`, the code and the active segment as it
+/// is now reach the bucket, by `<data>/ship.json`: polls every 200 ms, up
+/// to 225 times (45 s).
+pub fn wait_until_shipped(data: &Path, lsn: u64) -> bool {
+    for _ in 0..225 {
+        if let Ok(text) = std::fs::read_to_string(data.join("ship.json"))
+            && let Ok(v) = serde_json::from_str::<Value>(&text)
+            && v["snapshots"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|n| n.as_u64() == Some(lsn)))
+            && v["code"].as_array().is_some_and(|a| !a.is_empty())
+            && let Some(start) = v["active"][0].as_u64()
+            && let Some(size) = v["active"][1].as_u64()
+            && std::fs::metadata(data.join(format!("branches/main/log/{start:020}.seg")))
+                .is_ok_and(|m| m.len() == size)
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
 /// `kronik serve` as a child process, with its data in `<dir>/data`, its
 /// API socket at `<dir>/api.sock` and its stderr appended to
 /// `<dir>/serve.log`; killed when dropped.

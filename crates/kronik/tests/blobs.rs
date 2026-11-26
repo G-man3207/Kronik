@@ -20,7 +20,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use blob_fixtures::{hash, pattern, pattern_sum};
-use common::Daemon;
+use common::{Daemon, ship_now};
 use media_daemon::kronik_bin;
 use serde_json::{Value, json};
 
@@ -240,20 +240,4 @@ fn kronik(args: &[&str]) -> Output {
         .stdin(Stdio::null())
         .output()
         .unwrap()
-}
-
-/// One shipping round of the stopped daemon's directory into `url`.
-fn ship_now(data: &Path, url: &str) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        let remote = kronik_ship::Remote::open(url, None).unwrap();
-        let mut state = kronik_ship::ShipState::load(data).unwrap();
-        kronik_ship::ship_once(&remote, data, "main", &mut state)
-            .await
-            .unwrap();
-    });
 }
