@@ -274,14 +274,10 @@ pub async fn run(
     let index = setup.index.clone();
     let (trees, continuous) =
         replay::both(env, setup.clone(), options, workers, proposal_id, head).await?;
-    let prod_store = if let Some(store) = &setup.prod_store {
-        Some(store.clone())
-    } else {
-        match &continuous {
-            Some(_) => Some(replay::production_store(&index)?),
-            None => None,
-        }
-    };
+    let production = continuous
+        .as_ref()
+        .map(|_| replay::production_store(&index))
+        .transpose()?;
     let turns = continuous
         .as_ref()
         .map(Continuous::turns)
@@ -290,7 +286,7 @@ pub async fn run(
         .as_ref()
         .map(Continuous::skipped)
         .unwrap_or_default();
-    let view = match (&continuous, &prod_store) {
+    let view = match (&continuous, &production) {
         (Some(c), Some(p)) => Some(diff::ContinuousView {
             turns: &turns,
             fork: &c.store,

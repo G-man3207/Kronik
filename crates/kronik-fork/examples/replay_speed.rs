@@ -107,14 +107,13 @@ fn main() {
         let code = node.code().clone();
         let fc = fork_kinds(&index, fork_lsn, |h| code.get(h).map_err(|e| e.to_string()), &[]).unwrap();
         let config = config_at(&index, fork_lsn);
-        let mut setup = ReplaySetup::recorded("f-bench".into(), index.clone(), fc.kinds, config, None);
-        let t = Instant::now();
-        let rebuilt = kronik_fork::replay::production_store(&index).unwrap();
-        println!("applying the window to a fresh cursor: {:.3} s", t.elapsed().as_secs_f64());
-        if kronik_fork::replay::same_diff_rows(node.store(), &rebuilt).unwrap() {
-            setup.prod_store = Some(node.store().clone());
-        }
-        let setup = Arc::new(setup);
+        let setup = Arc::new(ReplaySetup::recorded(
+            "f-bench".into(),
+            index.clone(),
+            fc.kinds,
+            config,
+            None,
+        ));
         // Isolated replay alone, without building the diff.
         let t = Instant::now();
         let trees = kronik_fork::replay::isolated(node.env(), setup.clone(), index.roots.clone(), workers)

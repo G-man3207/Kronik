@@ -98,9 +98,6 @@ pub struct ReplaySetup {
     pub live: Option<LiveAccess>,
     /// What the fork sees of production's user data (M8).
     pub privacy: crate::privacy::ForkPrivacy,
-    /// Production's live `state.db` when its actor and kv rows match a
-    /// rebuilt store. `run` uses it instead of replaying the window again.
-    pub prod_store: Option<Arc<Store>>,
     /// Counts the root inputs replayed, when someone follows the replay.
     pub progress: Option<Arc<Progress>>,
     /// Main's simulator configuration at the fork point with the request's
@@ -214,7 +211,6 @@ impl ReplaySetup {
             stubs: Vec::new(),
             live: None,
             privacy: crate::privacy::ForkPrivacy::plain(),
-            prod_store: None,
             progress: None,
             rebase: false,
             preview: false,
@@ -4329,56 +4325,6 @@ pub fn production_store(index: &ProductionIndex) -> Result<Arc<Store>, ReplayErr
     advance(&store, index, index.to_lsn)?;
     store.end_bulk_replay()?;
     Ok(store)
-}
-/// Whether `live` has the same actors and kv rows the continuous diff
-/// reads from `rebuilt`. Actor LSN metadata is not compared; the diff
-/// uses kind, key, the SQL flag, and kv values.
-pub fn same_diff_rows(live: &Store, rebuilt: &Store) -> Result<bool, ReplayError> {
-    let mut after: Option<(String, String)> = None;
-    loop {
-        let page = live.db().actors(
-            None,
-            after.as_ref().map(|(k, y)| (k.as_str(), y.as_str())),
-            1000,
-        )?;
-        let Some(last) = page.last() else { break };
-        after = Some((last.kind.clone(), last.key.clone()));
-        for a in &page {
-            let other = rebuilt.db().actor(&a.kind, &a.key)?;
-            let Some(other) = other else {
-                return Ok(false);
-            };
-            if other.sql != a.sql {
-                return Ok(false);
-            }
-            let lv = live.db().kv_list(&a.kind, &a.key)?;
-            let rv = rebuilt.db().kv_list(&a.kind, &a.key)?;
-            if lv.len() != rv.len() {
-                return Ok(false);
-            }
-            for (l, r) in lv.iter().zip(&rv) {
-                if l.k != r.k || l.value != r.value || l.subject != r.subject {
-                    return Ok(false);
-                }
-            }
-        }
-    }
-    let mut after: Option<(String, String)> = None;
-    loop {
-        let page = rebuilt.db().actors(
-            None,
-            after.as_ref().map(|(k, y)| (k.as_str(), y.as_str())),
-            1000,
-        )?;
-        let Some(last) = page.last() else { break };
-        after = Some((last.kind.clone(), last.key.clone()));
-        for a in &page {
-            if live.db().actor(&a.kind, &a.key)?.is_none() {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
 }
 
 /// Isolated replay (sampled with `seed`, default the fork name) and
