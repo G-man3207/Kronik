@@ -112,7 +112,7 @@ pub fn check(args: CheckArgs, json: bool) -> ExitCode {
 fn execute(args: CheckArgs) -> Result<Done, ApiError> {
     let window_ms = crate::cli::parse_duration_ms(&args.window).map_err(|m| {
         ApiError::new(ErrorCode::BadRequest, format!("--window: {m}"))
-            .with_hint("Give a duration with ms, s, m or h, e.g. 6h.")
+            .with_hint("Give a duration with ms, s, m, h or d, e.g. 6h.")
     })?;
     let (configuration, selected_config) =
         crate::restore::key_config(args.config.as_deref(), args.master_key_file.clone())?;

@@ -44,23 +44,11 @@ pub fn parse_count(s: &str) -> Result<u64, String> {
     scale(s, n, factor)
 }
 
-/// A duration in milliseconds: a number with `ms`, `s`, `m` or `h`, e.g.
-/// `10s`.
+/// A duration in milliseconds: a number with `ms`, `s`, `m`, `h` or `d`,
+/// e.g. `10s` (the units of `kronik.toml`, [`crate::config::Dur`]).
 pub fn parse_duration_ms(s: &str) -> Result<u64, String> {
-    let (n, unit) = number(s)?;
-    let factor: u64 = match unit {
-        "ms" => 1,
-        "s" => 1_000,
-        "m" => 60_000,
-        "h" => 3_600_000,
-        "" => return Err(format!("{s:?} has no unit: give ms, s, m or h, e.g. 10s")),
-        _ => {
-            return Err(format!(
-                "unknown duration unit {unit:?}: give ms, s, m or h, e.g. 10s"
-            ));
-        }
-    };
-    scale(s, n, factor)
+    let crate::config::Dur(duration) = s.parse()?;
+    u64::try_from(duration.as_millis()).map_err(|_| format!("duration {s:?} is too long"))
 }
 
 /// The leading decimal number and the rest.
@@ -209,6 +197,7 @@ mod tests {
         assert_eq!(parse_duration_ms("10s"), Ok(10_000));
         assert_eq!(parse_duration_ms("2m"), Ok(120_000));
         assert_eq!(parse_duration_ms("1h"), Ok(3_600_000));
+        assert_eq!(parse_duration_ms("2d"), Ok(172_800_000));
         for bad in ["10", "10x", "s", "1.5s"] {
             assert!(parse_duration_ms(bad).is_err(), "{bad}");
         }
