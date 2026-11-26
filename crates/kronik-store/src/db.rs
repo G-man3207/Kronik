@@ -3123,7 +3123,8 @@ fn apply_connections(
 /// turns) state.db keeps, node-wide; the oldest go first (M24, review M5).
 pub const MAX_CONNECTION_DEAD_LETTERS: i64 = 10_000;
 
-fn message_input(
+/// The input a delivered message or compensation becomes; replay builds the same one.
+pub fn message_input(
     source: pb::MessageSource,
     sender: &pb::ActorRef,
     m: &pb::OutboundMessage,
