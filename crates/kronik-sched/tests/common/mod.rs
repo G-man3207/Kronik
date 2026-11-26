@@ -8,6 +8,8 @@
 // Each test binary uses only part of this module.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
+pub mod http;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;

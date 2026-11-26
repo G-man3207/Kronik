@@ -9,13 +9,13 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Write;
+use std::net::TcpStream;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{Proc, audit, install_component, log_records, point_open_turn_at, start_proc};
+use common::{Proc, audit, http, install_component, log_records, point_open_turn_at, start_proc};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_effects::{Delivery, Rate};
@@ -62,16 +62,9 @@ impl Server {
     }
 
     fn start_on(bind: &str) -> Server {
-        let listener = TcpListener::bind(bind).unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
         let state = Arc::new((Mutex::new(ServerState::default()), Condvar::new()));
         let st = state.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let st = st.clone();
-                std::thread::spawn(move || serve(stream, st));
-            }
-        });
+        let addr = http::serve_on(bind, move |req, w| serve(req, w, &st));
         Server { addr, state }
     }
 
@@ -107,79 +100,52 @@ impl Server {
     }
 }
 
-fn serve(stream: TcpStream, st: Arc<(Mutex<ServerState>, Condvar)>) {
-    let mut w = stream.try_clone().unwrap();
-    let mut r = BufReader::new(stream);
-    loop {
-        let mut line = String::new();
-        if r.read_line(&mut line).unwrap_or(0) == 0 {
-            return;
-        }
-        let mut parts = line.split_whitespace();
-        let method = parts.next().unwrap_or("").to_owned();
-        let path = parts.next().unwrap_or("").to_owned();
-        let mut headers = BTreeMap::new();
-        loop {
-            let mut h = String::new();
-            if r.read_line(&mut h).unwrap_or(0) == 0 {
-                return;
-            }
-            let h = h.trim_end();
-            if h.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = h.split_once(':') {
-                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_owned());
-            }
-        }
-        let len: usize = headers
-            .get("content-length")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let mut body = vec![0; len];
-        if r.read_exact(&mut body).is_err() {
-            return;
-        }
-        let (m, cv) = &*st;
-        let count = {
+fn serve(req: http::Request, w: &mut TcpStream, st: &(Mutex<ServerState>, Condvar)) {
+    let http::Request {
+        method,
+        path,
+        headers,
+        body,
+        ..
+    } = req;
+    let headers: BTreeMap<String, String> = headers.into_iter().collect();
+    let (m, cv) = st;
+    let count = {
+        let mut g = m.lock().unwrap();
+        g.seen.push(Seen {
+            method,
+            path: path.clone(),
+            headers: headers.clone(),
+            body: body.clone(),
+            at: Instant::now(),
+        });
+        cv.notify_all();
+        g.seen.iter().filter(|s| s.path == path).count()
+    };
+    let reply = match path.as_str() {
+        "/hang" => {
             let mut g = m.lock().unwrap();
-            g.seen.push(Seen {
-                method: method.clone(),
-                path: path.clone(),
-                headers: headers.clone(),
-                body: body.clone(),
-                at: Instant::now(),
-            });
-            cv.notify_all();
-            g.seen.iter().filter(|s| s.path == path).count()
-        };
-        let reply = match path.as_str() {
-            "/hang" => {
-                let mut g = m.lock().unwrap();
-                while !g.released {
-                    g = cv.wait(g).unwrap();
-                }
-                format!("released {count}")
+            while !g.released {
+                g = cv.wait(g).unwrap();
             }
-            p if p.starts_with("/echo") => {
-                format!("{headers:?} {}", String::from_utf8_lossy(&body))
-            }
-            _ => format!("ok {count}"),
-        };
-        // An echo server answers with the request's x-api-key as a header too.
-        let echo = headers
-            .get("x-api-key")
-            .filter(|_| path.starts_with("/echo"))
-            .map(|v| format!("x-echo: {v}\r\n"))
-            .unwrap_or_default();
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n{echo}\r\n{reply}",
-            reply.len()
-        );
-        if w.write_all(resp.as_bytes()).is_err() {
-            return;
+            format!("released {count}")
         }
-    }
+        p if p.starts_with("/echo") => {
+            format!("{headers:?} {}", String::from_utf8_lossy(&body))
+        }
+        _ => format!("ok {count}"),
+    };
+    // An echo server answers with the request's x-api-key as a header too.
+    let echo = headers
+        .get("x-api-key")
+        .filter(|_| path.starts_with("/echo"))
+        .map(|v| format!("x-echo: {v}\r\n"))
+        .unwrap_or_default();
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n{echo}\r\n{reply}",
+        reply.len()
+    );
+    let _ = w.write_all(resp.as_bytes());
 }
 
 // ---------------------------------------------------------------- daemon
