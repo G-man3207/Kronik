@@ -296,30 +296,14 @@ async fn revoked_deploy_waiting_for_lock_never_installs_or_logs() {
     assert!(node.fatal().is_none());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn revoked_resend_queued_behind_drain_releases_its_reservation() {
-    let dir = tempfile::tempdir().unwrap();
-    let (node, _) = node(dir.path()).await;
-    let failed = node
-        .send(
-            ActorRef::parse("counter/resend-revocation").unwrap(),
-            pb::Message {
-                name: "fail".into(),
-                ..Default::default()
-            },
-            audit(),
-            false,
-            common::lease(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!failed.committed());
-    let dead = failed.turn_id.lsn;
+/// Revokes a resend of `dead` queued behind a drain: it applies nothing
+/// and leaves `resent_as` unset; after the drain a resend runs and is
+/// recorded. Returns the revoked request's error.
+async fn assert_revoked_resend_releases(node: &Node, dead: u64) -> ApiError {
     let drain = node.drain(Duration::from_secs(5)).await.unwrap();
     let before = node.applied_lsn();
     let authority = common::Revocable::new();
-    revoked_while_pending(
+    let error = revoked_while_pending(
         node.resend(dead, audit(), false, authority.lease()),
         &authority,
     )
@@ -350,6 +334,30 @@ async fn revoked_resend_queued_behind_drain_releases_its_reservation() {
         Some(resent.turn_id.lsn)
     );
     assert!(node.fatal().is_none());
+    error
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn revoked_resend_queued_behind_drain_releases_its_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _) = node(dir.path()).await;
+    let failed = node
+        .send(
+            ActorRef::parse("counter/resend-revocation").unwrap(),
+            pb::Message {
+                name: "fail".into(),
+                ..Default::default()
+            },
+            audit(),
+            false,
+            common::lease(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!failed.committed());
+    let dead = failed.turn_id.lsn;
+    assert_revoked_resend_releases(&node, dead).await;
 }
 
 const ROOM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/room.wasm");
@@ -431,41 +439,8 @@ async fn revoked_connection_resend_queued_behind_drain_releases_its_reservation(
     let dir = tempfile::tempdir().unwrap();
     let (node, _) = node(dir.path()).await;
     let dead = connection_dead_letter(&node).await;
-    let drain = node.drain(Duration::from_secs(5)).await.unwrap();
-    let before = node.applied_lsn();
-    let authority = common::Revocable::new();
-    let error = revoked_while_pending(
-        node.resend(dead, audit(), false, authority.lease()),
-        &authority,
-    )
-    .await;
+    let error = assert_revoked_resend_releases(&node, dead).await;
     assert_eq!(error.message, "queued request revoked");
-    assert_eq!(node.applied_lsn(), before);
-    assert_eq!(
-        node.store()
-            .db()
-            .dead_letter(dead)
-            .unwrap()
-            .unwrap()
-            .resent_as,
-        None
-    );
-    drop(drain);
-    let resent = node
-        .resend(dead, audit(), false, common::lease())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        node.store()
-            .db()
-            .dead_letter(dead)
-            .unwrap()
-            .unwrap()
-            .resent_as,
-        Some(resent.turn_id.lsn)
-    );
-    assert!(node.fatal().is_none());
 }
 
 /// A connection resend a worker has already admitted still completes after
