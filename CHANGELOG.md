@@ -5,6 +5,13 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- Applying a record no longer compiles its SQL again: a `state.db`
+  connection keeps 256 prepared statements instead of rusqlite's 16, which
+  one apply has outgrown since the blob index, so every cached statement was
+  evicted before its next use. Isolated replay, which applies a production
+  record and a fork turn per root input, runs 3 to 5 times faster again;
+  the node's own applier runs the same statements. A test counts the
+  statements an apply-and-overlay cycle compiles (#611).
 - An approval now covers a forked grounding row only if that row was already
   changed when the approval was given. A diff after catch-up whose only new
   change is an answer from a foreign actor's copy needs a new approval; before,
