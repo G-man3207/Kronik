@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 mod common;
 
-use common::Daemon;
+use common::{Daemon, files_containing, log_records};
 
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -202,27 +202,6 @@ impl Daemon {
         }
         v["turns"].as_array().cloned().unwrap_or_default()
     }
-}
-
-/// Every record of the log, read after the daemon died.
-fn log_records(dir: &Path) -> Vec<Record> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
-        let reader = kronik_log::LogReader::new(env, dir.join("data/branches/main/log"), "main");
-        let mut out = Vec::new();
-        reader
-            .read(1, u64::MAX, |c| {
-                out.push(c.record);
-                Ok(())
-            })
-            .await
-            .unwrap();
-        out
-    })
 }
 
 /// The re-run rebuilt the recorded request byte-for-byte: method, URL,
@@ -452,20 +431,6 @@ fn revealed_secret_is_scrubbed_from_the_daemon_log_and_every_file() {
         log.contains("revealed [secret:db-password]"),
         "the guest log event is missing:\n{log}"
     );
-    let mut hits = Vec::new();
-    scan(dir.path(), SECRET.as_bytes(), &mut hits);
+    let hits = files_containing(dir.path(), SECRET.as_bytes());
     assert!(hits.is_empty(), "the revealed value is in {hits:?}");
-}
-
-fn scan(dir: &Path, needle: &[u8], hits: &mut Vec<String>) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let p = entry.unwrap().path();
-        if p.is_dir() {
-            scan(&p, needle, hits);
-        } else if let Ok(bytes) = std::fs::read(&p)
-            && bytes.windows(needle.len()).any(|w| w == needle)
-        {
-            hits.push(p.display().to_string());
-        }
-    }
 }

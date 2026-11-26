@@ -43,7 +43,7 @@ use serde_json::{Value, json};
 
 mod common;
 
-use common::{Daemon, Out};
+use common::{Daemon, Out, log_records};
 
 const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 const GUESTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests");
@@ -720,28 +720,6 @@ struct SecretVersion {
 }
 
 // ------------------------------------------------------------------- the log
-
-/// Every record of the log, read while the daemon runs (only fsynced records
-/// exist) or after it died.
-fn log_records(dir: &Path) -> Vec<Record> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
-        let reader = kronik_log::LogReader::new(env, dir.join("data/branches/main/log"), "main");
-        let mut out = Vec::new();
-        reader
-            .read(1, u64::MAX, |c| {
-                out.push(c.record);
-                Ok(())
-            })
-            .await
-            .unwrap();
-        out
-    })
-}
 
 /// The `SecretVersion` records of `name` that describe a usable value.
 fn recorded_versions(records: &[Record], name: &str) -> Vec<pb::SecretVersion> {
