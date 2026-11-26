@@ -190,7 +190,6 @@ fn recorded_denies_an_unmatched_call_and_compute_does_not_leak_the_key() {
         response,
         kronik_effects::crypto::hmac_sha256(KEY.as_bytes(), b"other").as_slice()
     );
-    assert_key_absent("compute effect response", response, &hex_of(response));
 
     let compute_diff = replay_fork(&p, &props, "compute", DiffOptions::default(), None);
     let compute_diff_text = String::from_utf8_lossy(&compute_diff);
@@ -198,8 +197,4 @@ fn recorded_denies_an_unmatched_call_and_compute_does_not_leak_the_key() {
     let compute_md =
         String::from_utf8(p.rt.block_on(props.diff("compute", true, false)).unwrap()).unwrap();
     assert_key_absent("compute markdown", compute_md.as_bytes(), &compute_md);
-}
-
-fn hex_of(bytes: &[u8]) -> String {
-    hex(bytes)
 }

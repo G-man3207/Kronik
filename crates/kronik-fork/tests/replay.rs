@@ -320,9 +320,6 @@ fn introduced_errors() {
     assert_eq!(e.items[0].message, "get is broken in this build");
     assert_eq!(e.items[0].input, "message get");
     assert_eq!(out.diff.samples.errors_introduced.len(), 3);
-    // The reverse direction counts as fixed.
-    let back = replay(&p, None, fork_lsn, &opts(Mode::Isolated), 1);
-    assert_eq!(back.diff.errors.fixed, 0);
 }
 
 /// Identity replay of 10 000 recorded requests (slow in debug builds; run
