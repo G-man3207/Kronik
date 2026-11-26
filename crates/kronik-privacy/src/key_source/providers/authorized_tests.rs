@@ -6,7 +6,8 @@
 use super::*;
 use crate::secret_backend::{BackendError, SecretBackend};
 use kronik_core::authority::Authority;
-use kronik_core::env::{BoxFuture, File, Fs};
+use kronik_core::env::BoxFuture;
+use kronik_core::env::test_fs::{FsCall, Then, hooked};
 use kronik_core::error::{ApiError, ErrorCode};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -481,42 +482,6 @@ async fn cold_provider_final_refusal_after_real_ready_sends_zero_http_bytes() {
     );
 }
 
-struct HeldFs {
-    inner: Arc<dyn Fs>,
-    entered: Arc<Notify>,
-}
-impl Fs for HeldFs {
-    fn open(&self, path: PathBuf, mode: OpenMode) -> BoxFuture<'static, io::Result<Arc<dyn File>>> {
-        if path == Path::new("/held-provider-ca") {
-            self.entered.notify_one();
-            Box::pin(std::future::pending())
-        } else {
-            self.inner.open(path, mode)
-        }
-    }
-    fn create_dir_all(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.create_dir_all(path)
-    }
-    fn exists(&self, path: PathBuf) -> BoxFuture<'static, io::Result<bool>> {
-        self.inner.exists(path)
-    }
-    fn read_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<Vec<String>>> {
-        self.inner.read_dir(path)
-    }
-    fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.rename(from, to)
-    }
-    fn remove_file(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.remove_file(path)
-    }
-    fn sync_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.sync_dir(path)
-    }
-    fn available(&self, path: PathBuf) -> BoxFuture<'static, io::Result<u64>> {
-        self.inner.available(path)
-    }
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn every_provider_operation_cancels_credential_wait_before_any_socket_admission() {
     for provider in ["aws", "azure", "gcp", "openbao"] {
@@ -526,9 +491,16 @@ async fn every_provider_operation_cancels_credential_wait_before_any_socket_admi
             let mut env = Env::real(tokio::runtime::Handle::current());
             let gate = Gate::new(false, None);
             let entered = Arc::new(Notify::new());
-            env.fs = Arc::new(HeldFs {
-                inner: env.fs.clone(),
-                entered: entered.clone(),
+            // Real files, but opening the provider CA says so and never finishes.
+            env.fs = hooked(env.fs.clone(), {
+                let entered = entered.clone();
+                move |call| match call {
+                    FsCall::Open(path, _) if path == Path::new("/held-provider-ca") => {
+                        entered.notify_one();
+                        Then::Wait(Box::pin(std::future::pending()))
+                    }
+                    _ => Then::Forward,
+                }
             });
             let (client, path, version) = backend(
                 env,

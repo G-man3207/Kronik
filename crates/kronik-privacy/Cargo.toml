@@ -28,7 +28,7 @@ tracing = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
-kronik-core = { workspace = true, features = ["real"] }
+kronik-core = { workspace = true, features = ["real", "test-util"] }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 
 [lints]
