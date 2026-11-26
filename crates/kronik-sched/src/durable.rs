@@ -93,6 +93,8 @@ pub(crate) mod test_ops {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard};
 
+    use kronik_core::sync::lock;
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) enum Op {
         Sync(PathBuf),
@@ -130,7 +132,7 @@ pub(crate) mod test_ops {
     static WATCHES: Mutex<Vec<Watch>> = Mutex::new(Vec::new());
 
     fn watches() -> MutexGuard<'static, Vec<Watch>> {
-        WATCHES.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&WATCHES)
     }
 
     /// Records the operations under `root` until the result drops; one that

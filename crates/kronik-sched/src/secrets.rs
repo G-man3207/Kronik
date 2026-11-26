@@ -2076,11 +2076,7 @@ impl Node {
             runtime.cache.register(row);
         }
         for stored in &file_rows {
-            if runtime
-                .cache
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
+            if lock(&runtime.cache.state)
                 .registry
                 .contains_key(&(stored.meta.name.clone(), stored.meta.version))
             {
