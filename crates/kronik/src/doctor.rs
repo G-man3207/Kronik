@@ -354,7 +354,7 @@ fn runsc(path: &Path) -> Check {
             .code("RUNSC_MISSING")
             .hint("only foreign actors need it: install gVisor with install.sh, see https://gvisor.dev/docs/user_guide/install/")
     };
-    if !is_executable(path) {
+    if !kronik_foreign::is_executable(path) {
         return missing(format!("{} is not an executable file", path.display()));
     }
     let sentry = path.with_file_name("gvisor-bin").join("gvisor_sentry");
@@ -386,11 +386,6 @@ fn runsc(path: &Path) -> Check {
             path.display()
         )),
     }
-}
-
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// `usable`: opening `/dev/kvm` read-write, as runsc's kvm platform does.
@@ -822,10 +817,7 @@ fn rootless() -> Vec<Check> {
 
 /// runc, for `--isolation trusted` (docs/design/m7-foreign.md §15).
 fn runc() -> Check {
-    let found = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin"]
-        .iter()
-        .map(|d| Path::new(d).join("runc"))
-        .find(|p| is_executable(p));
+    let found = kronik_foreign::find_runc();
     match found {
         Some(p) => check(
             "runc",
@@ -944,7 +936,7 @@ fn effective_uid(status: &str) -> Option<u32> {
 /// `--rootless`, a doctor process that is not root checks namespace-local
 /// authority, and lacking it is a warning: Wasm actors still run.
 fn caps(runsc: &Path, rootless: bool) -> Check {
-    if !is_executable(runsc) {
+    if !kronik_foreign::is_executable(runsc) {
         return check("caps", Status::Warn, "skipped: no runsc").code("RUNSC_MISSING");
     }
     let unit = unit_show(&["--property=MainPID", "--value"])
@@ -1028,7 +1020,7 @@ fn run_dir(dir: &Path) -> Check {
 /// Smoke test: a minimal sandbox with the chosen platform runs `true`. It
 /// catches seccomp, AppArmor and systrap problems on unusual hosts.
 fn sandbox(runsc: &Path, platform: Platform) -> Check {
-    if !is_executable(runsc) {
+    if !kronik_foreign::is_executable(runsc) {
         return check("sandbox", Status::Warn, "skipped: no runsc").code("RUNSC_MISSING");
     }
     if !kronik_foreign::sys::is_root() {

@@ -209,14 +209,15 @@ pub(crate) async fn run_quick(
 }
 
 /// Finds `runc` in the usual places.
-pub(crate) fn find_runc() -> Option<PathBuf> {
+pub fn find_runc() -> Option<PathBuf> {
     ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin"]
         .iter()
         .map(|d| Path::new(d).join("runc"))
         .find(|p| is_executable(p))
 }
 
-pub(crate) fn is_executable(p: &Path) -> bool {
+/// Whether `p` is a file with any execute bit set.
+pub fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
