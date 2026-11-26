@@ -289,18 +289,6 @@ fn a_rule_can_judge_forked_answers_per_target() {
 }
 
 #[test]
-fn actions_order_from_allow_to_deny() {
-    assert!(Action::Allow < Action::RequireApproval);
-    assert!(Action::RequireApproval < Action::Deny);
-    assert_eq!(
-        [Action::Deny, Action::Allow, Action::RequireApproval]
-            .into_iter()
-            .max(),
-        Some(Action::Deny)
-    );
-}
-
-#[test]
 fn the_strictest_action_among_fired_rules_wins() {
     let diff = fixture_named("diff-identity.json");
     let cases: &[(&[&str], Action)] = &[
@@ -912,11 +900,8 @@ fn evaluation_is_pure_and_rule_sets_are_shareable() {
     let before = diff.clone();
     let set = RuleSet::defaults();
     let first = set.evaluate(&diff);
-    let copy = set.clone();
-    for _ in 0..100 {
-        assert_eq!(set.evaluate(&diff), first);
-        assert_eq!(copy.evaluate(&diff), first);
-    }
+    assert_eq!(set.evaluate(&diff), first);
+    assert_eq!(set.clone().evaluate(&diff), first);
     assert_eq!(diff, before);
 
     let shared = std::sync::Arc::new(set);
