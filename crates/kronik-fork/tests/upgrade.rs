@@ -491,11 +491,10 @@ fn upgrade_replays_recorded_code_across_a_same_kind_deployment() {
 
 /// Privacy mode on; one turn whose `http.fetch` request is sealed for
 /// `user:1` (the target refuses the connection, so nothing listens), the
-/// subject erased, then one new turn with no subject. Returns the erasure
-/// snapshot's LSN.
-fn erased_workload(rt: &Runtime, dir: &Path) -> u64 {
+/// subject erased, then one new turn with no subject.
+fn erased_workload(rt: &Runtime, dir: &Path) {
     let node = start(rt, dir).unwrap();
-    let erased = rt.block_on(async {
+    rt.block_on(async {
         node.deploy(&guest("counter"), audit(), false, owner(&node))
             .await
             .unwrap();
@@ -526,11 +525,9 @@ fn erased_workload(rt: &Runtime, dir: &Path) -> u64 {
             .unwrap()
             .unwrap();
         assert!(r.committed(), "{r:?}");
-        let done = node
-            .erase_subject("user:1", audit(), false, owner(&node))
+        node.erase_subject("user:1", audit(), false, owner(&node))
             .await
             .unwrap();
-        let erased = done.lsn.unwrap();
         // The window is chosen against the gap between the erased turn and
         // this one, so make it unambiguous.
         std::thread::sleep(Duration::from_millis(50));
@@ -546,10 +543,8 @@ fn erased_workload(rt: &Runtime, dir: &Path) -> u64 {
             .unwrap()
             .unwrap();
         assert!(r.committed(), "{r:?}");
-        erased
     });
     drop(node);
-    erased
 }
 
 /// Evidence hook: `KRONIK_S16_KEEP=<directory>` keeps the S-16 fixture instead
@@ -601,7 +596,7 @@ async fn offline_sealer(
 fn an_erased_request_is_unverifiable_not_divergence() {
     let dir = tempdir();
     let rt = rt();
-    let _erased = erased_workload(&rt, dir.path());
+    erased_workload(&rt, dir.path());
 
     let long = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
     assert!(
@@ -642,51 +637,20 @@ fn an_erased_request_is_unverifiable_not_divergence() {
 fn an_erased_turns_state_write_is_not_a_change() {
     let dir = tempdir();
     let rt = rt();
-    {
-        let node = start(&rt, dir.path()).unwrap();
-        rt.block_on(async {
-            node.deploy(&guest("counter"), audit(), false, owner(&node))
-                .await
-                .unwrap();
-            node.deploy(&guest("notes"), audit(), false, owner(&node))
-                .await
-                .unwrap();
-            node.set_privacy_mode(pb::PrivacyState::On, audit(), false, owner(&node))
-                .await
-                .unwrap();
-            // The note's body is sealed for user:1, so the turn's recorded
-            // input is erased with the subject; production commits the insert.
-            let r = node
-                .send(
-                    ActorRef::parse("notes/n1").unwrap(),
-                    subject_msg("add", "note text", "user:1"),
-                    audit(),
-                    false,
-                    owner(&node),
-                )
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(r.committed(), "{r:?}");
-            node.erase_subject("user:1", audit(), false, owner(&node))
-                .await
-                .unwrap();
-            // Make the default window unambiguous about the gap.
-            std::thread::sleep(Duration::from_millis(50));
-            let r = node
-                .send(
-                    ActorRef::parse("counter/k9").unwrap(),
-                    msg("increment", ""),
-                    audit(),
-                    false,
-                    owner(&node),
-                )
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(r.committed(), "{r:?}");
-        });
-    }
+    // The note's body is sealed for user:1, so the turn's recorded input is
+    // erased with the subject; production commits the insert. The pause makes
+    // the default window unambiguous about the gap.
+    privacy_workload(
+        &rt,
+        dir.path(),
+        &["counter", "notes"],
+        &[
+            Step::Send("notes/n1", "add", "note text", Some("user:1")),
+            Step::Erase("user:1"),
+            Step::Pause(Duration::from_millis(50)),
+            Step::Send("counter/k9", "increment", "", None),
+        ],
+    );
     let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
     assert!(
         checked.report.passed,
@@ -792,73 +756,6 @@ fn privacy_workload(rt: &Runtime, dir: &Path, guests: &[&str], steps: &[Step<'_>
     drop(node);
 }
 
-/// Appends a crafted recording of a turn the guest cannot reproduce: a root
-/// `increment` that claims to have failed, with no effects and no writes. A
-/// replay of it is a verified difference (S-16 (2)).
-fn forge_failed_increment(rt: &Runtime, dir: &Path) {
-    let node = start_when_released(rt, dir);
-    let head = node.applied_lsn();
-    let (hash, input, epoch) = rt.block_on(async {
-        let mut hash = Vec::new();
-        let mut input = None;
-        let mut epoch = 0;
-        node.reader()
-            .read(1, head, |c| {
-                match &c.record {
-                    Record::Deployment(d) => {
-                        for k in &d.kinds {
-                            if k.kind == "counter" {
-                                hash = k.code_hash.clone();
-                            }
-                        }
-                    }
-                    Record::TurnRecord(t) if input.is_none() => {
-                        let msg = match t.input.as_ref().and_then(|i| i.kind.as_ref()) {
-                            Some(pb::input::Kind::Message(m)) => m.msg.as_ref(),
-                            _ => None,
-                        };
-                        if msg.is_some_and(|m| m.name == "increment") {
-                            input = t.input.clone();
-                            epoch = t.config_epoch;
-                        }
-                    }
-                    _ => {}
-                }
-                Ok(())
-            })
-            .await
-            .unwrap();
-        (hash, input.unwrap(), epoch)
-    });
-    drop(node);
-    let forged = pb::TurnRecord {
-        execution_id: String::new(),
-        actor: Some(pb::ActorRef {
-            kind: "counter".into(),
-            key: "forged".into(),
-        }),
-        code_hash: hash,
-        engine_version: ENGINE_VERSION.into(),
-        causal_key: Some(pb::CausalKey {
-            root: "forged-root".into(),
-            path: Vec::new(),
-        }),
-        logical_time_ms: 0,
-        random_seed: vec![0u8; 32],
-        input: Some(input),
-        effects: Vec::new(),
-        outcome: Some(pb::Outcome {
-            kind: pb::OutcomeKind::Failed as i32,
-            error_code: "TURN_FAILED".into(),
-            message: "forged: the recording says this failed".into(),
-            output: None,
-        }),
-        config_epoch: epoch,
-        ..Default::default()
-    };
-    append(rt, dir, forged);
-}
-
 /// Appends `record` to the log of the stopped node in `dir`.
 fn append(rt: &Runtime, dir: &Path, record: pb::TurnRecord) {
     rt.block_on(async {
@@ -912,7 +809,7 @@ fn recorded_turn(rt: &Runtime, dir: &Path, actor: &str, op: &str) -> pb::TurnRec
 
 /// A crafted recording of a root turn like the recorded `op` of `actor`,
 /// under its own root, that claims to have failed: the replay of it, which
-/// commits, is a verified difference.
+/// commits, is a verified difference (S-16 (2)).
 fn forge_failed(rt: &Runtime, dir: &Path, actor: &str, op: &str) {
     let mut t = recorded_turn(rt, dir, actor, op);
     t.execution_id = String::new();
@@ -963,7 +860,7 @@ fn an_erased_turns_state_value_is_no_change_but_a_real_divergence_fails() {
     assert!(checked.diff.state.isolated.is_empty(), "{text}");
     assert!(checked.diff.state.continuous.is_empty(), "{text}");
 
-    forge_failed_increment(&rt, dir.path());
+    forge_failed(&rt, dir.path(), "counter/k9", "increment");
     let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
     let text = String::from_utf8_lossy(&checked.diff_bytes);
     assert!(!checked.report.passed, "{text}");
@@ -1255,7 +1152,7 @@ fn a_real_divergence_still_fails_next_to_an_unverifiable_turn() {
     let passed = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
     assert!(passed.report.passed);
     assert_eq!(passed.report.unverifiable, 1);
-    forge_failed_increment(&rt, dir.path());
+    forge_failed(&rt, dir.path(), "counter/k9", "increment");
 
     let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
     assert!(!checked.report.passed, "{:?}", checked.report);
