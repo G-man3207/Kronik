@@ -1,9 +1,10 @@
 //! Effect simulators (brief, "Simulator-trait"): where an effect's result
 //! comes from when it is not performed live. Crash re-runs and forks ask a
-//! simulator first; v0.1 has `RecordedMatch` and `FailClosed` (`StubRules`
-//! arrives with forks in M3). M12 adds `ContractFake` and
-//! `RecordedNeighbor` here; the model simulator, which needs the network,
-//! is in `kronik-fork` (docs/design/m12-simulators.md).
+//! simulator first; v0.1 has `RecordedMatch`, and `FailClosed` here is only a
+//! test-only illustration (`StubRules` arrives with forks in M3). Forks fail
+//! closed in `kronik-fork`'s replay gate, not through this type. M12 adds
+//! `ContractFake` and `RecordedNeighbor` here; the model simulator, which
+//! needs the network, is in `kronik-fork` (docs/design/m12-simulators.md).
 
 use kronik_proto::log::v1 as pb;
 use prost::Message as _;
