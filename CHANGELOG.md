@@ -5,6 +5,11 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- Continuous replay no longer compiles an SQL statement for every fork turn
+  it applies: the bulk applier's check for open turns now uses the statement
+  cache. On the development machine's two-CPU control, continuous replay of
+  the reference window takes 1.44 to 1.57 s instead of 1.56 to 1.84 s. A test
+  counts the statements a bulk replay compiles turn by turn (#611).
 - Applying a record no longer compiles its SQL again: a `state.db`
   connection keeps 256 prepared statements instead of rusqlite's 16, which
   one apply has outgrown since the blob index, so every cached statement was
