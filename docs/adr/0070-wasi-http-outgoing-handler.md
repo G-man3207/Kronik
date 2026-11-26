@@ -1,7 +1,8 @@
 # 0070. Standard `fetch` through `wasi:http/outgoing-handler` as an `http.fetch` effect
 
 - **Status:** Accepted (the M22 spike proved §2 and §3's secret mapping for TypeScript `fetch`; §5 blocked on Wasmtime)
-- **Date:** 2026-10-27, amended 2026-11-07 (the gate of §5)
+- **Date:** 2026-10-27, amended 2026-11-07 (the gate of §5) and 2026-11-26
+  (the gate is checked by hand)
 
 ## Context
 
@@ -346,8 +347,8 @@ release with the next major version.
     by Wasmtime 51 alone and carry no information from then on, while opening
     the work early costs far more than waiting for one more row (below). It
     is a reading, not a decision: the maintainers can overrule it, and the
-    watcher shows the two rows apart (b1 and b2), so that either reading can
-    be read off its table.
+    check below looks at the two rows separately (b1 and b2), so that either
+    reading can be applied to its result.
 - **(c) A componentize-js release targets `wasi:http@0.3`.**
   - *State: not met.* npm `latest` is 0.23.0 (published 2026-09-21), the
     version that `sdk/ts/package-lock.json` pins. Its README names
@@ -423,7 +424,7 @@ TypeScript and the other SDKs follow when their toolchains have a 0.3
 target. Part (c) is the TypeScript part of the gate, and the criterion's
 evidence does not depend on it. The three-part gate stays as decided in §5;
 to open the Rust-guest work on (a) and (b) alone would be a decision for the
-maintainers, and the watcher says so when only (c) is open.
+maintainers; the gate stays closed while only (c) is met.
 
 ### What reopening costs
 
@@ -467,25 +468,18 @@ implementation]:
   §8, §5 here, the `IMPORT_NOT_ALLOWED` text, and the tests in
   `crates/kronik-runtime/src/allowlist.rs`.
 
-### Watching the gate
+## Amendment (2026-11-26, M22): the gate is checked by hand
 
-`scripts/check-wasi-p3-gate.py` reads the sources above with plain HTTPS GETs
-(no token, Python standard library only) and prints a table with a row for
-each of a1, a2, b1, b2 and c, the state on `main` and on the newest released
-branch, and a status: "met" (it holds on the release), "main only", "not met"
-or "unknown". Exit status 0: the gate is still closed. 1: all three
-conditions hold. 2: a source could not be read or parsed; the table shows
-what could be. Part (c) is a heuristic: it searches the README, the
-descriptions and the dependency names of npm `latest` for `wasi:http@0.3`, and
-a hit is not proof. An exit status of 1 is therefore a prompt to run the
-checks above by hand.
+The informational gate script, its offline tests and the `wasi-p3-gate` job
+in the nightly workflow are removed. The job ran only when someone started
+the nightly workflow by hand, and it was `continue-on-error`, so its result
+never blocked a run; an open gate was still confirmed with the three *Check*
+bullets above. The gate itself is unchanged.
 
-The nightly workflow, started by hand, runs the script as an informational job
-(`continue-on-error`, the table in the job summary), so it cannot turn that
-run red. Its unit tests use canned inputs and run in the `action` step of
-`scripts/ci.sh`. When the gate opens, record that in a further amendment,
-decide the async-handler ABI in its own ADR, and then follow §5.
-
-Revisit this amendment when Wasmtime 51.0.0 is released (row b1 should then
-read met), when the p3 banner or the tiers document changes, or when the
-maintainers settle the reading of part (b).
+The gate is checked by hand with those *Check* bullets, at each Wasmtime
+major upgrade and at the revisit points of the 2026-11-07 amendment. Revisit
+that amendment when Wasmtime 51.0.0 is released (row b1 should then read
+met), when the p3 banner or the tiers document changes, or when the
+maintainers settle the reading of part (b). When the gate opens, record that
+in a further amendment here, decide the async-handler ABI in its own ADR,
+and then follow §5.
