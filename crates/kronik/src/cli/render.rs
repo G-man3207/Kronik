@@ -1693,6 +1693,33 @@ mod tests {
         }
     }
 
+    /// A turn `id` at `lsn` that committed on `b3:0123456789ab` from an input
+    /// of `kind` with `summary`, and did nothing else.
+    fn turn_summary(id: &str, lsn: u64, kind: &str, summary: &str) -> TurnSummary {
+        TurnSummary {
+            turn_id: id.into(),
+            lsn,
+            logical_time_ms: 0,
+            code_hash: "b3:0123456789ab".into(),
+            input: kronik_api::types::InputSummary {
+                kind: kind.into(),
+                summary: summary.into(),
+            },
+            outcome: Outcome {
+                kind: "committed".into(),
+                error_code: None,
+                message: None,
+            },
+            writes: Vec::new(),
+            messages: Vec::new(),
+            sql_changes: 0,
+            fuel_used: 1,
+            effects: Vec::new(),
+            blobs: Vec::new(),
+            connection_ops: Vec::new(),
+        }
+    }
+
     const ADA: &str = "c-3f9a0d1c4b2e4f6a8d7c5b1e0a9f8e7d";
     const BOB: &str = "c-7b1e0a9f8e7d3f9a0d1c4b2e4f6a8d7c";
 
@@ -1811,27 +1838,9 @@ mod tests {
 
     #[test]
     fn history_lists_what_turns_sent_on_connections() {
-        use kronik_api::types::{ConnectionFates, ConnectionOpSummary, InputSummary};
+        use kronik_api::types::{ConnectionFates, ConnectionOpSummary};
         let t = TurnSummary {
-            turn_id: "main:17".into(),
-            lsn: 17,
-            logical_time_ms: 0,
-            code_hash: "b3:0123456789ab".into(),
-            input: InputSummary {
-                kind: "connection".into(),
-                summary: format!("frame {ADA} #3 text 27 B"),
-            },
-            outcome: Outcome {
-                kind: "committed".into(),
-                error_code: None,
-                message: None,
-            },
-            writes: Vec::new(),
-            messages: Vec::new(),
             sql_changes: 1,
-            fuel_used: 1,
-            effects: Vec::new(),
-            blobs: Vec::new(),
             connection_ops: vec![
                 ConnectionOpSummary {
                     op: "send".into(),
@@ -1857,6 +1866,12 @@ mod tests {
                     fates: None,
                 },
             ],
+            ..turn_summary(
+                "main:17",
+                17,
+                "connection",
+                &format!("frame {ADA} #3 text 27 B"),
+            )
         };
         let out = history(
             "chat/lobby",
@@ -1885,26 +1900,8 @@ mod tests {
             size: 300 << 20,
         };
         let summary = |id: &str| TurnSummary {
-            turn_id: id.into(),
-            lsn: 9,
-            logical_time_ms: 0,
-            code_hash: "b3:0123456789ab".into(),
-            input: InputSummary {
-                kind: "message".into(),
-                summary: "fanout from operator".into(),
-            },
-            outcome: Outcome {
-                kind: "committed".into(),
-                error_code: None,
-                message: None,
-            },
-            writes: Vec::new(),
-            messages: Vec::new(),
-            sql_changes: 0,
-            fuel_used: 1,
-            effects: Vec::new(),
             blobs: vec![blob.clone()],
-            connection_ops: Vec::new(),
+            ..turn_summary(id, 9, "message", "fanout from operator")
         };
         let shown = history(
             "counter/a",
@@ -2094,26 +2091,8 @@ mod tests {
     #[test]
     fn history_lists_code_effects_and_the_grant_for_a_denied_one() {
         let turn = |id: &str, effects| TurnSummary {
-            turn_id: id.into(),
-            lsn: 7,
-            logical_time_ms: 0,
-            code_hash: "b3:0123456789ab".into(),
-            input: kronik_api::types::InputSummary {
-                kind: "message".into(),
-                summary: "fetch".into(),
-            },
-            outcome: Outcome {
-                kind: "committed".into(),
-                error_code: None,
-                message: None,
-            },
-            writes: Vec::new(),
-            messages: Vec::new(),
-            sql_changes: 0,
-            fuel_used: 1,
             effects,
-            blobs: Vec::new(),
-            connection_ops: Vec::new(),
+            ..turn_summary(id, 7, "message", "fetch")
         };
         let denied = kronik_api::types::EffectSummary {
             ordinal: 0,
@@ -2199,26 +2178,8 @@ mod tests {
     #[test]
     fn history_shows_a_rotation_as_a_new_secret_version() {
         let turn = |id: &str, lsn, effects| TurnSummary {
-            turn_id: id.into(),
-            lsn,
-            logical_time_ms: 0,
-            code_hash: "b3:0123456789ab".into(),
-            input: kronik_api::types::InputSummary {
-                kind: "message".into(),
-                summary: "charge".into(),
-            },
-            outcome: Outcome {
-                kind: "committed".into(),
-                error_code: None,
-                message: None,
-            },
-            writes: Vec::new(),
-            messages: Vec::new(),
-            sql_changes: 0,
-            fuel_used: 1,
             effects,
-            blobs: Vec::new(),
-            connection_ops: Vec::new(),
+            ..turn_summary(id, lsn, "message", "charge")
         };
         let effect = |kind: &str, request: Option<&str>, secrets| EffectSummary {
             ordinal: 0,
@@ -2342,26 +2303,8 @@ mod tests {
             erased,
         };
         let t = TurnSummary {
-            turn_id: "main:9".into(),
-            lsn: 9,
-            logical_time_ms: 0,
-            code_hash: "b3:0123456789ab".into(),
-            input: kronik_api::types::InputSummary {
-                kind: "message".into(),
-                summary: "subject from operator".into(),
-            },
-            outcome: Outcome {
-                kind: "committed".into(),
-                error_code: None,
-                message: None,
-            },
             writes: vec![write("s", "user:1", true), write("t", "user:2", false)],
-            messages: Vec::new(),
-            sql_changes: 0,
-            fuel_used: 1,
-            effects: Vec::new(),
-            blobs: Vec::new(),
-            connection_ops: Vec::new(),
+            ..turn_summary("main:9", 9, "message", "subject from operator")
         };
         assert_eq!(changes(&t), "set s [erased], set t");
     }
@@ -2454,22 +2397,8 @@ mod tests {
 
         // In history's OUTCOME column, clipped to 60 characters.
         let trapped = TurnSummary {
-            turn_id: "main:12".into(),
-            lsn: 12,
-            logical_time_ms: 0,
-            code_hash: "b3:0123456789ab".into(),
-            input: kronik_api::types::InputSummary {
-                kind: "http".into(),
-                summary: "POST /media/a/forged-echo".into(),
-            },
             outcome: o("trap", Some("BLOB_NOT_HELD"), Some(not_held)),
-            writes: Vec::new(),
-            messages: Vec::new(),
-            sql_changes: 0,
-            fuel_used: 1,
-            effects: Vec::new(),
-            blobs: Vec::new(),
-            connection_ops: Vec::new(),
+            ..turn_summary("main:12", 12, "http", "POST /media/a/forged-echo")
         };
         let shown = history(
             "media/a",
