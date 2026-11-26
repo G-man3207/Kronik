@@ -56,7 +56,8 @@ proof, and the workflow must not grow a dispatch path that pretends to be one.
   ref. `scripts/ci.sh` is the check to run before pushing.
 - The WASI 0.3 gate job no longer reports every night. It still runs when the
   nightly workflow is started, and its unit tests still run in `scripts/ci.sh
-  action`.
+  action`. The job and its unit tests were later removed when the gate became
+  a manual check ([ADR 0070](0070-wasi-http-outgoing-handler.md#amendment-2026-11-26-m22-the-gate-is-checked-by-hand)).
 - Revisit this if hosted minutes stop being the constraint, or if a required
   status check has to follow every pull request again. Restoring a push or
   pull-request trigger on `ci.yml` must ignore

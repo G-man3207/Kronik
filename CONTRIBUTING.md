@@ -115,11 +115,10 @@ It needs HTTPS access for official fixed-hash verifier archives and maintained
 TUF roots, but no account or GitHub token. Fixture identities are private SOURCE
 copies, never production runtime trust overrides.
 It also runs the pure-Python documentation-surface, frozen released-corpus,
-corpus-promotion, performance-comparator and WASI 0.3 gate-watcher boundary
-tests in `scripts/tests`. These are semantic checks of parsers, provenance,
-tampering and regression enforcement, not real benchmark results or
-between-release performance acceptance. The gate-watcher tests use canned
-upstream inputs and make no request.
+corpus-promotion and performance-comparator boundary tests in `scripts/tests`.
+These are semantic checks of parsers, provenance, tampering and regression
+enforcement, not real benchmark results or between-release performance
+acceptance.
 It also runs the regressions of the microVM tool builder
 (`scripts/tests/test_build_microvm_tools.py`), which run
 `scripts/build-microvm-tools.sh` for its argument checks and for its
