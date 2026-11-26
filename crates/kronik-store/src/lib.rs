@@ -1273,11 +1273,13 @@ mod sql_pool_apply_tests {
 
     struct Counting {
         inner: MemOpener,
+        opens: AtomicUsize,
         opens_under_lock: AtomicUsize,
     }
 
     impl SqliteOpener for Counting {
         fn open(&self, actor: &str, vfs: &str) -> rusqlite::Result<Connection> {
+            self.opens.fetch_add(1, Ordering::Relaxed);
             if apply_lock_held() {
                 self.opens_under_lock.fetch_add(1, Ordering::Relaxed);
             }
@@ -1316,6 +1318,7 @@ mod sql_pool_apply_tests {
     fn store(capacity: usize) -> (Arc<Store>, Arc<Counting>) {
         let counting = Arc::new(Counting {
             inner: MemOpener,
+            opens: AtomicUsize::new(0),
             opens_under_lock: AtomicUsize::new(0),
         });
         let pool = SqlPool::new(counting.clone(), Limits::default(), capacity);
@@ -1363,37 +1366,10 @@ mod sql_pool_apply_tests {
 
     #[test]
     fn the_live_pool_keeps_a_thousand_actors_open() {
-        let counting = Arc::new(Counting {
-            inner: MemOpener,
-            opens_under_lock: AtomicUsize::new(0),
-        });
-        // Count every open, including the first.
-        let opens = Arc::new(AtomicUsize::new(0));
-        struct CountOpens {
-            inner: Arc<Counting>,
-            opens: Arc<AtomicUsize>,
-        }
-        impl SqliteOpener for CountOpens {
-            fn open(&self, actor: &str, vfs: &str) -> rusqlite::Result<Connection> {
-                self.opens.fetch_add(1, Ordering::Relaxed);
-                self.inner.open(actor, vfs)
-            }
-            fn exists(&self, actor: &str) -> bool {
-                self.inner.exists(actor)
-            }
-        }
-        let pool = SqlPool::new(
-            Arc::new(CountOpens {
-                inner: counting.clone(),
-                opens: opens.clone(),
-            }),
-            Limits::default(),
-            256,
-        );
-        pool.retain_opened(1_000);
-        let store = Store::open(Connection::open_in_memory().unwrap(), pool).unwrap();
+        let (store, counting) = store(256);
+        store.sql.retain_opened(1_000);
         apply_round(&store, 1, 1_000, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
-        let opened = opens.load(Ordering::Relaxed);
+        let opened = counting.opens.load(Ordering::Relaxed);
         apply_round(
             &store,
             1_001,
@@ -1401,7 +1377,7 @@ mod sql_pool_apply_tests {
             "CREATE TABLE t2 (id INTEGER PRIMARY KEY)",
         );
         assert_eq!(
-            opens.load(Ordering::Relaxed),
+            counting.opens.load(Ordering::Relaxed),
             opened,
             "a retained actor was opened again on the next turn"
         );

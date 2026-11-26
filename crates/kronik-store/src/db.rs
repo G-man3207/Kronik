@@ -5650,6 +5650,42 @@ mod tests {
             })),
         })
     }
+    /// A turn of `exec` for `subject` that schedules timer `id` and sends one
+    /// message to `counter/b` (message id `"{exec}-m"`), both with the body
+    /// `tagged(subject, "NEEDLE")`.
+    fn scheduling_turn(exec: &str, subject: &str, id: u64) -> pb::TurnRecord {
+        let Record::TurnRecord(mut t) = turn(
+            exec,
+            exec,
+            message(pb::MessageSource::Operator, exec, subject),
+        ) else {
+            unreachable!("turn() builds a TurnRecord");
+        };
+        let msg = || {
+            Some(pb::Message {
+                name: "store".into(),
+                body: tagged(subject, "NEEDLE"),
+                ..Default::default()
+            })
+        };
+        t.timers.push(pb::TimerOp {
+            kind: pb::TimerOpKind::Schedule as i32,
+            timer_id: id,
+            due_ms: 1_000,
+            msg: msg(),
+            ordinal: 0,
+        });
+        t.messages.push(pb::OutboundMessage {
+            to: Some(pb::ActorRef {
+                kind: "counter".into(),
+                key: "b".into(),
+            }),
+            msg: msg(),
+            ordinal: 1,
+            message_id: format!("{exec}-m"),
+        });
+        t
+    }
 
     fn with_outcome(mut r: Record, outcome: pb::Outcome) -> Record {
         if let Record::TurnRecord(t) = &mut r {
@@ -5742,35 +5778,10 @@ mod tests {
     fn queued_bodies_are_resealed_and_erased() {
         let conn = Connection::open_in_memory().unwrap();
         let mut db = StateDb::open(conn).unwrap();
-        let op = pb::MessageSource::Operator;
-        let body = |subject: &str| pb::Message {
-            name: "store".into(),
-            body: tagged(subject, "NEEDLE"),
-            ..Default::default()
-        };
-        let schedule = |exec: &str, subject: &str, id: u64| -> pb::TurnRecord {
-            let Record::TurnRecord(mut t) = turn(exec, exec, message(op, exec, subject)) else {
-                unreachable!("turn() builds a TurnRecord");
-            };
-            t.timers.push(pb::TimerOp {
-                kind: pb::TimerOpKind::Schedule as i32,
-                timer_id: id,
-                due_ms: 1_000,
-                msg: Some(body(subject)),
-                ordinal: 0,
-            });
-            t.messages.push(pb::OutboundMessage {
-                to: Some(pb::ActorRef {
-                    kind: "counter".into(),
-                    key: "b".into(),
-                }),
-                msg: Some(body(subject)),
-                ordinal: 1,
-                message_id: format!("{exec}-m"),
-            });
-            t
-        };
-        let (t1, t2) = (schedule("e1", "user:1", 1), schedule("e2", "user:2", 2));
+        let (t1, t2) = (
+            scheduling_turn("e1", "user:1", 1),
+            scheduling_turn("e2", "user:2", 2),
+        );
         db.apply(&[
             committed(1, Record::TurnRecord(t1.clone())),
             committed(2, Record::TurnRecord(t2)),
@@ -6102,38 +6113,9 @@ mod tests {
     fn erasure_subject_probes_search_instead_of_scanning() {
         let conn = Connection::open_in_memory().unwrap();
         let mut db = StateDb::open(conn).unwrap();
-        let op = pb::MessageSource::Operator;
-        let schedule = |exec: &str, subject: &str, id: u64| -> pb::TurnRecord {
-            let Record::TurnRecord(mut t) = turn(exec, exec, message(op, exec, subject)) else {
-                unreachable!("turn() builds a TurnRecord");
-            };
-            t.timers.push(pb::TimerOp {
-                kind: pb::TimerOpKind::Schedule as i32,
-                timer_id: id,
-                due_ms: 1_000,
-                msg: Some(pb::Message {
-                    body: tagged(subject, "NEEDLE"),
-                    ..Default::default()
-                }),
-                ordinal: 0,
-            });
-            t.messages.push(pb::OutboundMessage {
-                to: Some(pb::ActorRef {
-                    kind: "counter".into(),
-                    key: "b".into(),
-                }),
-                msg: Some(pb::Message {
-                    body: tagged(subject, "NEEDLE"),
-                    ..Default::default()
-                }),
-                ordinal: 1,
-                message_id: format!("{exec}-m"),
-            });
-            t
-        };
         db.apply(&[
-            committed(1, Record::TurnRecord(schedule("e1", "user:1", 1))),
-            committed(2, Record::TurnRecord(schedule("e2", "user:2", 2))),
+            committed(1, Record::TurnRecord(scheduling_turn("e1", "user:1", 1))),
+            committed(2, Record::TurnRecord(scheduling_turn("e2", "user:2", 2))),
         ])
         .unwrap();
         {
@@ -6226,39 +6208,6 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "erasing one subject over 20 000 unrelated rows took {elapsed:?}"
-        );
-        let timer = db
-            .timers(None)
-            .unwrap()
-            .into_iter()
-            .find(|t| t.timer_id == 1)
-            .unwrap();
-        assert!(
-            kronik_privacy::sealer::is_erased(timer.msg.body.as_ref().unwrap()),
-            "user:1's timer was not tombstoned"
-        );
-        let other = db
-            .timers(None)
-            .unwrap()
-            .into_iter()
-            .find(|t| t.timer_id == 2)
-            .unwrap();
-        assert!(
-            !kronik_privacy::sealer::is_erased(other.msg.body.as_ref().unwrap()),
-            "user:2's timer was tombstoned"
-        );
-        let mail = db
-            .mailbox()
-            .unwrap()
-            .into_iter()
-            .find(|m| m.message_id == "e1-m")
-            .unwrap();
-        let Some(pb::input::Kind::Message(m)) = mail.input.kind else {
-            panic!("not a message");
-        };
-        assert!(
-            kronik_privacy::sealer::is_erased(m.msg.as_ref().unwrap().body.as_ref().unwrap()),
-            "user:1's mailbox body was not tombstoned"
         );
         let kept: i64 = db
             .conn
