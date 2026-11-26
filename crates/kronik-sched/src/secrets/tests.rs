@@ -11,9 +11,7 @@ use kronik_privacy::secret_backend::config::Definition;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use tokio::sync::Semaphore;
 
-fn env() -> Env {
-    Env::real(tokio::runtime::Handle::current())
-}
+use crate::test_support::env;
 
 fn audit() -> pb::Audit {
     pb::Audit {

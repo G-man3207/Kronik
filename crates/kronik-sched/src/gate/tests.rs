@@ -7,20 +7,8 @@ use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
 
 use super::*;
+use crate::test_support::{COUNTER, audit};
 use crate::{NodeConfig, SwitchHold, start_local};
-
-const COUNTER: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/guests/counter.wasm"
-);
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
 
 /// A node with counter deployed; `hold.arrived` counts the turns that start.
 async fn node(dir: &std::path::Path) -> (Arc<Node>, Arc<SwitchHold>) {

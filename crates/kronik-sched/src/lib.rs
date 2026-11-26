@@ -40,6 +40,8 @@ mod sealing;
 pub mod secrets;
 pub mod snapshots;
 mod subject_keys;
+#[cfg(test)]
+mod test_support;
 mod timers;
 pub mod upgrade;
 

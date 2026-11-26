@@ -11,16 +11,14 @@ use super::*;
 use bytes::Bytes;
 use kronik_core::causal;
 use kronik_core::env::{BoxFuture, File, Fs, OpenMode};
-use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 
+use crate::test_support::COUNTER;
+pub(super) use crate::test_support::{env, run};
+
 pub(super) const MANIFEST: &str = "secret-coverage.json";
-const COUNTER: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/guests/counter.wasm"
-);
 const TEMPORARY: &str = "secret-coverage.json.tmp";
 
 /// What the file system under a node was asked to do.
@@ -199,10 +197,6 @@ impl File for RecordingFile {
     }
 }
 
-pub(super) fn env() -> Env {
-    Env::real(tokio::runtime::Handle::current())
-}
-
 pub(super) fn recording(read_delay: Duration, write_delay: Duration) -> (Env, Arc<Recording>) {
     let rec = Arc::new(Recording::default());
     let mut environment = env();
@@ -225,15 +219,6 @@ pub(super) fn config() -> crate::NodeConfig {
 
 pub(super) fn audit() -> pb::Audit {
     system_audit(&env(), "certification fixture")
-}
-
-/// Runs `future` on a runtime of its own, then drops the runtime with
-/// everything the node spawned on it: the node is gone as a `kill -9` leaves it.
-pub(super) fn run<T>(future: impl Future<Output = T>) -> T {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let output = runtime.block_on(future);
-    drop(runtime);
-    output
 }
 
 pub(super) async fn start(data: &Path, environment: Env) -> Arc<Node> {

@@ -9,20 +9,8 @@ use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 
 use super::Node;
+use crate::test_support::{COUNTER, audit};
 use crate::{NodeConfig, start_local};
-
-const COUNTER: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/guests/counter.wasm"
-);
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
 
 fn plain(bytes: &[u8]) -> Option<pb::Sealable> {
     Some(pb::Sealable {
