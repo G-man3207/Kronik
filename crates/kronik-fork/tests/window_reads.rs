@@ -5,67 +5,18 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::{Proc, ShiftedClock, audit, guest, tempdir};
-use kronik_core::env::{BoxFuture, File, Fs, OpenMode};
+use kronik_core::env::test_fs::{FsCall, Then, hooked};
 use kronik_core::ids::Lsn;
 use kronik_fork::ProductionIndex;
 use kronik_fork::diff::DiffOptions;
 use kronik_fork::proposal::{Proposals, ProposeRequest};
 use kronik_sched::NodeConfig;
 use kronik_sched::snapshots::StorageConfig;
-
-struct CountFs {
-    inner: Arc<dyn Fs>,
-    hits: Arc<Mutex<Vec<u64>>>,
-    armed: Arc<AtomicBool>,
-}
-
-impl Fs for CountFs {
-    fn create_dir_all(&self, path: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        let inner = self.inner.clone();
-        Box::pin(async move { inner.create_dir_all(path).await })
-    }
-    fn open(
-        &self,
-        path: PathBuf,
-        mode: OpenMode,
-    ) -> BoxFuture<'static, std::io::Result<Arc<dyn File>>> {
-        if self.armed.load(Ordering::SeqCst)
-            && path
-                .parent()
-                .is_some_and(|dir| dir.ends_with("branches/main/log"))
-            && let Some(start) = seg_start(&path)
-        {
-            self.hits.lock().unwrap().push(start);
-        }
-        let inner = self.inner.clone();
-        Box::pin(async move { inner.open(path, mode).await })
-    }
-    fn exists(&self, path: PathBuf) -> BoxFuture<'static, std::io::Result<bool>> {
-        let inner = self.inner.clone();
-        Box::pin(async move { inner.exists(path).await })
-    }
-    fn read_dir(&self, dir: PathBuf) -> BoxFuture<'static, std::io::Result<Vec<String>>> {
-        let inner = self.inner.clone();
-        Box::pin(async move { inner.read_dir(dir).await })
-    }
-    fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        let inner = self.inner.clone();
-        Box::pin(async move { inner.rename(from, to).await })
-    }
-    fn remove_file(&self, path: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        let inner = self.inner.clone();
-        Box::pin(async move { inner.remove_file(path).await })
-    }
-    fn sync_dir(&self, dir: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        let inner = self.inner.clone();
-        Box::pin(async move { inner.sync_dir(dir).await })
-    }
-}
 
 fn seg_start(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
@@ -92,10 +43,19 @@ fn start(
                 offset_ms: offset,
             });
             env.clock = clock;
-            env.fs = Arc::new(CountFs {
-                inner: env.fs.clone(),
-                hits,
-                armed,
+            // Real files, with the starts of the main log segments opened
+            // while `armed` recorded in `hits`.
+            env.fs = hooked(env.fs.clone(), move |call| {
+                if let FsCall::Open(path, _) = call
+                    && armed.load(Ordering::SeqCst)
+                    && path
+                        .parent()
+                        .is_some_and(|dir| dir.ends_with("branches/main/log"))
+                    && let Some(start) = seg_start(path)
+                {
+                    hits.lock().unwrap().push(start);
+                }
+                Then::Forward
             });
         },
     )
