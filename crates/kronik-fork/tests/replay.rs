@@ -1036,6 +1036,25 @@ fn only_effect(p: &Proc, r: &kronik_sched::TurnResult) -> kronik_proto::log::v1:
     }
 }
 
+/// An identity replay from `fork_lsn`, in each of `modes` with two
+/// workers, changes nothing and has a twin for every production turn.
+fn assert_identity(p: &Proc, fork_lsn: u64, modes: &[Mode]) {
+    for &mode in modes {
+        let out = replay(p, None, fork_lsn, &opts(mode), 2);
+        let s = &out.diff.summary;
+        assert!(
+            !s.changed,
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&out.bytes)
+        );
+        assert_eq!(
+            (s.turns_prod, s.divergent_turns),
+            (s.turns_fork, 0),
+            "{mode:?}"
+        );
+    }
+}
+
 /// Identity replay is empty over turns whose effects hit the actor type's
 /// effect bytes (ADR 0145, issue #74): a response that would pass them
 /// (sent, not recorded), a request that would pass them (not sent), and a
@@ -1173,37 +1192,17 @@ fn isolated_identity_over_timers_and_calls_is_empty() {
     for i in 0..3 {
         p.send(&format!("counter/c{i}"), "call", "counter/ledger increment");
     }
-    let to = p.settle();
-    let records: Vec<_> = (fork_lsn + 1..=to)
-        .filter_map(|l| p.rt.block_on(p.node.read_record(l)).unwrap())
-        .collect();
+    let turns = turns_after(&p, fork_lsn);
     let lsn_of = |actor: &str| {
-        records.iter().find_map(|c| match &c.record {
-            kronik_proto::Record::TurnRecord(t)
-                if t.actor
-                    .as_ref()
-                    .is_some_and(|a| format!("{}/{}", a.kind, a.key) == actor) =>
-            {
-                Some(c.lsn)
-            }
-            _ => None,
+        turns.iter().find_map(|(lsn, t)| {
+            (t.actor
+                .as_ref()
+                .is_some_and(|a| format!("{}/{}", a.kind, a.key) == actor))
+            .then_some(*lsn)
         })
     };
     assert!(lsn_of("counter/ledger").unwrap() < lsn_of("counter/c0").unwrap());
-    for mode in [Mode::Isolated, Mode::Both] {
-        let out = replay(&p, None, fork_lsn, &opts(mode), 2);
-        let s = &out.diff.summary;
-        assert!(
-            !s.changed,
-            "{mode:?}: {}",
-            String::from_utf8_lossy(&out.bytes)
-        );
-        assert_eq!(
-            (s.turns_prod, s.divergent_turns),
-            (s.turns_fork, 0),
-            "{mode:?}"
-        );
-    }
+    assert_identity(&p, fork_lsn, &[Mode::Isolated, Mode::Both]);
     // One worker: the trees share a cursor, in order of their first record.
     let out = replay(&p, None, fork_lsn, &opts(Mode::Isolated), 1);
     assert!(
@@ -1233,7 +1232,7 @@ fn isolated_identity_over_a_failed_call_compensation_is_empty() {
             &format!("counter/l{i} increment increment"),
         );
     }
-    let to = p.settle();
+    p.settle();
     for i in 0..3 {
         let n = p
             .node
@@ -1244,37 +1243,20 @@ fn isolated_identity_over_a_failed_call_compensation_is_empty() {
         assert_eq!(n.as_deref(), Some(b"2".as_slice()), "counter/l{i}");
     }
     // Production holds one compensation turn per failed call.
-    let records: Vec<_> = (fork_lsn + 1..=to)
-        .filter_map(|l| p.rt.block_on(p.node.read_record(l)).unwrap())
-        .collect();
-    let comps = records
+    let comps = turns_after(&p, fork_lsn)
         .iter()
-        .filter(|c| {
-            matches!(
-                &c.record,
-                kronik_proto::Record::TurnRecord(t)
-                    if t.input.as_ref().and_then(|i| i.kind.as_ref()).is_some_and(
-                        |k| matches!(k, kronik_proto::log::v1::input::Kind::Message(m)
-                            if m.source == kronik_proto::log::v1::MessageSource::Compensation as i32)
-                    )
-            )
+        .filter(|(_, t)| {
+            t.input
+                .as_ref()
+                .and_then(|i| i.kind.as_ref())
+                .is_some_and(|k| {
+                    matches!(k, kronik_proto::log::v1::input::Kind::Message(m)
+                    if m.source == kronik_proto::log::v1::MessageSource::Compensation as i32)
+                })
         })
         .count();
     assert_eq!(comps, 3, "production should hold three compensation turns");
-    for mode in [Mode::Isolated, Mode::Both] {
-        let out = replay(&p, None, fork_lsn, &opts(mode), 2);
-        let s = &out.diff.summary;
-        assert!(
-            !s.changed,
-            "{mode:?}: {}",
-            String::from_utf8_lossy(&out.bytes)
-        );
-        assert_eq!(
-            (s.turns_prod, s.divergent_turns),
-            (s.turns_fork, 0),
-            "{mode:?}"
-        );
-    }
+    assert_identity(&p, fork_lsn, &[Mode::Isolated, Mode::Both]);
     // One worker: the trees share a cursor, in order of their first record.
     let out = replay(&p, None, fork_lsn, &opts(Mode::Isolated), 1);
     assert!(
@@ -1307,33 +1289,24 @@ fn isolated_timer_sees_state_from_later_roots() {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let to = p.settle();
-    let records: Vec<_> = (fork_lsn + 1..=to)
-        .filter_map(|l| p.rt.block_on(p.node.read_record(l)).unwrap())
-        .collect();
+    let turns = turns_after(&p, fork_lsn);
     let lsn_of = |want: fn(&kronik_proto::log::v1::input::Kind) -> bool| {
-        records.iter().find_map(|c| match &c.record {
-            kronik_proto::Record::TurnRecord(t)
-                if t.input
-                    .as_ref()
-                    .and_then(|i| i.kind.as_ref())
-                    .is_some_and(want) =>
-            {
-                Some(c.lsn)
-            }
-            _ => None,
+        turns.iter().find_map(|(lsn, t)| {
+            t.input
+                .as_ref()
+                .and_then(|i| i.kind.as_ref())
+                .is_some_and(want)
+                .then_some(*lsn)
         })
     };
     let message = |name: &str| {
-        records.iter().find_map(|c| match &c.record {
-            kronik_proto::Record::TurnRecord(t)
-                if t.input.as_ref().is_some_and(|i| {
+        turns.iter().find_map(|(lsn, t)| {
+            t.input
+                .as_ref()
+                .is_some_and(|i| {
                     matches!(&i.kind, Some(kronik_proto::log::v1::input::Kind::Message(m)) if m.msg.as_ref().is_some_and(|msg| msg.name == name))
-                }) =>
-            {
-                Some(c.lsn)
-            }
-            _ => None,
+                })
+                .then_some(*lsn)
         })
     };
     let scheduled = message("schedule").unwrap();
@@ -1383,7 +1356,7 @@ fn identity_replay_over_a_withheld_call_reply_is_empty() {
         r.outcome
     );
     // The call and its compensation both incremented counter/b.
-    let to = p.settle();
+    p.settle();
     let n = p.node.store().db().kv_get("counter", "b", "n").unwrap();
     assert_eq!(n.as_deref(), Some(b"2".as_slice()));
     let call_of = |t: &pb::TurnRecord| {
@@ -1398,12 +1371,10 @@ fn identity_replay_over_a_withheld_call_reply_is_empty() {
             .as_ref()
             .is_some_and(|a| format!("{}/{}", a.kind, a.key) == actor)
     };
-    let prod = (fork_lsn + 1..=to)
-        .filter_map(|l| p.rt.block_on(p.node.read_record(l)).unwrap())
-        .find_map(|c| match c.record {
-            kronik_proto::Record::TurnRecord(t) if is(&t, "counter/a") => Some(t),
-            _ => None,
-        })
+    let prod = turns_after(&p, fork_lsn)
+        .into_iter()
+        .map(|(_, t)| t)
+        .find(|t| is(t, "counter/a"))
         .unwrap();
     let recorded = call_of(&prod);
     assert_eq!(
@@ -1415,20 +1386,7 @@ fn identity_replay_over_a_withheld_call_reply_is_empty() {
         Some(pb::EffectStatus::Ok as i32)
     );
     assert_eq!(recorded.callee_source.unwrap().branch, "main");
-    for mode in [Mode::Both, Mode::Isolated] {
-        let out = replay(&p, None, fork_lsn, &opts(mode), 2);
-        let s = &out.diff.summary;
-        assert!(
-            !s.changed,
-            "{mode:?}: {}",
-            String::from_utf8_lossy(&out.bytes)
-        );
-        assert_eq!(
-            (s.turns_prod, s.divergent_turns),
-            (s.turns_fork, 0),
-            "{mode:?}"
-        );
-    }
+    assert_identity(&p, fork_lsn, &[Mode::Both, Mode::Isolated]);
     // The fork's record names the fork's callee turn, and the fork delivers
     // the compensation as production did.
     let out = replay(&p, None, fork_lsn, &opts(Mode::Continuous), 1);
@@ -1593,32 +1551,14 @@ fn identity_replay_over_timed_out_calls_is_empty() {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let to = p.settle();
     // Both calls timed out in production.
-    let timed_out = (fork_lsn + 1..=to)
-        .filter_map(|l| p.rt.block_on(p.node.read_record(l)).unwrap())
-        .filter_map(|c| match c.record {
-            kronik_proto::Record::TurnRecord(t) => Some(t),
-            _ => None,
-        })
-        .flat_map(|t| t.effects)
+    let timed_out = turns_after(&p, fork_lsn)
+        .into_iter()
+        .flat_map(|(_, t)| t.effects)
         .filter(|e| e.timed_out_call())
         .count();
     assert_eq!(timed_out, 2);
-    for mode in [Mode::Both, Mode::Isolated] {
-        let out = replay(&p, None, fork_lsn, &opts(mode), 2);
-        let s = &out.diff.summary;
-        assert!(
-            !s.changed,
-            "{mode:?}: {}",
-            String::from_utf8_lossy(&out.bytes)
-        );
-        assert_eq!(
-            (s.turns_prod, s.divergent_turns),
-            (s.turns_fork, 0),
-            "{mode:?}"
-        );
-    }
+    assert_identity(&p, fork_lsn, &[Mode::Both, Mode::Isolated]);
 }
 
 /// A call that timed out and was then lost with its process: the next start
@@ -1660,17 +1600,10 @@ fn identity_replay_over_a_call_lost_to_a_restart_is_empty() {
             ..kronik_sched::NodeConfig::default()
         },
     );
-    let to = p.settle();
-    let closed: Vec<pb::TurnRecord> = (fork_lsn + 1..=to)
-        .filter_map(|l| p.rt.block_on(p.node.read_record(l)).unwrap())
-        .filter_map(|c| match c.record {
-            kronik_proto::Record::TurnRecord(t)
-                if t.actor.as_ref().is_some_and(|a| a.key == "e") =>
-            {
-                Some(t)
-            }
-            _ => None,
-        })
+    let closed: Vec<pb::TurnRecord> = turns_after(&p, fork_lsn)
+        .into_iter()
+        .map(|(_, t)| t)
+        .filter(|t| t.actor.as_ref().is_some_and(|a| a.key == "e"))
         .collect();
     assert_eq!(closed.len(), 1, "{closed:?}");
     assert_eq!(
@@ -1680,20 +1613,7 @@ fn identity_replay_over_a_call_lost_to_a_restart_is_empty() {
     assert!(closed[0].random_seed.is_empty(), "it never ran");
     let n = p.node.store().db().kv_get("counter", "e", "n").unwrap();
     assert_eq!(n, None, "neither the call nor its compensation ran");
-    for mode in [Mode::Both, Mode::Isolated] {
-        let out = replay(&p, None, fork_lsn, &opts(mode), 2);
-        let s = &out.diff.summary;
-        assert!(
-            !s.changed,
-            "{mode:?}: {}",
-            String::from_utf8_lossy(&out.bytes)
-        );
-        assert_eq!(
-            (s.turns_prod, s.divergent_turns),
-            (s.turns_fork, 0),
-            "{mode:?}"
-        );
-    }
+    assert_identity(&p, fork_lsn, &[Mode::Both, Mode::Isolated]);
 }
 
 /// A failed call's compensation runs in a fork with the caller's subject,
@@ -1828,13 +1748,9 @@ fn fork_replay_keeps_a_compensation_turns_caller_subject() {
     ];
     assert_eq!(sql_rows(p.node.store()), tagged_sql);
 
-    let to = p.settle();
-    let turns: Vec<pb::TurnRecord> = (fork_lsn + 1..=to)
-        .filter_map(|l| p.rt.block_on(p.node.read_record(l)).unwrap())
-        .filter_map(|c| match c.record {
-            kronik_proto::Record::TurnRecord(t) => Some(t),
-            _ => None,
-        })
+    let turns: Vec<pb::TurnRecord> = turns_after(&p, fork_lsn)
+        .into_iter()
+        .map(|(_, t)| t)
         .collect();
     let is_compensation = |t: &pb::TurnRecord| {
         matches!(
