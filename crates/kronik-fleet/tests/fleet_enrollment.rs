@@ -1227,14 +1227,8 @@ async fn raw_tunnel_preserves_native_sse_and_websocket_wire_bytes() {
          [b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n".as_slice(), &[0x81, 2, b'o', b'k', 0x88, 2, 3, 232]].concat()),
     ];
     for (request, response) in streams {
-        let (env, client, network, mut record, _dir) = setup().await;
-        record.phase = EnrollmentPhase::Active;
-        record.client_cert_der = Some(network.issue(
-            &record.csr_der,
-            &record.plan,
-            &record.request_id,
-            record.epoch,
-        ));
+        let (env, client, network, record, _dir) = setup().await;
+        let record = activate_control_record(&network, record);
         network.socket.pending_recv.store(true, Ordering::SeqCst);
         network
             .socket
@@ -1278,14 +1272,8 @@ async fn raw_tunnel_preserves_native_sse_and_websocket_wire_bytes() {
 
 #[tokio::test]
 async fn revoked_queued_http_bytes_never_reach_the_api_connection() {
-    let (env, client, network, mut record, _dir) = setup().await;
-    record.phase = EnrollmentPhase::Active;
-    record.client_cert_der = Some(network.issue(
-        &record.csr_der,
-        &record.plan,
-        &record.request_id,
-        record.epoch,
-    ));
+    let (env, client, network, record, _dir) = setup().await;
+    let record = activate_control_record(&network, record);
     network
         .socket
         .incoming
@@ -1332,15 +1320,9 @@ async fn preview_plan_does_not_network_or_prepare_durable_enrollment() {
 
 #[tokio::test]
 async fn revoke_during_dispatch_stops_reply_without_claiming_rollback() {
-    let (env, client, network, mut record, _dir) = setup().await;
-    record.phase = EnrollmentPhase::Active;
+    let (env, client, network, record, _dir) = setup().await;
     network.socket.pending_recv.store(true, Ordering::SeqCst);
-    record.client_cert_der = Some(network.issue(
-        &record.csr_der,
-        &record.plan,
-        &record.request_id,
-        record.epoch,
-    ));
+    let record = activate_control_record(&network, record);
     let authority = active_authority(&record);
     let admitted = Arc::new(AtomicUsize::new(0));
     let seen = admitted.clone();
@@ -1484,14 +1466,8 @@ async fn requested_identity_cannot_silently_replace_its_leaf_or_csr() {
 
 #[tokio::test]
 async fn ordinary_component_sized_http_bodies_cross_multiple_bounded_chunks() {
-    let (env, client, network, mut record, _dir) = setup().await;
-    record.phase = EnrollmentPhase::Active;
-    record.client_cert_der = Some(network.issue(
-        &record.csr_der,
-        &record.plan,
-        &record.request_id,
-        record.epoch,
-    ));
+    let (env, client, network, record, _dir) = setup().await;
+    let record = activate_control_record(&network, record);
     let body = vec![b'W'; 2 << 20];
     let mut request = format!(
         "POST /v1/deployments HTTP/1.1\r\nHost: installation\r\nContent-Length: {}\r\n\r\n",
@@ -1546,14 +1522,8 @@ async fn ordinary_component_sized_http_bodies_cross_multiple_bounded_chunks() {
 
 #[tokio::test]
 async fn an_oversized_outer_message_is_not_forwarded_as_http() {
-    let (env, client, network, mut record, _dir) = setup().await;
-    record.phase = EnrollmentPhase::Active;
-    record.client_cert_der = Some(network.issue(
-        &record.csr_der,
-        &record.plan,
-        &record.request_id,
-        record.epoch,
-    ));
+    let (env, client, network, record, _dir) = setup().await;
+    let record = activate_control_record(&network, record);
     network
         .socket
         .incoming
@@ -1589,14 +1559,8 @@ async fn an_oversized_outer_message_is_not_forwarded_as_http() {
 
 #[tokio::test]
 async fn revocation_cancels_a_pending_frame_before_any_dispatch() {
-    let (env, client, network, mut record, _dir) = setup().await;
-    record.phase = EnrollmentPhase::Active;
-    record.client_cert_der = Some(network.issue(
-        &record.csr_der,
-        &record.plan,
-        &record.request_id,
-        record.epoch,
-    ));
+    let (env, client, network, record, _dir) = setup().await;
+    let record = activate_control_record(&network, record);
     network.socket.pending_recv.store(true, Ordering::SeqCst);
     let authority = active_authority(&record);
     let guard = authority.guard();
