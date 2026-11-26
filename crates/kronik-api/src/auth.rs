@@ -108,7 +108,6 @@ pub trait Authenticator: Send + Sync {
         Ok(crate::CapturedRequest {
             caller,
             authority,
-            principal: None,
             verified_identity: None,
             session: None,
         })

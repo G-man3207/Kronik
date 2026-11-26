@@ -80,16 +80,12 @@ impl std::fmt::Debug for ApiRequest {
 pub struct CapturedRequest {
     pub(crate) caller: auth::Caller,
     pub(crate) authority: kronik_core::authority::AuthLease,
-    pub(crate) principal: Option<tokens::ForwardedPrincipal>,
     pub(crate) verified_identity: Option<Arc<pb::Sealable>>,
     pub(crate) session: Option<kronik_core::authority::SessionLease>,
 }
 impl CapturedRequest {
     pub fn authority(&self) -> &kronik_core::authority::AuthLease {
         &self.authority
-    }
-    pub fn principal(&self) -> Option<&tokens::ForwardedPrincipal> {
-        self.principal.as_ref()
     }
     pub fn session(&self) -> Option<&kronik_core::authority::SessionLease> {
         self.session.as_ref()
@@ -104,10 +100,6 @@ pub(crate) struct AuthorizedRequest {
     request: ApiRequest,
     pub(crate) caller: auth::Caller,
     pub(crate) authority: kronik_core::authority::AuthLease,
-    /// Forwarded-principal seam: the handler that reads it has not landed, so
-    /// it is not wired to routing yet.
-    #[allow(dead_code)]
-    pub(crate) principal: Option<tokens::ForwardedPrincipal>,
     pub(crate) verified_identity: Option<Arc<pb::Sealable>>,
 }
 impl std::ops::Deref for AuthorizedRequest {
@@ -1390,7 +1382,6 @@ impl Api {
         let CapturedRequest {
             caller,
             authority,
-            principal,
             verified_identity,
             session: _,
         } = captured;
@@ -1398,7 +1389,6 @@ impl Api {
             request,
             caller,
             authority,
-            principal,
             verified_identity,
         };
         // Box the dispatch future: the route match embeds every endpoint body, and

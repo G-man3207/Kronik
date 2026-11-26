@@ -16,9 +16,6 @@ impl TokenStore {
         authority: kronik_core::authority::AuthLease,
     ) -> Result<(TokenMeta, Option<String>), ApiError> {
         authority.check()?;
-        if self.metadata_revision()?.is_some() {
-            return Err(metadata_unavailable());
-        }
         audit.reason = {
             let values = node.certified_secret_values().await;
             let patterns = values
@@ -75,9 +72,6 @@ impl TokenStore {
         authority: kronik_core::authority::AuthLease,
     ) -> Result<TokenMeta, ApiError> {
         authority.check()?;
-        if self.metadata_revision()?.is_some() {
-            return Err(metadata_unavailable());
-        }
         audit.reason = {
             let values = node.certified_secret_values().await;
             let patterns = values

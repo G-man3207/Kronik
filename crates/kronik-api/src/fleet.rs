@@ -256,12 +256,6 @@ impl Fleet {
         startup_original: kronik_core::authority::AuthLease,
     ) -> Result<Arc<Self>, ApiError> {
         startup_original.check()?;
-        if tokens.metadata_revision()?.is_some() {
-            return Err(ApiError::new(
-                ErrorCode::Unavailable,
-                "native fleet cannot select a member token authority",
-            ));
-        }
         config.scopes = tokens::parse_scopes(&config.scopes)?
             .into_iter()
             .map(|scope| scope.as_str().to_owned())
@@ -1000,22 +994,6 @@ struct RequestAuthority {
 impl RequestAuthority {
     fn current(&self) -> Result<(), ApiError> {
         self.original.check()?;
-        if self
-            .fleet
-            .tokens
-            .fleet_phase(self.receipt.epoch, &self.receipt.request_id)?
-            .is_some_and(|phase| {
-                !matches!(
-                    phase,
-                    pb::fleet_state::Phase::Pending | pb::fleet_state::Phase::Requested
-                )
-            })
-        {
-            return Err(ApiError::new(
-                ErrorCode::Unauthenticated,
-                "fleet enrollment superseded or revoked",
-            ));
-        }
         let request = self.fleet.request.read().unwrap_or_else(|e| e.into_inner());
         if !request.as_ref().is_some_and(|r| {
             r.epoch == self.receipt.epoch
@@ -1084,17 +1062,6 @@ struct CleanupAuthority {
 impl CleanupAuthority {
     fn current(&self) -> Result<(), ApiError> {
         self.fleet.startup_original.check()?;
-        if self
-            .fleet
-            .tokens
-            .fleet_phase(self.receipt.epoch, &self.receipt.request_id)?
-            .is_some_and(|phase| phase != pb::fleet_state::Phase::Revoked)
-        {
-            return Err(ApiError::new(
-                ErrorCode::Unauthenticated,
-                "fleet cleanup superseded",
-            ));
-        }
         if self
             .fleet
             .request
