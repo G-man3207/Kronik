@@ -10,7 +10,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::{Proc, audit, slow_server, start_proc, wait_turn};
+use common::{Proc, audit, http, slow_server, start_proc, wait_turn};
 use kronik_blob::{BlobMeta, BlobStore, NoKeys, Space, StoreConfig};
 use kronik_core::env::Env;
 use kronik_core::env::test_fs::{FsCall, Then, hooked};
@@ -260,25 +260,13 @@ fn without_a_blob_store_blob_functions_trap() {
 
 /// Answers every request with 200 "ok" and counts them. A peer of the
 /// node, outside its `Env`, so it runs on an OS thread of its own.
-#[allow(clippy::disallowed_methods)]
 fn counting_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-    use std::io::{BufRead as _, BufReader, Write as _};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
+    use std::io::Write as _;
     let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = count.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
-                line.clear();
-            }
-            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut stream = stream;
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-        }
+    let addr = http::serve(move |_, w| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = w.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
     });
     (addr, count)
 }
@@ -341,58 +329,31 @@ type Sunk = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
 /// A peer for the effect tests: `GET /bytes/<n>` answers `n` bytes of the
 /// `write` pattern; `POST /sink` keeps the request's head and body and
 /// answers 201.
-#[allow(clippy::disallowed_methods)]
 fn peer() -> (String, Sunk) {
-    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
+    use std::io::Write as _;
     let sunk = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = sunk.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let seen = seen.clone();
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut head = String::new();
-                let mut line = String::new();
-                while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
-                    head.push_str(&line);
-                    line.clear();
+    let addr = http::serve(move |req, stream| {
+        if let Some(n) = req.path.strip_prefix("/bytes/") {
+            let n: u64 = n.parse().unwrap();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n"
+            );
+            let mut at = 0;
+            while at < n {
+                let end = (at + 65_536).min(n);
+                let part: Vec<u8> = (at..end).map(pattern).collect();
+                if stream.write_all(&part).is_err() {
+                    return;
                 }
-                let len: usize = head
-                    .lines()
-                    .find_map(|l| {
-                        let (name, value) = l.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse().unwrap())
-                    })
-                    .unwrap_or(0);
-                let mut body = vec![0; len];
-                reader.read_exact(&mut body).unwrap();
-                let path = head.split_whitespace().nth(1).unwrap_or("").to_owned();
-                let mut stream = stream;
-                if let Some(n) = path.strip_prefix("/bytes/") {
-                    let n: u64 = n.parse().unwrap();
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n"
-                    );
-                    let mut at = 0;
-                    while at < n {
-                        let end = (at + 65_536).min(n);
-                        let part: Vec<u8> = (at..end).map(pattern).collect();
-                        if stream.write_all(&part).is_err() {
-                            return;
-                        }
-                        at = end;
-                    }
-                } else {
-                    seen.lock().unwrap().push((head, body));
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                    );
-                }
-            });
+                at = end;
+            }
+        } else {
+            seen.lock().unwrap().push((req.head, req.body));
+            let _ = stream.write_all(
+                b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            );
         }
     });
     (addr, sunk)

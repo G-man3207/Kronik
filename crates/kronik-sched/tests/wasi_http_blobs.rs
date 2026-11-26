@@ -11,11 +11,11 @@
 
 mod common;
 
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use common::{Proc, audit, start_proc};
+use common::{Proc, audit, http, start_proc};
 use kronik_blob::{BlobMeta, BlobStore, NoKeys, Space, StoreConfig};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
@@ -83,39 +83,16 @@ type Got = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 /// An HTTP peer that answers every request with its body; keeps what it
 /// got.
 fn echo() -> (String, Got) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
     let got = Arc::new(Mutex::new(Vec::new()));
     let seen = got.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let seen = seen.clone();
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let (mut head, mut line) = (String::new(), String::new());
-                while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
-                    head.push_str(&line);
-                    line.clear();
-                }
-                let len: usize = head
-                    .lines()
-                    .find_map(|l| {
-                        let (name, value) = l.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse().unwrap())
-                    })
-                    .unwrap_or(0);
-                let mut body = vec![0; len];
-                reader.read_exact(&mut body).unwrap();
-                let mut stream = stream;
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
-                );
-                let _ = stream.write_all(&body);
-                seen.lock().unwrap().push((head, body));
-            });
-        }
+    let addr = http::serve(move |req, stream| {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            req.body.len()
+        );
+        let _ = stream.write_all(&req.body);
+        seen.lock().unwrap().push((req.head, req.body));
     });
     (addr, got)
 }
