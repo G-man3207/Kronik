@@ -19,30 +19,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use common::free_port;
-
-const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
-
-fn command() -> Command {
-    let mut c = Command::new(KRONIK);
-    for var in [
-        "KRONIK_CONFIG",
-        "KRONIK_DATA_DIR",
-        "KRONIK_HTTP_LISTEN",
-        "KRONIK_ADMIN_LISTEN",
-        "KRONIK_API_SOCKET",
-        "KRONIK_API_LISTEN",
-        "KRONIK_TOKEN",
-        "KRONIK_MASTER_KEY_FILE",
-        "KRONIK_MASTER_KEY",
-    ] {
-        c.env_remove(var);
-    }
-    // The tests' temporary file system may have less than the reserve.
-    c.env("KRONIK_DISK_RESERVE", "0B");
-    c.stdin(Stdio::null());
-    c
-}
+use common::{command, free_port};
 
 /// `kronik serve` with every path in `dir`.
 fn serve(dir: &Path, extra: &[&str]) -> Command {

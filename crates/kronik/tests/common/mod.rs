@@ -19,15 +19,24 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-/// The developer's settings that `kronik` reads from the environment.
-const SETTINGS_ENV: [&str; 7] = [
+/// The settings `kronik` reads from the environment, removed from every
+/// command the tests run so that the developer's shell cannot change
+/// them: the union of the lists the test files kept on their own.
+pub const SETTINGS_ENV: [&str; 14] = [
     "KRONIK_CONFIG",
     "KRONIK_DATA_DIR",
     "KRONIK_HTTP_LISTEN",
     "KRONIK_ADMIN_LISTEN",
     "KRONIK_API_SOCKET",
+    "KRONIK_API_LISTEN",
     "KRONIK_MASTER_KEY_FILE",
+    "KRONIK_MASTER_KEY",
     "KRONIK_TOKEN",
+    "KRONIK_URL",
+    "KRONIK_OTEL_ENDPOINT",
+    "KRONIK_AUDIT_SINK",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
 ];
 
 /// `kronik` without the developer's settings, with no disk reserve (the
@@ -228,7 +237,7 @@ impl Daemon {
     /// and passes `--config` with it; with `None`: `--data-dir <dir>/data`.
     /// Always: `--http-listen 127.0.0.1:0 --admin-listen 127.0.0.1:0
     /// --api-socket <dir>/api.sock`, `KRONIK_DISK_RESERVE=0B`,
-    /// `KRONIK_LOG=info`, `KRONIK_TOKEN` removed, stdin and stdout null.
+    /// `KRONIK_LOG=info`, [`SETTINGS_ENV`] removed, stdin and stdout null.
     /// Callers add arguments or override env before `spawn`.
     pub fn command(bin: impl AsRef<OsStr>, dir: &Path, config: Option<&str>) -> Command {
         let mut command = Command::new(bin);
@@ -236,9 +245,11 @@ impl Daemon {
             .arg("serve")
             .env("KRONIK_DISK_RESERVE", "0B")
             .env("KRONIK_LOG", "info")
-            .env_remove("KRONIK_TOKEN")
             .stdin(Stdio::null())
             .stdout(Stdio::null());
+        for var in SETTINGS_ENV {
+            command.env_remove(var);
+        }
         match config {
             Some(config) => {
                 let path = dir.join("kronik.toml");

@@ -16,7 +16,6 @@ use std::time::Duration;
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/guests/counter.wasm"
@@ -32,23 +31,13 @@ enum KeyAt {
     Env,
 }
 
-/// A `kronik` command with no setting from the developer's shell.
+/// `common::command()`, with the master key in `KRONIK_MASTER_KEY` for
+/// `KeyAt::Env`.
 fn command(key: KeyAt) -> Command {
-    let mut c = Command::new(KRONIK);
-    for var in [
-        "KRONIK_CONFIG",
-        "KRONIK_DATA_DIR",
-        "KRONIK_API_SOCKET",
-        "KRONIK_MASTER_KEY_FILE",
-        "KRONIK_MASTER_KEY",
-        "KRONIK_TOKEN",
-    ] {
-        c.env_remove(var);
-    }
+    let mut c = common::command();
     if let KeyAt::Env = key {
         c.env("KRONIK_MASTER_KEY", KEY_HEX);
     }
-    c.env("KRONIK_DISK_RESERVE", "0B").stdin(Stdio::null());
     c
 }
 
