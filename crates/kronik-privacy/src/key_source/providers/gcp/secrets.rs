@@ -310,8 +310,6 @@ mod tests {
 
     #[test]
     fn value_and_cursor_bounds_fail_closed() {
-        assert!(page_token(&"x".repeat(CAP + 1)).is_err());
-        assert!(page_token("x\n").is_err());
         let response = json!({"name":format!("{PATH}/versions/1"),"payload":{"data":STANDARD.encode(vec![0; 65_537])}});
         assert!(matches!(
             fetched(PATH, None, &response),

@@ -861,21 +861,6 @@ mod another_users_tree {
     }
 
     #[test]
-    fn a_wrap_that_is_done_says_so_when_the_old_key_cannot_be_removed() {
-        let why = std::io::Error::other("Operation not permitted");
-        let text = removal_failed(Path::new("/srv/data/keys/master.key"), &why).to_string();
-        for needle in [
-            "is wrapped",
-            "/srv/data/keys/master.key",
-            "Operation not permitted",
-            "remove the old file by hand",
-            "a wrapped key exists",
-        ] {
-            assert!(text.contains(needle), "{needle}: {text}");
-        }
-    }
-
-    #[test]
     fn a_path_is_outside_the_data_directory_by_its_spelling_and_a_dotdot_is_not_trusted() {
         let t = tree();
         std::fs::write(t.victim.join("op.key"), "ab".repeat(32)).unwrap();

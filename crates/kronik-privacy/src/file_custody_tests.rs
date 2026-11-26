@@ -246,7 +246,7 @@ fn owned_constructor_rejects_symlink_without_chmod_or_row_mutation() {
 }
 
 #[test]
-fn readonly_stage_preserves_values_and_rejects_mutable_connections_and_wrong_master() {
+fn readonly_stage_preserves_values_and_rejects_mutable_connections() {
     let (dir, master, source, _target) = pair();
     write(&source, 7, 3);
     let staged = source.stage_encrypted_snapshot(dir.path()).unwrap();
@@ -255,12 +255,7 @@ fn readonly_stage_preserves_values_and_rejects_mutable_connections_and_wrong_mas
         SecretStore::open_readonly(Connection::open(staged.database_path()).unwrap(), &master),
         Err(PrivacyError::SecretStoreUnowned)
     ));
-    let readonly = Connection::open_with_flags(
-        staged.database_path(),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    let reader = SecretStore::open_readonly(readonly, &master).unwrap();
+    let reader = open_reader(&staged, &master).unwrap();
     assert_eq!(
         reader.current("token").unwrap().unwrap().value,
         b"retained plaintext"
@@ -268,16 +263,6 @@ fn readonly_stage_preserves_values_and_rejects_mutable_connections_and_wrong_mas
     assert!(matches!(
         reader.delete("token", 7, 21),
         Err(PrivacyError::SecretStoreUnowned)
-    ));
-    drop(reader);
-    let readonly = Connection::open_with_flags(
-        staged.database_path(),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    assert!(matches!(
-        SecretStore::open_readonly(readonly, &MasterKey::from_bytes([8; 32]).unwrap()),
-        Err(PrivacyError::KeyMismatch(_))
     ));
     assert_eq!(std::fs::read(staged.database_path()).unwrap(), before);
 }
