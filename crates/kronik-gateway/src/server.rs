@@ -16,6 +16,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+use kronik_core::sync::lock;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -361,7 +362,7 @@ impl SlotHandle {
     }
 
     fn release(&self) {
-        drop(self.0.lock().unwrap_or_else(|e| e.into_inner()).take());
+        drop(lock(&self.0).take());
     }
 }
 
@@ -458,7 +459,7 @@ impl Slots {
         let counted = if trusted {
             None
         } else {
-            let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+            let mut clients = lock(&self.clients);
             let open = clients.entry(client).or_insert(0);
             if *open >= self.per_client {
                 return None;
@@ -487,7 +488,7 @@ impl Drop for Slot {
         let Some(client) = self.client else {
             return;
         };
-        let mut clients = self.slots.clients.lock().unwrap_or_else(|e| e.into_inner());
+        let mut clients = lock(&self.slots.clients);
         if let Some(open) = clients.get_mut(&client) {
             *open = open.saturating_sub(1);
             if *open == 0 {

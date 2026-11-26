@@ -8,6 +8,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use kronik_core::causal;
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
+use kronik_core::sync::lock;
 use kronik_effects::http::target_of;
 use kronik_privacy::sealer::Sealer;
 use kronik_proto::Record;
@@ -3161,7 +3162,7 @@ fn actor_rows(store: &Store, actor: &str) -> Result<Vec<TableRows>, ReplayError>
         .sql
         .get(actor)
         .map_err(|e| ReplayError::Host(e.to_string()))?;
-    let g = db.lock().unwrap_or_else(|e| e.into_inner());
+    let g = lock(&db);
     g.canonical_rows()
         .map_err(|e| ReplayError::Host(e.to_string()))
 }

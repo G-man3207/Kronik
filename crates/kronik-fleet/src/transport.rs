@@ -9,6 +9,7 @@ use bytes::BytesMut;
 use kronik_core::authority::AuthLease;
 use kronik_core::env::{BoxFuture, Env, Net, WebSocket, WebSocketRequest};
 use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::sync::lock;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
 use tokio::sync::Notify;
 
@@ -51,7 +52,7 @@ impl EpochAuthority {
     }
 
     pub fn guard(self: &Arc<Self>) -> EpochGuard {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = lock(&self.state);
         EpochGuard {
             authority: self.clone(),
             epoch: state.epoch,
@@ -63,7 +64,7 @@ impl EpochAuthority {
     /// Publish only after durable admission, under the ordinary authorization
     /// fence. Checking a guard never acquires that outer fence.
     pub fn publish(&self, record: &EnrollmentRecord) -> Result<(), FleetError> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = lock(&self.state);
         if record.epoch == 0 || record.request_id.is_empty() || record.epoch < state.epoch {
             return Err(FleetError::Invalid("stale enrollment authority"));
         }
@@ -128,11 +129,7 @@ impl EpochGuard {
     }
 
     pub fn check(&self) -> Result<(), FleetError> {
-        let state = self
-            .authority
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = lock(&self.authority.state);
         if self.epoch == 0
             || state.epoch != self.epoch
             || state.revision != self.revision

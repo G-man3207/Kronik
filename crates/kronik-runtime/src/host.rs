@@ -16,6 +16,7 @@ use kronik_core::causal;
 use kronik_core::env::BoxFuture;
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::ActorRef;
+use kronik_core::sync::lock;
 use kronik_proto::log::v1 as pb;
 use wasmtime::component::{HasData, Resource, ResourceTable};
 use wasmtime::{ResourceLimiter, bail};
@@ -465,15 +466,12 @@ impl Logs {
 
     fn push(&self, e: LogEvent) -> wasmtime::Result<()> {
         self.budget.charge(log_event_bytes(&e), "log output")?;
-        self.events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(e);
+        lock(&self.events).push(e);
         Ok(())
     }
 
     pub(crate) fn take(&self) -> Vec<LogEvent> {
-        std::mem::take(&mut *self.events.lock().unwrap_or_else(|e| e.into_inner()))
+        std::mem::take(&mut *lock(&self.events))
     }
 }
 

@@ -30,6 +30,8 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rusqlite::{Connection, OptionalExtension, params};
 use zeroize::{Zeroize, Zeroizing};
 
+use kronik_core::sync::lock;
+
 use key_memory::ProtectedKey;
 
 #[derive(Debug, thiserror::Error)]
@@ -932,7 +934,7 @@ impl SecretStore {
 
     // Only the private create-new encrypted stage selects a backup destination.
     fn backup_to(&self, path: &std::path::Path) -> Result<(), PrivacyError> {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner()).backup(
+        lock(&self.conn).backup(
             rusqlite::MAIN_DB,
             path,
             None::<fn(rusqlite::backup::Progress)>,
@@ -1125,7 +1127,7 @@ impl SecretStore {
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.conn)
     }
 
     /// The keyed immutable identity; legacy identities retain their exact bytes.
