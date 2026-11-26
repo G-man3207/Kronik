@@ -272,11 +272,6 @@ impl Stream {
         self.control.lock().await
     }
 
-    /// Pin and enable this before inspecting the corresponding durable control.
-    pub fn control_notification(&self) -> tokio::sync::futures::Notified<'_> {
-        self.rewound.notified()
-    }
-
     /// Capture the real native cut before this control-only owned initialization.
     pub async fn initialize_native_cursor(
         self: &Arc<Self>,

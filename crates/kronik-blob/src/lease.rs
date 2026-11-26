@@ -158,15 +158,6 @@ impl Lease {
             e.expires = expires;
         }
     }
-
-    /// Whether the lease is still in force (not expired).
-    pub fn is_live(&self) -> bool {
-        let now = self.0.leases.clock.monotonic();
-        lock(&self.0.leases.table)
-            .entries
-            .get(&self.0.id)
-            .is_some_and(|e| e.expires > now)
-    }
 }
 
 #[cfg(test)]
@@ -207,12 +198,12 @@ mod tests {
         assert!(!leases.is_leased(&a));
 
         let replay = leases.floor("replay", 40);
-        let other = leases.floor("proposal", 12);
+        let _other = leases.floor("proposal", 12);
         assert_eq!(leases.lowest_floor(), Some(12));
         // Not renewed for longer than the TTL: no longer a root.
         clock.0.store(301, Ordering::Relaxed);
         replay.renew();
-        assert!(replay.is_live() && !other.is_live());
+
         assert_eq!(leases.lowest_floor(), Some(40));
         assert_eq!(leases.holders(), ["replay"]);
     }
