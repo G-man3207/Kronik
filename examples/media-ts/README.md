@@ -40,7 +40,7 @@ How it uses blobs:
 
 ## Try it
 
-With `kronik serve` running (see the [quickstart](../../docs/guides/quickstart.md)),
+With `kronik serve` running (see the [quickstart](https://github.com/G-man3207/Kronik/wiki/Quickstart)),
 from the repository root:
 
 ```sh

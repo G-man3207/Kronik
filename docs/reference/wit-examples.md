@@ -2,7 +2,7 @@
 
 These are Rust **handler-context snippets** using bindings generated from the
 actual current WIT, not a declaration repeated as an example. Start with the
-[actor guide](../guides/actors.md) and the maintained
+[actor guide](https://github.com/G-man3207/Kronik/wiki/Writing-actors) and the maintained
 `tests/guests/test-actor`/SDK examples for a complete component. The
 [WIT reference](wit.md) defines results, limits and commit behavior. Imports do
 not grant capabilities. This page does not freeze the evolving IO ABI as 1.0.

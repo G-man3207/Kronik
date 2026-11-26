@@ -325,7 +325,7 @@ never loads one:
   normal-root/Rust notices, LICENSE/NOTICE and checksum. The manual release
   workflow reproduces it before the same keyless attestation as the daemon.
   `KRONIK_INSTALL_KEYHELPER=yes` selects only a correctly attested archive;
-  see the [installation guide](../guides/install.md#optional-gnu-pkcs11-helper).
+  see the [installation guide](https://github.com/G-man3207/Kronik/wiki/Installing#optional-gnu-pkcs11-helper).
 - **Run only for explicit PKCS#11 operations:** startup, `keys wrap`,
   `keys rewrap` and `keys enroll`. The helper disables dumps before sensitive
   input, uses private stdin/stdout and the trusted PIN-file descriptor at fd3,
