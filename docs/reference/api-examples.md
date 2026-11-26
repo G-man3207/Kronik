@@ -569,11 +569,11 @@ Content-Type: application/json
 
 ## GET /v1/cluster/status
 
-The installation's actual cluster observation. On a native installation the
-truthful answer is `{"member": false}`; only a real member runtime backed by
-its own MetaService returns member observations through its installed
-adapter, and that adapter's error is an error, never a fabricated non-member
-answer.
+The installation's actual cluster observation. A native installation answers
+`{"member": false}`; this release has no Member runtime to install, so that is
+always the answer. The schema also carries the member shape a cluster runtime
+will answer with, and the route's published contract does not change when it
+lands.
 
 ```http
 GET /v1/cluster/status HTTP/1.1

@@ -7,13 +7,11 @@ mod audit;
 pub mod auth;
 pub mod auth_config;
 mod blobs;
-mod cluster_status;
 mod connections;
 mod effect_secrets;
 #[cfg(feature = "server")]
 pub mod event_stream;
 pub mod events;
-pub use cluster_status::ClusterStatusRead;
 pub mod fleet;
 pub use fleet::Fleet;
 mod export;
@@ -150,7 +148,6 @@ pub struct Api {
     /// The export streams (M28) `GET /v1/export` shows.
     exports: Vec<Arc<kronik_otel::follow::Stream>>,
     browser: Option<Arc<oidc::BrowserAuth>>,
-    cluster_status: Option<ClusterStatusRead>,
     /// Log hash resumed across `GET /v1/integrity` calls (ADR 0153).
     integrity_log: m6::IntegrityLog,
 }
@@ -982,7 +979,6 @@ impl Api {
             audit_mapper: None,
             exports: Vec::new(),
             browser: None,
-            cluster_status: None,
             integrity_log: m6::IntegrityLog::new(),
         }
     }
@@ -1448,7 +1444,7 @@ impl Api {
         match (req.method.as_str(), segs.as_slice()) {
             ("GET", ["v1", "health"]) => self.health(),
             ("GET", ["v1", "openapi.json"]) => self.openapi(),
-            ("GET", ["v1", "cluster", "status"]) => self.cluster_status().await,
+            ("GET", ["v1", "cluster", "status"]) => ok(&serde_json::json!({"member": false})),
             ("GET", ["v1", "auth", "config"]) => self.auth_config_status(req),
             ("PUT", ["v1", "auth", "config"]) => self.auth_config_change(req).await,
             ("GET", ["v1", "events"]) => self.event_page(req, &q).await,
