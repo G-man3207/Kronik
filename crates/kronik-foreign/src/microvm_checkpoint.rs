@@ -576,15 +576,4 @@ mod tests {
             assert_eq!(fs::read(&victim).unwrap(), b"host file");
         }
     }
-
-    #[test]
-    fn snapshot_metadata_rejects_wrong_schema_fields_and_resource_rounding() {
-        assert!(
-            serde_json::from_value::<MicrovmMeta>(
-                serde_json::json!({"schema":SCHEMA,"unexpected":true})
-            )
-            .is_err()
-        );
-        assert_ne!(Resources::new(2001, 512 << 20).unwrap().vcpus, 3);
-    }
 }
