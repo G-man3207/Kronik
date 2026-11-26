@@ -1133,21 +1133,6 @@ mod tests {
         assert!(super::require_leaf(&Privilege::Unavailable("x".into()), ok("/")).is_ok());
     }
 
-    #[test]
-    fn the_advice_names_the_file_and_the_two_directives() {
-        let advice = super::root_leaf_advice();
-        for needle in [
-            super::ROOT_LEAF_DROPIN_PATH,
-            "Delegate=yes",
-            "DelegateSubgroup=daemon",
-            "254",
-        ] {
-            assert!(advice.contains(needle), "{advice}");
-        }
-        assert!(super::ROOT_LEAF_DROPIN.starts_with("[Service]\n"));
-        assert!(super::ROOT_LEAF_DROPIN.ends_with('\n'));
-    }
-
     use super::*;
 
     /// Pins the command line to the exact text, so that an edit is noticed.

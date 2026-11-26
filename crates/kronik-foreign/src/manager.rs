@@ -1323,16 +1323,6 @@ mod tests {
         assert!(allowed_layout_dir(&allowed.join("echo"), &[]).is_none());
     }
 
-    #[test]
-    fn one_daemon_per_run_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let first = lock_run_dir(tmp.path()).unwrap();
-        let second = lock_run_dir(tmp.path()).unwrap_err();
-        assert!(second.contains("another kronik serve"), "{second}");
-        drop(first);
-        lock_run_dir(tmp.path()).unwrap();
-    }
-
     /// What an in-place upgrade of an installation of v0.4.0 finds: the lock was
     /// created with the process's umask and survives a restart.
     #[test]

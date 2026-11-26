@@ -84,12 +84,6 @@ pub fn allocate(text: &str, max_id_in_use: u32) -> Option<Range> {
     range.end().map(|_| range)
 }
 
-/// The line to append for `user`.
-#[cfg(test)]
-fn line(user: &str, r: Range) -> String {
-    format!("{user}:{}:{}\n", r.start, r.count)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +133,5 @@ mod tests {
         assert_eq!(allocate("", 500_000).map(|r| r.start), Some(500_001));
         assert_eq!(allocate("x:4294900000:65536\n", 0), None);
         assert_eq!(allocate("", u32::MAX), None);
-        assert_eq!(line("kronik", Range { start: 1, count: 2 }), "kronik:1:2\n");
     }
 }
