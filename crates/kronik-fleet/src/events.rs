@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{SourcePos, hex};
-use kronik_log::MetadataAuditRecord;
 use kronik_otel::audit::{Line, Mapper};
 use kronik_proto::{Record, log::v1 as pb};
 use kronik_sched::ShardReader;
@@ -179,11 +178,6 @@ impl EventData {
         } else {
             None
         };
-        // Only the canonical mapper sets this closed fact after source validation.
-        // Wire-origin fields and free Line.details are not consumer provenance.
-        let adoption = line
-            .native_adoption_current_projection()
-            .map(|current_projection| NativeAdoption { current_projection });
         Ok(Self {
             schema: line.schema,
             kind: line.kind,
@@ -192,7 +186,8 @@ impl EventData {
             epoch: line.epoch,
             effect: line.effect,
             phase,
-            adoption,
+            // Only a Member metadata producer sets this closed fact (ADR 0162).
+            adoption: None,
             record_hash: line.record_hash,
         })
     }
@@ -265,7 +260,7 @@ pub fn event_id(
     })
 }
 
-/// Projects an actual committed actor record or actual typed metadata AuditEvent.
+/// Projects an actual committed actor record.
 /// Never substitute an empty catalogue for a failed Node inventory or invent a source LSN.
 pub fn project(
     mapper: &Mapper,
@@ -287,27 +282,6 @@ pub fn project(
     };
     let lines = mapper.operational_lines_actor_at(source, record, secrets)?;
     project_lines(identity, position, Some(&source.branch), record, lines)
-}
-
-/// Consume an actual metadata record envelope without dropping its adoption
-/// sidecar. The sole canonical mapper validates the record/origin relationship.
-pub fn project_metadata(
-    mapper: &Mapper,
-    identity: &Identity,
-    source: &MetadataAuditRecord,
-    secrets: &[(&str, &[u8])],
-) -> Result<Vec<Event>, ApiError> {
-    identity.validate().map_err(bad_cursor)?;
-    let lines = mapper.operational_lines_metadata(source, secrets)?;
-    project_lines(
-        identity,
-        SourcePos::Metadata {
-            index: source.index,
-        },
-        None,
-        &source.record,
-        lines,
-    )
 }
 
 fn project_lines(
@@ -361,7 +335,7 @@ pub struct Page {
     pub more: bool,
 }
 
-/// Bounded actor-log page. Metadata adapters retain their actual envelopes for `project_metadata`.
+/// Bounded actor-log page.
 /// A gap is acknowledged explicitly before reading events at its returned cursor.
 pub async fn page(
     reader: &ShardReader,
@@ -483,173 +457,6 @@ pub async fn page(
             subindex,
         })
         .map_err(bad_cursor)?;
-    Ok(result)
-}
-
-pub(crate) fn metadata_batch(
-    source: &dyn kronik_log::MetadataAuditSource,
-    from: u64,
-    limit: usize,
-) -> Result<kronik_log::MetadataAuditBatch, ApiError> {
-    if from == 0 || limit == 0 || limit > kronik_log::MAX_METADATA_AUDIT_RECORDS {
-        return Err(bad_cursor("events_limit"));
-    }
-    let batch = source.read_from(from, limit)?;
-    if batch.covered_from == 0
-        || batch.scanned_through > batch.durable_through
-        || batch.covered_from > batch.durable_through.saturating_add(1)
-        || batch.records.len() > limit
-        || (batch.records.len() == limit
-            && batch
-                .records
-                .last()
-                .is_none_or(|record| record.index != batch.scanned_through))
-        || (batch.records.len() < limit && batch.scanned_through != batch.durable_through)
-        || (from <= batch.durable_through && batch.scanned_through < from)
-        || batch
-            .records
-            .windows(2)
-            .any(|pair| pair[0].index >= pair[1].index)
-        || batch
-            .records
-            .iter()
-            .any(|record| record.index < from || record.index > batch.scanned_through)
-    {
-        return Err(ApiError::new(
-            ErrorCode::StorageCorrupt,
-            "invalid metadata audit coverage",
-        ));
-    }
-    Ok(batch)
-}
-
-/// One captured durable metadata image; non-audit indexes are covered, not gaps.
-/// The caller must obtain this complete catalogue fail closed before calling.
-pub fn metadata_page(
-    source: &dyn kronik_log::MetadataAuditSource,
-    mapper: &Mapper,
-    identity: &Identity,
-    cursor: &ResumeCursor,
-    secrets: &[(&str, &[u8])],
-    limit: usize,
-) -> Result<Page, ApiError> {
-    cursor.validate(identity).map_err(bad_cursor)?;
-    if limit == 0 || limit > MAX_EVENTS {
-        return Err(bad_cursor("events_limit"));
-    }
-    let from = cursor
-        .streams
-        .get("metadata")
-        .map_or(1, |position| coordinate(position.source));
-    let batch = metadata_batch(source, from, limit)?;
-    metadata_page_from_batch(batch, mapper, identity, cursor, secrets, limit)
-}
-
-// Callers validate the cursor and capture this exact bounded image before rendering.
-pub(crate) fn metadata_page_from_batch(
-    batch: kronik_log::MetadataAuditBatch,
-    mapper: &Mapper,
-    identity: &Identity,
-    cursor: &ResumeCursor,
-    secrets: &[(&str, &[u8])],
-    limit: usize,
-) -> Result<Page, ApiError> {
-    let at = |index| SourcePos::Metadata { index };
-    let start = cursor.streams.get("metadata").copied().unwrap_or(Position {
-        source: at(1),
-        subindex: 0,
-    });
-    let from = coordinate(start.source);
-    if from > batch.durable_through.saturating_add(1)
-        || (from > batch.durable_through && start.subindex != 0)
-    {
-        return Err(bad_cursor("events_cursor_ahead"));
-    }
-    let mut result = Page {
-        events: Vec::new(),
-        cursor: cursor.clone(),
-        applied: at(batch.durable_through),
-        gap: None,
-        more: false,
-    };
-    if from < batch.covered_from {
-        result.gap = Some(Gap {
-            from: at(from),
-            through: at(batch.covered_from - 1),
-        });
-        result
-            .cursor
-            .rewind(Position {
-                source: at(batch.covered_from),
-                subindex: 0,
-            })
-            .map_err(bad_cursor)?;
-        result.more = batch.covered_from <= batch.durable_through;
-        return Ok(result);
-    }
-    if start.subindex > 0
-        && batch
-            .records
-            .first()
-            .is_none_or(|record| record.index != from)
-    {
-        return Err(bad_cursor("events_cursor_subindex"));
-    }
-    let mut next = from;
-    let mut subindex = start.subindex;
-    let mut bytes = 0;
-    for record in batch.records {
-        let index = record.index;
-        if index != next {
-            next = index;
-            subindex = 0;
-        }
-        let events = project_metadata(mapper, identity, &record, secrets)?;
-        if subindex as usize > events.len() {
-            return Err(bad_cursor("events_cursor_subindex"));
-        }
-        for event in events.into_iter().skip(subindex as usize) {
-            let size = event
-                .body()
-                .map_err(|error| ApiError::new(ErrorCode::Internal, error))?
-                .len();
-            if size > MAX_PAGE_BYTES {
-                return Err(ApiError::new(ErrorCode::Internal, "events_limit"));
-            }
-            if result.events.len() == limit || bytes + size > MAX_PAGE_BYTES {
-                result
-                    .cursor
-                    .rewind(Position {
-                        source: at(next),
-                        subindex,
-                    })
-                    .map_err(bad_cursor)?;
-                result.more = next <= batch.durable_through;
-                return Ok(result);
-            }
-            bytes += size;
-            subindex += 1;
-            result.events.push(event);
-        }
-        next = index
-            .checked_add(1)
-            .ok_or_else(|| bad_cursor("metadata position exhausted"))?;
-        subindex = 0;
-    }
-    next = next.max(
-        batch
-            .scanned_through
-            .checked_add(1)
-            .ok_or_else(|| bad_cursor("metadata position exhausted"))?,
-    );
-    result
-        .cursor
-        .rewind(Position {
-            source: at(next),
-            subindex: 0,
-        })
-        .map_err(bad_cursor)?;
-    result.more = next <= batch.durable_through;
     Ok(result)
 }
 

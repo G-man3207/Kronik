@@ -419,44 +419,27 @@ that actual WAL-header branch, not the target Mapper's configured branch. The
 classification and private record identity pipeline are unchanged; no Mapper
 copy, new public hash or native/member position alias is introduced.
 
-The portable read-only metadata audit contract carries a real metadata index,
-canonical record and optional same-image native adoption view; it never turns
-metadata into an actor LSN. The source must report its actual coverage and durable
-cut from one image. Its declaration provides neither a producer nor metadata
-readiness. NativeAuthorityOrigin is only the existing sidecar message here;
-AuditEvent field 10 and native import/emission are not activated by this port.
-A reader that silently drops field 10 is not a governing old-reader fence.
-
-The same Mapper consumes that captured record/index/origin through
-`lines_metadata`, `operational_lines_metadata` and `expected_metadata`. An
-imported Record45 keeps its exact canonical body and v3 private identity; the
-closed public adoption view exposes only the actual adoption wall time, proven
-current/historical purpose and, when known, its original native branch and LSN.
-Verification checks this same-image view separately from the unchanged record
-hash, including the distinction between absent and known original provenance.
-The existing metadata coverage-gap, signing-key-change and replay schemas
-preserve only their strictly validated public coordinates and stream identity.
-String fields in those schemas, and in secret-version, secret-link, and typed
-operation details, are still scrubbed for stored secret values and token
-spellings. Numeric coordinates, epochs, and digest spellings are not rewritten
-by substring replacement. Export preparation stalls when the inventory cannot
-be loaded, rather than writing those strings unscrubbed.
+`lines_at` and `expected_at` also accept a metadata index
+(`SourcePos::Metadata`); it never turns into an actor LSN, and only audit
+events, secret versions, secret links and validated proposal approvals are
+valid there. The existing metadata coverage-gap, signing-key-change and replay
+schemas preserve only their strictly validated public coordinates and stream
+identity. String fields in those schemas, and in secret-version, secret-link,
+and typed operation details, are still scrubbed for stored secret values and
+token spellings. Numeric coordinates, epochs, and digest spellings are not
+rewritten by substring replacement. Export preparation stalls when the
+inventory cannot be loaded, rather than writing those strings unscrubbed.
 Persisted free audit reasons retain the shared whole-cell withholding policy;
-no protected approval identity, adoption token or adoption reason is published.
+no protected approval identity is published.
 
-The operational-event projection consumes the Mapper's private typed adoption
-fact through `Line::native_adoption_current_projection`, never free JSON details
-or an unselected protobuf carrier. The fact is absent from serialized audit
-lines and their schema. Historical JSON lines remain verification inputs;
-freshly mapped source records supply this internal operational-event fact.
-
-This portable reader fragment does not activate metadata export. Imported
-AuditEvent40 origins still require the unselected field10/import/fence closure;
-actor-feed replay, fleet-control-open and registered-export-rewind also retain
-their exact unselected validator dependencies. A known supplied Record40
-origin is rejected by the sidecar contract, not replaced by unknown or dropped.
-No metadata producer, source factory, readiness, governing reader fence or
-full-member support follows from these read-only declarations.
+No runtime in this repository produces metadata records, so the read-only
+metadata audit source (`MetadataAuditSource` and its captured
+record/index/native-adoption image), the Mapper's `lines_metadata`,
+`operational_lines_metadata` and `expected_metadata` view and its typed
+native-adoption fact were removed with the rest of the metadata-source event
+pipeline (ADR 0162). A Member metadata host restores them together with its
+producer. No metadata producer, source factory, readiness, governing reader
+fence or full-member support exists here.
 
 Not exported:
 - `TurnBegin` copies of that audit, because `TurnRecord` is the
@@ -754,12 +737,8 @@ the export cursor equals the applied LSN.
   final admission. A pathname descriptor is not a retained file proof.
   Control-only checkpoints contain causal IDs and cursor coordinates, not a
   grant to disclose records.
-  Configured metadata workers use the same guard's `metadata_records` mode,
-  retaining the real stream and paired certificate through delivery/cursor jobs;
-  sticky stream stop is checked inside the same original publication admission.
-  Metadata responses use the same guard's metadata projection to retain the
-  actual producer's paired snapshot and publication without an actor reader;
-  the original metadata authority and actual metadata source remain required.
+  Metadata workers and metadata responses have no guard mode until a Member
+  metadata host exists (ADR 0162).
 - **Changed publication:** a fingerprint alone never reattaches old prepared
   bytes to a new publication. The follower captures a fresh actual pair and
   rereads the same bounded LSN coordinates from a fresh genuine captured reader,

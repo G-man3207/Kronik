@@ -55,10 +55,7 @@ mod readset;
 pub use readset::CapturedLogReadset;
 
 mod metadata_audit;
-pub use metadata_audit::{
-    MAX_METADATA_AUDIT_RECORDS, MetadataAuditBatch, MetadataAuditGap, MetadataAuditRecord,
-    MetadataAuditSource, MetadataWebhookKeyChange, MetadataWebhookReplay,
-};
+pub use metadata_audit::{MetadataAuditGap, MetadataWebhookKeyChange, MetadataWebhookReplay};
 
 pub const MAGIC: &[u8; 4] = b"KRNK";
 pub const FORMAT_VERSION: u32 = 1;

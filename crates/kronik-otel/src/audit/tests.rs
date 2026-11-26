@@ -1,20 +1,12 @@
-//! The metadata view of `Mapper` (m28-otel §4.4): read-only identity images,
-//! not Raft/SQLite commits. These live in the crate because only
-//! `verify_range` can compare `Expected` against lines; the free `verify`
-//! covers only the actor LSN domain.
+//! `Mapper` at a metadata source position (m28-otel §4.4): the closed control
+//! schemas and protected approvals that a Member's metadata log carries. These
+//! live in the crate because only `verify_range` can compare `Expected`
+//! against lines; the free `verify` covers only the actor LSN domain.
 
 // Test helpers outside #[test] functions may unwrap.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "token:ops".into(),
-        reason: "test".into(),
-        wall_time_ms: 1,
-    }
-}
 
 fn mapper() -> Mapper {
     // The tempdir stays alive with the sealer: the keystore reads its files
@@ -47,227 +39,17 @@ fn mapper() -> Mapper {
     }
 }
 
-// The Record45 body is the actual immutable protobuf golden fixture.
-fn metadata_identity_fixture() -> Record {
-    let wire = kronik_core::ids::unhex(
-        include_str!("../../../kronik-proto/tests/fixtures/secret-version-wide-active-v1.hex")
-            .trim(),
-    )
-    .unwrap();
-    let record = Record::decode(45, &wire).unwrap();
-    assert_eq!(record.encode(), wire);
-    record
-}
+const AT: SourcePos = SourcePos::Metadata { index: 97 };
 
-fn metadata_origin_fixture(known: bool, current: bool) -> kronik_log::MetadataAuditRecord {
-    kronik_log::MetadataAuditRecord {
-        index: 97,
-        record: metadata_identity_fixture(),
-        native_origin: Some(pb::NativeAuthorityOrigin {
-            source: known.then(|| pb::ActorSource {
-                shard: None,
-                lsn: 41,
-                branch: "original-fork".into(),
-            }),
-            adoption_audit: Some(pb::Audit {
-                token_id: "unix:uid=0".into(),
-                reason: "private-adoption-reason-NEEDLE".into(),
-                wall_time_ms: 37,
-            }),
-            current_projection: current,
-        }),
-    }
-}
-
-fn metadata_view_complete(
-    mapper: &Mapper,
-    source: &kronik_log::MetadataAuditRecord,
-    lines: &[Line],
-) -> bool {
+fn metadata_view_complete(mapper: &Mapper, record: &Record, lines: &[Line]) -> bool {
     verify_range(
-        &mapper.expected_metadata(source).unwrap(),
+        &mapper.expected_at(AT, record).unwrap(),
         lines,
         96,
         97,
-        Some((
-            SourcePos::Metadata { index: 96 },
-            SourcePos::Metadata { index: 97 },
-        )),
+        Some((SourcePos::Metadata { index: 96 }, AT)),
     )
     .complete
-}
-
-#[test]
-fn metadata_identity_origin_keeps_known_facts_and_unknown_absence_out_of_the_body_hash() {
-    let mapper = mapper();
-    let secrets: &[(&str, &[u8])] = &[
-        ("field", b"native_origin"),
-        ("source", b"original_source"),
-        ("branch", b"original-fork"),
-        ("one", b"1"),
-        ("wall", b"37"),
-        ("lsn", b"41"),
-        ("adoption", b"private-adoption-reason-NEEDLE"),
-    ];
-    for known in [false, true] {
-        for current in [false, true] {
-            let source = metadata_origin_fixture(known, current);
-            let exact = source.record.encode();
-            let ordinary = mapper
-                .lines_at(SourcePos::Metadata { index: 97 }, &source.record, secrets)
-                .unwrap();
-            let lines = mapper.lines_metadata(&source, secrets).unwrap();
-            let line = &lines[0];
-            assert_eq!(
-                (&*line.schema, &*line.kind, &*line.action),
-                ("kronik.audit/v3", "secret_version", "secret.version")
-            );
-            assert_eq!(
-                (line.lsn, line.source),
-                (None, Some(SourcePos::Metadata { index: 97 }))
-            );
-            assert!(line.branch.is_empty());
-            let mut expected =
-                serde_json::json!({"adopted_at_wall_ms":37,"current_projection":current});
-            if known {
-                expected["original_source"] =
-                    serde_json::json!({"shard":null,"lsn":41,"branch":"original-fork"});
-            }
-            assert_eq!(line.details["native_origin"], expected);
-            assert_eq!(
-                (line.at_wall_ms, &*line.token_id, &*line.reason),
-                (
-                    ordinary[0].at_wall_ms,
-                    &*ordinary[0].token_id,
-                    &*ordinary[0].reason
-                )
-            );
-            assert_eq!(
-                line.record_hash,
-                record_hash(&source.record, &mapper.sealer).unwrap()
-            );
-            assert_eq!(line.record_hash, ordinary[0].record_hash);
-            assert_eq!(source.record.encode(), exact);
-            assert!(!line.to_json().contains("private-adoption-reason-NEEDLE"));
-            assert!(!line.to_json().contains("unix:uid=0"));
-            assert!(metadata_view_complete(&mapper, &source, &lines));
-        }
-    }
-}
-
-#[test]
-fn metadata_verification_checks_the_same_image_origin_even_when_record_identity_is_unchanged() {
-    let mapper = mapper();
-    let original = metadata_origin_fixture(true, true);
-    let original_lines = mapper.lines_metadata(&original, &[]).unwrap();
-    for mutation in 0..6 {
-        let mut changed = metadata_origin_fixture(true, true);
-        let origin = changed.native_origin.as_mut().unwrap();
-        match mutation {
-            0 => origin.source.as_mut().unwrap().lsn = 42,
-            1 => origin.source.as_mut().unwrap().branch = "different-real-branch".into(),
-            2 => origin.source = None,
-            3 => origin.current_projection = false,
-            4 => origin.adoption_audit.as_mut().unwrap().wall_time_ms = 38,
-            _ => changed.native_origin = None,
-        }
-        let lines = mapper.lines_metadata(&changed, &[]).unwrap();
-        assert_eq!(lines[0].record_hash, original_lines[0].record_hash);
-        assert!(!metadata_view_complete(&mapper, &original, &lines));
-    }
-    let mut missing = original_lines.clone();
-    missing[0].details.remove("native_origin");
-    assert!(!metadata_view_complete(&mapper, &original, &missing));
-    let ordinary = kronik_log::MetadataAuditRecord {
-        index: 97,
-        record: metadata_identity_fixture(),
-        native_origin: None,
-    };
-    assert!(!metadata_view_complete(&mapper, &ordinary, &original_lines));
-}
-
-#[test]
-fn metadata_view_rejects_malformed_or_unrepresentable_supplied_origin_instead_of_dropping_it() {
-    let mapper = mapper();
-    for mutation in 0..9 {
-        let mut source = metadata_origin_fixture(true, true);
-        match mutation {
-            0 => source.index = 0,
-            1 => source.index = i64::MAX as u64 + 1,
-            2 => {
-                source
-                    .native_origin
-                    .as_mut()
-                    .unwrap()
-                    .source
-                    .as_mut()
-                    .unwrap()
-                    .shard = Some(0)
-            }
-            3 => {
-                source
-                    .native_origin
-                    .as_mut()
-                    .unwrap()
-                    .source
-                    .as_mut()
-                    .unwrap()
-                    .lsn = 0
-            }
-            4 => source
-                .native_origin
-                .as_mut()
-                .unwrap()
-                .source
-                .as_mut()
-                .unwrap()
-                .branch
-                .clear(),
-            5 => source.native_origin.as_mut().unwrap().adoption_audit = None,
-            6 => source
-                .native_origin
-                .as_mut()
-                .unwrap()
-                .adoption_audit
-                .as_mut()
-                .unwrap()
-                .token_id
-                .clear(),
-            7 => {
-                source.record = Record::decode(
-                    46,
-                    &kronik_core::ids::unhex(
-                        include_str!("../../../kronik-proto/tests/fixtures/secret-link-v1.hex")
-                            .trim(),
-                    )
-                    .unwrap(),
-                )
-                .unwrap()
-            }
-            _ => {
-                source.record = Record::AuditEvent(pb::AuditEvent {
-                    action: "operator.note".into(),
-                    audit: Some(audit()),
-                    ..Default::default()
-                })
-            }
-        }
-        assert_eq!(
-            mapper.lines_metadata(&source, &[]).unwrap_err().code,
-            ErrorCode::StorageCorrupt
-        );
-        assert_eq!(
-            mapper
-                .operational_lines_metadata(&source, &[])
-                .unwrap_err()
-                .code,
-            ErrorCode::StorageCorrupt
-        );
-        assert_eq!(
-            mapper.expected_metadata(&source).err().unwrap().code,
-            ErrorCode::StorageCorrupt
-        );
-    }
 }
 
 /// The fixture secrets collide with closed stream markers. Longer matches win,
@@ -359,23 +141,15 @@ fn decoded_metadata_control_views_preserve_only_closed_facts_and_the_whole_persi
     ];
     for (record, details) in portable_metadata_control_fixtures() {
         let exact = record.encode();
-        let decoded = Record::decode(40, &exact).unwrap();
-        let source = kronik_log::MetadataAuditRecord {
-            index: 97,
-            record: decoded,
-            native_origin: None,
-        };
-        let lines = mapper.lines_metadata(&source, secrets).unwrap();
-        assert_eq!(
-            (lines[0].lsn, lines[0].source),
-            (None, Some(SourcePos::Metadata { index: 97 }))
-        );
+        let source = Record::decode(40, &exact).unwrap();
+        let lines = mapper.lines_at(AT, &source, secrets).unwrap();
+        assert_eq!((lines[0].lsn, lines[0].source), (None, Some(AT)));
         assert!(lines[0].branch.is_empty());
         assert_eq!(
             (&*lines[0].schema, &*lines[0].kind),
             ("kronik.audit/v3", "audit_event")
         );
-        let Record::AuditEvent(event) = &source.record else {
+        let Record::AuditEvent(event) = &source else {
             unreachable!()
         };
         assert_eq!(lines[0].action, event.action);
@@ -388,33 +162,28 @@ fn decoded_metadata_control_views_preserve_only_closed_facts_and_the_whole_persi
         assert!(!lines[0].reason.contains("private-NEEDLE"));
         assert!(!lines[0].reason.contains("exact-prefix"));
         assert!(!lines[0].reason.contains("exact-suffix"));
-        let unambiguous = mapper.lines_metadata(&source, &[]).unwrap();
+        let unambiguous = mapper.lines_at(AT, &source, &[]).unwrap();
         assert_eq!(unambiguous[0].reason, event.audit.as_ref().unwrap().reason);
         assert_eq!(lines[0].record_hash, unambiguous[0].record_hash);
         assert_eq!(lines[0].at_wall_ms, 19);
         assert_eq!(lines[0].token_id, "system:metadata");
-        assert_eq!(source.record.encode(), exact);
+        assert_eq!(source.encode(), exact);
         assert!(metadata_view_complete(&mapper, &source, &lines));
         let mut invalid = source;
-        let Record::AuditEvent(event) = &mut invalid.record else {
+        let Record::AuditEvent(event) = &mut invalid else {
             unreachable!()
         };
         event
             .details
             .insert("secret_value".into(), "private-NEEDLE".into());
-        assert!(mapper.lines_metadata(&invalid, secrets).is_err());
-        assert!(mapper.expected_metadata(&invalid).is_err());
+        assert!(mapper.lines_at(AT, &invalid, secrets).is_err());
+        assert!(mapper.expected_at(AT, &invalid).is_err());
     }
-    let (gap, _) = portable_metadata_control_fixtures()
+    let (source, _) = portable_metadata_control_fixtures()
         .into_iter()
         .next()
         .unwrap();
-    let source = kronik_log::MetadataAuditRecord {
-        index: 97,
-        record: gap,
-        native_origin: None,
-    };
-    let lines = mapper.lines_metadata(&source, secrets).unwrap();
+    let lines = mapper.lines_at(AT, &source, secrets).unwrap();
     for field in ["from_index", "through_index"] {
         let mut changed = lines.clone();
         changed[0]
@@ -424,11 +193,11 @@ fn decoded_metadata_control_views_preserve_only_closed_facts_and_the_whole_persi
         assert!(!metadata_view_complete(&mapper, &source, &changed));
     }
     let mut ordinary = source;
-    let Record::AuditEvent(event) = &mut ordinary.record else {
+    let Record::AuditEvent(event) = &mut ordinary else {
         unreachable!()
     };
     event.action = "operator.note".into();
-    let lines = mapper.lines_metadata(&ordinary, secrets).unwrap();
+    let lines = mapper.lines_at(AT, &ordinary, secrets).unwrap();
     assert_ne!(
         lines[0].details.get("namespace"),
         Some(&serde_json::json!("metadata"))
@@ -467,28 +236,21 @@ fn decoded_protected_approval_uses_the_metadata_receipt_without_publishing_its_i
         ..Default::default()
     });
     let exact = record.encode();
-    let source = kronik_log::MetadataAuditRecord {
-        index: 97,
-        record: Record::decode(8, &exact).unwrap(),
-        native_origin: None,
-    };
+    let source = Record::decode(8, &exact).unwrap();
     let lines = mapper
-        .lines_metadata(&source, &[("private", b"private-NEEDLE")])
+        .lines_at(AT, &source, &[("private", b"private-NEEDLE")])
         .unwrap();
     assert_eq!(
         (&*lines[0].schema, &*lines[0].kind, &*lines[0].action),
         ("kronik.audit/v3", "approval", "approve")
     );
-    assert_eq!(
-        (lines[0].lsn, lines[0].source),
-        (None, Some(SourcePos::Metadata { index: 97 }))
-    );
+    assert_eq!((lines[0].lsn, lines[0].source), (None, Some(AT)));
     assert!(lines[0].branch.is_empty());
     assert!(!lines[0].to_json().contains("private-NEEDLE"));
     assert!(!lines[0].details.contains_key("verified_identity"));
     assert!(!lines[0].details.contains_key("ciphertext"));
     assert!(metadata_view_complete(&mapper, &source, &lines));
-    assert_eq!(source.record.encode(), exact);
+    assert_eq!(source.encode(), exact);
     for mutation in 0..3 {
         let mut invalid = Record::decode(8, &exact).unwrap();
         let Record::Approval(approval) = &mut invalid else {
@@ -505,12 +267,7 @@ fn decoded_protected_approval_uses_the_metadata_receipt_without_publishing_its_i
             }
             _ => approval.verified_identity.as_mut().unwrap().value = None,
         }
-        let invalid = kronik_log::MetadataAuditRecord {
-            index: 97,
-            record: invalid,
-            native_origin: None,
-        };
-        assert!(mapper.lines_metadata(&invalid, &[]).is_err());
-        assert!(mapper.expected_metadata(&invalid).is_err());
+        assert!(mapper.lines_at(AT, &invalid, &[]).is_err());
+        assert!(mapper.expected_at(AT, &invalid).is_err());
     }
 }

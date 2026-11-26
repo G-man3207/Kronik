@@ -3080,48 +3080,8 @@ mod tests {
             from_index: 1,
             through_index: 17,
         };
+        // The ordinary actor audit producer refuses to forge a closed metadata gap.
         let before = fleet.node.applied_lsn();
-        assert_eq!(
-            fleet
-                .node
-                .record_metadata_audit_gap(gap.clone(), authority(&fleet))
-                .await
-                .unwrap_err()
-                .code,
-            ErrorCode::Unauthenticated
-        );
-        assert_eq!(fleet.node.applied_lsn(), before);
-        let physical = fleet.node.local_operator_authority().unwrap();
-        let receipt = fleet
-            .node
-            .record_metadata_audit_gap(gap.clone(), physical.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            fleet
-                .node
-                .record_metadata_audit_gap(gap.clone(), physical.clone())
-                .await
-                .unwrap(),
-            receipt
-        );
-        let kronik_core::ids::SourcePos::Actor { shard: None, lsn } = receipt else {
-            panic!("the native receipt must retain its actual actor-log namespace");
-        };
-        assert_eq!(fleet.node.applied_lsn(), lsn);
-        fleet
-            .node
-            .reader()
-            .read(lsn, lsn, |committed| {
-                let Record::AuditEvent(event) = committed.record else {
-                    panic!("missing durable metadata gap");
-                };
-                assert_eq!(event.details, gap.to_details());
-                kronik_proto::control::validate_metadata_gap_event(&event).unwrap();
-                Ok(())
-            })
-            .await
-            .unwrap();
         assert_eq!(
             fleet
                 .node
@@ -3137,7 +3097,7 @@ mod tests {
                 .code,
             ErrorCode::BadRequest
         );
-        assert_eq!(fleet.node.applied_lsn(), lsn);
+        assert_eq!(fleet.node.applied_lsn(), before);
         // Unknown inventory cannot turn free text into an unsanitized success.
         // Warm certified bytes survive ciphertext damage; the physical identity must become uncertifiable too.
         rusqlite::Connection::open(dir.path().join("keys/secrets.db"))
@@ -3155,35 +3115,6 @@ mod tests {
                 .is_err()
         );
         assert!(fleet.node.secret_values().is_err());
-        let unavailable_gap = kronik_log::MetadataAuditGap {
-            from_index: 18,
-            through_index: 19,
-            ..gap
-        };
-        let receipt = fleet
-            .node
-            .record_metadata_audit_gap(unavailable_gap.clone(), physical)
-            .await
-            .unwrap();
-        let kronik_core::ids::SourcePos::Actor { shard: None, lsn } = receipt else {
-            panic!("the native receipt must retain its actual actor-log namespace");
-        };
-        fleet
-            .node
-            .reader()
-            .read(lsn, lsn, |committed| {
-                let Record::AuditEvent(event) = committed.record else {
-                    panic!("missing durable metadata gap");
-                };
-                assert_eq!(event.details, unavailable_gap.to_details());
-                assert_eq!(
-                    event.audit.as_ref().unwrap().reason,
-                    kronik_sched::scrub::WITHHELD
-                );
-                Ok(())
-            })
-            .await
-            .unwrap();
         let result = fleet
             .node
             .record_audit_event_authorized(

@@ -52,17 +52,9 @@ pub struct Line {
     pub epoch: Option<u64>,
     pub details: Map<String, Value>,
     pub record_hash: String,
-    #[serde(skip)]
-    #[schemars(skip)]
-    native_adoption_current_projection: Option<bool>,
 }
 
 impl Line {
-    /// Closed source provenance from the Mapper, never inferred from free details.
-    pub fn native_adoption_current_projection(&self) -> Option<bool> {
-        self.native_adoption_current_projection
-    }
-
     /// The line as written to a sink, without its `\n`.
     pub fn to_json(&self) -> String {
         // A struct of strings, integers and JSON values always serializes.
@@ -141,39 +133,6 @@ impl Mapper {
             record,
             secrets,
         )
-    }
-
-    /// Consume the record and adoption facts from one authoritative metadata image.
-    pub fn lines_metadata(
-        &self,
-        source: &kronik_log::MetadataAuditRecord,
-        secrets: &[(&str, &[u8])],
-    ) -> Result<Vec<Line>, ApiError> {
-        source.validate()?;
-        let mut lines = self.lines_at(
-            SourcePos::Metadata {
-                index: source.index,
-            },
-            &source.record,
-            secrets,
-        )?;
-        if let Some(origin) = &source.native_origin {
-            for line in &mut lines {
-                line.details
-                    .insert("native_origin".into(), native_origin_details(origin)?);
-                line.native_adoption_current_projection = Some(origin.current_projection);
-            }
-        }
-        Ok(lines)
-    }
-
-    /// The metadata union contains no actor turns or separate dead-letter events.
-    pub fn operational_lines_metadata(
-        &self,
-        source: &kronik_log::MetadataAuditRecord,
-        secrets: &[(&str, &[u8])],
-    ) -> Result<Vec<Line>, ApiError> {
-        self.lines_metadata(source, secrets)
     }
 
     fn lines_in(
@@ -299,7 +258,6 @@ impl Mapper {
             epoch: None,
             details,
             record_hash: hash,
-            native_adoption_current_projection: None,
         });
         Ok(out)
     }
@@ -311,28 +269,6 @@ impl Mapper {
         record: &Record,
     ) -> Result<Vec<Expected>, ApiError> {
         self.expected_in(source, &self.branch, record)
-    }
-
-    pub fn expected_metadata(
-        &self,
-        source: &kronik_log::MetadataAuditRecord,
-    ) -> Result<Vec<Expected>, ApiError> {
-        source.validate()?;
-        let mut expected = self.expected_at(
-            SourcePos::Metadata {
-                index: source.index,
-            },
-            &source.record,
-        )?;
-        if let Some(origin) = &source.native_origin {
-            for item in &mut expected {
-                item.line
-                    .details
-                    .insert("native_origin".into(), native_origin_details(origin)?);
-                item.line.native_adoption_current_projection = Some(origin.current_projection);
-            }
-        }
-        Ok(expected)
     }
 
     fn expected_in(
@@ -695,7 +631,6 @@ fn projected_lines(
         epoch,
         details,
         record_hash: String::new(),
-        native_adoption_current_projection: None,
     };
     match record {
         Record::Deployment(d) => {
@@ -1064,26 +999,6 @@ fn projected_lines(
     Ok(out)
 }
 
-/// Only the shared validated NativeAuthorityOrigin schema reaches this projection.
-fn native_origin_details(origin: &pb::NativeAuthorityOrigin) -> Result<Value, ApiError> {
-    let adoption = origin
-        .adoption_audit
-        .as_ref()
-        .ok_or_else(|| corruption(LogError::Corrupt("missing native adoption audit".into())))?;
-    let mut public = obj(json!({
-        "adopted_at_wall_ms": adoption.wall_time_ms,
-        "current_projection": origin.current_projection,
-    }));
-    if let Some(original) = &origin.source {
-        public.insert(
-            "original_source".into(),
-            json!({
-                "shard": original.shard, "lsn": original.lsn, "branch": original.branch,
-            }),
-        );
-    }
-    Ok(public.into())
-}
 fn operation_details(
     operation: &pb::audit_event::Operation,
 ) -> Result<Map<String, Value>, ApiError> {

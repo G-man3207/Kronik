@@ -17,7 +17,7 @@ use kronik_log::Committed;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{ExportResume, Node, ShardReader};
 
-use crate::cursor::{Control, Cursors, Entry, Generation, Rewind};
+use crate::cursor::{Control, Cursors, Entry, Generation};
 
 /// What a sink did with a batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,102 +388,6 @@ impl Stream {
         Ok(saved)
     }
 
-    /// Only the actual metadata caller supplies these coordinates and its original lease.
-    pub async fn rewind_metadata(
-        self: &Arc<Self>,
-        env: &Env,
-        to: u64,
-        original: AuthLease,
-    ) -> Result<Rewind, ApiError> {
-        original.check()?;
-        if self.is_stopping() {
-            return Err(ApiError::new(
-                ErrorCode::Unavailable,
-                "the export stream is stopping",
-            ));
-        }
-        let held = tokio::select! {
-            biased;
-            () = self.stopped() => return Err(ApiError::new(ErrorCode::Unavailable, "the export stream is stopping")),
-            () = original.cancelled() => {
-                original.check()?;
-                return Err(ApiError::new(ErrorCode::Unauthenticated, "metadata rewind authority was revoked"));
-            },
-            held = self.control.clone().lock_owned() => held,
-        };
-        let current = self.cursors.get(self.name.as_ref()).unwrap_or_default();
-        let generation = loop {
-            let generation = env.random_bytes();
-            if generation != [0; 16]
-                && generation != current.generation()
-                && current
-                    .pending_rewind()
-                    .is_none_or(|rewind| rewind.generation != generation)
-            {
-                break generation;
-            }
-        };
-        let (stream, retained) = (self.clone(), original.clone());
-        let mut job = Some(async move {
-            let (_control, _original) = (held, retained);
-            if stream.is_stopping() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "the export stream is stopping",
-                ));
-            }
-            let rewind = stream
-                .cursors
-                .request_rewind(stream.name.as_ref(), generation, to)
-                .await?;
-            stream.rewound.notify_one();
-            Ok(rewind)
-        });
-        let mut denial = Some(ApiError::new(
-            ErrorCode::Unavailable,
-            "the export stream stopped before metadata rewind admission",
-        ));
-        let mut accepted = None;
-        original.admit(&mut || {
-            if self.is_stopping() {
-                return Err(denial.take().unwrap_or_else(|| ApiError {
-                    code: ErrorCode::Internal,
-                    message: String::new(),
-                    hint: None,
-                }));
-            }
-            let job = job.take().ok_or_else(|| ApiError {
-                code: ErrorCode::Internal,
-                message: String::new(),
-                hint: None,
-            })?;
-            accepted = Some(env.spawn("export-rewind", job));
-            Ok(())
-        })?;
-        accepted
-            .ok_or_else(|| {
-                ApiError::new(
-                    ErrorCode::Internal,
-                    "metadata rewind authority did not enqueue the operation",
-                )
-            })?
-            .await
-            .unwrap_or_else(|| Err(io::Error::other("metadata rewind task did not complete")))
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::InvalidInput {
-                    ApiError::new(
-                        ErrorCode::BadRequest,
-                        "the rewind no longer matches the durable metadata cursor",
-                    )
-                } else {
-                    ApiError::new(
-                        ErrorCode::Unavailable,
-                        "the metadata export rewind could not be made durable",
-                    )
-                }
-            })
-    }
-
     /// Durably requests a new replay generation before waking the follower.
     /// The owned task completes even if the operator stops waiting.
     pub async fn rewind(
@@ -602,12 +506,6 @@ enum Projection {
         Arc<CertifiedSecretSnapshot>,
         SecretSnapshotPublication,
     ),
-    Metadata(Arc<CertifiedSecretSnapshot>, SecretSnapshotPublication),
-    MetadataRecords(
-        Arc<Stream>,
-        Arc<CertifiedSecretSnapshot>,
-        SecretSnapshotPublication,
-    ),
 }
 
 pub struct RetainedDisclosure {
@@ -624,12 +522,6 @@ impl RetainedDisclosure {
                 Projection::Checkpoint => "the original native checkpoint admission is unavailable",
                 Projection::Records(..) => {
                     "the retained native secret snapshot changed before publication"
-                }
-                Projection::Metadata(..) => {
-                    "the captured metadata response secret snapshot changed before publication"
-                }
-                Projection::MetadataRecords(..) => {
-                    "the retained metadata stream or secret snapshot changed before publication"
                 }
             },
         )
@@ -648,18 +540,6 @@ impl RetainedDisclosure {
         })
     }
 
-    /// Retain the actual metadata producer's paired certificate, not metadata authority.
-    pub fn metadata_response(
-        snapshot: Arc<CertifiedSecretSnapshot>,
-        publication: SecretSnapshotPublication,
-        original: AuthLease,
-    ) -> AuthLease {
-        Arc::new(Self {
-            original,
-            projection: Projection::Metadata(snapshot, publication),
-        })
-    }
-
     /// Private configured lifecycle/control publication, not a disclosure escape.
     pub(crate) fn native_checkpoint(original: AuthLease) -> AuthLease {
         Arc::new(Self {
@@ -667,18 +547,6 @@ impl RetainedDisclosure {
             projection: Projection::Checkpoint,
         })
     }
-}
-/// The configured metadata worker keeps the same stream, paired DATA and original through EOF/cursor publication.
-pub fn metadata_records(
-    stream: &Arc<Stream>,
-    snapshot: Arc<CertifiedSecretSnapshot>,
-    publication: SecretSnapshotPublication,
-    original: AuthLease,
-) -> AuthLease {
-    Arc::new(RetainedDisclosure {
-        original,
-        projection: Projection::MetadataRecords(stream.clone(), snapshot, publication),
-    })
 }
 
 impl Authority for RetainedDisclosure {
@@ -690,31 +558,10 @@ impl Authority for RetainedDisclosure {
                 reader.check()?;
                 publication.check_current()
             }
-            Projection::Metadata(_snapshot, publication) => publication.check_current(),
-            Projection::MetadataRecords(stream, _snapshot, publication) => {
-                if stream.is_stopping() {
-                    return Err(ApiError::new(
-                        ErrorCode::Unavailable,
-                        "the metadata export stream is stopping",
-                    ));
-                }
-                publication.check_current()
-            }
         }
     }
     fn cancelled(&self) -> BoxFuture<'static, ()> {
-        match &self.projection {
-            Projection::MetadataRecords(stream, ..) => {
-                let stream = stream.clone();
-                let original = self.original.clone();
-                Box::pin(async move {
-                    tokio::select! {
-                    biased;
-                    () = stream.stopped() => {}, () = original.cancelled() => {} }
-                })
-            }
-            _ => self.original.cancelled(),
-        }
+        self.original.cancelled()
     }
     fn admit(&self, effect: &mut dyn FnMut() -> Result<(), ApiError>) -> Result<(), ApiError> {
         self.original.admit(&mut || match &self.projection {
@@ -724,26 +571,6 @@ impl Authority for RetainedDisclosure {
                     return Err(self.denied());
                 }
                 publication.with_current_publication(|| self.denied(), &mut *effect)
-            }
-            Projection::Metadata(_snapshot, publication) => {
-                publication.with_current_publication(|| self.denied(), &mut *effect)
-            }
-            Projection::MetadataRecords(stream, _snapshot, publication) => {
-                let published = publication.with_current_publication(
-                    || self.denied(),
-                    || {
-                        if stream.is_stopping() {
-                            return Ok(false);
-                        }
-                        effect()?;
-                        Ok(true)
-                    },
-                )?;
-                if published {
-                    Ok(())
-                } else {
-                    Err(self.denied())
-                }
             }
         })
     }
@@ -1066,74 +893,6 @@ mod retained_file_tests {
     }
 
     #[tokio::test]
-    async fn metadata_projection_retains_the_same_certificate_without_granting_a_stale_publication()
-    {
-        // Exercise DATA retention with a genuine producer certificate, not a fabricated metadata source.
-        let data = tempfile::tempdir().unwrap();
-        let node = kronik_sched::start_local(
-            Env::real(tokio::runtime::Handle::current()),
-            data.path(),
-            kronik_sched::NodeConfig::default(),
-        )
-        .await
-        .unwrap();
-        let original = node.local_operator_authority().unwrap();
-        let audit = pb::Audit {
-            token_id: "unix:uid=0".into(),
-            reason: "actual certificate data retention".into(),
-            wall_time_ms: node.env().clock.wall_ms(),
-        };
-        node.secret_set(
-            "metadata-projection",
-            b"first-certificate-needle".to_vec(),
-            &audit,
-            false,
-            original.clone(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let (snapshot, publication) = node.native_secret_snapshot_with_publication().unwrap();
-        let held = Arc::downgrade(&snapshot);
-        let guarded =
-            RetainedDisclosure::metadata_response(snapshot, publication, original.clone());
-        assert!(held.upgrade().is_some());
-        guarded.check().unwrap();
-        let mut published = 0;
-        guarded
-            .admit(&mut || {
-                published += 1;
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(published, 1);
-        node.secret_set(
-            "metadata-projection",
-            b"second-certificate-needle".to_vec(),
-            &audit,
-            false,
-            original.clone(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        original.check().unwrap();
-        assert!(guarded.check().is_err());
-        assert!(
-            guarded
-                .admit(&mut || {
-                    published += 1;
-                    Ok(())
-                })
-                .is_err()
-        );
-        assert_eq!(published, 1);
-        assert!(held.upgrade().is_some());
-        drop(guarded);
-        assert!(held.upgrade().is_none());
-    }
-
-    #[tokio::test]
     async fn refreshed_same_facts_require_fresh_preparation_before_a_real_post() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -1351,70 +1110,6 @@ mod retained_file_tests {
     }
 
     #[tokio::test]
-    async fn metadata_worker_guard_retains_exact_pair_and_refuses_post_stop_admission() {
-        let data = tempfile::tempdir().unwrap();
-        let env = Env::real(tokio::runtime::Handle::current());
-        let node = kronik_sched::start_local(
-            env.clone(),
-            data.path(),
-            kronik_sched::NodeConfig::default(),
-        )
-        .await
-        .unwrap();
-        let original = node.local_operator_authority().unwrap();
-        let audit = pb::Audit {
-            token_id: "unix:uid=0".into(),
-            reason: "actual metadata worker data retention".into(),
-            wall_time_ms: env.clock.wall_ms(),
-        };
-        node.secret_set(
-            "metadata-worker",
-            b"actual-worker-held-needle".to_vec(),
-            &audit,
-            false,
-            original.clone(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let (snapshot, publication) = node.native_secret_snapshot_with_publication().unwrap();
-        let held = Arc::downgrade(&snapshot);
-        let cursors = Arc::new(Cursors::load(env, data.path()).await.unwrap());
-        let stream = Stream::new(
-            format!("events-{}:metadata", "actual-worker"),
-            true,
-            String::new(),
-            0,
-            cursors,
-        );
-        let guarded = metadata_records(&stream, snapshot, publication, original.clone());
-        assert!(held.upgrade().is_some());
-        let mut published = 0;
-        guarded
-            .admit(&mut || {
-                published += 1;
-                Ok(())
-            })
-            .unwrap();
-        stream.stop_and_join().await.unwrap();
-        original.check().unwrap();
-        assert!(guarded.check().is_err());
-        assert!(
-            guarded
-                .admit(&mut || {
-                    published += 1;
-                    Ok(())
-                })
-                .is_err()
-        );
-        assert_eq!(published, 1);
-        guarded.cancelled().await;
-        assert!(held.upgrade().is_some());
-        drop(guarded);
-        assert!(held.upgrade().is_none());
-    }
-
-    #[tokio::test]
     async fn stopping_joins_the_real_owned_http_worker_through_held_response_eof() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let data = tempfile::tempdir().unwrap();
@@ -1446,13 +1141,14 @@ mod retained_file_tests {
         let held = Arc::downgrade(&snapshot);
         let cursors = Arc::new(Cursors::load(env.clone(), data.path()).await.unwrap());
         let stream = Stream::new(
-            format!("events-{}:metadata", "held-response"),
+            "events-held-response".to_owned(),
             true,
             String::new(),
             0,
             cursors,
         );
-        let guard = metadata_records(&stream, snapshot, publication, original);
+        let reader = Arc::new(node.capture_system_export_reader().await.unwrap());
+        let guard = RetainedDisclosure::native(reader, snapshot, publication, original);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (received, request_received) = tokio::sync::oneshot::channel();
