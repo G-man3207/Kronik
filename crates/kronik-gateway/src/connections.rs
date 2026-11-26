@@ -107,13 +107,14 @@ impl Limits {
 }
 
 fn to_message(frame: &pb::Frame) -> Message {
-    let data: &[u8] = match frame.data.as_ref().and_then(|d| d.value.as_ref()) {
-        Some(pb::sealable::Value::Plain(b)) => b,
-        // The hub gets the committed record's frames before they are
-        // sealed. The one value that is not plain is the tombstone of a
-        // subject erased while the turn ran (§6.8): it goes out empty.
-        _ => &[],
-    };
+    // The hub gets the committed record's frames before they are sealed. The
+    // one value that is not plain is the tombstone of a subject erased while
+    // the turn ran (§6.8): it goes out empty.
+    let data: &[u8] = frame
+        .data
+        .as_ref()
+        .and_then(pb::Sealable::plain)
+        .unwrap_or_default();
     match pb::frame::Kind::try_from(frame.kind) {
         Ok(pb::frame::Kind::Binary) => Message::Binary(Bytes::copy_from_slice(data)),
         // An event's data is a text frame on a WebSocket.

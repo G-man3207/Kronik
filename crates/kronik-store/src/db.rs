@@ -2763,10 +2763,14 @@ fn apply_turn(
                     }
                 }
             } else {
-                let turn_id =
-                    pb::CallEffectResponse::decode(sealable_plain(e.response.as_ref()).as_slice())
-                        .map(|r| r.turn_id)
-                        .unwrap_or_default();
+                let turn_id = pb::CallEffectResponse::decode(
+                    e.response
+                        .as_ref()
+                        .and_then(pb::Sealable::plain)
+                        .unwrap_or_default(),
+                )
+                .map(|r| r.turn_id)
+                .unwrap_or_default();
                 // An erased answer carries no response body, but its
                 // committed callee is the effect's source (ADR 0124).
                 if !turn_id.is_empty() {
@@ -3118,13 +3122,6 @@ fn apply_connections(
 /// How many dead letters of connection inputs (failed frame and close
 /// turns) state.db keeps, node-wide; the oldest go first (M24, review M5).
 pub const MAX_CONNECTION_DEAD_LETTERS: i64 = 10_000;
-
-fn sealable_plain(s: Option<&pb::Sealable>) -> Vec<u8> {
-    match s.and_then(|s| s.value.as_ref()) {
-        Some(pb::sealable::Value::Plain(b)) => b.clone(),
-        _ => Vec::new(),
-    }
-}
 
 fn message_input(
     source: pb::MessageSource,
