@@ -10,15 +10,14 @@ publish.workspace = true
 aho-corasick = { workspace = true }
 blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
-hmac = { workspace = true }
 http = { workspace = true }
 kronik-core = { workspace = true }
 kronik-privacy = { workspace = true }
 kronik-proto = { workspace = true }
 prost = { workspace = true }
+ring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 zeroize = { workspace = true }
 
 [lints]
