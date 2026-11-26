@@ -28,9 +28,6 @@ use serde_json::json;
 /// sign: the crate itself signs through the key resolver.
 fn signature(key: &[u8], timestamp_ms: u64, event_id: &str, body: &[u8]) -> Result<String, String> {
     use hmac::{KeyInit as _, Mac as _};
-    if key.is_empty() {
-        return Err("webhook_signature".into());
-    }
     let input = kronik_fleet::webhook::signing_input(timestamp_ms, event_id, body)?;
     let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key)
         .map_err(|_| "webhook_signature".to_owned())?;
@@ -716,36 +713,13 @@ fn effect_subindices_are_distinct_and_sse_resumes_after_each_event() {
 }
 
 #[test]
-fn hmac_authenticates_version_timestamp_identity_and_exact_body() {
+fn signing_input_is_versioned_exact_and_refuses_a_bad_event_id() {
     let id = "ke1.69.6d.actor.native.9.0.0000000000000000000000000000000000000000000000000000000000000000";
-    let signed = signature(b"dummy-key", 123, id, b"{\"a\":1}").unwrap();
-    assert_eq!(
-        signed,
-        signature(b"dummy-key", 123, id, b"{\"a\":1}").unwrap()
-    );
-    assert_ne!(
-        signed,
-        signature(b"dummy-key", 124, id, b"{\"a\":1}").unwrap()
-    );
-    let different = "ke1.69.6d.actor.native.10.0.0000000000000000000000000000000000000000000000000000000000000000";
-    assert_ne!(
-        signed,
-        signature(b"dummy-key", 123, different, b"{\"a\":1}").unwrap()
-    );
-    assert_ne!(
-        signed,
-        signature(b"dummy-key", 123, id, b"{\"a\":2}").unwrap()
-    );
-    assert_ne!(
-        signed,
-        signature(b"wrong-key", 123, id, b"{\"a\":1}").unwrap()
-    );
-    assert!(signature(b"dummy-key", 123, "ke1.bad\nheader", b"{}").is_err());
-    assert!(signature(b"", 123, id, b"{}").is_err());
     assert_eq!(
         webhook::signing_input(123, id, b"{}").unwrap(),
         format!("kronik.webhook/v1\n123\n{id}\n{{}}").into_bytes()
     );
+    assert!(webhook::signing_input(123, "ke1.bad\nheader", b"{}").is_err());
 }
 
 #[tokio::test]
@@ -1771,105 +1745,6 @@ async fn canonical_operational_identity_separates_visible_changes_not_sealable_v
         )
         .is_err()
     );
-}
-
-#[tokio::test]
-// Not exercised yet: the underlying feature is not implemented. The cluster
-// milestones M16-M19 (and their record kinds 20-25:
-// shard_term, shard_membership, inbox, outbox_ack, epoch_barrier,
-// shard_origin) are not implemented; the record enum and the native log
-// cannot decode those kinds yet, so the exact event variants cannot be
-// exercised. Restore this test when the cluster record kinds are implemented.
-#[ignore = "not implemented: needs M16-M19 cluster record kinds 20-25"]
-async fn decoded_operational_wire_records_fsynced_in_native_log_publish_exact_variants() {
-    let (_directory, log, mut committed, _fatal) = native_log().await;
-    let schema = events::schemas().unwrap();
-    for (kind, wire, expected_kind, expected_action, epoch) in [
-        (
-            20,
-            include_str!("../../kronik-proto/tests/fixtures/shard-term-v1.hex"),
-            "shard_term",
-            "shard.term",
-            None,
-        ),
-        (
-            21,
-            include_str!("../../kronik-proto/tests/fixtures/shard-membership-v1.hex"),
-            "shard_membership",
-            "shard.membership",
-            None,
-        ),
-        (
-            22,
-            include_str!("../../kronik-proto/tests/fixtures/inbox-v1.hex"),
-            "inbox",
-            "shard.inbox",
-            None,
-        ),
-        (
-            23,
-            include_str!("../../kronik-proto/tests/fixtures/outbox-ack-v1.hex"),
-            "outbox_ack",
-            "shard.outbox_ack",
-            None,
-        ),
-        (
-            24,
-            include_str!("../../kronik-proto/tests/fixtures/epoch-barrier-v1.hex"),
-            "epoch_barrier",
-            "shard.epoch_barrier",
-            Some(4),
-        ),
-        (
-            25,
-            include_str!("../../kronik-proto/tests/fixtures/shard-origin-v1.hex"),
-            "shard_origin",
-            "shard.origin",
-            None,
-        ),
-    ] {
-        let bytes = kronik_core::ids::unhex(wire.trim()).unwrap();
-        let record = Record::decode(kind, &bytes).unwrap();
-        let lsn = log.append(record).await.unwrap();
-        let source = committed.recv().await.unwrap();
-        assert_eq!(source.lsn, lsn);
-        assert_eq!(source.record.kind(), kind);
-        let projected = events::project(
-            &mapper(),
-            &identity(),
-            &main_frame(source.lsn),
-            &source.record,
-            &[],
-        )
-        .unwrap();
-        let event = projected
-            .iter()
-            .find(|event| event.data.action == expected_action)
-            .unwrap();
-        assert_eq!(event.data.kind, expected_kind);
-        assert_eq!(event.data.epoch, epoch);
-        assert_eq!(event.data.at_wall_ms, 0);
-        assert_eq!(event.data.effect, None);
-        assert_eq!(event.source, native(source.lsn));
-        assert_eq!(event.record_kind, kind);
-        assert_eq!(serde_json::to_value(event).unwrap().get("lsn"), None);
-        assert_eq!(serde_json::to_value(event).unwrap().get("shard"), None);
-        let metadata = serde_json::to_value(&event.data).unwrap();
-        for private in ["reason", "token_id", "details", "body", "payload"] {
-            assert!(metadata.get(private).is_none());
-        }
-        let constraint = schema["allOf"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|constraint| {
-                constraint["if"]["properties"]["record_kind"]["const"] == json!(kind)
-            })
-            .unwrap();
-        let published = &constraint["then"]["properties"]["data"]["properties"];
-        assert_eq!(published["kind"]["const"], expected_kind);
-        assert_eq!(published["action"]["const"], expected_action);
-    }
 }
 
 #[tokio::test]
