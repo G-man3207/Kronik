@@ -704,7 +704,8 @@ impl TraceState {
 mod tests {
     use super::*;
     use kronik_core::causal;
-    use kronik_core::env::{BoxFuture, Fs};
+    use kronik_core::env::Fs;
+    use kronik_core::env::test_fs::{FsCall, Then, hooked};
     use kronik_core::ids::ActorRef;
     use kronik_proto::log::v1 as pb;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -1108,16 +1109,6 @@ mod tests {
         assert!(source.is::<io::Error>());
     }
 
-    struct FaultFs {
-        inner: Arc<dyn Fs>,
-        fail: Arc<AtomicU8>,
-        syncs: Arc<AtomicUsize>,
-    }
-    struct FaultFile {
-        inner: Arc<dyn File>,
-        fail: Arc<AtomicU8>,
-        syncs: Arc<AtomicUsize>,
-    }
     fn inject(fail: &AtomicU8, point: u8) -> io::Result<()> {
         if fail
             .compare_exchange(point, 0, Ordering::SeqCst, Ordering::SeqCst)
@@ -1132,82 +1123,26 @@ mod tests {
             Ok(())
         }
     }
-    impl File for FaultFile {
-        fn len(&self) -> BoxFuture<'static, io::Result<u64>> {
-            self.inner.len()
-        }
-        fn read_at(&self, offset: u64, len: usize) -> BoxFuture<'static, io::Result<Vec<u8>>> {
-            self.inner.read_at(offset, len)
-        }
-        fn write_at(&self, offset: u64, bytes: Bytes) -> BoxFuture<'static, io::Result<()>> {
-            for point in [5, 7] {
-                if let Err(e) = inject(&self.fail, point) {
-                    return Box::pin(async { Err(e) });
+    /// `fs`, failing a call at the injection point `fail` holds (see
+    /// `inject`) and counting the `sync_data` calls in `syncs`.
+    fn faulty(fs: Arc<dyn Fs>, fail: Arc<AtomicU8>, syncs: Arc<AtomicUsize>) -> Arc<dyn Fs> {
+        hooked(fs, move |call| {
+            let points: &[u8] = match call {
+                FsCall::Open(..) => &[4],
+                FsCall::Rename { .. } => &[2, 8],
+                FsCall::SyncDir(_) => &[3],
+                FsCall::WriteAt { .. } => &[5, 7],
+                FsCall::SyncData(_) => {
+                    syncs.fetch_add(1, Ordering::SeqCst);
+                    &[1, 6]
                 }
+                _ => &[],
+            };
+            match points.iter().try_for_each(|&point| inject(&fail, point)) {
+                Ok(()) => Then::Forward,
+                Err(error) => Then::Fail(error),
             }
-            self.inner.write_at(offset, bytes)
-        }
-        fn set_len(&self, len: u64) -> BoxFuture<'static, io::Result<()>> {
-            self.inner.set_len(len)
-        }
-        fn sync_data(&self) -> BoxFuture<'static, io::Result<()>> {
-            self.syncs.fetch_add(1, Ordering::SeqCst);
-            if let Err(e) = inject(&self.fail, 1) {
-                return Box::pin(async { Err(e) });
-            }
-            if let Err(e) = inject(&self.fail, 6) {
-                return Box::pin(async { Err(e) });
-            }
-            self.inner.sync_data()
-        }
-    }
-    impl Fs for FaultFs {
-        fn create_dir_all(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-            self.inner.create_dir_all(path)
-        }
-        fn open(
-            &self,
-            path: PathBuf,
-            mode: OpenMode,
-        ) -> BoxFuture<'static, io::Result<Arc<dyn File>>> {
-            if let Err(e) = inject(&self.fail, 4) {
-                return Box::pin(async { Err(e) });
-            }
-            let future = self.inner.open(path, mode);
-            let fail = self.fail.clone();
-            let syncs = self.syncs.clone();
-            Box::pin(async move {
-                Ok(Arc::new(FaultFile {
-                    inner: future.await?,
-                    fail,
-                    syncs,
-                }) as Arc<dyn File>)
-            })
-        }
-        fn exists(&self, path: PathBuf) -> BoxFuture<'static, io::Result<bool>> {
-            self.inner.exists(path)
-        }
-        fn read_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<Vec<String>>> {
-            self.inner.read_dir(path)
-        }
-        fn remove_file(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-            self.inner.remove_file(path)
-        }
-        fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-            if let Err(e) = inject(&self.fail, 2) {
-                return Box::pin(async { Err(e) });
-            }
-            if let Err(e) = inject(&self.fail, 8) {
-                return Box::pin(async { Err(e) });
-            }
-            self.inner.rename(from, to)
-        }
-        fn sync_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-            if let Err(e) = inject(&self.fail, 3) {
-                return Box::pin(async { Err(e) });
-            }
-            self.inner.sync_dir(path)
-        }
+        })
     }
 
     #[tokio::test]
@@ -1217,11 +1152,7 @@ mod tests {
             let mut env = env();
             let fail = Arc::new(AtomicU8::new(0));
             let syncs = Arc::new(AtomicUsize::new(0));
-            env.fs = Arc::new(FaultFs {
-                inner: env.fs.clone(),
-                fail: fail.clone(),
-                syncs: syncs.clone(),
-            });
+            env.fs = faulty(env.fs.clone(), fail.clone(), syncs.clone());
             let (mut state, mut open) = start(env.clone(), dir.path()).await;
             open.begin(&causal::root("chosen".into()), None);
             let chosen = state.checkpoint(&mut open, 1).await.unwrap();
@@ -1290,11 +1221,7 @@ mod tests {
         let mut env = env();
         let fail = Arc::new(AtomicU8::new(0));
         let syncs = Arc::new(AtomicUsize::new(0));
-        env.fs = Arc::new(FaultFs {
-            inner: env.fs.clone(),
-            fail: fail.clone(),
-            syncs: syncs.clone(),
-        });
+        env.fs = faulty(env.fs.clone(), fail.clone(), syncs.clone());
         let (mut state, mut open) = start(env.clone(), dir.path()).await;
         open.begin(&causal::root("durable".into()), None);
         let chosen = state.checkpoint(&mut open, 1).await.unwrap();
@@ -1379,11 +1306,7 @@ mod tests {
             let mut env = env();
             let fail = Arc::new(AtomicU8::new(0));
             let syncs = Arc::new(AtomicUsize::new(0));
-            env.fs = Arc::new(FaultFs {
-                inner: env.fs.clone(),
-                fail: fail.clone(),
-                syncs,
-            });
+            env.fs = faulty(env.fs.clone(), fail.clone(), syncs);
             let (mut state, mut open) = start(env.clone(), dir.path()).await;
             open.begin(&causal::root("snapshot".into()), None);
             fail.store(point, Ordering::SeqCst);
@@ -1418,11 +1341,7 @@ mod tests {
         let mut env = env();
         let fail = Arc::new(AtomicU8::new(0));
         let syncs = Arc::new(AtomicUsize::new(0));
-        env.fs = Arc::new(FaultFs {
-            inner: env.fs.clone(),
-            fail: fail.clone(),
-            syncs: syncs.clone(),
-        });
+        env.fs = faulty(env.fs.clone(), fail.clone(), syncs.clone());
         let (mut state, mut open) = start(env, dir.path()).await;
         open.begin(&causal::root("first".into()), None);
         state.checkpoint(&mut open, 1).await.unwrap();
