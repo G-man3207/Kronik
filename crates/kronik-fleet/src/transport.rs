@@ -9,7 +9,6 @@ use bytes::BytesMut;
 use kronik_core::authority::AuthLease;
 use kronik_core::env::{BoxFuture, Env, Net, WebSocket, WebSocketRequest};
 use kronik_core::error::{ApiError, ErrorCode};
-use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
 use tokio::sync::Notify;
 
@@ -165,9 +164,6 @@ struct ConnectCommand {
     original: AuthLease,
     guard: EpochGuard,
     request_id: Arc<str>,
-    key_version: [u8; 32],
-    body_hash: [u8; 32],
-    command_hash: [u8; 32],
     permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -180,15 +176,6 @@ pub struct PreparedControl {
 impl PreparedControl {
     pub fn destination(&self) -> &str {
         &self.command.request.url
-    }
-    pub fn body_hash(&self) -> [u8; 32] {
-        self.command.body_hash
-    }
-    pub fn command_hash(&self) -> [u8; 32] {
-        self.command.command_hash
-    }
-    pub fn key_version(&self) -> [u8; 32] {
-        self.command.key_version
     }
     pub fn epoch(&self) -> u64 {
         self.command.guard.epoch()
@@ -279,12 +266,8 @@ impl ReadyControl {
             original,
             guard,
             permit,
-            key_version,
-            body_hash,
-            command_hash,
-            request_id,
+            ..
         } = self.0;
-        let _binding = (key_version, body_hash, command_hash, request_id);
         let _opening_permit = permit;
         let socket = net
             .websocket(request)
@@ -301,42 +284,6 @@ impl ReadyControl {
 fn check_control(original: &AuthLease, guard: &EpochGuard) -> Result<(), FleetError> {
     original.check().map_err(|_| FleetError::Revoked)?;
     guard.check()
-}
-
-fn hash_field(hash: &mut Sha256, bytes: &[u8]) {
-    hash.update((bytes.len() as u64).to_be_bytes());
-    hash.update(bytes);
-}
-
-fn control_hashes(
-    request: &WebSocketRequest,
-    enrollment: &EnrollmentRecord,
-) -> Result<([u8; 32], [u8; 32]), FleetError> {
-    let key_version = kronik_proto::control::fleet_control_tls_version(
-        &enrollment.plan.ca_sha256,
-        &enrollment.client_key_sha256,
-        enrollment
-            .client_cert_der
-            .as_deref()
-            .ok_or(FleetError::Protocol)?,
-    )
-    .map_err(|_| FleetError::Protocol)?;
-    let mut command = Sha256::new();
-    hash_field(&mut command, b"kronik.fleet-control-opening/v1");
-    hash_field(&mut command, b"GET");
-    hash_field(&mut command, request.url.as_bytes());
-    hash_field(&mut command, &(request.headers.len() as u64).to_be_bytes());
-    for (name, value) in &request.headers {
-        hash_field(&mut command, name.as_bytes());
-        hash_field(&mut command, value.as_bytes());
-    }
-    hash_field(&mut command, b"");
-    hash_field(
-        &mut command,
-        &(request.max_message_bytes as u64).to_be_bytes(),
-    );
-    hash_field(&mut command, &key_version);
-    Ok((key_version, command.finalize().into()))
 }
 
 /// One ordinary HTTP connection, including native streaming and upgrades.
@@ -389,7 +336,6 @@ where
         ],
         max_message_bytes: TUNNEL_CHUNK_BYTES,
     };
-    let (key_version, command_hash) = control_hashes(&request, enrollment)?;
     let request_id = guard.request_id.clone().ok_or(FleetError::Revoked)?;
     let permit = tokio::select! {
         biased;
@@ -404,9 +350,6 @@ where
         original: original.clone(),
         guard: guard.clone(),
         request_id,
-        key_version,
-        body_hash: Sha256::digest(b"").into(),
-        command_hash,
         permit,
     };
     let socket = dispatch(PreparedControl { command }).await?;

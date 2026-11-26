@@ -15,36 +15,6 @@ pub const TOKEN_SCOPES: [&str; 8] = [
     "read", "fork", "propose", "approve", "promote", "operate", "pii:read", "admin",
 ];
 
-/// The exact existing Native control TLS-version framing. Public certificate
-/// validation/custody and current Active-command admission remain separate.
-pub fn fleet_control_tls_version(
-    ca_sha256: &str,
-    client_key_sha256: &str,
-    cert_der: &[u8],
-) -> Result<[u8; 32], DecodeError> {
-    if [ca_sha256, client_key_sha256].iter().any(|value| {
-        value.len() != 64
-            || !value
-                .bytes()
-                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    }) || cert_der.is_empty()
-        || cert_der.len() > MAX_PUBLIC_DER_BYTES
-    {
-        return Err(invalid("FleetControlTLSVersion"));
-    }
-    let mut key = Sha256::new();
-    for field in [
-        b"kronik.fleet-control-tls/v1".as_slice(),
-        ca_sha256.as_bytes(),
-        client_key_sha256.as_bytes(),
-        cert_der,
-    ] {
-        key.update((field.len() as u64).to_be_bytes());
-        key.update(field);
-    }
-    Ok(key.finalize().into())
-}
-
 /// The managed token's public name, not an authority marker. The complete
 /// request id must still match its independently recorded fleet provenance.
 pub fn fleet_token_name(epoch: u64, request: &[u8]) -> Result<String, DecodeError> {

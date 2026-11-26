@@ -438,8 +438,6 @@ struct EnrollmentDraft {
     net: Arc<dyn Net>,
     request: HttpRequest,
     original: AuthLease,
-    body_hash: [u8; 32],
-    command_hash: [u8; 32],
 }
 
 /// Once-owned, already-capacity-reserved controller command. Neither its raw
@@ -452,12 +450,6 @@ pub struct PreparedEnrollment {
 impl PreparedEnrollment {
     pub fn destination(&self) -> &str {
         &self.draft.request.url
-    }
-    pub fn body_hash(&self) -> [u8; 32] {
-        self.draft.body_hash
-    }
-    pub fn command_hash(&self) -> [u8; 32] {
-        self.draft.command_hash
     }
     pub async fn dispatch(self) -> Result<HttpResponse, FleetError> {
         self.dispatch_with_admission(|| std::future::ready(Ok(())))
@@ -485,10 +477,7 @@ impl PreparedEnrollment {
                 net,
                 request,
                 original: retained_original,
-                body_hash,
-                command_hash,
             } = draft;
-            let _descriptor = (body_hash, command_hash);
             job_env
                 .timeout(Duration::from_secs(30), async move {
                     let _hold = before_io().await?;
@@ -512,31 +501,6 @@ impl PreparedEnrollment {
             response = accepted => response.ok_or(FleetError::Unavailable)?,
         }
     }
-}
-
-fn command_hash(
-    method: &str,
-    url: &str,
-    headers: &[(String, String)],
-    body: &[u8],
-    max: u64,
-) -> [u8; 32] {
-    fn field(hash: &mut Sha256, bytes: &[u8]) {
-        hash.update((bytes.len() as u64).to_be_bytes());
-        hash.update(bytes);
-    }
-    let mut hash = Sha256::new();
-    field(&mut hash, b"kronik.fleet-enrollment-http/v1");
-    field(&mut hash, method.as_bytes());
-    field(&mut hash, url.as_bytes());
-    field(&mut hash, &(headers.len() as u64).to_be_bytes());
-    for (name, value) in headers {
-        field(&mut hash, name.as_bytes());
-        field(&mut hash, value.as_bytes());
-    }
-    field(&mut hash, body);
-    field(&mut hash, &max.to_be_bytes());
-    hash.finalize().into()
 }
 
 /// `Requested` is durable before any token transmission. Ambiguous failure must
@@ -611,14 +575,10 @@ where
         return Err(FleetError::Invalid("enrollment body too large"));
     }
     let url = client.endpoint("/v1/enroll");
-    let body_hash = Sha256::digest(&body).into();
-    let command_hash = command_hash("POST", &url, &headers, &body, MAX_ENROLLMENT_BYTES as u64);
     let draft = EnrollmentDraft {
         env: env.clone(),
         net: client.net.clone(),
         original: authority.clone(),
-        body_hash,
-        command_hash,
         request: HttpRequest {
             method: "POST".into(),
             url,
