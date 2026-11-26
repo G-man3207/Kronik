@@ -1284,12 +1284,13 @@ impl StateDb {
         let hwm = self.time_hwm()?;
         let tx = self.conn.savepoint()?;
         // With both tables empty, no turn record has an open turn or effect
-        // to delete.
-        let open_rows: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM open_turns) OR EXISTS (SELECT 1 FROM open_effects)",
-            [],
-            |r| r.get(0),
-        )?;
+        // to delete. Cached: continuous replay applies every turn on its own
+        // (#611).
+        let open_rows: bool = tx
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM open_turns) OR EXISTS (SELECT 1 FROM open_effects)",
+            )?
+            .query_row([], |r| r.get(0))?;
         if open_rows {
             let mut del_turn =
                 tx.prepare_cached("DELETE FROM open_turns WHERE execution_id = ?1")?;
@@ -6584,20 +6585,12 @@ mod tests {
         assert_eq!(timer_pins(&db, "blob-new"), 0);
     }
 
-    /// #611: isolated replay applies production's next record, then the
-    /// fork's turn in an overlay, once per root input. Each statement is
-    /// compiled once: with a cache smaller than the cycle's statements, every
-    /// cycle evicted and compiled them again.
-    #[test]
-    fn an_apply_and_overlay_cycle_compiles_no_statement_again() {
+    /// Counts the statements `db` compiles: SQLite authorizes a statement's
+    /// actions when it compiles it. A batch's savepoint and transaction are
+    /// compiled each time on purpose, so they are not counted.
+    fn compilations(db: &mut StateDb) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
         use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let mut db = StateDb::open(Connection::open_in_memory().unwrap()).unwrap();
-        // SQLite authorizes a statement's actions when it compiles it. The
-        // overlay's savepoints and a batch's transaction are compiled each
-        // time on purpose.
-        let compiled = Arc::new(AtomicUsize::new(0));
+        let compiled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = compiled.clone();
         db.conn
             .authorizer(Some(move |ctx: AuthContext<'_>| {
@@ -6605,37 +6598,51 @@ mod tests {
                     ctx.action,
                     AuthAction::Savepoint { .. } | AuthAction::Transaction { .. }
                 ) {
-                    seen.fetch_add(1, Ordering::Relaxed);
+                    seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Authorization::Allow
             }))
             .unwrap();
-        let counted = |exec: &str, key: &str, value: &[u8]| {
-            let mut t = turn(exec, exec, http_input());
-            let Record::TurnRecord(r) = &mut t else {
-                unreachable!("turn() builds a TurnRecord");
-            };
-            r.actor = Some(pb::ActorRef {
-                kind: "counter".into(),
-                key: key.into(),
-            });
-            r.writes = vec![pb::StateWrite {
-                op: pb::StateOp::Set as i32,
-                key: "count".into(),
-                value: Some(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(value.to_vec())),
-                }),
-            }];
-            t
+        compiled
+    }
+
+    /// The counter's turn: it sets `count` of `counter/<key>` to `value`.
+    fn counter_turn(exec: &str, key: &str, value: &[u8]) -> Record {
+        let mut t = turn(exec, exec, http_input());
+        let Record::TurnRecord(r) = &mut t else {
+            unreachable!("turn() builds a TurnRecord");
         };
+        r.actor = Some(pb::ActorRef {
+            kind: "counter".into(),
+            key: key.into(),
+        });
+        r.writes = vec![pb::StateWrite {
+            op: pb::StateOp::Set as i32,
+            key: "count".into(),
+            value: Some(pb::Sealable {
+                subject: None,
+                value: Some(pb::sealable::Value::Plain(value.to_vec())),
+            }),
+        }];
+        t
+    }
+
+    /// #611: isolated replay applies production's next record, then the
+    /// fork's turn in an overlay, once per root input. Each statement is
+    /// compiled once: with a cache smaller than the cycle's statements, every
+    /// cycle evicted and compiled them again.
+    #[test]
+    fn an_apply_and_overlay_cycle_compiles_no_statement_again() {
+        use std::sync::atomic::Ordering;
+        let mut db = StateDb::open(Connection::open_in_memory().unwrap()).unwrap();
+        let compiled = compilations(&mut db);
         for n in 0..4u64 {
             // The first two cycles warm the cache.
             if n == 2 {
                 compiled.store(0, Ordering::Relaxed);
             }
             let key = format!("k{n}");
-            db.apply(&[committed(n + 1, counted(&format!("p{n}"), &key, b"1"))])
+            db.apply(&[committed(n + 1, counter_turn(&format!("p{n}"), &key, b"1"))])
                 .unwrap();
             db.overlay_begin().unwrap();
             assert!(db.actor("counter", &key).unwrap().is_some());
@@ -6643,10 +6650,39 @@ mod tests {
                 db.kv_get("counter", &key, "count").unwrap().as_deref(),
                 Some(&b"1"[..])
             );
-            db.apply(&[committed(n + 2, counted(&format!("f{n}"), &key, b"2"))])
+            db.apply(&[committed(n + 2, counter_turn(&format!("f{n}"), &key, b"2"))])
                 .unwrap();
             db.overlay_rollback().unwrap();
         }
         assert_eq!(compiled.load(Ordering::Relaxed), 0);
+    }
+
+    /// #611: continuous replay applies each fork turn on its own, in a bulk
+    /// replay ([`StateDb::apply_rows`]). Each statement is compiled once: its
+    /// probe for open turns was compiled again on every turn.
+    #[test]
+    fn a_bulk_replay_turn_by_turn_compiles_no_statement_again() {
+        use std::sync::atomic::Ordering;
+        let mut db = StateDb::open(Connection::open_in_memory().unwrap()).unwrap();
+        db.begin_bulk_replay().unwrap();
+        let compiled = compilations(&mut db);
+        for n in 0..4u64 {
+            // The first two turns warm the cache.
+            if n == 2 {
+                compiled.store(0, Ordering::Relaxed);
+            }
+            db.apply(&[committed(
+                n + 1,
+                counter_turn(&format!("f{n}"), &format!("k{n}"), b"1"),
+            )])
+            .unwrap();
+        }
+        assert_eq!(compiled.load(Ordering::Relaxed), 0);
+        db.end_bulk_replay().unwrap();
+        assert_eq!(db.applied_lsn().unwrap(), 4);
+        assert_eq!(
+            db.kv_get("counter", "k3", "count").unwrap().as_deref(),
+            Some(&b"1"[..])
+        );
     }
 }

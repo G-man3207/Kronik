@@ -283,6 +283,57 @@ isolated (20.8x to 23.3x), 4.09 to 4.77 s continuous and 5.00 to 5.36 s both
   not lowered and the shortcut does not come back; #611 stays open for
   continuous replay.
 
+### Results (development machine, 2 CPUs, 2026-11-26, continuous replay, #611)
+
+A `perf` profile of continuous replay alone (development machine, two CPUs)
+showed SQLite compiling a statement for every fork turn. Continuous replay
+applies each fork turn on its own, inside a bulk replay, through
+`StateDb::apply_rows`. That function asked whether `open_turns` or
+`open_effects` held a row with `query_row`, which prepares its statement
+outside the statement cache, so every turn compiled it again. The probe now
+takes a cached statement (`crates/kronik-store/src/db.rs`), and a test counts
+the statements a bulk replay compiles turn by turn. The probe dates from v0.1,
+so it is not the regression since v0.1. The savepoint around each apply is
+still compiled each time, as before.
+
+`replay_speed --workers 2`, release, the whole process confined to two CPUs
+(`taskset -c 0,1`), 12 000 requests at 200 req/s, 60.0 s production window,
+both-mode diff empty in every run. "before" is `8a9c678e` (main with the
+statement cache); "after" is this change. Each pair ran back to back. The
+load is the 1-minute value before each run and includes other work on the
+machine; that work disturbed "before" run 1, whose isolated replay took twice
+its usual time.
+
+| Run | Binary | Load | Isolated | Continuous | Both |
+| --- | --- | --- | --- | --- | --- |
+| 1 | before | 5.33 | 2.50 s, 24.0x | 3.12 s, 19.2x | 3.52 s, 17.1x |
+| 1 | after | 13.00 | 1.05 s, 57.0x | 1.52 s, 39.4x | 2.43 s, 24.7x |
+| 2 | before | 12.08 | 1.13 s, 53.2x | 1.78 s, 33.8x | 1.81 s, 33.1x |
+| 2 | after | 5.26 | 1.12 s, 53.7x | 1.48 s, 40.6x | 1.74 s, 34.4x |
+| 3 | before | 2.51 | 1.34 s, 44.8x | 1.84 s, 32.6x | 2.25 s, 26.7x |
+| 3 | after | 2.98 | 1.21 s, 49.5x | 1.57 s, 38.2x | 2.20 s, 27.3x |
+| 4 | before | 14.57 | 1.10 s, 54.5x | 1.66 s, 36.2x | 1.83 s, 32.8x |
+| 4 | after | 6.44 | 1.02 s, 59.0x | 1.46 s, 41.0x | 1.63 s, 36.9x |
+| 5 | before | 2.63 | 1.04 s, 58.0x | 1.56 s, 38.5x | 1.72 s, 34.9x |
+| 5 | after | 2.19 | 1.06 s, 56.5x | 1.44 s, 41.7x | 1.81 s, 33.2x |
+
+- **Continuous replay is faster in every pair.** Leaving out the disturbed
+  run, it took 1.56 to 1.84 s before (32.6x to 38.5x) and 1.44 to 1.57 s
+  after (38.2x to 41.7x), 0.12 to 0.30 s less per pair. Isolated replay does
+  not use the bulk applier, and it and Both stay within their run-to-run
+  spread here.
+- **The test machine was not re-measured with this change.**
+- **Both is bound by the two modes' work together.** Both runs continuous
+  replay next to one isolated worker, and the continuous task joins the
+  isolated work once it is done, so both CPUs stay busy until the end. Both
+  is then about (2 × isolated + continuous) / 2, using the two-worker isolated
+  time. The test machine's rows above fit this within 0.8 s: v0.1 run 2,
+  (2 × 2.16 + 3.45) / 2 = 3.89 s against 4.17 s; #611 run 2, (2 × 2.72 +
+  4.90) / 2 = 5.17 s against 5.06 s. 20x there means Both at 3.0 s, so
+  2 × isolated + continuous at about 6 s, where #611 measured 10.3 to 11.4 s.
+  Continuous replay alone 1.5 times faster would therefore not be enough, and
+  isolated replay has to get faster too.
+
 ### Memory cost of the resident Wasm memories
 
 The pool has `2 × concurrency` linear memory slots per engine (one engine
