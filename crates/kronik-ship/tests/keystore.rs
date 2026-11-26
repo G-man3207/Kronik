@@ -13,13 +13,50 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use common::{restore_main, restore_two_phases, rt};
 use kronik_core::env::Env;
 use kronik_privacy::MasterKey;
-use kronik_privacy::keystore::{KeyLookup, Keystore};
+use kronik_privacy::keystore::{KeyLookup, Keystore, KeystoreRestore};
 use kronik_privacy::sealer::{Opened, Sealer};
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{NodeConfig, start_local};
 use kronik_ship::{
     KeystoreMode, Remote, ShipError, ShipState, current_keystore_revision, ship_keystore, ship_once,
 };
+
+/// Opens a backup the way `kronik restore` does: under a fresh owned data
+/// directory, in the restore phase, never at a live `keys/keystore.db`.
+fn staged_backup(
+    master: &MasterKey,
+    backup: &[u8],
+) -> (tempfile::TempDir, KeystoreRestore, Arc<Keystore>) {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = kronik_privacy::key_source::lock_data(dir.path()).unwrap();
+    let restore = owner.begin_keystore_restore().unwrap();
+    let keys = Keystore::restore_staged(&restore, Path::new(".restore"), master, backup).unwrap();
+    (dir, restore, keys)
+}
+
+/// Installs `backup` over `data/keys/keystore.db` the way `kronik restore`
+/// does: checkpoint and close the stage, rename the staged files into place,
+/// then finish the restore on the installed file.
+fn install_backup(
+    ownership: &kronik_privacy::key_source::DataOwnership,
+    data: &Path,
+    master: &MasterKey,
+    backup: &[u8],
+) -> Arc<Keystore> {
+    let restore = ownership.begin_keystore_restore().unwrap();
+    let staged = Keystore::restore_staged(&restore, Path::new(".restore"), master, backup).unwrap();
+    restore.close_stage(staged).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let from = data.join(format!(".restore/keystore.db{suffix}"));
+        let to = data.join(format!("keys/keystore.db{suffix}"));
+        if from.exists() {
+            std::fs::rename(from, to).unwrap();
+        } else if to.exists() {
+            std::fs::remove_file(to).unwrap();
+        }
+    }
+    restore.finish(Some(master)).unwrap().unwrap()
+}
 
 #[test]
 fn a_keystore_change_is_shipped_pruned_and_restored() {
@@ -77,9 +114,7 @@ fn a_keystore_change_is_shipped_pruned_and_restored() {
         None,
     )
     .unwrap();
-    let round = tempfile::tempdir().unwrap();
-    let round_owner = kronik_privacy::key_source::lock_data(round.path()).unwrap();
-    let restored = Keystore::restore_owned(&round_owner, &master, &bytes).unwrap();
+    let (_round, _restore, restored) = staged_backup(&master, &bytes);
     assert!(matches!(
         restored.key("user:1", 1).unwrap(),
         KeyLookup::Found(_)
@@ -140,17 +175,16 @@ fn a_keystore_change_is_shipped_pruned_and_restored() {
     ));
 }
 
-/// A settled view of the keystore's semantic content: export it, install it in
+/// A settled view of the keystore's semantic content: export it, stage it in
 /// a fresh owned directory, close that database's only connection (checkpointing
 /// and removing the WAL), then freeze and measure the database and WAL files.
 /// This target holds no bare SQLite handle, so this settles the semantics the
 /// way shipping does; shipping reads must not change what it observes.
 fn settled_keystore_metadata(store: &Keystore, master: &MasterKey) -> [(u64, SystemTime); 2] {
     let backup = store.export_backup([42; 24]).unwrap();
-    let round = tempfile::tempdir().unwrap();
-    let owner = kronik_privacy::key_source::lock_data(round.path()).unwrap();
-    drop(Keystore::restore_owned(&owner, master, &backup).unwrap());
-    fixed_keystore_metadata(&round.path().join("keys/keystore.db"))
+    let (round, _restore, restored) = staged_backup(master, &backup);
+    drop(restored);
+    fixed_keystore_metadata(&round.path().join(".restore/keystore.db"))
 }
 
 fn fixed_keystore_metadata(path: &Path) -> [(u64, SystemTime); 2] {
@@ -234,20 +268,22 @@ fn semantic_revisions_ship_rotate_erase_and_import_with_identical_file_and_wal_m
     .unwrap();
     let mut state = ShipState::load(source.path()).unwrap();
     assert!(state.keystore_revision.is_none());
-    let ship = |state: &mut ShipState, wall, nonce| {
+    let key_source = node.key_source().unwrap().clone();
+    let source_path = source.path().to_path_buf();
+    let ship = |state: &mut ShipState, store: &Arc<Keystore>, wall, nonce| {
         runtime.block_on(ship_keystore(
             &environment,
             &remote,
-            source.path(),
+            &source_path,
             state,
             wall,
             Duration::from_secs(30 * 86_400),
             [nonce; 24],
-            node.key_source().unwrap(),
-            &store,
+            &key_source,
+            store,
         ))
     };
-    assert_eq!(ship(&mut state, wall, 14).unwrap().objects, 1);
+    assert_eq!(ship(&mut state, &store, wall, 14).unwrap().objects, 1);
     state = ShipState::load(source.path()).unwrap();
     assert!(
         state.keystore_revision.unwrap().covers(
@@ -260,17 +296,28 @@ fn semantic_revisions_ship_rotate_erase_and_import_with_identical_file_and_wal_m
                 .unwrap()
         )
     );
-    assert_eq!(ship(&mut state, wall + 60_000, 15).unwrap().objects, 0);
+    assert_eq!(
+        ship(&mut state, &store, wall + 60_000, 15).unwrap().objects,
+        0
+    );
 
     writer
         .rotate("user:revision", [16; 32], [17; 24], 2)
         .unwrap();
     let current = sealed_newest(node.sealer(), b"current-subject-value", 18, 3);
     assert_eq!(settled_keystore_metadata(&store, &master), metadata);
-    assert_eq!(ship(&mut state, wall + 60_000, 19).unwrap().objects, 1);
+    assert_eq!(
+        ship(&mut state, &store, wall + 60_000, 19).unwrap().objects,
+        1
+    );
     writer.erase_through("user:revision", 1, 3).unwrap();
     assert_eq!(settled_keystore_metadata(&store, &master), metadata);
-    assert_eq!(ship(&mut state, wall + 120_000, 20).unwrap().objects, 1);
+    assert_eq!(
+        ship(&mut state, &store, wall + 120_000, 20)
+            .unwrap()
+            .objects,
+        1
+    );
 
     let erased_backup = std::fs::read(
         bucket
@@ -278,42 +325,61 @@ fn semantic_revisions_ship_rotate_erase_and_import_with_identical_file_and_wal_m
             .join(format!("keystore/{}.bin", wall + 120_000)),
     )
     .unwrap();
-    let restored = Arc::new(Keystore::restore_memory(&master, &erased_backup).unwrap());
-    let view = Sealer::new(restored);
-    assert!(matches!(view.open(&original), Opened::Erased { .. }));
-    assert_eq!(
-        view.open(&current).bytes(),
-        Some(b"current-subject-value".as_slice())
-    );
+    {
+        let (_dir, _restore, restored) = staged_backup(&master, &erased_backup);
+        let view = Sealer::new(restored);
+        assert!(matches!(view.open(&original), Opened::Erased { .. }));
+        assert_eq!(
+            view.open(&current).bytes(),
+            Some(b"current-subject-value".as_slice())
+        );
+    }
 
-    let incoming = Keystore::restore_memory(&master, &erased_backup).unwrap();
-    incoming
-        .key_for_sealing("user:other", [21; 32], [22; 24], 4)
-        .unwrap();
-    let incoming_backup = incoming.export_backup([23; 24]).unwrap();
-    let imported =
-        Keystore::restore_owned(store.data_ownership().unwrap(), &master, &incoming_backup)
+    let incoming_backup = {
+        let (_dir, _restore, incoming) = staged_backup(&master, &erased_backup);
+        incoming
+            .key_for_sealing("user:other", [21; 32], [22; 24], 4)
             .unwrap();
-    drop(imported);
+        incoming.export_backup([23; 24]).unwrap()
+    };
+
+    // An import is an offline install, not an edit of the live file. Close
+    // every handle into the old lineage first, then rename the staged one in.
+    let ownership = store.data_ownership().unwrap().clone();
+    drop(writer);
+    drop(store);
+    drop(node);
+    let store = install_backup(&ownership, source.path(), &master, &incoming_backup);
+    assert!(matches!(
+        store.key("user:other", 1).unwrap(),
+        KeyLookup::Found(_)
+    ));
     assert_eq!(settled_keystore_metadata(&store, &master), metadata);
-    assert_eq!(ship(&mut state, wall + 180_000, 24).unwrap().objects, 1);
+    assert_eq!(
+        ship(&mut state, &store, wall + 180_000, 24)
+            .unwrap()
+            .objects,
+        1
+    );
     let bytes = std::fs::read(
         bucket
             .path()
             .join(format!("keystore/{}.bin", wall + 180_000)),
     )
     .unwrap();
-    let restored = Arc::new(Keystore::restore_memory(&master, &bytes).unwrap());
-    assert!(matches!(
-        restored.key("user:other", 1).unwrap(),
-        KeyLookup::Found(_)
-    ));
-    let view = Sealer::new(restored);
-    assert!(matches!(view.open(&original), Opened::Erased { .. }));
-    assert_eq!(
-        view.open(&current).bytes(),
-        Some(b"current-subject-value".as_slice())
-    );
+    {
+        let (_dir, _restore, restored) = staged_backup(&master, &bytes);
+        assert!(matches!(
+            restored.key("user:other", 1).unwrap(),
+            KeyLookup::Found(_)
+        ));
+        let view = Sealer::new(restored);
+        assert!(matches!(view.open(&original), Opened::Erased { .. }));
+        assert_eq!(
+            view.open(&current).bytes(),
+            Some(b"current-subject-value".as_slice())
+        );
+    }
 
     let before = state.clone();
     // Break the keystore held by the live path: the revision read must fail
@@ -322,7 +388,7 @@ fn semantic_revisions_ship_rotate_erase_and_import_with_identical_file_and_wal_m
     std::fs::rename(&path, &detached).unwrap();
     std::fs::write(&path, b"not the held keystore").unwrap();
     assert!(matches!(
-        ship(&mut state, wall + 240_000, 25),
+        ship(&mut state, &store, wall + 240_000, 25),
         Err(ShipError::Keystore(_))
     ));
     assert_eq!(state, before);

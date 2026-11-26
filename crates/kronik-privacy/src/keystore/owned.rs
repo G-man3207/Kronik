@@ -3,7 +3,7 @@
 //! independent managed handles reuse it. External raw SQL corruption remains
 //! covered by pre/post SQL checks, not by this process-local final-move fence.
 //! Filesystem promotion preserves the offline restore contract: managed SQLite
-//! handles close before rename; in-place restore_owned supports live handles.
+//! handles close before rename.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -185,23 +185,6 @@ impl Keystore {
             .map_err(Into::into)
     }
 
-    pub fn restore_owned(
-        owner: &DataOwnership,
-        master: &MasterKey,
-        backup: &[u8],
-    ) -> Result<Arc<Self>, PrivacyError> {
-        let rows = Self::read_backup(master, backup)?;
-        let mutation = owner.publisher().begin()?;
-        let (conn, store) = OwnedStore::open(owner, Path::new("keys"), true, None, true)?;
-        {
-            let mut connection = conn.lock().map_err(|_| PublicationError::Uncertified)?;
-            Self::replace_backup(&mut connection, master, &rows)?;
-        }
-        let result = Self::open_connection(conn, master, Custody::Owned(store.clone()))?;
-        mutation.finish_selected((store.identity.device, store.identity.inode))?;
-        Ok(Arc::new(result))
-    }
-
     /// Import belongs to the SAME already-started restore phase. It does not
     /// certify the live root before its caller's durable filesystem install.
     pub fn restore_staged(
@@ -250,20 +233,6 @@ impl Keystore {
         };
         drop(stage);
         Ok(Arc::new(keys))
-    }
-
-    pub fn restore_memory(master: &MasterKey, backup: &[u8]) -> Result<Self, PrivacyError> {
-        let rows = Self::read_backup(master, backup)?;
-        let conn = Mutex::new(Connection::open_in_memory()?);
-        {
-            let mut connection = conn.lock().map_err(|_| PublicationError::Uncertified)?;
-            Self::replace_backup(&mut connection, master, &rows)?;
-        }
-        Self::open_connection(
-            conn,
-            master,
-            Custody::Memory(Arc::new(DataPublisher::default())),
-        )
     }
 }
 

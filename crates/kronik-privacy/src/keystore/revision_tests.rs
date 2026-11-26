@@ -197,45 +197,6 @@ fn own_connection_mutations_invalidate_other_sealers_even_when_data_version_is_u
 }
 
 #[test]
-fn restoring_different_keys_at_the_same_version_invalidates_loaded_consumers() {
-    let pair = Pair::new();
-    let old = warm(&pair);
-    let source = Keystore::open_memory(&pair.master).unwrap();
-    source
-        .key_for_sealing("user:1", [11; 32], [12; 24], 1)
-        .unwrap();
-    let backup = source.export_backup([13; 24]).unwrap();
-    let before = settled_stamps(&pair.path);
-    let revision = pair.first.revision().unwrap();
-    drop(Keystore::restore_owned(&pair.owner, &pair.master, &backup).unwrap());
-    assert_eq!(settled_stamps(&pair.path), before);
-    assert!(pair.first.revision().unwrap() > revision);
-    assert!(matches!(pair.a.open(&old), Opened::Unreadable { .. }));
-    assert!(matches!(pair.b.open(&old), Opened::Unreadable { .. }));
-    let current = pair.seal(&pair.a, b"replacement lineage");
-    assert_eq!(version(&current), 1);
-    let KeyLookup::Found(key) = source.key("user:1", 1).unwrap() else {
-        panic!("missing backup key")
-    };
-    let Some(pb::sealable::Value::Sealed(value)) = &current.value else {
-        panic!("not sealed")
-    };
-    let stored = SealedValue {
-        key_version: value.key_version,
-        nonce: value.nonce.as_slice().try_into().unwrap(),
-        ciphertext: value.ciphertext.clone(),
-    };
-    assert_eq!(
-        unseal("user:1", &key, &stored).unwrap(),
-        b"replacement lineage"
-    );
-    assert_eq!(
-        pair.b.open(&current).bytes(),
-        Some(b"replacement lineage".as_slice())
-    );
-}
-
-#[test]
 fn logged_partial_erasure_preserves_newer_versions_and_noop_does_not_advance_revision() {
     let pair = Pair::new();
     let old = warm(&pair);
@@ -421,17 +382,42 @@ fn legacy_schema_migrates_without_changing_wrapped_rows_or_krkstor1_backup_bytes
     assert!(migrated.revision().unwrap() > revision);
 }
 
+/// Stages `backup` under `pair`'s owner and installs it the way `kronik
+/// restore` does: checkpoint and close the stage, rename it into `keys/`,
+/// then finish the restore on the installed file.
+fn install_backup(pair: &Pair, backup: &[u8]) -> Arc<Keystore> {
+    let restore = pair.owner.begin_keystore_restore().unwrap();
+    let staged =
+        Keystore::restore_staged(&restore, Path::new(".restore"), &pair.master, backup).unwrap();
+    let revision = staged.revision().unwrap();
+    restore.close_stage(staged).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let from = pair
+            ._dir
+            .path()
+            .join(format!(".restore/keystore.db{suffix}"));
+        let to = pair._dir.path().join(format!("keys/keystore.db{suffix}"));
+        if from.exists() {
+            std::fs::rename(from, to).unwrap();
+        } else if to.exists() {
+            std::fs::remove_file(to).unwrap();
+        }
+    }
+    let installed = restore.finish(Some(&pair.master)).unwrap().unwrap();
+    assert_eq!(installed.revision().unwrap(), revision);
+    installed
+}
+
 #[test]
-fn even_an_empty_backup_install_advances_the_persistent_revision_and_checkpoints_do_not() {
+fn even_an_empty_backup_install_advances_the_staged_revision_and_checkpoints_do_not() {
     let pair = Pair::new();
     let backup = pair.first.export_backup([71; 24]).unwrap();
     let before = pair.first.revision().unwrap();
-    drop(Keystore::restore_owned(&pair.owner, &pair.master, &backup).unwrap());
-    let installed = pair.first.revision().unwrap();
-    assert!(installed > before);
+    let installed = install_backup(&pair, &backup);
+    let revision = installed.revision().unwrap();
+    assert!(revision > before);
     settled_stamps(&pair.path);
-    assert_eq!(pair.first.revision().unwrap(), installed);
-    assert_eq!(pair.second.revision().unwrap(), installed);
+    assert_eq!(installed.revision().unwrap(), revision);
 }
 
 #[test]

@@ -71,11 +71,6 @@ impl DataPublisher {
         Ok(())
     }
 
-    /// Invalidate before the first destructive write; this returns no lock.
-    pub(crate) fn begin(self: &Arc<Self>) -> Result<KeystoreMutation, PublicationError> {
-        self.begin_for(None)
-    }
-
     pub(crate) fn begin_for(
         self: &Arc<Self>,
         stage: Option<u64>,
