@@ -192,7 +192,7 @@ protection rules**.
 | `environment` | `kronik-production` | `promote`: the job's environment, whose approval of the run is required for `require_approval`. |
 | `reason` | the pull request or commit, the actor and the run URL | The reason recorded with the proposal and the promotion. |
 | `window` | `kronik propose`'s | The replay window, such as `1h`. |
-| `timeout` | `45m` | How long `kronik proposal wait` waits (`ms`, `s`, `m` or `h`); also bounds every `kronik` call. |
+| `timeout` | `45m` | How long `kronik proposal wait` waits (`ms`, `s`, `m`, `h` or `d`); also bounds every `kronik` call. |
 | `allow-forks` | `false` | Propose for pull requests from forks, and on the events below, too. |
 | `github-token` | `${{ github.token }}` | The token for the check run, the comment and the run's approvals. |
 | `comment` | `true` | Create or update the pull request comment. |
