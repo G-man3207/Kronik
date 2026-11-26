@@ -23,6 +23,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Once};
 
+use kronik_core::sync::lock;
 use rusqlite::Connection;
 use rusqlite::ffi;
 
@@ -597,12 +598,7 @@ impl Drop for CowInner {
         let Some(counter) = &self.private else {
             return;
         };
-        let pages = self
-            .bytes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .dirty
-            .len() as u64;
+        let pages = lock(&self.bytes).dirty.len() as u64;
         counter.fetch_sub(pages * COW_PAGE, Ordering::Relaxed);
     }
 }
@@ -620,7 +616,7 @@ fn image_map() -> &'static Mutex<HashMap<String, BoundImage>> {
 }
 
 fn lock_images() -> std::sync::MutexGuard<'static, HashMap<String, BoundImage>> {
-    image_map().lock().unwrap_or_else(|e| e.into_inner())
+    lock(image_map())
 }
 
 /// Shared private-byte counter for one snapshot image. Paths bound through
@@ -651,22 +647,14 @@ impl CowShare {
                 private: self.private.clone(),
             },
         );
-        self.paths
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(path.to_owned());
+        lock(&self.paths).push(path.to_owned());
     }
 }
 
 impl Drop for CowShare {
     fn drop(&mut self) {
         let mut images = lock_images();
-        for path in self
-            .paths
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-        {
+        for path in lock(&self.paths).drain(..) {
             images.remove(&path);
         }
     }
@@ -760,7 +748,7 @@ unsafe extern "C" fn cow_read(
     // SAFETY: SQLite passes a writable buffer of `amt` bytes and our file.
     let out = unsafe { std::slice::from_raw_parts_mut(dst.cast::<u8>(), amt) };
     let inner = unsafe { &*(*file.cast::<CowFile>()).inner };
-    let bytes = inner.bytes.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = lock(&inner.bytes);
     if offset >= bytes.size {
         out.fill(0);
         return ffi::SQLITE_IOERR_SHORT_READ;
@@ -791,7 +779,7 @@ unsafe extern "C" fn cow_write(
     // SAFETY: SQLite passes `amt` readable bytes and our file.
     let input = unsafe { std::slice::from_raw_parts(src.cast::<u8>(), amt) };
     let inner = unsafe { &*(*file.cast::<CowFile>()).inner };
-    let mut bytes = inner.bytes.lock().unwrap_or_else(|e| e.into_inner());
+    let mut bytes = lock(&inner.bytes);
     write_at(&mut bytes, offset, input, &inner.private);
     ffi::SQLITE_OK
 }
@@ -801,7 +789,7 @@ unsafe extern "C" fn cow_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlit
         return ffi::SQLITE_IOERR;
     }
     let inner = unsafe { &*(*file.cast::<CowFile>()).inner };
-    let mut bytes = inner.bytes.lock().unwrap_or_else(|e| e.into_inner());
+    let mut bytes = lock(&inner.bytes);
     bytes.size = size as u64;
     let keep = bytes.size.div_ceil(COW_PAGE);
     let before = bytes.dirty.len();
@@ -824,7 +812,7 @@ unsafe extern "C" fn cow_file_size(
     out: *mut ffi::sqlite3_int64,
 ) -> c_int {
     let inner = unsafe { &*(*file.cast::<CowFile>()).inner };
-    let size = inner.bytes.lock().unwrap_or_else(|e| e.into_inner()).size;
+    let size = lock(&inner.bytes).size;
     // SAFETY: SQLite passes a writable i64.
     unsafe { *out = size as ffi::sqlite3_int64 };
     ffi::SQLITE_OK

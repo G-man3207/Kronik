@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use kronik_core::ids::Lsn;
+use kronik_core::sync::lock;
 use kronik_log::Committed;
 use kronik_privacy::sealer::Opened;
 use kronik_proto::Record;
@@ -302,7 +303,7 @@ impl Store {
 
     /// The sealer that opens sealed SQL changesets when they are applied.
     pub fn set_sealer(&self, sealer: Arc<kronik_privacy::sealer::Sealer>) {
-        *self.sealer.lock().unwrap_or_else(|e| e.into_inner()) = sealer;
+        *lock(&self.sealer) = sealer;
     }
 
     /// Pseudonymizes text and blob cells of subject-tagged SQL changesets
@@ -311,14 +312,11 @@ impl Store {
         &self,
         rewrite: impl Fn(&str, &[u8]) -> Vec<u8> + Send + Sync + 'static,
     ) {
-        *self.sql_rewrite.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(rewrite));
+        *lock(&self.sql_rewrite) = Some(Arc::new(rewrite));
     }
 
     fn sql_rewrite(&self) -> Option<SqlCellRewrite> {
-        self.sql_rewrite
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        lock(&self.sql_rewrite).clone()
     }
 
     /// The sealer this store opens SQL changesets with.
@@ -327,10 +325,7 @@ impl Store {
     }
 
     fn sealer(&self) -> Arc<kronik_privacy::sealer::Sealer> {
-        self.sealer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        lock(&self.sealer).clone()
     }
 
     /// Starts an overlay over `state.db` and every actor database used
@@ -351,7 +346,7 @@ impl Store {
     }
 
     fn apply_lock(&self) -> ApplyLock<'_> {
-        let guard = self.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = lock(&self.apply_lock);
         // Odd before any write, so a copy that started earlier discards itself.
         self.apply_epoch.fetch_add(1, Ordering::Release);
         #[cfg(test)]
@@ -368,7 +363,7 @@ impl Store {
 
     /// Read access to `state.db`.
     pub fn db(&self) -> MutexGuard<'_, StateDb> {
-        self.db.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.db)
     }
 
     /// Applies consecutive durable records: SQL changes to the actor
@@ -483,7 +478,7 @@ impl Store {
                 continue;
             }
             let db = self.sql.get(&name)?;
-            let applied = db.lock().unwrap_or_else(|e| e.into_inner()).applied_lsn()?;
+            let applied = lock(&db).applied_lsn()?;
             if applied < lsn {
                 lost.push((kind, key));
             }
@@ -530,13 +525,13 @@ impl Store {
                 continue;
             }
             let db = self.sql.get(&name)?;
-            let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut db = lock(&db);
             if db.applied_lsn()? >= lsn {
                 continue;
             }
             if theirs {
                 let src = shadow.sql.get(&name)?;
-                let mut src = src.lock().unwrap_or_else(|e| e.into_inner());
+                let mut src = lock(&src);
                 // The copy carries the stamp: no window where the content
                 // is the shadow's but the applied LSN is main's.
                 src.stamp_applied(lsn)?;
@@ -589,7 +584,7 @@ impl Store {
         let actors = self.db().sql_actors()?;
         for name in actors {
             let db = self.sql.get(&name)?;
-            let applied = db.lock().unwrap_or_else(|e| e.into_inner()).applied_lsn()?;
+            let applied = lock(&db).applied_lsn()?;
             from = from.min(applied);
         }
         Ok(from)
@@ -635,7 +630,7 @@ impl Store {
                 let _apply = self.apply_lock();
                 let to = self.applied.get();
                 for (name, db) in dbs {
-                    let mut guard = db.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut guard = lock(&db);
                     match guard.raise_applied(floor, to)? {
                         Some(true) => raised.push((name, db.clone())),
                         Some(false) => {}
@@ -654,7 +649,7 @@ impl Store {
                 let to = self.applied.get();
                 let mut still = Vec::new();
                 for (name, db) in busy {
-                    let mut guard = db.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut guard = lock(&db);
                     match guard.raise_applied(floor, to)? {
                         Some(true) => raised.push((name, db.clone())),
                         Some(false) => {}
@@ -670,10 +665,7 @@ impl Store {
             for _ in 0..=BUSY_RETRIES {
                 let mut still = Vec::new();
                 for (name, db) in pending {
-                    let durable = db
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .checkpoint_durable()?;
+                    let durable = lock(&db).checkpoint_durable()?;
                     if !durable {
                         still.push((name, db));
                     }
@@ -704,7 +696,7 @@ impl Store {
         };
         let name = format!("{}/{}", actor.kind, actor.key);
         let db = self.sql.get(&name)?;
-        let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+        let mut db = lock(&db);
         if db.applied_lsn()? >= lsn {
             return Ok(());
         }
@@ -763,7 +755,7 @@ impl Store {
     pub fn erasure_blocked(&self, subject: &str) -> Result<Option<String>, StoreError> {
         for name in self.actors_for_erasure(subject, &[])? {
             let db = self.sql.get(&name)?;
-            let db = db.lock().unwrap_or_else(|e| e.into_inner());
+            let db = lock(&db);
             if let Some(blocked) = db
                 .erasure_blocked_by(subject)
                 .map_err(|e| StoreError::Corrupt(format!("erasure check in {name}: {e}")))?
@@ -792,7 +784,7 @@ impl Store {
         let mut checkpoint = Vec::new();
         for name in self.actors_for_erasure(subject, earlier)? {
             let db = self.sql.get(&name)?;
-            let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut db = lock(&db);
             if db.applied_lsn()? >= lsn {
                 continue;
             }
@@ -841,7 +833,7 @@ impl Store {
             let name = format!("{kind}/{key}");
             let subjects = {
                 let db = self.sql.get(&name)?;
-                let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+                let mut db = lock(&db);
                 db.distinct_subjects()
                     .map_err(|e| StoreError::Corrupt(format!("subjects in {name}: {e}")))?
             };
@@ -855,7 +847,7 @@ impl Store {
         for name in names {
             match self.sql.get(name) {
                 Ok(db) => {
-                    let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut db = lock(&db);
                     db.checkpoint_erasure();
                 }
                 Err(e) => {
@@ -889,7 +881,7 @@ impl Store {
                 let mut checkpoint = Vec::new();
                 for name in &names {
                     let db = self.sql.get(name)?;
-                    let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut db = lock(&db);
                     let applied = db.applied_lsn()?;
                     let (_n, needs) = db
                         .erase_subject_at(subject, applied)
