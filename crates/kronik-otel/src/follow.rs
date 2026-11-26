@@ -605,6 +605,36 @@ mod retained_file_tests {
         }
     }
 
+    /// A local node on `data` holding the secret `name` = `value`, set by the
+    /// local operator with `reason`. Returns the node, the operator's
+    /// authority, the audit the secret was set with, and the secret's version.
+    async fn node_with_secret(
+        data: &std::path::Path,
+        name: &str,
+        value: &[u8],
+        reason: &str,
+    ) -> (Arc<kronik_sched::Node>, AuthLease, pb::Audit, u64) {
+        let node = kronik_sched::start_local(
+            Env::real(tokio::runtime::Handle::current()),
+            data,
+            kronik_sched::NodeConfig::default(),
+        )
+        .await
+        .unwrap();
+        let original = node.local_operator_authority().unwrap();
+        let audit = pb::Audit {
+            token_id: "unix:uid=0".into(),
+            reason: reason.into(),
+            wall_time_ms: node.env().clock.wall_ms(),
+        };
+        let stored = node
+            .secret_set(name, value.to_vec(), &audit, false, original.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        (node, original, audit, stored.version)
+    }
+
     /// A sink that keeps what it prepared and delivered, and refuses its
     /// first delivery the way a refused admission does.
     #[derive(Default, Clone)]
@@ -727,30 +757,11 @@ mod retained_file_tests {
     #[tokio::test]
     async fn real_file_mac_uses_the_owned_guard_without_cache_reentrancy_or_cache_echo() {
         let data = tempfile::tempdir().unwrap();
-        let env = Env::real(tokio::runtime::Handle::current());
-        let node = kronik_sched::start_local(env, data.path(), kronik_sched::NodeConfig::default())
-            .await
-            .unwrap();
-        let original = node.local_operator_authority().unwrap();
-        let audit = pb::Audit {
-            token_id: "unix:uid=0".into(),
-            reason: "actual native FILE MAC".into(),
-            wall_time_ms: node.env().clock.wall_ms(),
-        };
         let key = b"actual-file-mac-key";
-        let stored = node
-            .secret_set(
-                "m28-file-mac",
-                key.to_vec(),
-                &audit,
-                false,
-                original.clone(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+        let (node, original, _, version) =
+            node_with_secret(data.path(), "m28-file-mac", key, "actual native FILE MAC").await;
         let identity = node
-            .secret_identity(node.branch(), "m28-file-mac", stored.version)
+            .secret_identity(node.branch(), "m28-file-mac", version)
             .await
             .unwrap();
         settled(&node).await;
@@ -892,25 +903,13 @@ mod retained_file_tests {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
         let data = tempfile::tempdir().unwrap();
-        let env = Env::real(tokio::runtime::Handle::current());
-        let node = kronik_sched::start_local(env, data.path(), kronik_sched::NodeConfig::default())
-            .await
-            .unwrap();
-        let original = node.local_operator_authority().unwrap();
-        let audit = pb::Audit {
-            token_id: "unix:uid=0".into(),
-            reason: "native output publication".into(),
-            wall_time_ms: node.env().clock.wall_ms(),
-        };
-        node.secret_set(
+        let (node, original, _, _) = node_with_secret(
+            data.path(),
             "publication",
-            b"wire-publication-needle".to_vec(),
-            &audit,
-            false,
-            original.clone(),
+            b"wire-publication-needle",
+            "native output publication",
         )
-        .await
-        .unwrap();
+        .await;
         let render = |snapshot: &CertifiedSecretSnapshot| {
             bytes::Bytes::from(kronik_sched::scrub::for_log(
                 "detail: wire-publication-needle",
@@ -1039,29 +1038,13 @@ mod retained_file_tests {
     #[tokio::test]
     async fn a_fresh_certificate_cannot_authorize_an_old_readers_configuration_epoch() {
         let data = tempfile::tempdir().unwrap();
-        let node = kronik_sched::start_local(
-            Env::real(tokio::runtime::Handle::current()),
+        let (node, original, audit, _) = node_with_secret(
             data.path(),
-            kronik_sched::NodeConfig::default(),
-        )
-        .await
-        .unwrap();
-        let original = node.local_operator_authority().unwrap();
-        let audit = pb::Audit {
-            token_id: "unix:uid=0".into(),
-            reason: "actual source configuration change".into(),
-            wall_time_ms: node.env().clock.wall_ms(),
-        };
-        node.secret_set(
             "reader-epoch",
-            b"held-reader-epoch-needle".to_vec(),
-            &audit,
-            false,
-            original.clone(),
+            b"held-reader-epoch-needle",
+            "actual source configuration change",
         )
-        .await
-        .unwrap()
-        .unwrap();
+        .await;
         let stale = Arc::new(node.capture_system_export_reader().await.unwrap());
         let mode = if node.privacy_mode().0 == pb::PrivacyState::On {
             pb::PrivacyState::Off
@@ -1108,30 +1091,14 @@ mod retained_file_tests {
     async fn stopping_joins_the_real_owned_http_worker_through_held_response_eof() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let data = tempfile::tempdir().unwrap();
-        let env = Env::real(tokio::runtime::Handle::current());
-        let node = kronik_sched::start_local(
-            env.clone(),
+        let (node, original, _, _) = node_with_secret(
             data.path(),
-            kronik_sched::NodeConfig::default(),
-        )
-        .await
-        .unwrap();
-        let original = node.local_operator_authority().unwrap();
-        let audit = pb::Audit {
-            token_id: "unix:uid=0".into(),
-            reason: "actual stopped worker EOF ownership".into(),
-            wall_time_ms: env.clock.wall_ms(),
-        };
-        node.secret_set(
             "owned-eof",
-            b"actual-eof-held-needle".to_vec(),
-            &audit,
-            false,
-            original.clone(),
+            b"actual-eof-held-needle",
+            "actual stopped worker EOF ownership",
         )
-        .await
-        .unwrap()
-        .unwrap();
+        .await;
+        let env = node.env().clone();
         let (snapshot, publication) = node.native_secret_snapshot_with_publication().unwrap();
         let held = Arc::downgrade(&snapshot);
         let cursors = Arc::new(Cursors::load(env.clone(), data.path()).await.unwrap());
