@@ -16,6 +16,7 @@ pub use actor::{
 pub(crate) use ffi::{CowShare, arm_cow_vfs, cow_vfs_name};
 pub use rewrite::pseudonymize_changeset;
 
+use kronik_core::sync::lock;
 use rusqlite::types::Value;
 
 /// One decoded row change of a changeset (behavior diffs).
@@ -144,14 +145,14 @@ impl SqlPool {
     /// Keep every actor this pool opens, up to `max`. The constructed
     /// capacity stays the floor. A later call only raises the ceiling.
     pub(crate) fn retain_opened(&self, max: usize) {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = lock(&self.inner);
         let max = max.max(g.capacity);
         g.retain_max = Some(g.retain_max.map_or(max, |had| had.max(max)));
     }
 
     /// The database of `actor` ("kind/key"), opened (and created) on demand.
     pub fn get(&self, actor: &str) -> rusqlite::Result<Arc<Mutex<SqlActor>>> {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = lock(&self.inner);
         loop {
             g.tick += 1;
             let tick = g.tick;
@@ -179,7 +180,7 @@ impl SqlPool {
         );
         let opened = SqlActor::open(self.opener.as_ref(), actor, self.limits);
 
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = lock(&self.inner);
         g.opening.remove(actor);
         let a = match opened {
             Ok(db) => {
@@ -213,10 +214,7 @@ impl SqlPool {
         if let Some(touched) = g.overlay.as_mut()
             && touched.insert(actor.to_owned())
         {
-            a.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .overlay_begin()
-                .map_err(overlay_err)?;
+            lock(a).overlay_begin().map_err(overlay_err)?;
         }
         evict(g);
         Ok(())
@@ -225,13 +223,12 @@ impl SqlPool {
     /// Starts an overlay: every database used until `overlay_rollback`
     /// gets a savepoint that is rolled back then.
     pub fn overlay_begin(&self) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).overlay =
-            Some(std::collections::BTreeSet::new());
+        lock(&self.inner).overlay = Some(std::collections::BTreeSet::new());
     }
 
     pub fn overlay_rollback(&self) -> Result<(), String> {
         let open: Vec<Arc<Mutex<SqlActor>>> = {
-            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = lock(&self.inner);
             let touched = g.overlay.take().unwrap_or_default();
             touched
                 .iter()
@@ -239,25 +236,23 @@ impl SqlPool {
                 .collect()
         };
         for a in open {
-            a.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .overlay_rollback()?;
+            lock(&a).overlay_rollback()?;
         }
         Ok(())
     }
 
     /// Whether `actor` has a database (open or on disk) without creating one.
     pub fn exists(&self, actor: &str) -> bool {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let g = lock(&self.inner);
         g.open.contains_key(actor) || self.opener.exists(actor)
     }
 
     /// A crash of the process that keeps the databases: every turn in
     /// progress is rolled back, as SQLite does when a connection dies.
     pub fn abort_turns(&self) {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let g = lock(&self.inner);
         for (_, db) in g.open.values() {
-            db.lock().unwrap_or_else(|e| e.into_inner()).abort_turn();
+            lock(db).abort_turn();
         }
     }
 
@@ -266,14 +261,14 @@ impl SqlPool {
     /// only: this does not create a database.
     pub(crate) fn open_sessions(&self) -> Vec<String> {
         let open: Vec<_> = {
-            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let g = lock(&self.inner);
             g.open
                 .iter()
                 .map(|(name, (_, db))| (name.clone(), db.clone()))
                 .collect()
         };
         open.into_iter()
-            .filter(|(_, db)| db.lock().unwrap_or_else(|e| e.into_inner()).has_session())
+            .filter(|(_, db)| lock(db).has_session())
             .map(|(name, _)| name)
             .collect()
     }
