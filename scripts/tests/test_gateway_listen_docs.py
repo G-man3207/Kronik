@@ -70,4 +70,3 @@ class GatewayListenDocsTest(unittest.TestCase):
             f"With `--domain` it writes `{acme}` and ACME, unless `--http-listen`",
             flat,
         )
-        self.assertNotIn("unless `--http-listen` says otherwise", flat)

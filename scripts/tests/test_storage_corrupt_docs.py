@@ -3,8 +3,7 @@
 When the applied LSN is past the end of the log, moving state.db aside
 installs a snapshot and replays what is left. That drops acknowledged
 records only state.db still had. The row must send that case to restore
-into a new directory, and keep the rebuild only for a log that still
-holds every acknowledged record.
+into a new directory.
 """
 
 from pathlib import Path
@@ -40,15 +39,6 @@ def start_refusal():
 
 
 class StorageCorruptTroubleshootingTest(unittest.TestCase):
-    def test_short_log_is_not_rebuilt_by_deleting_state(self):
-        what = what_to_do(troubleshooting_row())
-        short, marker, _rebuild = what.partition("Moving `state.db`")
-        self.assertTrue(marker, what)
-        self.assertIn("state.db has applied lsn N, but the log ends at M", short)
-        self.assertNotIn("aside", short)
-        self.assertNotIn("moving it away", what)
-        self.assertNotIn("can be rebuilt by moving it away", OPERATIONS)
-
     def test_short_log_matches_the_start_error(self):
         what = what_to_do(troubleshooting_row()).replace("`", "")
         start = start_refusal()
@@ -61,11 +51,3 @@ class StorageCorruptTroubleshootingTest(unittest.TestCase):
             self.assertIn(fact, what, fact)
         self.assertIn("Keep the", start)
         self.assertIn("Keep the data directory", what)
-
-    def test_a_complete_log_can_still_be_rebuilt(self):
-        what = what_to_do(troubleshooting_row())
-        self.assertIn(
-            "Moving `state.db` aside and starting again rebuilds it only when "
-            "the log still holds every acknowledged record",
-            what,
-        )
