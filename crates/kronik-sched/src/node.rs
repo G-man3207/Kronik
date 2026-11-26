@@ -6012,7 +6012,9 @@ fn reused(key: &str) -> ApiError {
     )
 }
 
-fn body_subject(msg: Option<&pb::Message>) -> Option<String> {
+/// The subject tag on a message body: live delivery uses it as the
+/// receiving turn's default subject, and so does replay.
+pub fn body_subject(msg: Option<&pb::Message>) -> Option<String> {
     msg.and_then(|m| m.body.as_ref())
         .and_then(|b| b.subject.clone())
 }

@@ -26,11 +26,13 @@ use kronik_runtime::{
     CallOutcome, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchBody, FetchHeader, FetchOutcome,
     FetchRequest, GateError, Program, SendNowOutcome, SendNowRequest, TurnLimits, TurnRequest,
 };
+use kronik_sched::body_subject;
 use kronik_sched::effects::{
     map_call_outcome, outcome_of_fetch, outcome_of_send_now, plain, tagged,
 };
 use kronik_sched::host::{SqlHandle, SqlTurn};
 use kronik_store::Store;
+use kronik_store::db::message_input;
 use kronik_store::sql::TurnOpts;
 use prost::Message as _;
 
@@ -1522,7 +1524,13 @@ impl Runner {
                     order,
                     Pending {
                         actor: to,
-                        input: message_input(pb::MessageSource::Actor, &p.actor, m, time, ""),
+                        input: message_input(
+                            pb::MessageSource::Actor,
+                            &p.actor.to_pb(),
+                            m,
+                            time,
+                            "",
+                        ),
                         key,
                         time,
                         subject,
@@ -1572,7 +1580,7 @@ impl Runner {
                         actor: to,
                         input: message_input(
                             pb::MessageSource::Compensation,
-                            &p.actor,
+                            &p.actor.to_pb(),
                             m,
                             time,
                             &compensates,
@@ -1610,33 +1618,6 @@ impl Runner {
         lock(&self.turns).push(turn.clone());
         Ok(turn)
     }
-}
-
-fn message_input(
-    source: pb::MessageSource,
-    sender: &ActorRef,
-    m: &pb::OutboundMessage,
-    sent: u64,
-    compensates: &str,
-) -> pb::Input {
-    pb::Input {
-        kind: Some(pb::input::Kind::Message(pb::MessageInput {
-            source: source as i32,
-            sender: Some(sender.to_pb()),
-            msg: m.msg.clone(),
-            message_id: m.message_id.clone(),
-            sent_logical_time_ms: sent,
-            compensates: compensates.to_owned(),
-            ..Default::default()
-        })),
-    }
-}
-
-/// The subject tag on a message body: live delivery uses it as the
-/// receiving turn's default subject, and so does replay.
-fn body_subject(msg: Option<&pb::Message>) -> Option<String> {
-    msg.and_then(|m| m.body.as_ref())
-        .and_then(|b| b.subject.clone())
 }
 
 /// Whether a turn's effects used a secret (ADR 0015): a `crypto.*` effect or
