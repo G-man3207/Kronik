@@ -11,6 +11,8 @@
 
 mod common;
 
+use common::files_containing;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
@@ -502,20 +504,6 @@ fn mcp_call(d: &Daemon, token: &str, tool: &str, arguments: Value) -> Value {
     r
 }
 
-/// Every file under `dir` (recursively) whose bytes contain `needle`.
-fn files_with(dir: &Path, needle: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut todo = vec![dir.to_path_buf()];
-    while let Some(p) = todo.pop() {
-        if p.is_dir() {
-            todo.extend(std::fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()));
-        } else if std::fs::read(&p).is_ok_and(|b| contains(&b, needle)) {
-            out.push(p);
-        }
-    }
-    out
-}
-
 /// M8 v0.1 gap: an `http.fetch` of a turn with a subject records its
 /// request and response under that subject. A proposal that changes the
 /// request must neither show those values in its diff (JSON, Markdown, CLI,
@@ -584,7 +572,7 @@ fn a_subjects_effect_values_stay_sealed_in_proposals() {
     let mut leaks = Vec::new();
     for secret in [REQUEST, RESPONSE, NOTE] {
         for id in [&with_pii, &without] {
-            for f in files_with(&dir.join("data/branches").join(id), secret) {
+            for f in files_containing(&dir.join("data/branches").join(id), secret.as_bytes()) {
                 leaks.push(format!("{secret} in {}", f.display()));
             }
         }
@@ -1048,25 +1036,11 @@ fn no_pii_forks_show_no_sql_rows() {
         }
     }
     for id in [&fork, &proposal] {
-        for f in files_with(&dir.join("data/branches").join(id), ROW) {
+        for f in files_containing(&dir.join("data/branches").join(id), ROW.as_bytes()) {
             leaks.push(f.display().to_string());
         }
     }
     assert!(leaks.is_empty(), "{ROW} in {leaks:#?}");
-}
-
-/// Every file under `dir` (recursively) whose bytes contain `needle`.
-fn files_with_bytes(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut todo = vec![dir.to_path_buf()];
-    while let Some(p) = todo.pop() {
-        if p.is_dir() {
-            todo.extend(std::fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()));
-        } else if std::fs::read(&p).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle)) {
-            out.push(p);
-        }
-    }
-    out
 }
 
 /// The wrapped keys of `subject`, read from a copy of `keys/keystore.db`
@@ -1154,11 +1128,11 @@ fn an_erasure_leaves_nothing_in_the_data_directory() {
     let wrapped = wrapped_keys(&data, "user:1");
     assert!(!wrapped.is_empty(), "user:1 has a key");
     assert!(
-        !files_with_bytes(&data, &wrapped[0]).is_empty(),
+        !files_containing(&data, &wrapped[0]).is_empty(),
         "the scan finds the wrapped key before the erasure"
     );
     assert!(
-        !files_with(&data, NOTE1).is_empty(),
+        !files_containing(&data, NOTE1.as_bytes()).is_empty(),
         "the scan finds the SQL row before the erasure"
     );
 
@@ -1171,14 +1145,14 @@ fn an_erasure_leaves_nothing_in_the_data_directory() {
         let mut leaks = Vec::new();
         for m in [NOTE1, STATE1, DEAD1] {
             leaks.extend(
-                files_with(data, m)
+                files_containing(data, m.as_bytes())
                     .into_iter()
                     .map(|f| format!("{m}: {f:?}")),
             );
         }
         for k in &wrapped {
             leaks.extend(
-                files_with_bytes(data, k)
+                files_containing(data, k)
                     .into_iter()
                     .map(|f| format!("user:1's wrapped key: {f:?}")),
             );
@@ -1366,7 +1340,10 @@ fn an_agents_probe_sees_only_pseudonyms_of_the_request_line() {
             assert!(!text.contains(real), "{real} in the {what}: {text}");
         }
     }
-    let files = files_with(&tmp.path().join("data/branches").join(&id), "rt-SECRET42");
+    let files = files_containing(
+        &tmp.path().join("data/branches").join(&id),
+        "rt-SECRET42".as_bytes(),
+    );
     assert!(files.is_empty(), "{files:?}");
 }
 

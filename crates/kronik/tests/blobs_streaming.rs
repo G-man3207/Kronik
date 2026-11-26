@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use blob_fixtures::{hash, pattern};
-use common::Daemon;
+use common::{Daemon, log_records};
 use serde_json::{Value, json};
 
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
@@ -433,26 +433,6 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
         .any(|w| &w[..8] == head && w == needle)
 }
 
-fn records(dir: &Path) -> Vec<kronik_proto::Record> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
-        let reader = kronik_log::LogReader::new(env, dir.join("data/branches/main/log"), "main");
-        let mut out = Vec::new();
-        reader
-            .read(1, u64::MAX, |c| {
-                out.push(c.record);
-                Ok(())
-            })
-            .await
-            .unwrap();
-        out
-    })
-}
-
 /// Criterion 3: the log holds only the hash above the threshold; a body of
 /// the threshold stays inline and one byte more does not; an identity
 /// replay of a turn that reads three ranges has no difference.
@@ -542,7 +522,7 @@ fn the_log_holds_only_the_hash_above_the_threshold() {
     // The records hold the references.
     let mut inputs = Vec::new();
     let mut responses = Vec::new();
-    for record in records(dir.path()) {
+    for record in log_records(dir.path()) {
         let kronik_proto::Record::TurnRecord(t) = record else {
             continue;
         };

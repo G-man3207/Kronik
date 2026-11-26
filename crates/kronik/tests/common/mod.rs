@@ -294,6 +294,42 @@ pub fn read_answer(reader: impl std::io::Read) -> Answer {
     }
 }
 
+/// Every record of the `main` branch's log under `<dir>/data`, read while
+/// the daemon runs (only fsynced records exist) or after it died.
+pub fn log_records(dir: &Path) -> Vec<kronik_proto::Record> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+        let reader = kronik_log::LogReader::new(env, dir.join("data/branches/main/log"), "main");
+        let mut out = Vec::new();
+        reader
+            .read(1, u64::MAX, |c| {
+                out.push(c.record);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        out
+    })
+}
+
+/// Every file under `dir`, recursively, whose bytes contain `needle`.
+pub fn files_containing(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(p) = todo.pop() {
+        if p.is_dir() {
+            todo.extend(std::fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()));
+        } else if std::fs::read(&p).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle)) {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// `kronik serve` as a child process, with its data in `<dir>/data`, its
 /// API socket at `<dir>/api.sock` and its stderr appended to
 /// `<dir>/serve.log`; killed when dropped.
