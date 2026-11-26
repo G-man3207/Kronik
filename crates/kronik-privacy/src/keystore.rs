@@ -850,7 +850,8 @@ impl Keystore {
 
     /// The whole keystore, encrypted under a key derived from the master key
     /// with the fresh `nonce`, for shipping: subject ids and erasures are
-    /// hidden too. [`Keystore::restore_owned`] restores it under the original owner.
+    /// hidden too. [`Keystore::restore_staged`] imports it into a restore that
+    /// the original owner began.
     pub fn export_backup(&self, nonce: [u8; 24]) -> Result<Vec<u8>, PrivacyError> {
         let conn = self.checked_conn()?;
         let mut payload = Zeroizing::new(Vec::new());
@@ -1113,6 +1114,21 @@ impl Pseudonyms {
     }
 }
 
+/// Opens a backup the way `kronik restore` does: under a fresh owned data
+/// directory, in the restore phase, never at the live `keys/keystore.db`.
+#[cfg(test)]
+pub(crate) fn staged_backup(
+    master: &MasterKey,
+    backup: &[u8],
+) -> Result<(tempfile::TempDir, KeystoreRestore, std::sync::Arc<Keystore>), PrivacyError> {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = crate::key_source::lock_data(dir.path()).unwrap();
+    let restore = owner.begin_keystore_restore().unwrap();
+    let keys =
+        Keystore::restore_staged(&restore, std::path::Path::new(".restore"), master, backup)?;
+    Ok((dir, restore, keys))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1261,8 +1277,8 @@ mod tests {
         assert!(backup.starts_with(BACKUP_MAGIC));
         assert!(!backup.windows(6).any(|w| w == b"user:1" || w == b"user:2"));
 
-        let restored =
-            Keystore::restore_memory(&MasterKey::from_bytes([1; 32]).unwrap(), &backup).unwrap();
+        let master = MasterKey::from_bytes([1; 32]).unwrap();
+        let (_restored_dir, _restore, restored) = staged_backup(&master, &backup).unwrap();
         assert_eq!(
             unseal(
                 "user:1",
@@ -1278,15 +1294,14 @@ mod tests {
         ));
         assert_eq!(restored.stats().unwrap(), ks.stats().unwrap());
 
-        let wrong = Keystore::restore_memory(&MasterKey::from_bytes([2; 32]).unwrap(), &backup);
+        let wrong = staged_backup(&MasterKey::from_bytes([2; 32]).unwrap(), &backup);
         assert!(matches!(wrong, Err(PrivacyError::Decrypt(_))));
         let mut tampered = backup.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 1;
-        let tampered =
-            Keystore::restore_memory(&MasterKey::from_bytes([1; 32]).unwrap(), &tampered);
+        let tampered = staged_backup(&master, &tampered);
         assert!(matches!(tampered, Err(PrivacyError::Decrypt(_))));
-        let junk = Keystore::restore_memory(&MasterKey::from_bytes([1; 32]).unwrap(), b"junk");
+        let junk = staged_backup(&master, b"junk");
         assert!(matches!(junk, Err(PrivacyError::BadBackup)));
 
         // A backup under another key leaves an existing store untouched,
@@ -1296,28 +1311,60 @@ mod tests {
         let kept_master = MasterKey::from_bytes([3; 32]).unwrap();
         let kept = Keystore::open_owned(&owner, &kept_master).unwrap();
         kept.key_for_sealing("user:7", [7; 32], [7; 24], 0).unwrap();
-        assert!(matches!(
-            Keystore::restore_owned(&owner, &kept_master, &backup),
-            Err(PrivacyError::Decrypt(_))
-        ));
+        let restore = owner.begin_keystore_restore().unwrap();
+        let failed = Keystore::restore_staged(
+            &restore,
+            std::path::Path::new(".restore"),
+            &kept_master,
+            &backup,
+        );
+        assert!(matches!(failed, Err(PrivacyError::Decrypt(_))));
         found(kept.key("user:7", 1).unwrap());
         found(kept.reopen_owned().unwrap().key("user:7", 1).unwrap());
+        drop(restore);
+        drop(kept);
 
-        // A restore over a keystore of another key replaces it, key included.
+        // Installing a backup over a keystore of another key replaces it,
+        // key included.
         let replacement = tempfile::tempdir().unwrap();
         let replacement_owner = crate::key_source::lock_data(replacement.path()).unwrap();
         let old = Keystore::open_owned(&replacement_owner, &kept_master).unwrap();
         old.key_for_sealing("user:9", [9; 32], [9; 24], 0).unwrap();
+        drop(old);
         let restored_master = MasterKey::from_bytes([1; 32]).unwrap();
-        let replaced =
-            Keystore::restore_owned(&replacement_owner, &restored_master, &backup).unwrap();
+        let restore = replacement_owner.begin_keystore_restore().unwrap();
+        let staged = Keystore::restore_staged(
+            &restore,
+            std::path::Path::new(".restore"),
+            &restored_master,
+            &backup,
+        )
+        .unwrap();
+        restore.close_stage(staged).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let from = replacement
+                .path()
+                .join(format!(".restore/keystore.db{suffix}"));
+            let to = replacement.path().join(format!("keys/keystore.db{suffix}"));
+            if from.exists() {
+                std::fs::rename(from, to).unwrap();
+            } else if to.exists() {
+                std::fs::remove_file(to).unwrap();
+            }
+        }
+        let replaced = restore.finish(Some(&restored_master)).unwrap().unwrap();
         found(replaced.key("user:1", 1).unwrap());
         assert!(matches!(
-            old.key("user:9", 1),
+            Keystore::open_owned(&replacement_owner, &kept_master),
             Err(PrivacyError::KeyMismatch(_))
         ));
         drop(replaced);
-        Keystore::open_owned(&replacement_owner, &restored_master).unwrap();
+        found(
+            Keystore::open_owned(&replacement_owner, &restored_master)
+                .unwrap()
+                .key("user:1", 1)
+                .unwrap(),
+        );
     }
 
     /// Review F4: a key of the right version from another lineage (a new

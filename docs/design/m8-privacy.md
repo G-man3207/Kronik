@@ -336,10 +336,12 @@ starts a background compaction that requires the mode to be `on`:
 `Keystore::export_backup(nonce)` produces one blob: `KRKSTOR1`, a 24-byte
 nonce, and XChaCha20-Poly1305 under `derive_key("kronik keystore backup v1",
 master)` of every key row and erasure row. Subject ids are therefore hidden
-too. `Keystore::restore_owned(original_owner, master, blob)` restores it using
-the same exclusive data-directory owner and shared negative publication as all
-other mutable handles. `reopen_owned()` shares that owner; private memory and
-actual read-only connections are distinct modes, not file-owner substitutes.
+too. `Keystore::restore_staged` imports it into the stage that
+`DataOwnership::begin_keystore_restore` opened, and `kronik restore` installs
+that staged file by rename using the same exclusive data-directory owner and
+shared negative publication as all other mutable handles. `reopen_owned()`
+shares that owner; private memory and actual read-only connections are distinct
+modes, not file-owner substitutes.
 
 The M6 shipper uploads a backup after keystore changes (debounced, at most
 once a minute) and daily, as `keystore/<wall_ms>.bin`. It deletes backups

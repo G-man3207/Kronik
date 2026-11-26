@@ -1377,9 +1377,9 @@ mod blob_key_tests {
         s.set_on(true);
         let keys = s.blob_keys("user:9", &fill(2), 1).unwrap();
         let backup = s.keystore().unwrap().export_backup([1; 24]).unwrap();
-        let restored = Sealer::new(Arc::new(
-            Keystore::restore_memory(&master(), &backup).unwrap(),
-        ));
+        let (_dir, _restore, restored) =
+            crate::keystore::staged_backup(&master(), &backup).unwrap();
+        let restored = Sealer::new(restored);
         let access = restored.blob_key_access();
         assert_eq!(
             *found(access.identity_key("user:9", keys.key_version)),
