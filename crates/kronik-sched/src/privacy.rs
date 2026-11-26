@@ -379,15 +379,8 @@ impl Node {
 mod tests {
     use kronik_core::env::Env;
     use kronik_core::error::ErrorCode;
-    use kronik_proto::log::v1 as pb;
 
-    fn audit() -> pb::Audit {
-        pb::Audit {
-            token_id: "test".into(),
-            reason: "test".into(),
-            wall_time_ms: 0,
-        }
-    }
+    use crate::test_support::audit;
 
     /// Erasure uses the same subject rule as the log format, and the refusal
     /// names [`kronik_proto::blobs::MAX_SUBJECT_BYTES`].

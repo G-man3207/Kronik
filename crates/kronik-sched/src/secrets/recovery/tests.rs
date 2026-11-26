@@ -7,15 +7,12 @@ use super::super::Scope;
 use super::*;
 use crate::Ingress;
 use crate::secrets::certification_tests::{begin, config, env, install_file, plain, reveal, run};
+use crate::test_support::COUNTER;
 use kronik_core::env::{BoxFuture, HttpRequest, HttpResponse, Net, NetError, Spawner};
 use kronik_privacy::{SecretMeta, secret_backend::config::Definition};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-const COUNTER: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/guests/counter.wasm"
-);
 static TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 fn audit() -> pb::Audit {
     super::super::system_audit(&env(), "recorded secret recovery fixture")
