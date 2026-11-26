@@ -56,16 +56,6 @@ impl Daemon {
     }
 }
 
-fn until(what: &str, f: impl Fn() -> bool) {
-    for _ in 0..800 {
-        if f() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for {what}");
-}
-
 /// Every text the client got until the connection ended.
 fn transcript(ws: &mut WebSocket<TcpStream>, until_text: &str) -> Vec<String> {
     let mut got = Vec::new();
@@ -120,7 +110,7 @@ fn run(stream: &str, safe: bool) {
     drop(ws);
 
     let d = Daemon::start(dir.path(), &[]);
-    until("the restart close", || {
+    d.wait_until("the restart close", |_| {
         d.ask("closes").contains("host 1012 restart")
     });
     // The re-run's send-now: OUTCOME_UNKNOWN, never sent again.

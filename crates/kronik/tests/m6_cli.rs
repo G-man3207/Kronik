@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::{Child, Stdio};
 use std::time::Duration;
 
-use common::{Out, command};
+use common::{Out, command, ship_now, wait_until_shipped};
 use serde_json::Value;
 
 const COUNTER: &str = concat!(
@@ -524,23 +524,6 @@ fn actor_databases(root: &Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// Ships the data directory `data` to the bucket `url` once, the way a node
-/// does every few seconds (`kronik_ship::ship_once`), without a running node.
-fn ship_now(data: &Path, url: &str) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        let remote = kronik_ship::Remote::open(url, None).unwrap();
-        let mut state = kronik_ship::ShipState::load(data).unwrap();
-        kronik_ship::ship_once(&remote, data, "main", &mut state)
-            .await
-            .unwrap();
-    });
-}
-
 /// The applied LSN of every actor database under `root`.
 fn actor_markers(root: &Path) -> Vec<i64> {
     let mut out = Vec::new();
@@ -858,7 +841,7 @@ fn restore_from_a_file_bucket_lands_in_the_named_directory() {
         .as_str()
         .unwrap()
         .to_owned();
-    let shipped = wait_until_shipped(&data, lsn, 225);
+    let shipped = wait_until_shipped(&data, lsn);
     let _ = child.kill();
     let _ = child.wait();
     assert!(shipped, "the snapshot was not in the bucket after 45s");
@@ -987,40 +970,6 @@ fn restore_from_a_file_bucket_lands_in_the_named_directory() {
     ]);
     assert_ne!(bad.code, 0, "{bad:?}");
     assert!(bad.json()["error"]["code"].is_string(), "{bad:?}");
-}
-
-fn wait_until_shipped(data: &Path, lsn: u64, rounds: u32) -> bool {
-    for _ in 0..rounds {
-        if let Ok(text) = std::fs::read_to_string(data.join("ship.json"))
-            && let Ok(v) = serde_json::from_str::<Value>(&text)
-        {
-            let snaps = v["snapshots"]
-                .as_array()
-                .is_some_and(|a| a.iter().any(|n| n.as_u64() == Some(lsn)));
-            let code = v["code"].as_array().is_some_and(|a| !a.is_empty());
-            if snaps && code && segment_caught_up(data, &v) {
-                return true;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    false
-}
-
-fn segment_caught_up(data: &Path, v: &Value) -> bool {
-    let Some(active) = v["active"].as_array() else {
-        return false;
-    };
-    let Some(start) = active.first().and_then(|n| n.as_u64()) else {
-        return false;
-    };
-    let Some(size) = active.get(1).and_then(|n| n.as_u64()) else {
-        return false;
-    };
-    let path = data
-        .join("branches/main/log")
-        .join(format!("{start:020}.seg"));
-    std::fs::metadata(path).is_ok_and(|m| m.len() == size)
 }
 
 fn first_zst(dir: &Path) -> Option<std::path::PathBuf> {

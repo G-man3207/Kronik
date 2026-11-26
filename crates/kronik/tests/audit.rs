@@ -27,7 +27,7 @@ mod common;
 #[path = "../../kronik-api/tests/common/oidc_provider.rs"]
 mod oidc_provider;
 
-use common::command;
+use common::{command, wait_until_shipped};
 
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -1555,29 +1555,6 @@ fn restore_over_the_exported_directory(stop_after_event: bool) {
     let (code, report) = verify(&d, &data);
     assert_eq!(code, 0, "{report}");
     assert!(report["superseded"].as_u64().unwrap() >= 3, "{report}");
-}
-
-/// The snapshot at `lsn`, the code and the active segment as it is now are
-/// in the bucket (as `m6_cli.rs` waits).
-fn wait_until_shipped(data: &Path, lsn: u64) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(45);
-    while Instant::now() < deadline {
-        if let Ok(text) = std::fs::read_to_string(data.join("ship.json"))
-            && let Ok(v) = serde_json::from_str::<Value>(&text)
-            && v["snapshots"]
-                .as_array()
-                .is_some_and(|a| a.iter().any(|n| n.as_u64() == Some(lsn)))
-            && v["code"].as_array().is_some_and(|a| !a.is_empty())
-            && let Some(start) = v["active"][0].as_u64()
-            && let Some(size) = v["active"][1].as_u64()
-            && std::fs::metadata(data.join(format!("branches/main/log/{start:020}.seg")))
-                .is_ok_and(|m| m.len() == size)
-        {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    false
 }
 
 fn copy_dir(from: &Path, to: &Path) {
