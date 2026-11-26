@@ -442,6 +442,7 @@ async fn failed_temporary_unlink_leaves_cache_and_other_stream_unchanged() {
     cursors.save("audit", entry(3, [0; 16])).await.unwrap();
     let restored = Cursors::load(env(), dir.path()).await.unwrap();
     assert_eq!(restored.get("traces").unwrap().lsn, 10);
+    assert_eq!(restored.get("traces").unwrap().state["checkpoint"], 10);
     assert_eq!(restored.get("audit").unwrap().lsn, 3);
 }
 
