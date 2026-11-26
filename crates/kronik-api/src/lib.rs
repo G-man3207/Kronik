@@ -240,13 +240,6 @@ mod reason_tests {
     }
 }
 
-fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
-    match s.and_then(|s| s.value.as_ref()) {
-        Some(pb::sealable::Value::Plain(b)) => b.clone(),
-        _ => Vec::new(),
-    }
-}
-
 /// The message a send names: its body plain, tagged with its subject;
 /// `application/octet-stream` when it names no content type.
 fn send_message(
@@ -552,10 +545,8 @@ fn request_line(e: &pb::EffectRecord) -> Option<String> {
     if !matches!(e.kind.as_str(), "http.fetch" | "foreign.http") {
         return None;
     }
-    let Some(pb::sealable::Value::Plain(bytes)) = e.request.as_ref()?.value.as_ref() else {
-        return None;
-    };
-    let r = pb::HttpEffectRequest::decode(bytes.as_slice()).ok()?;
+    let bytes = e.request.as_ref()?.plain()?;
+    let r = pb::HttpEffectRequest::decode(bytes).ok()?;
     let rest = r
         .url
         .split_once("://")
@@ -617,7 +608,7 @@ fn payload_json(b: &[u8]) -> serde_json::Value {
 fn sealable_json(s: Option<&pb::Sealable>) -> serde_json::Value {
     serde_json::json!({
         "subject": s.and_then(|s| s.subject.clone()),
-        "value": payload_json(&sealable_bytes(s)),
+        "value": payload_json(s.and_then(pb::Sealable::plain).unwrap_or_default()),
     })
 }
 
@@ -815,9 +806,11 @@ pub(crate) fn accept_subprotocol(v: &mut serde_json::Value, t: &pb::TurnRecord, 
         .headers
         .iter()
         .filter(|h| h.name.eq_ignore_ascii_case("sec-websocket-protocol"))
-        .filter_map(|h| match h.value.as_ref().and_then(|v| v.value.as_ref()) {
-            Some(pb::sealable::Value::Plain(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-            _ => None,
+        .filter_map(|h| {
+            h.value
+                .as_ref()
+                .and_then(pb::Sealable::plain)
+                .map(|b| String::from_utf8_lossy(b).into_owned())
         })
         .collect();
     let offered =
@@ -933,7 +926,7 @@ fn turn_json(branch: &str, lsn: u64, t: &pb::TurnRecord) -> TurnJson {
         "sql_schema": t.sql_schema.iter().map(|s| s.statement.clone()).collect::<Vec<_>>(),
         "sql_changes": t.sql_changes.iter().map(|c| serde_json::json!({
             "subject": c.changeset.as_ref().and_then(|s| s.subject.clone()),
-            "bytes": sealable_bytes(c.changeset.as_ref()).len(),
+            "bytes": c.changeset.as_ref().and_then(pb::Sealable::plain).map_or(0, <[u8]>::len),
         })).collect::<Vec<_>>(),
         "fuel_used": t.fuel_used,
         "memory_peak_bytes": t.memory_peak_bytes,

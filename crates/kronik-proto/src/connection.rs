@@ -21,10 +21,11 @@ const SEND_NOW_DOMAIN: &[u8] = b"kronik.fingerprint.connection.v1";
 pub fn send_now_fingerprint(connection: &str, frame: &pb::Frame) -> Vec<u8> {
     let mut h = blake3::Hasher::new();
     h.update(SEND_NOW_DOMAIN);
-    let data: &[u8] = match frame.data.as_ref().and_then(|d| d.value.as_ref()) {
-        Some(pb::sealable::Value::Plain(b)) => b.as_slice(),
-        _ => &[],
-    };
+    let data: &[u8] = frame
+        .data
+        .as_ref()
+        .and_then(pb::Sealable::plain)
+        .unwrap_or_default();
     let kind = frame.kind.to_le_bytes();
     for field in [
         connection.as_bytes(),
@@ -50,10 +51,12 @@ pub fn send_now_request(
         connection: connection.to_owned(),
         seq,
         kind: frame.kind,
-        data: match frame.data.as_ref().and_then(|d| d.value.as_ref()) {
-            Some(pb::sealable::Value::Plain(b)) => b.clone(),
-            _ => Vec::new(),
-        },
+        data: frame
+            .data
+            .as_ref()
+            .and_then(pb::Sealable::plain)
+            .unwrap_or_default()
+            .to_vec(),
         event: frame.event.clone(),
         id: frame.id.clone(),
     }

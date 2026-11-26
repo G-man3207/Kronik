@@ -2088,13 +2088,6 @@ fn disclose_prepared_neighbor(
         .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))
 }
 
-fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
-    match s.and_then(|s| s.value.as_ref()) {
-        Some(pb::sealable::Value::Plain(b)) => b.clone(),
-        _ => Vec::new(),
-    }
-}
-
 /// The guest-visible text of a replay without a recording (FailClosed).
 pub const NO_RECORDING: &str = "replay: no recording";
 
@@ -2679,7 +2672,13 @@ impl ReplayGate {
             .as_ref()
             .filter(|p| p.kind == kind && p.request.is_some())
             .and_then(|p| {
-                pb::HttpEffectRequest::decode(sealable_bytes(p.request.as_ref()).as_slice()).ok()
+                pb::HttpEffectRequest::decode(
+                    p.request
+                        .as_ref()
+                        .and_then(pb::Sealable::plain)
+                        .unwrap_or_default(),
+                )
+                .ok()
             });
         let mut headers = Vec::new();
         for (name, value) in &req.headers {
@@ -3580,7 +3579,13 @@ impl ReplayGate {
             let mut rec = p;
             rec.grounding = pb::Grounding::Exact as i32;
             let out = if rec.status == pb::EffectStatus::Ok as i32 {
-                CryptoOutcome::Ok(sealable_bytes(rec.response.as_ref()))
+                CryptoOutcome::Ok(
+                    rec.response
+                        .as_ref()
+                        .and_then(pb::Sealable::plain)
+                        .unwrap_or_default()
+                        .to_vec(),
+                )
             } else if rec.status == pb::EffectStatus::Denied as i32 {
                 CryptoOutcome::Denied(rec.error.clone())
             } else {
