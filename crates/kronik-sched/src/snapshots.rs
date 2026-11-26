@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::Lsn;
+use kronik_core::sync::lock;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use serde::{Deserialize, Serialize};
@@ -81,7 +82,7 @@ impl RetentionHold {
 
     /// Refreshes the durable floor without completing any pending rewind.
     pub fn set(&self, floor: Lsn, now_ms: u64) {
-        let rewind = self.rewind.lock().unwrap_or_else(|e| e.into_inner());
+        let rewind = lock(&self.rewind);
         let floor = rewind.map_or(floor, |(_, to)| floor.min(to));
         self.floor.store(floor, Ordering::Relaxed);
         self.set_ms.store(now_ms, Ordering::Relaxed);
@@ -89,7 +90,7 @@ impl RetentionHold {
 
     /// Holds the earliest cut until the latest generation durably completes.
     pub fn rewind(&self, generation: [u8; 16], to: Lsn, now_ms: u64) {
-        let mut rewind = self.rewind.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rewind = lock(&self.rewind);
         let to = rewind.map_or(to, |(_, cut)| cut.min(to));
         *rewind = Some((generation, to));
         self.floor.fetch_min(to, Ordering::Relaxed);
@@ -98,7 +99,7 @@ impl RetentionHold {
 
     /// Only a durable completion of the current generation releases its cut.
     pub fn complete_rewind(&self, generation: [u8; 16], floor: Lsn, now_ms: u64) {
-        let mut rewind = self.rewind.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rewind = lock(&self.rewind);
         if rewind.is_some_and(|(pending, _)| pending == generation) {
             *rewind = None;
         }
@@ -115,7 +116,7 @@ impl RetentionHold {
         durable_floor: Lsn,
         now_ms: u64,
     ) {
-        let mut rewind = self.rewind.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rewind = lock(&self.rewind);
         if !rewind.is_some_and(|(generation, _)| generation == failed_generation) {
             return;
         }
@@ -1103,11 +1104,7 @@ impl Node {
     /// segment that it would have deleted otherwise (`GET /v1/health`,
     /// `kronik doctor`).
     pub fn retention_pin(&self) -> Option<RetentionPin> {
-        self.retention_pin
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .current
-            .clone()
+        lock(&self.retention_pin).current.clone()
     }
 
     /// Records what the open-turn pin kept in a pass (`held`: the first LSNs
@@ -1140,7 +1137,7 @@ impl Node {
             &[("source", "snapshot")],
             if pin.is_some() && !live { count } else { 0.0 },
         );
-        let mut state = self.retention_pin.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = lock(&self.retention_pin);
         let Some(pin) = pin else {
             state.current = None;
             return;

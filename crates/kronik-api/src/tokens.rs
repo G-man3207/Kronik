@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine as _;
 use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::sync::lock;
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -419,17 +420,15 @@ impl TokenStore {
     }
 
     fn inner(&self) -> MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.inner)
     }
 
     fn live(&self) -> MutexGuard<'_, Live> {
-        self.live.lock().unwrap_or_else(|error| error.into_inner())
+        lock(&self.live)
     }
 
     fn publication(&self) -> MutexGuard<'_, ()> {
-        self.publication
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+        lock(&self.publication)
     }
 
     /// Publish already-durable revocation/configuration, or a conservative early
@@ -450,11 +449,7 @@ impl TokenStore {
     /// Managed provenance, including revoked names, without SQLite I/O.
     pub fn fleet_token(&self, token_id: &str) -> Option<Arc<FleetToken>> {
         let name = token_id.strip_prefix("token:")?;
-        self.managed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(name)
-            .cloned()
+        lock(&self.managed).get(name).cloned()
     }
 
     /// Creates the token `name` from 32 bytes of fresh randomness and
@@ -573,10 +568,7 @@ impl TokenStore {
             .map(|fleet| (name.to_owned(), Arc::new(fleet.clone())));
         self.publish_auth_change(&mut || {
             if let Some((name, fleet)) = managed.take() {
-                self.managed
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(name, fleet);
+                lock(&self.managed).insert(name, fleet);
             }
             self.live()
                 .insert(digest, (name.to_owned(), meta.scopes.clone()));
@@ -676,7 +668,7 @@ impl TokenStore {
         token_name: Option<&str>,
     ) -> bool {
         let live = self.live();
-        let managed = self.managed.lock().unwrap_or_else(|e| e.into_inner());
+        let managed = lock(&self.managed);
         live.values().any(|(name, current_scopes)| {
             token_name.is_none_or(|expected| name == expected)
                 && current_scopes.len() == scopes.len()
@@ -707,9 +699,7 @@ impl TokenStore {
             return false;
         }
         let matches = |fleet: &FleetToken| fleet.epoch == epoch && fleet.request_id == request_id;
-        self.managed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lock(&self.managed)
             .get(name)
             .is_some_and(|fleet| matches(fleet))
     }

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::sync::lock;
 use kronik_fleet::enrollment::{
     self, ControllerClient, ControllerConfig, EnrollmentPhase, EnrollmentPlan, EnrollmentRecord,
     FleetError, FleetIdentity,
@@ -819,16 +820,14 @@ impl Fleet {
                         .await
                         .map_err(|_| FleetError::Persistence)?;
                     if record.phase == EnrollmentPhase::Active {
-                        *completed.lock().unwrap_or_else(|e| e.into_inner()) = Some(admitting);
+                        *lock(&completed) = Some(admitting);
                     }
                     Ok(())
                 })
             },
         );
         let accepted = enrollment.await.map_err(fleet_error)?;
-        let admitting = completed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let admitting = lock(&completed)
             .take()
             .ok_or_else(|| internal("fleet completion missing"))?;
         Ok(FleetStatus::acknowledged(accepted, admitting))

@@ -9,6 +9,7 @@
 //!   with `SUBJECT_ERASED` and becomes a dead letter.
 
 use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::sync::lock;
 use kronik_privacy::sealer::Unreadable;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
@@ -89,12 +90,9 @@ impl Node {
     /// subject never seals under a key version newer than the erased ones
     /// (ADR 0123 §6, docs/design/m8-privacy.md §6.8).
     pub fn tombstone_fork_record(&self, record: &mut Record, born: Born) -> usize {
-        self.erasure_marks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .tombstone(born, |f| {
-                kronik_proto::sealables::record_mut(record, f);
-            })
+        lock(&self.erasure_marks).tombstone(born, |f| {
+            kronik_proto::sealables::record_mut(record, f);
+        })
     }
 
     /// Seals a record a fork writes to disk (its log, its samples): like

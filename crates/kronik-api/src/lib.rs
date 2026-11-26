@@ -37,6 +37,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, CodeHash, TurnId};
+use kronik_core::sync::lock;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Node, TurnResult};
 use serde::Serialize;
@@ -1757,11 +1758,7 @@ impl Api {
                 .sql
                 .get(&actor.to_string())
                 .map_err(internal)?;
-            let rows = db
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .table_rows()
-                .map_err(internal)?;
+            let rows = lock(&db).table_rows().map_err(internal)?;
             Some(SqlSummary {
                 tables: rows
                     .into_iter()
