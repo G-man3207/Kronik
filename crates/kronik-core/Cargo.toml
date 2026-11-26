@@ -31,6 +31,10 @@ real = [
     "tokio/process",
 ]
 
+# A forwarding test file system (env::test_fs), for other crates' tests only:
+# enable it in [dev-dependencies], never in [dependencies].
+test-util = []
+
 [dependencies]
 schemars = { workspace = true, optional = true }
 blake3 = { workspace = true }

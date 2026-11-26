@@ -27,6 +27,9 @@ use bytes::Bytes;
 #[cfg(feature = "real")]
 pub mod real;
 
+#[cfg(feature = "test-util")]
+pub mod test_fs;
+
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Time. The wall clock may jump in either direction (NTP, VM migration,
