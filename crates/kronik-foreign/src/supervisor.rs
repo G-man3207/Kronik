@@ -1214,10 +1214,11 @@ mod tests {
         assert_eq!(e, "SECRET_NOT_FOUND: the secret store is not configured");
     }
 
-    /// The bundle spec of a trusted declaration denies the escape syscalls.
-    /// gVisor and a microVM have their own kernels and get no host filter.
-    /// Passing `syscall_filter: true` itself would not catch a supervisor
-    /// that stopped setting the flag.
+    /// A trusted declaration's bundle spec gets the host seccomp filter (its
+    /// content is pinned by `oci::tests::runtime_spec_applies_the_overrides`);
+    /// gVisor and a microVM have their own kernels and get none. Passing
+    /// `syscall_filter: true` itself would not catch a supervisor that stopped
+    /// setting the flag.
     #[test]
     fn a_trusted_declaration_spec_denies_escape_syscalls() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1256,27 +1257,11 @@ mod tests {
             oci::runtime_spec(&image, &rootfs, &overrides).unwrap()
         };
         let trusted = spec_for(pb::Isolation::Trusted as i32);
-        let filter = &trusted.json["linux"]["seccomp"];
-        assert_eq!(filter["defaultAction"], "SCMP_ACT_ALLOW");
-        let denied = filter["syscalls"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|rule| {
-                rule["names"]
-                    .as_array()
-                    .is_some_and(|names| names.iter().any(|name| name == "unshare"))
-            })
-            .unwrap_or_else(|| panic!("no denied-syscall rule: {filter}"));
-        assert_eq!(denied["action"], "SCMP_ACT_ERRNO");
-        assert_eq!(denied["errnoRet"], 1);
-        let names = denied["names"].as_array().unwrap();
-        for syscall in ["unshare", "mount", "bpf", "io_uring_setup"] {
-            assert!(
-                names.contains(&serde_json::json!(syscall)),
-                "trusted spec does not deny {syscall}: {names:?}"
-            );
-        }
+        assert!(
+            trusted.json["linux"]["seccomp"]["syscalls"].is_array(),
+            "a trusted declaration must get the host filter: {}",
+            trusted.json["linux"]
+        );
         for isolation in [pb::Isolation::Gvisor as i32, pb::Isolation::Microvm as i32] {
             let spec = spec_for(isolation);
             assert!(

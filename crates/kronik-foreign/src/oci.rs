@@ -2319,8 +2319,13 @@ mod tests {
         let filter = &trusted.json["linux"]["seccomp"];
         assert_eq!(filter["defaultAction"], "SCMP_ACT_ALLOW");
         let names = filter["syscalls"][0]["names"].as_array().unwrap();
+        assert_eq!(filter["syscalls"][0]["action"], "SCMP_ACT_ERRNO");
+        assert_eq!(filter["syscalls"][0]["errnoRet"], 1);
         assert!(names.contains(&json!("unshare")) && names.contains(&json!("bpf")));
-        assert!(names.contains(&json!("io_uring_setup")));
+        assert!(
+            names.contains(&json!("io_uring_setup")) && names.contains(&json!("mount")),
+            "the deny rule must name {names:?}"
+        );
         assert_eq!(filter["syscalls"][1]["errnoRet"], 38);
         assert_eq!(filter["syscalls"].as_array().unwrap().len(), 9);
     }
