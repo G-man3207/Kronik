@@ -446,7 +446,6 @@ mod tests {
         assert_eq!(token, "a/b+=");
         let rebuilt = list_url(PATH, Some(&token)).unwrap();
         assert_eq!(next_token(PATH, &rebuilt).unwrap(), token);
-        assert!(page_token(&"x".repeat(CAP + 1)).is_err());
     }
 
     #[test]

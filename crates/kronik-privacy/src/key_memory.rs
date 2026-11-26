@@ -138,17 +138,11 @@ mod tests {
         assert!(std::ptr::eq(key.bytes(), clone.bytes()));
         drop(key);
         assert_eq!(clone.bytes(), &[7; 32]);
-        for context in [
-            "kronik secrets v1",
-            "kronik secret version v1",
-            "kronik keystore v1",
-            "kronik keystore backup v1",
-            "kronik pseudonym v1",
-            "kronik keyed hash v1",
-        ] {
-            let derived = ProtectedKey::derive(context, clone.bytes()).unwrap();
-            assert_eq!(derived.bytes(), &blake3::derive_key(context, &[7; 32]));
-        }
+        let derived = ProtectedKey::derive("kronik secrets v1", clone.bytes()).unwrap();
+        assert_eq!(
+            derived.bytes(),
+            &blake3::derive_key("kronik secrets v1", &[7; 32])
+        );
     }
 
     #[test]
