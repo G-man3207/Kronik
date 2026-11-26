@@ -724,8 +724,11 @@ async fn a_kept_alive_lease_outlives_its_ttl_while_held() {
     kept.add(meta.id);
     kept.keep_alive(&env);
     env.clock.sleep(Duration::from_millis(400)).await;
-    assert!(!plain.is_live(), "an unrenewed lease expires");
-    assert!(kept.is_live(), "a kept-alive lease does not");
+    assert_eq!(
+        store.leases().holders(),
+        ["kept"],
+        "an unrenewed lease expires, a kept-alive lease does not"
+    );
     assert!(store.leases().is_leased(&meta.id));
     drop(kept);
     drop(plain);

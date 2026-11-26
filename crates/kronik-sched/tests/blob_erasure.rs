@@ -479,7 +479,10 @@ fn the_first_pass_after_an_erasure_deletes_the_subjects_loose_plain_files() {
     p.rt.block_on(p.node.blob_gc(kronik_blob::SweepOptions::default()))
         .unwrap();
     assert_eq!(files_of(dir.path(), "user:1"), Vec::<bool>::new());
-    assert!(lease.is_live(), "the lease did not keep it");
+    assert!(
+        store.leases().holders().contains(&"upload"),
+        "the lease did not keep it"
+    );
 }
 
 /// The erasure is pending in `privacy status` until a collector pass after
