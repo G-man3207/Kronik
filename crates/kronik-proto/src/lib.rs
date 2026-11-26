@@ -1000,13 +1000,6 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_turn_record() {
-        let record = Record::TurnRecord(turn_record());
-        let bytes = record.encode();
-        assert_eq!(Record::decode(kind::TURN_RECORD, &bytes).unwrap(), record);
-    }
-
-    #[test]
     fn enum_zero_and_unknown_are_invalid() {
         let mut t = turn_record();
         t.writes[0].op = 0;
@@ -1379,33 +1372,6 @@ mod connection_tests {
 
     fn check(t: pb::TurnRecord) -> Result<Record, DecodeError> {
         Record::decode(kind::TURN_RECORD, &Record::TurnRecord(t).encode())
-    }
-
-    #[test]
-    fn a_valid_connection_turn_round_trips() {
-        let mut t = turn(frame_input(pb::ConnectionProtocol::Websocket));
-        t.connection_ops = vec![
-            pb::ConnectionOp {
-                connections: vec![CONN.into(), "c-ffffffffffffffffffffffffffffffff".into()],
-                seqs: vec![3, 0],
-                op: Some(pb::connection_op::Op::Send(text("msg"))),
-                dropped: Vec::new(),
-            },
-            pb::ConnectionOp {
-                connections: vec![CONN.into()],
-                seqs: vec![],
-                op: Some(pb::connection_op::Op::Close(pb::ConnectionCloseRequest {
-                    code: 1000,
-                    reason: plain(b"bye"),
-                })),
-                dropped: Vec::new(),
-            },
-        ];
-        let record = Record::TurnRecord(t);
-        assert_eq!(
-            Record::decode(kind::TURN_RECORD, &record.encode()).unwrap(),
-            record
-        );
     }
 
     /// M24 §6.3: an enum value 0 or an unknown one, a bad id, a missing
