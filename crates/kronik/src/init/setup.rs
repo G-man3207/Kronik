@@ -655,15 +655,6 @@ mod doctor_tests {
         assert_eq!(parse_doctor(br#"{"checks":[]}"#).unwrap(), (vec![], vec![]));
     }
 
-    #[test]
-    fn the_end_of_the_install_says_what_is_not_proven_only_when_something_is_not() {
-        use super::*;
-        // Printing is a side effect; the shape of the input is what matters here.
-        print_warnings(&[]);
-        let (warnings, _) = parse_doctor(REPORT.as_bytes()).unwrap();
-        print_warnings(&warnings);
-    }
-
     /// A directory this test's process owns, under `/tmp`: the service
     /// identities below are neither owner nor group, so only the "other"
     /// bits decide what they can reach.

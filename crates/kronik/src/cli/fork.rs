@@ -2381,28 +2381,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_lines_name_the_fired_rules() {
-        let mut out = String::new();
-        policy_lines(
-            &mut out,
-            &json!({"outcome": "require_approval", "fired": [
-                {"name": "payments-must-be-exact", "action": "require_approval"}
-            ], "errors": []}),
-        );
-        assert_eq!(
-            out,
-            "Policy   payments-must-be-exact -> APPROVAL REQUIRED\n"
-        );
-        let mut out = String::new();
-        policy_lines(
-            &mut out,
-            &json!({"outcome": "allow", "fired": [], "errors": []}),
-        );
-        assert_eq!(out, "Policy   ALLOW\n");
-    }
-
-    #[test]
-    fn the_policy_line_lists_every_fired_rule_with_the_floor() {
+    fn policy_lines_name_every_fired_rule_or_the_outcome() {
         let mut out = String::new();
         policy_lines(
             &mut out,
@@ -2417,6 +2396,12 @@ mod tests {
             "Policy   any-change -> APPROVAL REQUIRED, pii-masked-needs-approval -> \
              APPROVAL REQUIRED: 8 turns could not be verified without personal data\n"
         );
+        let mut out = String::new();
+        policy_lines(
+            &mut out,
+            &json!({"outcome": "allow", "fired": [], "errors": []}),
+        );
+        assert_eq!(out, "Policy   ALLOW\n");
     }
 
     /// Turns that met erased data are `Unverifiable`, as the upgrade check
