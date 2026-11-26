@@ -13,6 +13,7 @@ use std::sync::Arc;
 use common::{Proc, audit, slow_server, start_proc, wait_turn};
 use kronik_blob::{BlobMeta, BlobStore, NoKeys, Space, StoreConfig};
 use kronik_core::env::Env;
+use kronik_core::env::test_fs::{FsCall, Then, hooked};
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
@@ -668,76 +669,36 @@ fn a_turn_that_fills_the_store_itself_stops_waiting() {
 /// Real files. Renames into `objects/` (naming a blob) fail with an I/O
 /// error while `fail` is set; otherwise they, and the syncs of `objects/`
 /// directories, are recorded in `events` in order.
-struct ObjectsFs {
-    inner: Arc<dyn kronik_core::env::Fs>,
+fn objects_fs(
+    fs: Arc<dyn kronik_core::env::Fs>,
     events: Arc<std::sync::Mutex<Vec<String>>>,
     fail: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl kronik_core::env::Fs for ObjectsFs {
-    fn create_dir_all(
-        &self,
-        path: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
-        self.inner.create_dir_all(path)
-    }
-    fn open(
-        &self,
-        path: std::path::PathBuf,
-        mode: kronik_core::env::OpenMode,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<Arc<dyn kronik_core::env::File>>>
-    {
-        self.inner.open(path, mode)
-    }
-    fn exists(
-        &self,
-        path: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<bool>> {
-        self.inner.exists(path)
-    }
-    fn read_dir(
-        &self,
-        dir: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<Vec<String>>> {
-        self.inner.read_dir(dir)
-    }
-    fn rename(
-        &self,
-        from: std::path::PathBuf,
-        to: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
-        if to.components().any(|c| c.as_os_str() == "objects") {
-            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Box::pin(async { Err(std::io::Error::other("injected EIO")) });
+) -> Arc<dyn kronik_core::env::Fs> {
+    hooked(fs, move |call| {
+        let objects = |path: &Path| path.components().any(|c| c.as_os_str() == "objects");
+        match call {
+            FsCall::Rename { to, .. } if objects(to) => {
+                if fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Then::Fail(std::io::Error::other("injected EIO"));
+                }
+                events
+                    .lock()
+                    .unwrap()
+                    .push(format!("named {}", to.display()));
             }
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("named {}", to.display()));
+            FsCall::SyncDir(dir) if objects(dir) => {
+                events
+                    .lock()
+                    .unwrap()
+                    .push(format!("synced {}", dir.display()));
+            }
+            _ => {}
         }
-        self.inner.rename(from, to)
-    }
-    fn remove_file(
-        &self,
-        path: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
-        self.inner.remove_file(path)
-    }
-    fn sync_dir(
-        &self,
-        dir: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
-        if dir.components().any(|c| c.as_os_str() == "objects") {
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("synced {}", dir.display()));
-        }
-        self.inner.sync_dir(dir)
-    }
+        Then::Forward
+    })
 }
 
-/// A node with blobs whose files go through [`ObjectsFs`]; `media` deployed.
+/// A node with blobs whose files go through [`objects_fs`]; `media` deployed.
 fn start_on_objects_fs(
     dir: &Path,
     events: Arc<std::sync::Mutex<Vec<String>>>,
@@ -750,11 +711,7 @@ fn start_on_objects_fs(
         .unwrap();
     let node = rt.block_on(async {
         let mut env = Env::real(tokio::runtime::Handle::current());
-        env.fs = Arc::new(ObjectsFs {
-            inner: env.fs.clone(),
-            events,
-            fail,
-        });
+        env.fs = objects_fs(env.fs.clone(), events, fail);
         let config = NodeConfig {
             concurrency: 8,
             blobs: Some(BlobsConfig::default()),
