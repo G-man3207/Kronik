@@ -1,8 +1,6 @@
 use super::*;
-use bytes::Bytes;
-use kronik_core::env::{BoxFuture, File, Fs, OpenMode};
+use kronik_core::env::test_fs::{FsCall, Then, hooked};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 async fn native_node(branch: &str) -> (tempfile::TempDir, Arc<Node>) {
@@ -233,105 +231,6 @@ async fn corrupt_or_torn_actual_source_frame_is_never_complete_evidence() {
     }
 }
 
-/// Counts `read_at` on segment files while `armed` is set.
-struct CountingFs {
-    inner: std::sync::Arc<dyn Fs>,
-    reads: std::sync::Arc<AtomicU64>,
-    armed: std::sync::Arc<AtomicBool>,
-}
-
-struct CountingFile {
-    inner: std::sync::Arc<dyn File>,
-    segment: bool,
-    reads: std::sync::Arc<AtomicU64>,
-    armed: std::sync::Arc<AtomicBool>,
-}
-
-impl Fs for CountingFs {
-    fn create_dir_all(&self, path: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.create_dir_all(path)
-    }
-    fn open(
-        &self,
-        path: PathBuf,
-        mode: OpenMode,
-    ) -> BoxFuture<'static, std::io::Result<std::sync::Arc<dyn File>>> {
-        let segment = path.extension().is_some_and(|ext| ext == "seg");
-        let reads = self.reads.clone();
-        let armed = self.armed.clone();
-        let open = self.inner.open(path, mode);
-        Box::pin(async move {
-            let inner = open.await?;
-            Ok(std::sync::Arc::new(CountingFile {
-                inner,
-                segment,
-                reads,
-                armed,
-            }) as std::sync::Arc<dyn File>)
-        })
-    }
-    fn exists(&self, path: PathBuf) -> BoxFuture<'static, std::io::Result<bool>> {
-        self.inner.exists(path)
-    }
-    fn read_dir(&self, dir: PathBuf) -> BoxFuture<'static, std::io::Result<Vec<String>>> {
-        self.inner.read_dir(dir)
-    }
-    fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.rename(from, to)
-    }
-    fn remove_file(&self, path: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.remove_file(path)
-    }
-    fn sync_dir(&self, dir: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.sync_dir(dir)
-    }
-    fn available(&self, path: PathBuf) -> BoxFuture<'static, std::io::Result<u64>> {
-        self.inner.available(path)
-    }
-    fn read_secure(
-        &self,
-        path: PathBuf,
-        max_bytes: usize,
-    ) -> BoxFuture<'static, std::io::Result<Vec<u8>>> {
-        self.inner.read_secure(path, max_bytes)
-    }
-    fn write_secure(
-        &self,
-        path: PathBuf,
-        bytes: Vec<u8>,
-    ) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.write_secure(path, bytes)
-    }
-    fn write_secure_new(
-        &self,
-        path: PathBuf,
-        bytes: Bytes,
-    ) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.write_secure_new(path, bytes)
-    }
-}
-
-impl File for CountingFile {
-    fn len(&self) -> BoxFuture<'static, std::io::Result<u64>> {
-        self.inner.len()
-    }
-    fn read_at(&self, offset: u64, len: usize) -> BoxFuture<'static, std::io::Result<Vec<u8>>> {
-        if self.segment && self.armed.load(Ordering::SeqCst) {
-            self.reads.fetch_add(1, Ordering::SeqCst);
-        }
-        self.inner.read_at(offset, len)
-    }
-    fn write_at(&self, offset: u64, data: Bytes) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.write_at(offset, data)
-    }
-    fn set_len(&self, len: u64) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.set_len(len)
-    }
-    fn sync_data(&self) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.sync_data()
-    }
-}
-
 fn begin_n(node: &Node, n: u32) -> pb::TurnBegin {
     let mut turn = begin(node, 'a');
     turn.execution_id = format!("{n:032x}");
@@ -346,10 +245,18 @@ async fn indexed_actor_source_does_not_read_each_preceding_record() {
     let reads = std::sync::Arc::new(AtomicU64::new(0));
     let armed = std::sync::Arc::new(AtomicBool::new(false));
     let env = Env {
-        fs: std::sync::Arc::new(CountingFs {
-            inner: real.fs.clone(),
-            reads: reads.clone(),
-            armed: armed.clone(),
+        // Real files, with `read_at` on segment files counted while `armed`.
+        fs: hooked(real.fs.clone(), {
+            let (reads, armed) = (reads.clone(), armed.clone());
+            move |call| {
+                if let FsCall::ReadAt { path, .. } = call
+                    && path.extension().is_some_and(|ext| ext == "seg")
+                    && armed.load(Ordering::SeqCst)
+                {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                }
+                Then::Forward
+            }
         }),
         ..real
     };

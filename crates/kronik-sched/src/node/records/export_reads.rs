@@ -1,7 +1,8 @@
 //! Issue #243: an export page deep in a segment must not CRC-walk the prefix.
 use super::*;
-use kronik_core::env::{BoxFuture, Env, File, Fs, OpenMode};
-use std::path::{Path, PathBuf};
+use kronik_core::env::Env;
+use kronik_core::env::test_fs::{FsCall, Then, hooked};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -19,130 +20,12 @@ struct Hit {
     offset: u64,
 }
 
-struct CountingFs {
-    inner: Arc<dyn Fs>,
-    armed: Arc<AtomicBool>,
-    node: Arc<OnceLock<Arc<Node>>>,
-    hits: Arc<Mutex<Vec<Hit>>>,
-    opens: Arc<Mutex<Vec<u64>>>,
-    lock_held: Arc<AtomicBool>,
-}
-
-struct CountingFile {
-    inner: Arc<dyn File>,
-    segment: Option<u64>,
-    armed: Arc<AtomicBool>,
-    node: Arc<OnceLock<Arc<Node>>>,
-    hits: Arc<Mutex<Vec<Hit>>>,
-    lock_held: Arc<AtomicBool>,
-}
-
+/// The start a `.seg` file is named after; `None` for any other file.
 fn segment_start(path: &Path) -> Option<u64> {
-    let name = path.file_stem()?.to_str()?;
-    name.parse().ok()
-}
-
-impl Fs for CountingFs {
-    fn create_dir_all(&self, path: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.create_dir_all(path)
+    if path.extension()? != "seg" {
+        return None;
     }
-    fn open(
-        &self,
-        path: PathBuf,
-        mode: OpenMode,
-    ) -> BoxFuture<'static, std::io::Result<Arc<dyn File>>> {
-        let segment = path.extension().is_some_and(|ext| ext == "seg");
-        let start = segment.then(|| segment_start(&path)).flatten();
-        if segment
-            && self.armed.load(Ordering::SeqCst)
-            && let Some(start) = start
-        {
-            self.opens.lock().unwrap().push(start);
-        }
-        let armed = self.armed.clone();
-        let node = self.node.clone();
-        let hits = self.hits.clone();
-        let lock_held = self.lock_held.clone();
-        let open = self.inner.open(path, mode);
-        Box::pin(async move {
-            let inner = open.await?;
-            Ok(Arc::new(CountingFile {
-                inner,
-                segment: start,
-                armed,
-                node,
-                hits,
-                lock_held,
-            }) as Arc<dyn File>)
-        })
-    }
-    fn exists(&self, path: PathBuf) -> BoxFuture<'static, std::io::Result<bool>> {
-        self.inner.exists(path)
-    }
-    fn read_dir(&self, dir: PathBuf) -> BoxFuture<'static, std::io::Result<Vec<String>>> {
-        self.inner.read_dir(dir)
-    }
-    fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.rename(from, to)
-    }
-    fn remove_file(&self, path: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.remove_file(path)
-    }
-    fn sync_dir(&self, dir: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.sync_dir(dir)
-    }
-    fn available(&self, path: PathBuf) -> BoxFuture<'static, std::io::Result<u64>> {
-        self.inner.available(path)
-    }
-    fn read_secure(
-        &self,
-        path: PathBuf,
-        max_bytes: usize,
-    ) -> BoxFuture<'static, std::io::Result<Vec<u8>>> {
-        self.inner.read_secure(path, max_bytes)
-    }
-    fn write_secure(
-        &self,
-        path: PathBuf,
-        bytes: Vec<u8>,
-    ) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.write_secure(path, bytes)
-    }
-    fn write_secure_new(
-        &self,
-        path: PathBuf,
-        bytes: bytes::Bytes,
-    ) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.write_secure_new(path, bytes)
-    }
-}
-
-impl File for CountingFile {
-    fn len(&self) -> BoxFuture<'static, std::io::Result<u64>> {
-        self.inner.len()
-    }
-    fn read_at(&self, offset: u64, len: usize) -> BoxFuture<'static, std::io::Result<Vec<u8>>> {
-        if self.armed.load(Ordering::SeqCst)
-            && let Some(segment) = self.segment
-        {
-            self.hits.lock().unwrap().push(Hit { segment, offset });
-            if let Some(node) = self.node.get()
-                && node.snapshot_lock.try_lock().is_err()
-            {
-                self.lock_held.store(true, Ordering::SeqCst);
-            }
-        }
-        self.inner.read_at(offset, len)
-    }
-    fn write_at(&self, offset: u64, data: bytes::Bytes) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.write_at(offset, data)
-    }
-    fn set_len(&self, len: u64) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.set_len(len)
-    }
-    fn sync_data(&self) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.sync_data()
-    }
+    path.file_stem()?.to_str()?.parse().ok()
 }
 
 async fn append_n(node: &Arc<Node>, n: u32) {
@@ -179,18 +62,44 @@ async fn a_page_100_000_records_into_a_segment_does_not_read_the_prefix() {
     let data = tempfile::tempdir().unwrap();
     let real = Env::real(tokio::runtime::Handle::current());
     let armed = Arc::new(AtomicBool::new(false));
-    let node_slot = Arc::new(OnceLock::new());
+    let node_slot: Arc<OnceLock<Arc<Node>>> = Arc::new(OnceLock::new());
     let hits = Arc::new(Mutex::new(Vec::new()));
     let opens = Arc::new(Mutex::new(Vec::new()));
     let lock_held = Arc::new(AtomicBool::new(false));
     let env = Env {
-        fs: Arc::new(CountingFs {
-            inner: real.fs.clone(),
-            armed: armed.clone(),
-            node: node_slot.clone(),
-            hits: hits.clone(),
-            opens: opens.clone(),
-            lock_held: lock_held.clone(),
+        // Real files. While `armed`: segment opens go to `opens`, segment
+        // reads to `hits`, and a read under the node's snapshot lock sets
+        // `lock_held`.
+        fs: hooked(real.fs.clone(), {
+            let (armed, node_slot, hits) = (armed.clone(), node_slot.clone(), hits.clone());
+            let (opens, lock_held) = (opens.clone(), lock_held.clone());
+            move |call| {
+                if !armed.load(Ordering::SeqCst) {
+                    return Then::Forward;
+                }
+                match call {
+                    FsCall::Open(path, _) => {
+                        if let Some(start) = segment_start(path) {
+                            opens.lock().unwrap().push(start);
+                        }
+                    }
+                    FsCall::ReadAt { path, offset, .. } => {
+                        if let Some(segment) = segment_start(path) {
+                            hits.lock().unwrap().push(Hit {
+                                segment,
+                                offset: *offset,
+                            });
+                            if let Some(node) = node_slot.get()
+                                && node.snapshot_lock.try_lock().is_err()
+                            {
+                                lock_held.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                Then::Forward
+            }
         }),
         ..real
     };
