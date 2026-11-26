@@ -252,7 +252,7 @@ fn value_at(
         return Value::Null;
     };
     let skipped = skip.contains(&(change.table.clone(), column));
-    sql_val(&mapped(value, skipped, rewrite))
+    super::value_of(mapped(value, skipped, rewrite))
 }
 
 fn mapped(value: &Val, skip: bool, rewrite: &mut impl FnMut(&[u8]) -> Vec<u8>) -> Val {
@@ -269,16 +269,6 @@ fn mapped(value: &Val, skip: bool, rewrite: &mut impl FnMut(&[u8]) -> Vec<u8>) -
         }
         Val::Blob(bytes) => Val::Blob(rewrite(bytes)),
         other => other.clone(),
-    }
-}
-
-fn sql_val(value: &Val) -> Value {
-    match value {
-        Val::Null => Value::Null,
-        Val::Int(i) => Value::Integer(*i),
-        Val::Real(r) => Value::Real(*r),
-        Val::Text(t) => Value::Text(t.clone()),
-        Val::Blob(b) => Value::Blob(b.clone()),
     }
 }
 
