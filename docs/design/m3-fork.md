@@ -681,9 +681,11 @@ Proposal `status`: `evaluated`, `approved`, `promoted`, `rejected`
   production wall time of the window divided by replay wall time, recorded
   in `docs/perf.md`. The 2026-10-25 and 2026-10-26 `Both` results used a
   benchmark shortcut that skipped the production-store rebuild, so they do
-  not establish the target for the production path (#402). A 2-vCPU control
-  on the development machine measured 15.6× to 17.7× for `Both` after the
-  shortcut was removed; the test VPS must be re-measured (#611).
+  not establish the target for the production path (#402). Re-measured on
+  the test machine that now stands in for the test VPS (two CPUs), after
+  fixing an isolated-replay regression (#611): isolated 18.0× to 22.1×,
+  `Both` 9.2× to 12.5×, held back by continuous replay (12.2× to 14.0×).
+  The target is not met there; #611 tracks continuous replay.
 
 ## 11. As built (M3 implementation notes)
 

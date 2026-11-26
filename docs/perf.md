@@ -199,7 +199,8 @@ What changed:
 - Measured and not kept: caching the overlay's `SAVEPOINT` and
   `ROLLBACK TO` statements made isolated replay 2.3 times slower (5.0 to
   5.6 s on the VPS); the split alone, without the memory change, left both
-  at 3.38 and 3.40 s.
+  at 3.38 and 3.40 s. The two statements pushed each root input's statements
+  past rusqlite's 16-statement cache, the regression #611 found (below).
 
 ### Results (development machine, 2 vCPUs, 2026-11-26, production path)
 
@@ -218,16 +219,69 @@ run. The load average is the 1-minute value from `uptime` before each run.
 | 1 | production path | 4.05 | 3.80 s, 15.8x | 1.56 s, 38.5x | 3.80 s, 15.8x |
 | 2 | production path | 1.83 | 3.52 s, 17.1x | 1.51 s, 39.6x | 3.40 s, 17.7x |
 | 3 | production path | 1.46 | 3.36 s, 17.8x | 1.58 s, 38.0x | 3.86 s, 15.6x |
+| 1 | statement cache (#611) | 3.05 | 0.94 s, 63.7x | 3.70 s, 16.2x | 2.98 s, 20.1x |
+| 2 | statement cache (#611) | 2.27 | 1.08 s, 55.7x | 1.61 s, 37.3x | 1.63 s, 36.8x |
+| 3 | statement cache (#611) | 1.62 | 1.15 s, 52.0x | 1.98 s, 30.3x | 2.00 s, 29.9x |
 
 The timed rebuild took 0.123 and 0.127 s in the two shortcut runs. Continuous
 on the production path is 0.1 to 0.2 s above the shortcut time; Both moves
-less than its run-to-run spread. **Both does not meet 20x on this control**,
-and it did not before the change either: Isolated, which never used the
-shortcut, is 15.8x to 17.8x, while the 2026-10-26 test VPS measured 34.8x to
-40.9x. This control is not the test VPS and does not say where Both stands
-there. The 2026-10-26 VPS Both figures still used the shortcut and are not a
-production-path pass; the target is not lowered and the shortcut does not
-come back. #611 tracks the test-VPS re-measurement and any fix.
+less than its run-to-run spread. Both did not meet 20x on this control before
+#611, with or without the shortcut, because isolated replay had regressed
+(15.8x to 17.8x here, against 34.8x to 40.9x on the 2026-10-26 test VPS).
+With the statement cache of #611 (the last three rows; run 1 started right
+after a build), Both is 20.1x to 36.8x on this control. The test machine's
+results follow.
+
+### Results (test machine, 2 CPUs, 2026-11-26, production path, #611)
+
+The test VPS host is now the 4-vCPU test machine of the Machines table. As for
+v0.5.0, the process runs in a scope confined to two of its CPUs and 4 GiB
+(`systemd-run --scope -p AllowedCPUs=0-1 -p MemoryMax=4G replay_speed
+--workers 2`), release, 12 000 requests at 200 req/s, 60.01 s production
+window, diff empty in every run. "v0.1" is `ac93821c`, the code the
+2026-10-26 VPS rows measured (its continuous and both runs still take the
+shortcut); "main" is `d0069063`; "#611" is the statement cache.
+
+| Run | Binary | Load | Isolated | Continuous | Both |
+| --- | --- | --- | --- | --- | --- |
+| 1 | v0.1 | 3.49 | 2.24 s, 26.7x | 3.64 s, 16.5x | 3.99 s, 15.0x |
+| 2 | v0.1 | 1.39 | 2.16 s, 27.7x | 3.45 s, 17.4x | 4.17 s, 14.4x |
+| 1 | main | 1.84 | 12.75 s, 4.7x | 4.50 s, 13.3x | 15.35 s, 3.9x |
+| 2 | main | 1.35 | 13.37 s, 4.5x | 4.29 s, 14.0x | 15.19 s, 3.9x |
+| 1 | #611 | 1.57 | 3.33 s, 18.0x | 4.75 s, 12.6x | 6.51 s, 9.2x |
+| 2 | #611 | 1.48 | 2.72 s, 22.1x | 4.90 s, 12.2x | 5.06 s, 11.8x |
+| 3 | #611 | 1.44 | 3.12 s, 19.2x | 4.92 s, 12.2x | 4.80 s, 12.5x |
+
+Unconfined (all four CPUs, still two workers), main measured 12.1 to 13.0 s
+isolated and 12.8 to 15.5 s both (3.9x to 4.7x), and #611 2.58 to 2.89 s
+isolated (20.8x to 23.3x), 4.09 to 4.77 s continuous and 5.00 to 5.36 s both
+(11.2x to 12.0x).
+
+- **Isolated replay had regressed about six times.** A `git bisect` of main
+  on the development machine (two cores, 4 000 requests at 1 000 req/s,
+  isolated replay without the diff) went from 0.24 s at `4db45ba4` to
+  0.91 s at `28546909` (the blob index, M25 slice B11), and 1.2 s at main.
+  rusqlite keeps 16 prepared statements per connection, least recently used
+  out. Since the blob index, applying a record runs more distinct statements
+  than that, so each `prepare_cached` found its statement evicted and SQLite
+  compiled the SQL again: in the profile, the parser instead of the
+  statements. Isolated replay pays it twice per root input (production's
+  record, then the fork turn in an overlay, with reads between); continuous
+  replay's bulk apply uses fewer statements. A `state.db` connection now
+  keeps 256 (`crates/kronik-store/src/db.rs`), more than the store has, and
+  a test counts the statements an apply-and-overlay cycle compiles.
+  Production's applier runs the same statements.
+- **Both does not meet 20x on the test machine.** Continuous replay alone
+  takes 4.3 to 4.9 s there (12.2x to 14.0x), and Both waits for it. v0.1,
+  the code that met 20x on the 2026-10-26 VPS with the shortcut, measures
+  continuous 3.45 to 3.64 s and Both 14.4x to 15.0x here: this machine is
+  slower than that VPS for this workload, so the 2026-10-26 figures do not
+  carry over to it. Continuous replay on the production path is 0.7 to
+  1.5 s above v0.1's shortcut runs, of which about 0.25 s is the rebuild
+  (v0.1 applied the window to a fresh cursor in 0.24 to 0.25 s). Both at
+  20x here needs continuous replay about 1.5 times faster. The target is
+  not lowered and the shortcut does not come back; #611 stays open for
+  continuous replay.
 
 ### Memory cost of the resident Wasm memories
 
