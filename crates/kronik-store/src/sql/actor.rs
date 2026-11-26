@@ -1212,7 +1212,7 @@ impl SqlActor {
             else {
                 return Ok(None);
             };
-            key.push((col, to_sql(&value)));
+            key.push((col, super::value_of(value)));
         }
         Ok((!key.is_empty()).then_some(key))
     }
@@ -1859,16 +1859,6 @@ fn val_text(v: Option<Val>) -> Option<String> {
     }
 }
 
-fn to_sql(v: &Val) -> Value {
-    match v {
-        Val::Null => Value::Null,
-        Val::Int(i) => Value::Integer(*i),
-        Val::Real(r) => Value::Real(*r),
-        Val::Text(t) => Value::Text(t.clone()),
-        Val::Blob(b) => Value::Blob(b.clone()),
-    }
-}
-
 pub(super) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -2040,7 +2030,7 @@ impl SqlActor {
                             .get(k)
                             .cloned()
                             .flatten()
-                            .map(|v| to_sql(&v))
+                            .map(super::value_of)
                             .unwrap_or(Value::Null),
                     );
                 }
