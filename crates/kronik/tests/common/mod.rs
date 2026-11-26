@@ -221,6 +221,79 @@ pub fn try_api(
     Some((status, serde_json::from_slice(&buf).ok()?))
 }
 
+/// One HTTP answer, parsed by [`read_answer`].
+pub struct Answer {
+    pub status: u16,
+    /// Lower-case names, trimmed values, in order.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Answer {
+    /// The first value of header `name`, case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// One HTTP/1.1 answer from `reader`: a chunked body, a `content-length`
+/// one, or everything to the end. Panics on a malformed answer.
+pub fn read_answer(reader: impl std::io::Read) -> Answer {
+    let mut reader = BufReader::new(reader);
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+            break;
+        }
+        head.push_str(&line);
+    }
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .unwrap_or_else(|| panic!("no status in {head:?}"));
+    let headers: Vec<(String, String)> = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+        .collect();
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.as_str())
+    };
+    let mut body = Vec::new();
+    if header("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
+        loop {
+            let mut size = String::new();
+            reader.read_line(&mut size).unwrap();
+            let size = usize::from_str_radix(size.trim(), 16).unwrap();
+            let mut chunk = vec![0; size + 2];
+            reader.read_exact(&mut chunk).unwrap();
+            if size == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..size]);
+        }
+    } else if let Some(len) = header("content-length") {
+        body = vec![0; len.parse().unwrap()];
+        reader.read_exact(&mut body).unwrap();
+    } else {
+        reader.read_to_end(&mut body).unwrap();
+    }
+    Answer {
+        status,
+        headers,
+        body,
+    }
+}
+
 /// `kronik serve` as a child process, with its data in `<dir>/data`, its
 /// API socket at `<dir>/api.sock` and its stderr appended to
 /// `<dir>/serve.log`; killed when dropped.
