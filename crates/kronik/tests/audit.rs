@@ -14,7 +14,7 @@ use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -22,10 +22,13 @@ use kronik_otel::audit::Line;
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::{self, Message, WebSocket};
 
+mod common;
+
 #[path = "../../kronik-api/tests/common/oidc_provider.rs"]
 mod oidc_provider;
 
-const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
+use common::command;
+
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/guests/counter.wasm"
@@ -41,29 +44,6 @@ const ROOM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/room
 const SECRET: &str = "s3cr3t-needle-91ab";
 const SUBJECT: &str = "customer-needle-4711";
 const BODY: &str = "body-needle-c0ffee";
-
-fn command() -> Command {
-    let mut c = Command::new(KRONIK);
-    for var in [
-        "KRONIK_CONFIG",
-        "KRONIK_DATA_DIR",
-        "KRONIK_HTTP_LISTEN",
-        "KRONIK_ADMIN_LISTEN",
-        "KRONIK_API_SOCKET",
-        "KRONIK_API_LISTEN",
-        "KRONIK_TOKEN",
-        "KRONIK_MASTER_KEY_FILE",
-        "KRONIK_MASTER_KEY",
-        "KRONIK_OTEL_ENDPOINT",
-        "KRONIK_AUDIT_SINK",
-    ] {
-        c.env_remove(var);
-    }
-    // The tests' temporary file system may have less than the reserve.
-    c.env("KRONIK_DISK_RESERVE", "0B");
-    c.stdin(Stdio::null());
-    c
-}
 
 fn b64(path: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(std::fs::read(path).unwrap())

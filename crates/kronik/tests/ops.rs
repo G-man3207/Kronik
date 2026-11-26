@@ -12,36 +12,12 @@ use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
-use common::free_port;
+use common::{command, free_port};
 
-const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/guests/counter.wasm"
 );
-
-/// The environment variables `kronik serve` and the CLI read, cleared so
-/// that the developer's shell can't override the tests' files and flags.
-const SETTINGS_ENV: [&str; 7] = [
-    "KRONIK_CONFIG",
-    "KRONIK_DATA_DIR",
-    "KRONIK_HTTP_LISTEN",
-    "KRONIK_ADMIN_LISTEN",
-    "KRONIK_API_SOCKET",
-    "KRONIK_MASTER_KEY_FILE",
-    "KRONIK_MASTER_KEY",
-];
-
-fn command() -> Command {
-    let mut command = Command::new(KRONIK);
-    for var in SETTINGS_ENV {
-        command.env_remove(var);
-    }
-    // The tests' temporary file system may have less than the reserve.
-    command.env("KRONIK_DISK_RESERVE", "0B");
-    command.stdin(Stdio::null());
-    command
-}
 
 fn kronik(args: &[&str]) -> Output {
     command().args(args).output().unwrap()
@@ -605,9 +581,6 @@ fn tls_from_files_serves_https_and_a_bad_file_stops_the_start() {
 /// `kronik --json doctor --config <file>`: the report and the exit code.
 fn doctor(config: &Path) -> (serde_json::Value, bool) {
     let out = command()
-        .env_remove("KRONIK_TOKEN")
-        .env_remove("KRONIK_AUDIT_SINK")
-        .env_remove("KRONIK_OTEL_ENDPOINT")
         .args(["--json", "doctor", "--config", config.to_str().unwrap()])
         .output()
         .unwrap();
@@ -715,7 +688,6 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
         "{report}"
     );
     let human = command()
-        .env_remove("KRONIK_TOKEN")
         .args(["doctor", "--config", config.to_str().unwrap()])
         .output()
         .unwrap();
@@ -759,7 +731,6 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
         "{report}"
     );
     let human = command()
-        .env_remove("KRONIK_TOKEN")
         .args(["doctor", "--config", config.to_str().unwrap()])
         .output()
         .unwrap();

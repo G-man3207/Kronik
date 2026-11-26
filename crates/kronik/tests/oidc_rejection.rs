@@ -16,12 +16,11 @@ mod oidc_provider;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use common::command;
 use serde_json::{Value, json};
-
-const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 
 /// Modes the fixture can mint, and that the callback must reject. `signature`
 /// is a key that is not the published one. `algorithm` is RS384. `azp` lists
@@ -38,26 +37,6 @@ const REJECTED: [&str; 9] = [
     "nbf",
     "jku",
 ];
-
-fn command() -> Command {
-    let mut command = Command::new(KRONIK);
-    for var in [
-        "KRONIK_CONFIG",
-        "KRONIK_DATA_DIR",
-        "KRONIK_HTTP_LISTEN",
-        "KRONIK_ADMIN_LISTEN",
-        "KRONIK_API_SOCKET",
-        "KRONIK_API_LISTEN",
-        "KRONIK_TOKEN",
-        "KRONIK_MASTER_KEY_FILE",
-        "KRONIK_MASTER_KEY",
-    ] {
-        command.env_remove(var);
-    }
-    command.env("KRONIK_DISK_RESERVE", "0B");
-    command.stdin(Stdio::null());
-    command
-}
 
 struct Answer {
     status: u16,

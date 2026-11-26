@@ -15,12 +15,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::free_port;
+use common::{command, free_port};
 use http_body_util::{BodyExt as _, Full};
 use kronik_core::ids::hex;
 use kronik_otel::otlp::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -31,7 +31,6 @@ use kronik_otel::otlp::trace::v1::Span;
 use prost::Message as _;
 use serde_json::Value;
 
-const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/guests/counter.wasm"
@@ -148,28 +147,6 @@ fn receiver() -> Receiver {
 }
 
 // ---- the daemon ----
-
-fn command() -> Command {
-    let mut c = Command::new(KRONIK);
-    for var in [
-        "KRONIK_CONFIG",
-        "KRONIK_DATA_DIR",
-        "KRONIK_HTTP_LISTEN",
-        "KRONIK_ADMIN_LISTEN",
-        "KRONIK_API_SOCKET",
-        "KRONIK_API_LISTEN",
-        "KRONIK_TOKEN",
-        "KRONIK_MASTER_KEY_FILE",
-        "KRONIK_MASTER_KEY",
-        "KRONIK_OTEL_ENDPOINT",
-    ] {
-        c.env_remove(var);
-    }
-    // The tests' temporary file system may have less than the reserve.
-    c.env("KRONIK_DISK_RESERVE", "0B");
-    c.stdin(Stdio::null());
-    c
-}
 
 /// `kronik serve` from a configuration file with `[otel]` pointing at the
 /// receiver; killed when dropped.
