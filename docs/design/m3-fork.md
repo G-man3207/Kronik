@@ -679,7 +679,11 @@ Proposal `status`: `evaluated`, `approved`, `promoted`, `rejected`
 - **Speed**: replay of the reference workload (the counter workload of
   `docs/perf.md`) at ≥ 20× real time on the test VPS, measured as
   production wall time of the window divided by replay wall time, recorded
-  in `docs/perf.md`.
+  in `docs/perf.md`. The 2026-10-25 and 2026-10-26 `Both` results used a
+  benchmark shortcut that skipped the production-store rebuild, so they do
+  not establish the target for the production path (#402). A 2-vCPU control
+  on the development machine measured 15.6× to 17.7× for `Both` after the
+  shortcut was removed; the test VPS must be re-measured (#611).
 
 ## 11. As built (M3 implementation notes)
 

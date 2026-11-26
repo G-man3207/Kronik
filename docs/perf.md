@@ -106,8 +106,15 @@ divided by the replay wall time (docs/design/m3-fork.md §10).
   replay of every root input on W workers (default: all cores), continuous
   replay, and both (continuous on its own task next to W-1 isolated
   workers), each including the diff build. It also reports isolated
-  replay without the diff and the diff build alone.
+  replay without the diff and the diff build alone. A continuous or both
+  run rebuilds production's store from the index before the diff, as
+  `propose` does; the rebuild is inside the timed run.
 - `scripts/acceptance-m3.sh` runs it with 12 000 requests at 200 req/s.
+
+  Before #402, the benchmark instead took production's live store when its
+  actor and kv rows matched a rebuild. That skipped the rebuild a proposal
+  pays, so the continuous and both figures up to 2026-10-26 are shortcut
+  figures, not production-path figures. Isolated is unaffected.
 
 ### Results (development machine, 2026-10-25)
 
@@ -131,9 +138,10 @@ The numbers move by a factor of up to two between runs.
 ### Results (VPS, 2026-10-25)
 
 test VPS, 2 vCPU, release, `replay_speed --workers 2`. 12 000 requests
-at 200 req/s, 60.01 s production window. Identity diff empty. The continuous
-diff reads production's live `state.db` after its actor and kv rows match a
-rebuilt store. Index time is building the root and causal maps.
+at 200 req/s, 60.01 s production window. Identity diff empty. These runs
+used the shortcut: the continuous diff read production's live `state.db`
+after its actor and kv rows matched a rebuilt store. Index time is building
+the root and causal maps.
 
 | Run | Isolated | Continuous | Both | Index |
 | --- | --- | --- | --- | --- |
@@ -157,8 +165,9 @@ The load average is the 1-minute value from `uptime` before each run.
 | 2 | with the changes | 1.55 | 1.49 s, 40.4x | 2.10 s, 28.6x | 2.68 s, 22.4x |
 | 3 | with the changes | 1.45 | 1.72 s, 34.8x | 2.22 s, 27.1x | 2.47 s, 24.3x |
 
-**Both meets 20x** in three consecutive runs; isolated and continuous got
-faster too.
+**Both met 20x** in three consecutive runs with the benchmark shortcut;
+isolated and continuous got faster too. The shortcut is gone (#402), so
+these Both figures do not measure the production path.
 
 What the profile showed:
 
@@ -191,6 +200,34 @@ What changed:
   `ROLLBACK TO` statements made isolated replay 2.3 times slower (5.0 to
   5.6 s on the VPS); the split alone, without the memory change, left both
   at 3.38 and 3.40 s.
+
+### Results (development machine, 2 vCPUs, 2026-11-26, production path)
+
+#402 removed the shortcut. Each continuous and both run now rebuilds
+production's store from the index before the diff, as a proposal does. The
+"before" rows are `bbc00dfb` (main before #402); the rest are this change. The
+development machine has eight vCPUs, so these runs confine the whole release
+process to two of them (`taskset -c 0,1`), as the test VPS has two. 12 000
+requests at 200 req/s, 60.0 s production window, both-mode diff empty in every
+run. The load average is the 1-minute value from `uptime` before each run.
+
+| Run | Binary | Load | Isolated | Continuous | Both |
+| --- | --- | --- | --- | --- | --- |
+| before 1 | shortcut | 1.58 | 3.75 s, 16.0x | 1.46 s, 41.2x | 3.66 s, 16.4x |
+| before 2 | shortcut | 1.59 | 3.54 s, 17.0x | 1.39 s, 43.0x | 3.76 s, 16.0x |
+| 1 | production path | 4.05 | 3.80 s, 15.8x | 1.56 s, 38.5x | 3.80 s, 15.8x |
+| 2 | production path | 1.83 | 3.52 s, 17.1x | 1.51 s, 39.6x | 3.40 s, 17.7x |
+| 3 | production path | 1.46 | 3.36 s, 17.8x | 1.58 s, 38.0x | 3.86 s, 15.6x |
+
+The timed rebuild took 0.123 and 0.127 s in the two shortcut runs. Continuous
+on the production path is 0.1 to 0.2 s above the shortcut time; Both moves
+less than its run-to-run spread. **Both does not meet 20x on this control**,
+and it did not before the change either: Isolated, which never used the
+shortcut, is 15.8x to 17.8x, while the 2026-10-26 test VPS measured 34.8x to
+40.9x. This control is not the test VPS and does not say where Both stands
+there. The 2026-10-26 VPS Both figures still used the shortcut and are not a
+production-path pass; the target is not lowered and the shortcut does not
+come back. #611 tracks the test-VPS re-measurement and any fix.
 
 ### Memory cost of the resident Wasm memories
 
