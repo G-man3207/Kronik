@@ -20,13 +20,14 @@ mod net;
 mod protocol;
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kronik_api::{Api, ApiRequest, ApiResponse};
 use kronik_core::env::{
     BoxFuture, Clock, EntropySource, Env, Process, ProcessRunner, ProcessSpec, Spawner,
 };
+use kronik_core::sync::lock;
 use kronik_gateway::{
     Gateway, GatewayConfig, HttpRequest, HttpResponse, RequestBody, ResponseBody,
 };
@@ -308,7 +309,7 @@ struct SeededEntropy {
 impl EntropySource for SeededEntropy {
     fn fill(&self, buf: &mut [u8]) {
         let n = {
-            let mut c = self.counter.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut c = lock(&self.counter);
             *c += 1;
             *c
         };

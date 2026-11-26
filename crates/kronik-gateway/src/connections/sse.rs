@@ -21,6 +21,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kronik_core::sync::lock;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::connections::{FinishGuard, Hub, Outgoing, RESTART_CODE, Transport};
 use tokio::sync::{Notify, mpsc};
@@ -87,14 +88,14 @@ impl Transport for SseTransport {
     }
 
     fn close(&self, code: u16, _reason: &str) {
-        *self.host_close.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
+        *lock(&self.host_close) = Some(code);
         self.notify.notify_one();
     }
 }
 
 impl SseTransport {
     fn host_close(&self) -> Option<u16> {
-        *self.host_close.lock().unwrap_or_else(|e| e.into_inner())
+        *lock(&self.host_close)
     }
 }
 

@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use bytes::Bytes;
 use kronik_core::env::{Env, OpenMode};
 use kronik_core::ids::Lsn;
+use kronik_core::sync::lock;
 use serde::{Deserialize, Serialize};
 
 /// Delivery identity; zero is the legacy generation, before any rewind.
@@ -395,7 +396,7 @@ impl Cursors {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Entry>> {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.entries)
     }
 }
 

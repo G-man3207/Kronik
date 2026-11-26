@@ -321,7 +321,7 @@ pub fn cursor(index: &ProductionIndex) -> Result<Arc<Store>, ReplayError> {
                 .sql
                 .get(&name)
                 .map_err(|e| ReplayError::Host(e.to_string()))?;
-            let mut actor = db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut actor = lock(&db);
             actor
                 .pseudonymize_subject_cells(|subject, value| {
                     crate::privacy::ForkPrivacy::sql_cell(&index.sealer, subject, value)
@@ -1004,13 +1004,12 @@ impl Runner {
         if !lock(&self.taint).has_sql(&name) && !self.setup.index.has_erased_sql(&name) {
             return Ok(false);
         }
-        let untagged = self
+        let db = self
             .store
             .sql
             .get(&name)
-            .map_err(|e| ReplayError::Host(e.to_string()))?
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .map_err(|e| ReplayError::Host(e.to_string()))?;
+        let untagged = lock(&db)
             .has_table_without_subject()
             .map_err(ReplayError::Host)?;
         Ok(lock(&self.taint).sql(&name, at, untagged)

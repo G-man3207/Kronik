@@ -16,6 +16,8 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rusqlite::{Connection, OptionalExtension, params};
 use zeroize::Zeroizing;
 
+use kronik_core::sync::lock;
+
 use crate::key_memory::ProtectedKey;
 use crate::{MasterKey, PrivacyError, hex};
 
@@ -328,7 +330,7 @@ impl Keystore {
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.conn)
     }
 
     fn checked_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, PrivacyError> {

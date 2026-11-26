@@ -1,9 +1,10 @@
 //! A clock that moves only when the test says so.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use kronik_core::env::{BoxFuture, Clock};
+use kronik_core::sync::lock;
 use tokio::sync::oneshot;
 
 /// Wall and monotonic time that stand still until [`ManualClock::advance`].
@@ -32,7 +33,7 @@ impl ManualClock {
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     /// Moves both clocks forward by `d` and wakes the sleeps that are due.

@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kronik_core::ids::{ActorRef, Lsn};
+use kronik_core::sync::lock;
 use kronik_privacy::sealer::{Opened, Sealer};
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::StateView;
@@ -272,7 +273,7 @@ impl ForkState {
     /// Marks the turn when `unverified` says what it reads may differ.
     fn check(&self, unverified: impl FnOnce(&Taint, &str, Lsn) -> bool) {
         if let Some((taint, at)) = &self.taint {
-            let taint = taint.lock().unwrap_or_else(|e| e.into_inner());
+            let taint = lock(taint);
             if unverified(&taint, &self.actor_name(), *at) {
                 self.erased.store(true, Ordering::Relaxed);
             }

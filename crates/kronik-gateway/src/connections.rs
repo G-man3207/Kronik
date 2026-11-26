@@ -31,6 +31,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
 use hyper_util::rt::TokioIo;
+use kronik_core::sync::lock;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::connections::{FinishGuard, Hub, Outgoing, Transport};
 use tokio::sync::Notify;
@@ -65,25 +66,18 @@ impl Transport for WsTransport {
     }
 
     fn close(&self, code: u16, reason: &str) {
-        *self.host_close.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((code, reason.to_owned()));
+        *lock(&self.host_close) = Some((code, reason.to_owned()));
         self.notify.notify_one();
     }
 }
 
 impl WsTransport {
     fn take_host_close(&self) -> Option<(u16, String)> {
-        self.host_close
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
+        lock(&self.host_close).take()
     }
 
     fn host_close_pending(&self) -> bool {
-        self.host_close
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+        lock(&self.host_close).is_some()
     }
 }
 

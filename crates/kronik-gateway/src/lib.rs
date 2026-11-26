@@ -34,6 +34,7 @@ use kronik_core::env::BoxFuture;
 use kronik_core::env::{BodySource, BytesSource};
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, valid_key};
+use kronik_core::sync::lock;
 use kronik_privacy::sealer::is_erased;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{BodyPolicy, Ingress, IngressExtras, Node, RouteEntry, TurnResult};
@@ -908,7 +909,7 @@ impl Gateway {
     /// lock, which only a new epoch pays for, not every request.
     fn route_table(&self) -> Arc<Vec<Route>> {
         let epoch = self.node.epoch();
-        let mut cache = self.routes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = lock(&self.routes);
         if cache.0 != Some(epoch) {
             #[cfg(test)]
             self.route_reads
