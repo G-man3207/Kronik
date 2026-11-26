@@ -23,7 +23,7 @@ use kronik_effects::http::ScrubError;
 use kronik_effects::http::{
     CompiledScrubber, Target, parse_request_url, parse_url, prepared_version, route_pattern,
 };
-use kronik_effects::simulator::{ContractFake, NeighborSource, RecordedNeighbor};
+use kronik_effects::simulator::{ContractFake, NeighborSource, RecordedNeighbor, plain_bytes};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::scrub::{BoundedWriter, original_secret_prefix};
@@ -888,19 +888,6 @@ fn text(b: &[u8]) -> Option<String> {
     )
 }
 
-/// A plain value without a subject, else `None`: the model never sees a
-/// value with a subject, sealed or not.
-fn subject_free(s: Option<&pb::Sealable>) -> Option<&[u8]> {
-    let s = s?;
-    if s.subject.is_some() {
-        return None;
-    }
-    match s.value.as_ref()? {
-        pb::sealable::Value::Plain(b) => Some(b),
-        pb::sealable::Value::Sealed(_) => None,
-    }
-}
-
 /// The request as the model sees it, or `None` when it carries a secret.
 fn request_view(req: &pb::HttpEffectRequest) -> Option<serde_json::Value> {
     let mut headers = BTreeMap::new();
@@ -1074,9 +1061,9 @@ pub fn model_examples(
         .iter()
         .filter(|(_, effect, _)| effect.status == pb::EffectStatus::Ok as i32)
         .filter_map(|(_, effect, prefix)| {
-            let req = pb::HttpEffectRequest::decode(subject_free(effect.request.as_ref())?).ok()?;
+            let req = pb::HttpEffectRequest::decode(plain_bytes(effect.request.as_ref())?).ok()?;
             let resp =
-                pb::HttpEffectResponse::decode(subject_free(effect.response.as_ref())?).ok()?;
+                pb::HttpEffectResponse::decode(plain_bytes(effect.response.as_ref())?).ok()?;
             match req.fingerprint_version {
                 0 => {
                     let holds = |bytes: &[u8]| matcher.is_match(bytes);
@@ -1999,7 +1986,7 @@ mod tests {
         let mut source = exchange();
         source.ordinal = 2;
         let mut request =
-            pb::HttpEffectRequest::decode(subject_free(source.request.as_ref()).unwrap()).unwrap();
+            pb::HttpEffectRequest::decode(plain_bytes(source.request.as_ref()).unwrap()).unwrap();
         request.fingerprint_version = 2;
         source.request = plain(request.encode_to_vec());
         let mut turn = pb::TurnRecord {
@@ -2154,7 +2141,7 @@ mod tests {
         assert_eq!(record.fingerprint, source_fp);
         assert_ne!(record.fingerprint, fork_fp);
         let stored =
-            pb::HttpEffectRequest::decode(subject_free(record.request.as_ref()).unwrap()).unwrap();
+            pb::HttpEffectRequest::decode(plain_bytes(record.request.as_ref()).unwrap()).unwrap();
         assert_eq!(stored.fingerprint_version, source_req.fingerprint_version);
         assert_eq!(stored.url, source_req.url);
         assert_ne!(stored.url, fork_req.url);
@@ -2277,7 +2264,7 @@ mod tests {
         assert_ne!(recorded.record.fingerprint, fork_fp);
         assert_eq!(recorded.record.simulator, "neighbor");
         let stored =
-            pb::HttpEffectRequest::decode(subject_free(recorded.record.request.as_ref()).unwrap())
+            pb::HttpEffectRequest::decode(plain_bytes(recorded.record.request.as_ref()).unwrap())
                 .unwrap();
         assert_eq!(stored.fingerprint_version, 0);
         assert_eq!(stored.url, source_req.url);
