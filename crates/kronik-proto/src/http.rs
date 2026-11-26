@@ -70,11 +70,7 @@ mod tests {
     /// the plain fields. Fixture: `tests/fixtures/http-input-v1.hex`.
     #[test]
     fn records_from_before_sealable_fields_read_their_plain_fields() {
-        let hex = include_str!("../tests/fixtures/http-input-v1.hex");
-        let bytes: Vec<u8> = (0..hex.trim().len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex.trim()[i..i + 2], 16).unwrap())
-            .collect();
+        let bytes = crate::unhex(include_str!("../tests/fixtures/http-input-v1.hex"));
         let h = pb::HttpInput::decode(bytes.as_slice()).unwrap();
         assert_eq!(h.path_text(), "/counter/a/increment");
         assert_eq!(h.query_text(), "email=a%40example.com");

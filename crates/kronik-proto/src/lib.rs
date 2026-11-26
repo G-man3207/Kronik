@@ -943,6 +943,16 @@ fn turn_record(m: &pb::TurnRecord) -> Result<(), DecodeError> {
     Ok(())
 }
 
+/// Test fixtures: lowercase hex, surrounding whitespace ignored.
+#[cfg(test)]
+pub(crate) fn unhex(hex: &str) -> Vec<u8> {
+    let hex = hex.trim();
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1128,15 +1138,6 @@ mod tests {
             Err(DecodeError::Invalid { .. })
         ));
     }
-
-    fn unhex(hex: &str) -> Vec<u8> {
-        let hex = hex.trim();
-        (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-            .collect()
-    }
-
     /// A TurnRecord written before `duration_us` existed decodes with 0.
     /// Fixture: `tests/fixtures/turn-record-v1.hex`.
     #[test]
