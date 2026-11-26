@@ -8,13 +8,13 @@ mod common;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::TcpListener;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::*;
-use kronik_core::env::{BoxFuture, Clock, Env, File, Fs, OpenMode, Spawner};
+use kronik_core::env::test_fs::{FsCall, Then, hooked};
+use kronik_core::env::{BoxFuture, Clock, Env, OpenMode, Spawner};
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, Lsn};
 use kronik_fork::diff::{DiffOptions, Mode};
@@ -990,55 +990,6 @@ impl Spawner for PauseEnv {
     }
 }
 
-impl Fs for PauseEnv {
-    fn create_dir_all(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.fs.create_dir_all(p)
-    }
-
-    fn open(
-        &self,
-        p: PathBuf,
-        mode: OpenMode,
-    ) -> BoxFuture<'static, std::io::Result<Arc<dyn File>>> {
-        if matches!(mode, OpenMode::Read)
-            && self.pause.timer_started.load(Ordering::SeqCst)
-            && !self.pause.read_started.swap(true, Ordering::SeqCst)
-        {
-            let inner = self.inner.fs.clone();
-            let pause = self.pause.clone();
-            return Box::pin(async move {
-                pause.release_read.acquire().await.unwrap().forget();
-                inner.open(p, mode).await
-            });
-        }
-        self.inner.fs.open(p, mode)
-    }
-
-    fn exists(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<bool>> {
-        self.inner.fs.exists(p)
-    }
-
-    fn read_dir(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<Vec<String>>> {
-        self.inner.fs.read_dir(p)
-    }
-
-    fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.fs.rename(from, to)
-    }
-
-    fn remove_file(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.fs.remove_file(p)
-    }
-
-    fn sync_dir(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.fs.sync_dir(p)
-    }
-
-    fn available(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<u64>> {
-        self.inner.fs.available(p)
-    }
-}
-
 /// H5: a queued request is not admitted before the pause deadline and is
 /// admitted at it, even while the last round's log I/O cannot complete.
 #[test]
@@ -1067,13 +1018,28 @@ fn a_pause_deadline_releases_admission_before_catch_up_io_finishes() {
             ..NodeConfig::default()
         },
         move |env| {
+            // Real files, but the first read-only open after the pause timer
+            // started waits for `release_read`.
+            let pause = control.clone();
+            env.fs = hooked(env.fs.clone(), move |call| match call {
+                FsCall::Open(_, OpenMode::Read)
+                    if pause.timer_started.load(Ordering::SeqCst)
+                        && !pause.read_started.swap(true, Ordering::SeqCst) =>
+                {
+                    let pause = pause.clone();
+                    Then::Wait(Box::pin(async move {
+                        pause.release_read.acquire().await.unwrap().forget();
+                        Ok(())
+                    }))
+                }
+                _ => Then::Forward,
+            });
             let wrapped = Arc::new(PauseEnv {
                 inner: env.clone(),
                 pause: control,
                 max_pause,
             });
             env.clock = wrapped.clone();
-            env.fs = wrapped.clone();
             env.spawner = wrapped;
         },
         |_| {},
