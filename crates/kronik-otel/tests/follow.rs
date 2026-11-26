@@ -837,7 +837,7 @@ async fn cancelled_stop_waiter_does_not_lose_the_real_join_handle() {
 }
 
 #[tokio::test]
-async fn stopping_drains_actual_control_and_refuses_the_queued_metadata_rewind() {
+async fn stopping_drains_actual_control_and_refuses_the_queued_rewind() {
     let directory = tempfile::tempdir().unwrap();
     let env = Env::real(tokio::runtime::Handle::current());
     let node = start_local(env.clone(), directory.path(), NodeConfig::default())
@@ -845,19 +845,15 @@ async fn stopping_drains_actual_control_and_refuses_the_queued_metadata_rewind()
         .unwrap();
     let original = node.local_operator_authority().unwrap();
     let cursors = Arc::new(Cursors::load(env.clone(), directory.path()).await.unwrap());
-    // A persisted control fixture, not a fabricated metadata history or authority grant.
+    // A persisted control fixture, not a fabricated history or authority grant.
     let entry = Entry {
         lsn: 17,
-        state: serde_json::json!({"source":kronik_core::ids::SourcePos::Metadata {index:17}}),
         ..Default::default()
     };
-    cursors
-        .save("metadata-control", entry.clone())
-        .await
-        .unwrap();
-    let stream = Stream::new("metadata-control", true, String::new(), 17, cursors.clone());
+    cursors.save("export-control", entry.clone()).await.unwrap();
+    let stream = Stream::new("export-control", true, String::new(), 17, cursors.clone());
     let held = stream.control_guard().await;
-    let queued = stream.rewind_metadata(&env, 3, original.clone());
+    let queued = stream.rewind(&node, 3, original.clone());
     tokio::pin!(queued);
     tokio::select! {
         biased;
@@ -878,12 +874,12 @@ async fn stopping_drains_actual_control_and_refuses_the_queued_metadata_rewind()
         rewind.unwrap_err().code,
         kronik_core::error::ErrorCode::Unavailable
     );
-    assert_eq!(cursors.get("metadata-control").unwrap(), entry);
+    assert_eq!(cursors.get("export-control").unwrap(), entry);
     assert_eq!(
         Cursors::load(env.clone(), directory.path())
             .await
             .unwrap()
-            .get("metadata-control")
+            .get("export-control")
             .unwrap(),
         entry
     );

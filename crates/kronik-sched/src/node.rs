@@ -33,7 +33,6 @@ use crate::{NodeConfig, TurnResult};
 
 mod native;
 mod native_installation;
-mod native_metadata_audit;
 mod native_subject_keys;
 mod records;
 mod source_gc;

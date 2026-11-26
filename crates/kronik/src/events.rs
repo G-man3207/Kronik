@@ -167,21 +167,11 @@ pub(crate) async fn start_native(
         installation: installation.to_owned(),
         branch: node.branch().to_owned(),
     };
-    let targets = streams
-        .iter()
-        .map(|(name, stream)| {
-            (
-                name.clone(),
-                kronik_api::events::WebhookTarget::Native {
-                    stream: stream.clone(),
-                },
-            )
-        })
-        .collect();
-    match kronik_api::events::Events::native(identity, node)
-        .and_then(|events| events.with_webhooks(targets))
-    {
-        Ok(events) => Ok((Arc::new(events), streams.into_values().collect())),
+    match kronik_api::events::Events::native(identity, node) {
+        Ok(events) => {
+            let events = events.with_webhooks(streams.clone());
+            Ok((Arc::new(events), streams.into_values().collect()))
+        }
         Err(mut error) => {
             for stream in streams.into_values() {
                 if let Err(cleanup) = stream.stop_and_join().await {

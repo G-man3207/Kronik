@@ -1,19 +1,18 @@
-//! Signed delivery from actual actor or metadata sources, using the same durable
-//! M28 cursor, replay generations, prepared bodies, immutable secret pin and Net.
+//! Signed delivery from actual actor sources, using the same durable M28
+//! cursor, replay generations, prepared bodies, immutable secret pin and Net.
 
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use kronik_core::authority::AuthLease;
-use kronik_core::env::{BoxFuture, Env};
+use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{SourcePos, hex};
-use kronik_log::{Committed, MetadataAuditGap, MetadataAuditSource, MetadataWebhookKeyChange};
+use kronik_log::{Committed, MetadataWebhookKeyChange};
 use kronik_otel::{
     audit::Mapper,
-    cursor::{Control, Cursors, Entry, Generation},
+    cursor::{Cursors, Entry, Generation},
     follow::{self, Delivery, Sink, Stream},
     http,
 };
@@ -23,9 +22,8 @@ use kronik_sched::{
     secrets::{CertifiedSecretSnapshot, SecretSnapshotPublication},
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::futures::Notified;
 
-use crate::events::{self, Event, Identity, Page, Position, ResumeCursor};
+use crate::events::{self, Event, Identity, Position, ResumeCursor};
 
 const STATE_SCHEMA: &str = "kronik.webhook-state/v2";
 pub const SIGNATURE_VERSION: &str = "v1";
@@ -54,36 +52,6 @@ pub type Resolver = dyn Fn(
     ) -> Pin<Box<dyn Future<Output = Result<[u8; 32], String>> + Send>>
     + Send
     + Sync;
-
-/// The fixed host producer must durably commit this exact closed notice, return
-/// its actual source position, and deduplicate retries by stream and index range.
-/// The receipt's namespace is independent of the described metadata range.
-pub type MetadataGapRecorder = dyn Fn(MetadataAuditGap, AuthLease) -> BoxFuture<'static, Result<SourcePos, ApiError>>
-    + Send
-    + Sync;
-
-/// The sole physical M23 runtime supplies an already-certified retained privacy
-/// catalogue. Missing or stale certification is an error, never an empty fallback.
-/// The pair is captured before any authoritative metadata read; the same
-/// publication is retained through the final owned delivery and durable cursor.
-pub type MetadataCatalogue = dyn Fn() -> Result<(Arc<CertifiedSecretSnapshot>, SecretSnapshotPublication), ApiError>
-    + Send
-    + Sync;
-
-/// Commits the fixed registered-stream configuration notice before pin activation.
-pub type MetadataConfigRecorder = dyn Fn(MetadataWebhookKeyChange, AuthLease) -> BoxFuture<'static, Result<SourcePos, ApiError>>
-    + Send
-    + Sync;
-
-#[derive(Clone)]
-pub struct MetadataRuntime {
-    pub env: Env,
-    /// Original registered physical boot and hosted role capability; metadata
-    /// hosts retain their metadata role. Never renew it or promote the catalogue.
-    pub execution: AuthLease,
-    pub catalogue: Arc<MetadataCatalogue>,
-    pub config_recorder: Arc<MetadataConfigRecorder>,
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -183,53 +151,36 @@ pub struct Webhook {
     state: State,
 }
 
-// The two hosts' callback fields carry the webhook's wiring.
-#[allow(clippy::type_complexity)]
-enum Host {
-    Native {
-        node: Arc<Node>,
-        execution: AuthLease,
-    },
-    Metadata(MetadataRuntime),
+struct Host {
+    node: Arc<Node>,
+    execution: AuthLease,
 }
 
 impl Host {
     fn env(&self) -> &Env {
-        match self {
-            Self::Native { node, .. } => node.env(),
-            Self::Metadata(runtime) => &runtime.env,
-        }
+        self.node.env()
     }
 
     fn execution(&self) -> &AuthLease {
-        match self {
-            Self::Native { execution, .. } => execution,
-            Self::Metadata(runtime) => &runtime.execution,
-        }
+        &self.execution
     }
 
     fn catalogue(
         &self,
     ) -> Result<(Arc<CertifiedSecretSnapshot>, SecretSnapshotPublication), ApiError> {
-        match self {
-            Self::Native { node, .. } => node.native_secret_snapshot_with_publication(),
-            Self::Metadata(runtime) => (runtime.catalogue)(),
-        }
+        self.node.native_secret_snapshot_with_publication()
     }
 
     async fn capture_actor(&self, original: &AuthLease) -> Result<Arc<ShardReader>, String> {
         original
             .check()
             .map_err(|error| error.code.as_str().to_owned())?;
-        let reader = match self {
-            Self::Native { node, .. } => tokio::select! {
-                biased;
-                () = original.cancelled() => return Err("execution_revoked".into()),
-                reader = node.capture_system_export_reader() => reader,
-            }
-            .map(Arc::new),
-            Self::Metadata(_) => return Err("metadata_requires_actual_metadata_source".into()),
+        let reader = tokio::select! {
+            biased;
+            () = original.cancelled() => return Err("execution_revoked".into()),
+            reader = self.node.capture_system_export_reader() => reader,
         }
+        .map(Arc::new)
         .map_err(|error| error.code.as_str().to_owned())?;
         original
             .check()
@@ -242,40 +193,28 @@ impl Host {
         change: MetadataWebhookKeyChange,
         binding: SourcePos,
     ) -> Result<(), String> {
-        let recorder = match self {
-            Self::Native { node, execution } => {
-                let details = [
-                    ("change".into(), "webhook.signing_key".into()),
-                    ("source".into(), events::domain(binding).into_owned()),
-                    ("from_version".into(), change.from_version.to_string()),
-                    ("to_version".into(), change.to_version.to_string()),
-                ]
-                .into();
-                node.record_audit_event_authorized(
-                    "audit.config",
-                    &change.stream,
-                    details,
-                    pb::Audit {
-                        token_id: "system".into(),
-                        reason: "the configured webhook signing version changed".into(),
-                        wall_time_ms: node.env().clock.wall_ms(),
-                    },
-                    execution.clone(),
-                )
-                .await
-                .map_err(|_| "webhook_config_audit".to_owned())?;
-                return Ok(());
-            }
-            Self::Metadata(runtime) => &runtime.config_recorder,
-        };
-        let receipt = recorder(change, self.execution().clone())
+        let details = [
+            ("change".into(), "webhook.signing_key".into()),
+            ("source".into(), events::domain(binding).into_owned()),
+            ("from_version".into(), change.from_version.to_string()),
+            ("to_version".into(), change.to_version.to_string()),
+        ]
+        .into();
+        self.node
+            .record_audit_event_authorized(
+                "audit.config",
+                &change.stream,
+                details,
+                pb::Audit {
+                    token_id: "system".into(),
+                    reason: "the configured webhook signing version changed".into(),
+                    wall_time_ms: self.node.env().clock.wall_ms(),
+                },
+                self.execution.clone(),
+            )
             .await
-            .map_err(|error| error.code.as_str().to_owned())?;
-        if events::valid_source(receipt) {
-            Ok(())
-        } else {
-            Err("webhook_config_audit".into())
-        }
+            .map_err(|_| "webhook_config_audit".to_owned())?;
+        Ok(())
     }
 }
 
@@ -466,7 +405,7 @@ impl Webhook {
             return Err("webhook_config".into());
         }
         Self::open_at(
-            Host::Native { node, execution },
+            Host { node, execution },
             mapper,
             identity,
             SourcePos::Actor { shard, lsn: 0 },
@@ -476,24 +415,6 @@ impl Webhook {
             resolver,
         )
         .await
-    }
-
-    pub async fn open_metadata(
-        runtime: MetadataRuntime,
-        mapper: Arc<Mapper>,
-        identity: Identity,
-        stream: Arc<Stream>,
-        cursors: Arc<Cursors>,
-        settings: Settings,
-        resolver: Arc<Resolver>,
-    ) -> Result<Self, String> {
-        let execution = runtime.execution.clone();
-        tokio::select! {
-            biased;
-            () = execution.cancelled() => Err("execution_revoked".into()),
-            opened = Self::open_at(Host::Metadata(runtime), mapper, identity, SourcePos::Metadata { index: 0 },
-                stream, cursors, settings, resolver) => opened,
-        }
     }
 
     // The webhook stream's opening inputs.
@@ -527,15 +448,7 @@ impl Webhook {
         {
             return Err("webhook_config".into());
         }
-        let saved = cursors.get(stream.name.as_ref());
-        if matches!(binding, SourcePos::Metadata { .. })
-            && saved
-                .as_ref()
-                .is_some_and(|entry| entry.state.is_null() || entry.state.get("source").is_none())
-        {
-            return Err("metadata_cursor_source_missing".into());
-        }
-        let mut entry = saved.unwrap_or_default();
+        let mut entry = cursors.get(stream.name.as_ref()).unwrap_or_default();
         let expected = State {
             schema: STATE_SCHEMA.into(),
             identity,
@@ -714,75 +627,6 @@ impl Webhook {
         original
             .check()
             .map_err(|error| error.code.as_str().to_owned())
-    }
-
-    /// Only a page built from the actual MetadataAuditSource, never actor Committed.
-    pub async fn prepare_metadata(
-        &mut self,
-        page: Page,
-        generation: Generation,
-    ) -> Result<Arc<Batch>, String> {
-        if !matches!(self.state.source, SourcePos::Metadata { .. })
-            || !matches!(page.applied, SourcePos::Metadata { .. })
-            || page.gap.is_some()
-        {
-            return Err("webhook_source".into());
-        }
-        let source = page.events.first().ok_or("metadata_batch_empty")?.source;
-        let next = page
-            .cursor
-            .streams
-            .get("metadata")
-            .ok_or("metadata_cursor_missing")?;
-        if next.subindex != 0 || !matches!(next.source, SourcePos::Metadata { .. }) {
-            return Err("metadata_batch_requires_record_boundary".into());
-        }
-        let through = events::coordinate(next.source)
-            .checked_sub(1)
-            .ok_or("metadata_cursor_missing")?;
-        self.prepare_events(
-            page.events,
-            source,
-            SourcePos::Metadata { index: through },
-            generation,
-        )
-        .await
-    }
-
-    fn pending_metadata(
-        &self,
-        image: kronik_log::MetadataAuditBatch,
-        generation: Generation,
-        secrets: &[(&str, &[u8])],
-    ) -> Result<Arc<Batch>, String> {
-        let batch = self.state.pending.as_ref().ok_or("webhook_state")?;
-        let SourcePos::Metadata { index } = batch.source else {
-            return Err("webhook_source".into());
-        };
-        if batch.generation != generation {
-            return Err("webhook_state".into());
-        }
-        if !matches!(self.host, Host::Metadata(_)) {
-            return Err("metadata_requires_actual_metadata_source".into());
-        }
-        if index > image.durable_through {
-            return Err("webhook_history_conflict".into());
-        }
-        if let Some(record) = image
-            .records
-            .into_iter()
-            .next()
-            .filter(|record| record.index == index)
-        {
-            let projected =
-                events::project_metadata(&self.mapper, &self.state.identity, &record, secrets)
-                    .map_err(|error| error.code.as_str().to_owned())?;
-            verify_prepared(batch, &projected)?;
-        } else if index >= image.covered_from {
-            return Err("webhook_history_conflict".into());
-        }
-        // Only explicit lost coverage may rely on the durable prepared witness.
-        Ok(batch.clone())
     }
 
     fn checkpoint_value(&self, source: SourcePos) -> Result<serde_json::Value, String> {
@@ -975,10 +819,7 @@ impl Sink for Webhook {
                 Delivery::Retry { code, .. } | Delivery::Dropped { code } => return Err(code),
             }
         }
-        let node = match &self.host {
-            Host::Native { node, .. } => node,
-            Host::Metadata(_) => return Err("metadata_requires_typed_gap".into()),
-        };
+        let node = &self.host.node;
         let reader = self.host.capture_actor(&original).await?;
         let mut recorded = false;
         let mut after = reader.point().retained_from.saturating_sub(1);
@@ -1030,588 +871,5 @@ impl Sink for Webhook {
             .map_err(|_| "webhook_gap".to_owned())?;
         }
         Ok(())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct MetadataProgress {
-    pub cursor: SourcePos,
-    pub last_error: Option<String>,
-    pub gaps: u64,
-}
-
-#[derive(Default)]
-struct MetadataErrors {
-    code: Option<String>,
-    gaps: u64,
-    last_gap: Option<events::Gap>,
-}
-
-/// A thin actual-metadata reader/control adapter, not an actor follower or queue.
-pub struct MetadataStream {
-    stream: Arc<Stream>,
-    runtime: MetadataRuntime,
-    cursors: Arc<Cursors>,
-    source: Arc<dyn MetadataAuditSource>,
-    gap_recorder: Arc<MetadataGapRecorder>,
-    errors: Mutex<MetadataErrors>,
-}
-
-impl MetadataStream {
-    pub fn stream(&self) -> &Arc<Stream> {
-        &self.stream
-    }
-    pub fn enabled(&self) -> bool {
-        self.stream.enabled
-    }
-
-    pub fn progress(&self) -> Result<MetadataProgress, ApiError> {
-        let entry = self.cursors.get(self.stream.name.as_ref()).ok_or_else(|| {
-            ApiError::new(ErrorCode::Unavailable, "metadata webhook cursor is missing")
-        })?;
-        let cursor = cursor_source(&entry)?;
-        if !matches!(cursor, SourcePos::Metadata { .. }) {
-            return Err(ApiError::new(
-                ErrorCode::StorageCorrupt,
-                "metadata webhook source changed",
-            ));
-        }
-        let errors = match self.errors.lock() {
-            Ok(errors) => errors,
-            Err(error) => error.into_inner(),
-        };
-        Ok(MetadataProgress {
-            cursor,
-            last_error: errors.code.clone(),
-            gaps: errors.gaps,
-        })
-    }
-
-    /// The original request lease gates the existing owned rewind job's actual enqueue.
-    pub async fn rewind(
-        self: &Arc<Self>,
-        to: Position,
-        authority: kronik_core::authority::AuthLease,
-    ) -> Result<(), ApiError> {
-        let SourcePos::Metadata { index } = to.source else {
-            return Err(ApiError::new(
-                ErrorCode::BadRequest,
-                "metadata replay requires a metadata position",
-            ));
-        };
-        if index == 0 || to.subindex != 0 {
-            return Err(ApiError::new(
-                ErrorCode::BadRequest,
-                "metadata replay must start at a record boundary",
-            ));
-        }
-        let coverage = self.source.read_from(index, 1)?;
-        let progress = self.progress()?;
-        if index < coverage.covered_from || index > coverage.durable_through.saturating_add(1) {
-            return Err(ApiError::new(
-                ErrorCode::AuditRangeGone,
-                "metadata replay is outside retained coverage",
-            ));
-        }
-        if index - 1 > events::coordinate(progress.cursor) {
-            return Err(ApiError::new(
-                ErrorCode::BadRequest,
-                "metadata replay may only rewind",
-            ));
-        }
-        self.stream
-            .rewind_metadata(&self.runtime.env, index - 1, authority)
-            .await?;
-        Ok(())
-    }
-
-    fn failure(&self, code: String, gap: Option<events::Gap>) {
-        let mut errors = match self.errors.lock() {
-            Ok(errors) => errors,
-            Err(error) => error.into_inner(),
-        };
-        errors.code = Some(code);
-        if let Some(gap) = gap
-            && errors.last_gap.as_ref() != Some(&gap)
-        {
-            errors.gaps = errors.gaps.saturating_add(1);
-            errors.last_gap = Some(gap);
-        }
-    }
-
-    fn success(&self) {
-        let mut errors = match self.errors.lock() {
-            Ok(errors) => errors,
-            Err(error) => error.into_inner(),
-        };
-        errors.code = None;
-    }
-}
-
-// The webhook stream's opening inputs; grouping them would only move
-// the same names into a struct every caller unpacks again.
-#[allow(clippy::too_many_arguments)]
-pub async fn start_metadata(
-    runtime: MetadataRuntime,
-    mapper: Arc<Mapper>,
-    identity: Identity,
-    stream: Arc<Stream>,
-    cursors: Arc<Cursors>,
-    settings: Settings,
-    resolver: Arc<Resolver>,
-    source: Arc<dyn MetadataAuditSource>,
-    gap_recorder: Arc<MetadataGapRecorder>,
-) -> Result<Arc<MetadataStream>, ApiError> {
-    runtime.execution.check()?;
-    let sink = Webhook::open_metadata(
-        runtime.clone(),
-        mapper,
-        identity,
-        stream.clone(),
-        cursors.clone(),
-        settings,
-        resolver,
-    )
-    .await
-    .map_err(|_| {
-        ApiError::new(
-            ErrorCode::Unavailable,
-            "metadata webhook initialization failed",
-        )
-    })?;
-    let shared = Arc::new(MetadataStream {
-        stream,
-        runtime: runtime.clone(),
-        cursors,
-        source,
-        gap_recorder,
-        errors: Mutex::default(),
-    });
-    shared.stream.own_task(
-        runtime
-            .env
-            .spawn("metadata-webhook", follow_metadata(sink, shared.clone())),
-    );
-    Ok(shared)
-}
-
-async fn pause(
-    env: &Env,
-    stream: &Stream,
-    changed: Pin<&mut Notified<'_>>,
-    delay: Duration,
-) -> bool {
-    tokio::select! {
-    biased;
-    () = stream.stopped() => true, () = changed => true, () = env.clock.sleep(delay) => false }
-}
-
-async fn metadata_checkpoint(
-    sink: &mut Webhook,
-    shared: &MetadataStream,
-    coordinate: u64,
-    control: Option<Control>,
-    original: &AuthLease,
-) -> Result<Entry, String> {
-    let source = SourcePos::Metadata { index: coordinate };
-    let state = sink.checkpoint_value(source)?;
-    let saved = advance_cursor(
-        &shared.runtime.env,
-        shared.stream.clone(),
-        shared.cursors.clone(),
-        Entry {
-            lsn: coordinate,
-            state,
-            control,
-        },
-        original,
-    )
-    .await?;
-    if cursor_source(&saved).map_err(|error| error.code.as_str().to_owned())? != source {
-        return Err("webhook_source".into());
-    }
-    sink.accept_checkpoint(source);
-    shared.success();
-    Ok(saved)
-}
-
-async fn metadata_gap_checkpoint(
-    sink: &mut Webhook,
-    shared: &MetadataStream,
-    position: u64,
-    generation: Generation,
-) -> Result<(), String> {
-    let _control = shared.stream.control_guard().await;
-    let current = shared
-        .cursors
-        .get(shared.stream.name.as_ref())
-        .ok_or("webhook_state")?;
-    if current.generation() != generation
-        || current.lsn != position
-        || current
-            .pending_rewind()
-            .is_some_and(|rewind| rewind.generation != generation)
-    {
-        return Ok(());
-    }
-    let source = SourcePos::Metadata { index: position };
-    if cursor_source(&current).map_err(|error| error.code.as_str().to_owned())? != source
-        || sink.state.source != source
-        || sink.state.pending.is_some()
-        || current
-            .state
-            .get("pending")
-            .is_none_or(|pending| !pending.is_null())
-    {
-        return Err("webhook_state".into());
-    }
-    let from = position
-        .checked_add(1)
-        .ok_or("metadata_position_exhausted")?;
-    // A new durable image, not the stale public page, authorizes the exact range.
-    let coverage = events::metadata_batch(shared.source.as_ref(), from, 1)
-        .map_err(|error| error.code.as_str().to_owned())?;
-    if from >= coverage.covered_from {
-        return Ok(());
-    }
-    let through = coverage.covered_from - 1;
-    let receipt = (shared.gap_recorder)(
-        MetadataAuditGap {
-            stream: shared.stream.name.to_string(),
-            from_index: from,
-            through_index: through,
-        },
-        shared.runtime.execution.clone(),
-    )
-    .await
-    .map_err(|error| error.code.as_str().to_owned())?;
-    let valid_receipt = match receipt {
-        SourcePos::Actor { shard, lsn } => {
-            lsn > 0 && shard.is_none_or(|shard| shard < kronik_proto::MAX_SHARD_COUNT)
-        }
-        SourcePos::Metadata { index } => index > through,
-    };
-    if !valid_receipt {
-        return Err("webhook_gap_receipt".into());
-    }
-    // A late durable rewind must survive even if it was written by another
-    // controller while the producer completed its fsync.
-    let latest = shared
-        .cursors
-        .get(shared.stream.name.as_ref())
-        .ok_or("webhook_state")?;
-    if latest.generation() != generation
-        || latest.lsn != position
-        || latest
-            .pending_rewind()
-            .is_some_and(|rewind| rewind.generation != generation)
-    {
-        return Ok(());
-    }
-    if cursor_source(&latest).map_err(|error| error.code.as_str().to_owned())? != source
-        || latest
-            .state
-            .get("pending")
-            .is_none_or(|pending| !pending.is_null())
-    {
-        return Err("webhook_state".into());
-    }
-    // Forward coverage loss is not a rewind: keep the current generation and
-    // let the existing cursor writer merge any still-later control intent.
-    metadata_checkpoint(
-        sink,
-        shared,
-        through,
-        latest.control,
-        &shared.runtime.execution,
-    )
-    .await?;
-    Ok(())
-}
-
-async fn follow_metadata(sink: Webhook, shared: Arc<MetadataStream>) {
-    let execution = shared.runtime.execution.clone();
-    tokio::select! {
-        biased;
-        () = execution.cancelled() => shared.failure("execution_revoked".into(), None),
-        () = follow_metadata_live(sink, shared.clone()) => {},
-    }
-}
-
-async fn follow_metadata_live(mut sink: Webhook, shared: Arc<MetadataStream>) {
-    let env = shared.runtime.env.clone();
-    let mut backoff = follow::FIRST_BACKOFF;
-    'source: loop {
-        if shared.stream.is_stopping() {
-            return;
-        }
-        let changed = shared.stream.control_notification();
-        tokio::pin!(changed);
-        changed.as_mut().enable();
-        let Some(mut entry) = shared.cursors.get(shared.stream.name.as_ref()) else {
-            shared.failure("webhook_state".into(), None);
-            pause(&env, &shared.stream, changed.as_mut(), backoff).await;
-            backoff = backoff.saturating_mul(2).min(follow::MAX_BACKOFF);
-            continue;
-        };
-        if entry
-            .pending_rewind()
-            .is_some_and(|rewind| rewind.generation != entry.generation())
-        {
-            let _control = shared.stream.control_guard().await;
-            if let Some(latest) = shared.cursors.get(shared.stream.name.as_ref()) {
-                entry = latest;
-            }
-            if let Some(rewind) = entry
-                .pending_rewind()
-                .filter(|rewind| rewind.generation != entry.generation())
-            {
-                sink.state.pending = None;
-                match metadata_checkpoint(
-                    &mut sink,
-                    &shared,
-                    rewind.to,
-                    Some(Control::new(rewind.generation)),
-                    &shared.runtime.execution,
-                )
-                .await
-                {
-                    Ok(_) => {
-                        backoff = follow::FIRST_BACKOFF;
-                        continue;
-                    }
-                    Err(code) => shared.failure(code, None),
-                }
-                drop(_control);
-                pause(&env, &shared.stream, changed.as_mut(), backoff).await;
-                backoff = backoff.saturating_mul(2).min(follow::MAX_BACKOFF);
-                continue;
-            }
-        }
-        let position = match cursor_source(&entry) {
-            Ok(SourcePos::Metadata { index }) => index,
-            _ => {
-                shared.failure("webhook_source".into(), None);
-                pause(&env, &shared.stream, changed.as_mut(), backoff).await;
-                continue;
-            }
-        };
-        let generation = entry.generation();
-        if let Err(error) = shared.runtime.execution.check() {
-            shared.failure(error.code.as_str().into(), None);
-            return;
-        }
-        let Some(next) = position.checked_add(1) else {
-            shared.failure("metadata_position_exhausted".into(), None);
-            pause(&env, &shared.stream, changed.as_mut(), follow::MAX_BACKOFF).await;
-            continue;
-        };
-        // Capture even a failure before reading: fixed gaps and empty coverage
-        // need no values, but records can never acquire a newer certificate.
-        let captured = (shared.runtime.catalogue)();
-        let from = sink
-            .state
-            .pending
-            .as_ref()
-            .map_or(next, |batch| events::coordinate(batch.source));
-        let image = match events::metadata_batch(shared.source.as_ref(), from, 1) {
-            Ok(image) => image,
-            Err(error) => {
-                shared.failure(error.code.as_str().into(), None);
-                pause(&env, &shared.stream, changed.as_mut(), backoff).await;
-                backoff = backoff.saturating_mul(2).min(follow::MAX_BACKOFF);
-                continue;
-            }
-        };
-        if sink.state.pending.is_none() && from < image.covered_from {
-            shared.failure(
-                "AUDIT_RANGE_GONE".into(),
-                Some(events::Gap {
-                    from: SourcePos::Metadata { index: from },
-                    through: SourcePos::Metadata {
-                        index: image.covered_from - 1,
-                    },
-                }),
-            );
-            match metadata_gap_checkpoint(&mut sink, &shared, position, generation).await {
-                Ok(()) => {
-                    backoff = follow::FIRST_BACKOFF;
-                    continue;
-                }
-                Err(code) => shared.failure(code, None),
-            }
-            pause(&env, &shared.stream, changed.as_mut(), backoff).await;
-            backoff = backoff.saturating_mul(2).min(follow::MAX_BACKOFF);
-            continue;
-        }
-        if sink.state.pending.is_none() && image.records.is_empty() {
-            if from > image.durable_through.saturating_add(1) {
-                shared.failure("webhook_source".into(), None);
-            } else if image.scanned_through > position
-                && let Err(code) = metadata_checkpoint(
-                    &mut sink,
-                    &shared,
-                    image.scanned_through,
-                    entry.control,
-                    &shared.runtime.execution,
-                )
-                .await
-            {
-                shared.failure(code, None);
-            }
-            pause(
-                &env,
-                &shared.stream,
-                changed.as_mut(),
-                Duration::from_millis(100),
-            )
-            .await;
-            continue;
-        }
-        let (snapshot, publication) = match captured {
-            Ok(pair) => pair,
-            Err(error) => {
-                shared.failure(error.code.as_str().into(), None);
-                pause(&env, &shared.stream, changed.as_mut(), backoff).await;
-                backoff = backoff.saturating_mul(2).min(follow::MAX_BACKOFF);
-                continue;
-            }
-        };
-        let authorization = follow::metadata_records(
-            &shared.stream,
-            snapshot.clone(),
-            publication,
-            shared.runtime.execution.clone(),
-        );
-        let secrets: Vec<_> = snapshot
-            .values
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_slice()))
-            .collect();
-        let batch = if sink.state.pending.is_some() {
-            sink.pending_metadata(image, generation, &secrets)
-        } else {
-            let mut cursor = ResumeCursor::new(sink.state.identity.clone());
-            if cursor
-                .rewind(Position {
-                    source: SourcePos::Metadata { index: next },
-                    subindex: 0,
-                })
-                .is_err()
-            {
-                shared.failure("webhook_source".into(), None);
-                pause(&env, &shared.stream, changed.as_mut(), backoff).await;
-                continue;
-            }
-            let page = match events::metadata_page_from_batch(
-                image,
-                &sink.mapper,
-                &sink.state.identity,
-                &cursor,
-                &secrets,
-                1,
-            ) {
-                Ok(page) => page,
-                Err(error) => {
-                    shared.failure(error.code.as_str().into(), None);
-                    pause(&env, &shared.stream, changed.as_mut(), backoff).await;
-                    backoff = backoff.saturating_mul(2).min(follow::MAX_BACKOFF);
-                    continue;
-                }
-            };
-            if page.events.is_empty() {
-                let Some(position) = page.cursor.streams.get("metadata") else {
-                    shared.failure("webhook_source".into(), None);
-                    continue;
-                };
-                let through = events::coordinate(position.source).saturating_sub(1);
-                if let Err(code) =
-                    metadata_checkpoint(&mut sink, &shared, through, entry.control, &authorization)
-                        .await
-                {
-                    shared.failure(code, None);
-                }
-                pause(
-                    &env,
-                    &shared.stream,
-                    changed.as_mut(),
-                    Duration::from_millis(100),
-                )
-                .await;
-                continue;
-            }
-            sink.prepare_metadata(page, generation).await
-        };
-        let batch = match batch {
-            Ok(batch) => batch,
-            Err(code) => {
-                shared.failure(code, None);
-                pause(&env, &shared.stream, changed.as_mut(), backoff).await;
-                backoff = backoff.saturating_mul(2).min(follow::MAX_BACKOFF);
-                continue;
-            }
-        };
-        if shared
-            .cursors
-            .get(shared.stream.name.as_ref())
-            .is_some_and(|latest| {
-                latest
-                    .pending_rewind()
-                    .is_some_and(|rewind| rewind.generation != generation)
-            })
-        {
-            continue;
-        }
-        // An admitted delivery owns its bounded completion; a rewind must not
-        // detach its pending fsync or HTTP body and then reuse this sink.
-        let delivery = sink.deliver(&batch, authorization.clone()).await;
-        match delivery {
-            Delivery::Delivered => {}
-            Delivery::Retry { code, after } => {
-                shared.failure(code, None);
-                let delay = after.map_or(backoff, |delay| delay.min(follow::MAX_RETRY_AFTER));
-                pause(&env, &shared.stream, changed.as_mut(), delay).await;
-                backoff = backoff.saturating_mul(2).min(follow::MAX_BACKOFF);
-                continue;
-            }
-            Delivery::Dropped { code } => {
-                shared.failure(code, None);
-                pause(&env, &shared.stream, changed.as_mut(), backoff).await;
-                continue;
-            }
-        }
-        // Freeze the remote ACK while local durability retries; never repost it here.
-        loop {
-            if shared
-                .cursors
-                .get(shared.stream.name.as_ref())
-                .is_some_and(|latest| {
-                    latest
-                        .pending_rewind()
-                        .is_some_and(|rewind| rewind.generation != generation)
-                })
-            {
-                continue 'source;
-            }
-            match metadata_checkpoint(
-                &mut sink,
-                &shared,
-                events::coordinate(batch.through),
-                entry.control,
-                &authorization,
-            )
-            .await
-            {
-                Ok(_) => {
-                    backoff = follow::FIRST_BACKOFF;
-                    continue 'source;
-                }
-                Err(code) => shared.failure(code, None),
-            }
-            if pause(&env, &shared.stream, changed.as_mut(), backoff).await {
-                continue 'source;
-            }
-            backoff = backoff.saturating_mul(2).min(follow::MAX_BACKOFF);
-        }
     }
 }

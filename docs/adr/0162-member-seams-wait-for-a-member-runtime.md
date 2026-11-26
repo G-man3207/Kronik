@@ -45,7 +45,14 @@ Member producer:
   `{"member": false}` directly.
 - #331: remove the metadata-source event pipeline from `kronik-fleet`,
   `kronik-otel`, `kronik-sched` and `kronik-api`; `Events` keeps only the
-  native source.
+  native source. The read side that only this pipeline consumed goes with it:
+  `kronik-log`'s `MetadataAuditSource`, `MetadataAuditBatch` and
+  `MetadataAuditRecord`, and the Mapper's typed native-adoption fact. The
+  closed metadata audit-record schemas (`MetadataAuditGap`,
+  `MetadataWebhookKeyChange`, `MetadataWebhookReplay` and their `kronik-proto`
+  validators), `SourcePos::Metadata`, and the event schema's `metadata` source
+  and `adoption` field stay: they are the format a Member must produce. The
+  last commit with the pipeline is `58d82501`.
 - #332: remove `TokenStore::for_member` and the member-only metadata types and
   methods; `TokenStore.inner` stops being an `Option`.
 - #334: remove the enrollment and control hashes with their accessors, and

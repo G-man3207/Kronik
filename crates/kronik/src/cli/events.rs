@@ -1646,87 +1646,46 @@ mod tests {
             operation: None,
         });
         let secrets = [("token", b"PRIVATE-CREDENTIAL".as_slice())];
-        let event = match source {
-            SourcePos::Actor { shard, lsn } => {
-                // Projection consumes the committed source envelope, not a bare
-                // position; this helper's actor lines are in the "main" namespace.
-                let source = pb::ActorSource {
-                    shard,
-                    lsn,
-                    branch: identity.branch.clone(),
-                };
-                kronik_fleet::events::project(&mapper, &identity, &source, &record, &secrets)
-            }
-            SourcePos::Metadata { index } => {
-                let record = Record::decode(record.kind(), &record.encode()).unwrap();
-                let envelope = kronik_log::MetadataAuditRecord {
-                    index,
-                    record,
-                    native_origin: None,
-                };
-                kronik_fleet::events::project_metadata(&mapper, &identity, &envelope, &secrets)
-            }
+        let (shard, lsn) = match source {
+            SourcePos::Actor { shard, lsn } => (shard, lsn),
+            // A Member serves the same data under its metadata identity; the
+            // in-tree metadata producer waits for one (ADR 0162).
+            SourcePos::Metadata { index } => (None, index),
+        };
+        // Projection consumes the committed source envelope, not a bare
+        // position; this helper's actor lines are in the "main" namespace.
+        let actor = pb::ActorSource {
+            shard,
+            lsn,
+            branch: identity.branch.clone(),
+        };
+        let mut event =
+            kronik_fleet::events::project(&mapper, &identity, &actor, &record, &secrets)
+                .unwrap()
+                .remove(0);
+        if let SourcePos::Metadata { .. } = source {
+            event.source = source;
+            event.branch = None;
+            event.id = kronik_fleet::events::event_id(
+                &identity,
+                source,
+                None,
+                event.subindex,
+                &event.data.record_hash,
+            )
+            .unwrap();
         }
-        .unwrap()
-        .remove(0);
         (event, ResumeCursor::new(identity))
     }
 
     #[test]
-    fn native_secret_adoption_metadata_fixture_labels_archive_and_current_imports() {
-        use kronik_fleet::events::Identity;
-        use kronik_otel::audit::{Keys, Mapper};
-        use kronik_privacy::sealer::Sealer;
-        use kronik_proto::{Record, log::v1 as pb};
-        let identity = Identity {
-            installation: "installation-1".into(),
-            branch: "main".into(),
-        };
-        let master = kronik_privacy::MasterKey::from_bytes([7; 32]).unwrap();
-        let keyed = kronik_privacy::keystore::Pseudonyms::new(&master).unwrap();
-        let mapper = Mapper {
-            keys: Keys::Omit,
-            sealer: Arc::new(Sealer::plain().with_pseudonyms(keyed)),
-            branch: "main".into(),
-        };
-        for current_projection in [false, true] {
-            let bytes = kronik_core::ids::unhex(
-                include_str!(
-                    "../../../kronik-proto/tests/fixtures/secret-version-wide-active-v1.hex"
-                )
-                .trim(),
-            )
-            .unwrap();
-            let record = Record::decode(kronik_proto::kind::SECRET_VERSION, &bytes).unwrap();
-            // Existing supported Record45 sidecar: a wire/rendering unit, not a Raft receipt.
-            let envelope = kronik_log::MetadataAuditRecord {
-                index: 53,
-                record,
-                native_origin: Some(pb::NativeAuthorityOrigin {
-                    source: None,
-                    adoption_audit: Some(pb::Audit {
-                        token_id: "unix:uid=0".into(),
-                        reason: "native authority initialization".into(),
-                        wall_time_ms: 37,
-                    }),
-                    current_projection,
-                }),
-            };
-            let event = kronik_fleet::events::project_metadata(&mapper, &identity, &envelope, &[])
-                .unwrap()
-                .remove(0);
-            assert_eq!(event.source, SourcePos::Metadata { index: 53 });
-            assert_eq!(event.record_kind, envelope.record.kind());
-            assert_eq!(
-                Some(event.data.record_hash.clone()),
-                kronik_otel::audit::record_hash(&envelope.record, &mapper.sealer)
-            );
-            assert_eq!(
-                event.data.adoption.as_ref().unwrap().current_projection,
-                current_projection
-            );
-            assert!(event.branch.is_none());
-            let cursor = ResumeCursor::new(identity.clone());
+    fn imported_history_events_label_archive_and_current_adoption() {
+        for (current_projection, marker) in [
+            (false, "adoption=archive (imported history)"),
+            (true, "adoption=current-projection (imported history)"),
+        ] {
+            let (mut event, cursor) = projected_event_at(SourcePos::Metadata { index: 53 });
+            event.data.adoption = Some(kronik_fleet::events::NativeAdoption { current_projection });
             let stream = kronik_fleet::events::sse_event(&event, &cursor).unwrap();
             let mut human = Vec::new();
             follow(
@@ -1739,14 +1698,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            let human = String::from_utf8(human).unwrap();
-            for private in [
-                "unix:uid=0",
-                "native authority initialization",
-                "adoption_audit",
-            ] {
-                assert!(!human.contains(private));
-            }
+            assert!(String::from_utf8(human).unwrap().contains(marker));
             let mut json = Vec::new();
             follow(
                 stream.as_bytes(),
@@ -1760,10 +1712,6 @@ mod tests {
             .unwrap();
             let decoded: kronik_fleet::events::Event = serde_json::from_slice(&json).unwrap();
             assert_eq!(decoded, event);
-            assert_eq!(
-                decoded.data.adoption.unwrap().current_projection,
-                current_projection
-            );
         }
     }
 
