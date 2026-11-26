@@ -119,19 +119,10 @@ fn next_epoch(record: Option<&EnrollmentRecord>) -> Result<u64, ApiError> {
         .ok_or_else(|| bad("fleet epoch exhausted"))
 }
 fn token_name(record: &EnrollmentRecord) -> Result<String, ApiError> {
-    let bytes = record.request_id.as_bytes();
-    if bytes.len() != 64 {
-        return Err(internal("invalid fleet request identity"));
-    }
-    let mut request = [0; 32];
-    for (byte, pair) in request.iter_mut().zip(bytes.as_chunks::<2>().0) {
-        let nibble = |value| match value {
-            b'0'..=b'9' => Ok(value - b'0'),
-            b'a'..=b'f' => Ok(value - b'a' + 10),
-            _ => Err(internal("invalid fleet request identity")),
-        };
-        *byte = nibble(pair[0])? << 4 | nibble(pair[1])?;
-    }
+    let request: [u8; 32] = digest_bytes(&record.request_id)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| internal("invalid fleet request identity"))?;
     kronik_proto::control::fleet_token_name(record.epoch, &request).map_err(internal)
 }
 fn validate_caller(token_id: &str, reason: &str) -> Result<(), ApiError> {
