@@ -2396,7 +2396,6 @@ mod tests {
         let current = model_scope(&snapshot, Some(&previous_scope)).unwrap();
         let patterns = kronik_sched::effects::secret_patterns(&snapshot.values);
         let matcher = CompiledScrubber::new(&patterns, 1024).unwrap();
-        let cache = ModelCache::memory();
         assert_eq!(
             prepared_request_safe(
                 &request,
@@ -2407,7 +2406,6 @@ mod tests {
             ),
             Err(ScrubError::SourceScopeUnavailable)
         );
-        assert!(cache.is_empty());
         assert_eq!(request.body, b"[secret:old]");
         assert!(model_scope(&snapshot, None).is_err());
     }
