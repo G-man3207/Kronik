@@ -1129,6 +1129,35 @@ pub(crate) fn staged_backup(
     Ok((dir, restore, keys))
 }
 
+/// Stages `backup` under `owner` and installs it the way `kronik restore`
+/// does: checkpoint and close the stage, rename it into `keys/`, then
+/// finish the restore on the installed file.
+#[cfg(test)]
+pub(crate) fn install_backup(
+    owner: &crate::key_source::DataOwnership,
+    master: &MasterKey,
+    backup: &[u8],
+) -> std::sync::Arc<Keystore> {
+    let restore = owner.begin_keystore_restore().unwrap();
+    let staged =
+        Keystore::restore_staged(&restore, std::path::Path::new(".restore"), master, backup)
+            .unwrap();
+    let revision = staged.revision().unwrap();
+    restore.close_stage(staged).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let from = owner.path().join(format!(".restore/keystore.db{suffix}"));
+        let to = owner.path().join(format!("keys/keystore.db{suffix}"));
+        if from.exists() {
+            std::fs::rename(from, to).unwrap();
+        } else if to.exists() {
+            std::fs::remove_file(to).unwrap();
+        }
+    }
+    let installed = restore.finish(Some(master)).unwrap().unwrap();
+    assert_eq!(installed.revision().unwrap(), revision);
+    installed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1332,27 +1361,7 @@ mod tests {
         old.key_for_sealing("user:9", [9; 32], [9; 24], 0).unwrap();
         drop(old);
         let restored_master = MasterKey::from_bytes([1; 32]).unwrap();
-        let restore = replacement_owner.begin_keystore_restore().unwrap();
-        let staged = Keystore::restore_staged(
-            &restore,
-            std::path::Path::new(".restore"),
-            &restored_master,
-            &backup,
-        )
-        .unwrap();
-        restore.close_stage(staged).unwrap();
-        for suffix in ["", "-wal", "-shm"] {
-            let from = replacement
-                .path()
-                .join(format!(".restore/keystore.db{suffix}"));
-            let to = replacement.path().join(format!("keys/keystore.db{suffix}"));
-            if from.exists() {
-                std::fs::rename(from, to).unwrap();
-            } else if to.exists() {
-                std::fs::remove_file(to).unwrap();
-            }
-        }
-        let replaced = restore.finish(Some(&restored_master)).unwrap().unwrap();
+        let replaced = install_backup(&replacement_owner, &restored_master, &backup);
         found(replaced.key("user:1", 1).unwrap());
         assert!(matches!(
             Keystore::open_owned(&replacement_owner, &kept_master),

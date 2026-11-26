@@ -382,38 +382,12 @@ fn legacy_schema_migrates_without_changing_wrapped_rows_or_krkstor1_backup_bytes
     assert!(migrated.revision().unwrap() > revision);
 }
 
-/// Stages `backup` under `pair`'s owner and installs it the way `kronik
-/// restore` does: checkpoint and close the stage, rename it into `keys/`,
-/// then finish the restore on the installed file.
-fn install_backup(pair: &Pair, backup: &[u8]) -> Arc<Keystore> {
-    let restore = pair.owner.begin_keystore_restore().unwrap();
-    let staged =
-        Keystore::restore_staged(&restore, Path::new(".restore"), &pair.master, backup).unwrap();
-    let revision = staged.revision().unwrap();
-    restore.close_stage(staged).unwrap();
-    for suffix in ["", "-wal", "-shm"] {
-        let from = pair
-            ._dir
-            .path()
-            .join(format!(".restore/keystore.db{suffix}"));
-        let to = pair._dir.path().join(format!("keys/keystore.db{suffix}"));
-        if from.exists() {
-            std::fs::rename(from, to).unwrap();
-        } else if to.exists() {
-            std::fs::remove_file(to).unwrap();
-        }
-    }
-    let installed = restore.finish(Some(&pair.master)).unwrap().unwrap();
-    assert_eq!(installed.revision().unwrap(), revision);
-    installed
-}
-
 #[test]
 fn even_an_empty_backup_install_advances_the_staged_revision_and_checkpoints_do_not() {
     let pair = Pair::new();
     let backup = pair.first.export_backup([71; 24]).unwrap();
     let before = pair.first.revision().unwrap();
-    let installed = install_backup(&pair, &backup);
+    let installed = install_backup(&pair.owner, &pair.master, &backup);
     let revision = installed.revision().unwrap();
     assert!(revision > before);
     settled_stamps(&pair.path);
