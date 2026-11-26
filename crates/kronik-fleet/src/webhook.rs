@@ -190,17 +190,6 @@ enum Host {
         node: Arc<Node>,
         execution: AuthLease,
     },
-    Registered {
-        runtime: MetadataRuntime,
-        capture: Arc<
-            dyn Fn(AuthLease) -> BoxFuture<'static, Result<Arc<ShardReader>, ApiError>>
-                + Send
-                + Sync,
-        >,
-        record_gap: Arc<
-            dyn Fn(u64, u64, AuthLease) -> BoxFuture<'static, Result<(), ApiError>> + Send + Sync,
-        >,
-    },
     Metadata(MetadataRuntime),
 }
 
@@ -208,7 +197,6 @@ impl Host {
     fn env(&self) -> &Env {
         match self {
             Self::Native { node, .. } => node.env(),
-            Self::Registered { runtime, .. } => &runtime.env,
             Self::Metadata(runtime) => &runtime.env,
         }
     }
@@ -216,7 +204,6 @@ impl Host {
     fn execution(&self) -> &AuthLease {
         match self {
             Self::Native { execution, .. } => execution,
-            Self::Registered { runtime, .. } => &runtime.execution,
             Self::Metadata(runtime) => &runtime.execution,
         }
     }
@@ -226,7 +213,6 @@ impl Host {
     ) -> Result<(Arc<CertifiedSecretSnapshot>, SecretSnapshotPublication), ApiError> {
         match self {
             Self::Native { node, .. } => node.native_secret_snapshot_with_publication(),
-            Self::Registered { runtime, .. } => (runtime.catalogue)(),
             Self::Metadata(runtime) => (runtime.catalogue)(),
         }
     }
@@ -242,11 +228,6 @@ impl Host {
                 reader = node.capture_system_export_reader() => reader,
             }
             .map(Arc::new),
-            Self::Registered { capture, .. } => tokio::select! {
-                biased;
-                () = original.cancelled() => return Err("execution_revoked".into()),
-                reader = capture(original.clone()) => reader,
-            },
             Self::Metadata(_) => return Err("metadata_requires_actual_metadata_source".into()),
         }
         .map_err(|error| error.code.as_str().to_owned())?;
@@ -285,7 +266,6 @@ impl Host {
                 .map_err(|_| "webhook_config_audit".to_owned())?;
                 return Ok(());
             }
-            Self::Registered { runtime, .. } => &runtime.config_recorder,
             Self::Metadata(runtime) => &runtime.config_recorder,
         };
         let receipt = recorder(change, self.execution().clone())
@@ -498,47 +478,6 @@ impl Webhook {
         .await
     }
 
-    /// The real Member producer validates the exact registered source, branch,
-    /// shard, cursors and stream before constructing these retained callbacks.
-    /// Capture returns that producer's ONE actual reader Arc, never a Node fallback.
-    // The webhook stream's opening inputs; grouping them would only move
-    // the same names into a struct every caller unpacks again.
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    pub async fn open_registered(
-        runtime: MetadataRuntime,
-        capture: Arc<
-            dyn Fn(AuthLease) -> BoxFuture<'static, Result<Arc<ShardReader>, ApiError>>
-                + Send
-                + Sync,
-        >,
-        record_gap: Arc<
-            dyn Fn(u64, u64, AuthLease) -> BoxFuture<'static, Result<(), ApiError>> + Send + Sync,
-        >,
-        mapper: Arc<Mapper>,
-        identity: Identity,
-        shard: Option<u32>,
-        stream: Arc<Stream>,
-        cursors: Arc<Cursors>,
-        settings: Settings,
-        resolver: Arc<Resolver>,
-    ) -> Result<Self, String> {
-        Self::open_at(
-            Host::Registered {
-                runtime,
-                capture,
-                record_gap,
-            },
-            mapper,
-            identity,
-            SourcePos::Actor { shard, lsn: 0 },
-            stream,
-            cursors,
-            settings,
-            resolver,
-        )
-        .await
-    }
-
     pub async fn open_metadata(
         runtime: MetadataRuntime,
         mapper: Arc<Mapper>,
@@ -557,7 +496,7 @@ impl Webhook {
         }
     }
 
-    // As open_registered: the webhook stream's opening inputs.
+    // The webhook stream's opening inputs.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     async fn open_at(
         host: Host,
@@ -1038,11 +977,6 @@ impl Sink for Webhook {
         }
         let node = match &self.host {
             Host::Native { node, .. } => node,
-            Host::Registered { record_gap, .. } => {
-                return record_gap(from, to, original)
-                    .await
-                    .map_err(|error| error.code.as_str().to_owned());
-            }
             Host::Metadata(_) => return Err("metadata_requires_typed_gap".into()),
         };
         let reader = self.host.capture_actor(&original).await?;

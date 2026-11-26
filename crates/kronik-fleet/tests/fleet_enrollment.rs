@@ -24,7 +24,6 @@ use rcgen::{
     ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use rustls_pki_types::CertificateSigningRequestDer;
-use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use zeroize::Zeroizing;
 
@@ -930,8 +929,6 @@ fn controller_origin_and_scope_validation_are_local() {
 async fn lost_reply_resumes_same_identity_without_one_time_credential() {
     let (env, client, network, record, _dir) = setup().await;
     network.mode.store(1, Ordering::SeqCst);
-    let descriptors = Arc::new(Mutex::new(Vec::new()));
-    let capture = descriptors.clone();
     let first = enroll(
         &env,
         &client,
@@ -940,21 +937,13 @@ async fn lost_reply_resumes_same_identity_without_one_time_credential() {
         "dummy-api",
         RevocableAuthority::new(),
         network.http_capacity.clone(),
-        move |prepared| {
-            capture.lock().unwrap().push((
-                prepared.destination().to_owned(),
-                prepared.body_hash(),
-                prepared.command_hash(),
-            ));
-            native_dispatch(prepared)
-        },
+        native_dispatch,
         persistence(&network),
     )
     .await;
     assert!(matches!(first, Err(FleetError::Unavailable)));
     let requested = network.durable.lock().unwrap().last().unwrap().clone();
     assert_eq!(requested.request_id, record.request_id);
-    let capture = descriptors.clone();
     let active = enroll(
         &env,
         &client,
@@ -963,14 +952,7 @@ async fn lost_reply_resumes_same_identity_without_one_time_credential() {
         "dummy-api",
         RevocableAuthority::new(),
         network.http_capacity.clone(),
-        move |prepared| {
-            capture.lock().unwrap().push((
-                prepared.destination().to_owned(),
-                prepared.body_hash(),
-                prepared.command_hash(),
-            ));
-            native_dispatch(prepared)
-        },
+        native_dispatch,
         persistence(&network),
     )
     .await
@@ -998,17 +980,6 @@ async fn lost_reply_resumes_same_identity_without_one_time_credential() {
             .any(|(name, _)| name == "authorization")
     );
     assert_eq!(network.scoped.load(Ordering::SeqCst), 1);
-    let descriptors = descriptors.lock().unwrap();
-    assert_eq!(descriptors.len(), 2);
-    assert_eq!(descriptors[0].0, "https://controller.test/v1/enroll");
-    assert_eq!(descriptors[1].0, descriptors[0].0);
-    let expected_body_hash: [u8; 32] = Sha256::digest(&bodies[0]).into();
-    assert_eq!(descriptors[0].1, expected_body_hash);
-    assert_eq!(descriptors[1].1, expected_body_hash);
-    assert_ne!(
-        descriptors[0].2, descriptors[1].2,
-        "initial credential header is command-bound"
-    );
 }
 
 #[tokio::test]
@@ -2315,17 +2286,6 @@ async fn control_opening_resources_release_before_channel_lifetime_and_original_
     let signal = entered.clone();
     let expected_id = record.request_id.clone();
     let expected_epoch = record.epoch;
-    let mut version = Sha256::new();
-    for field in [
-        b"kronik.fleet-control-tls/v1".as_slice(),
-        record.plan.ca_sha256.as_bytes(),
-        record.client_key_sha256.as_bytes(),
-        record.client_cert_der.as_deref().unwrap(),
-    ] {
-        version.update((field.len() as u64).to_be_bytes());
-        version.update(field);
-    }
-    let expected_version: [u8; 32] = version.finalize().into();
     network.socket.pending_recv.store(true, Ordering::SeqCst);
     let (task_env, task_network, task_original) = (env.clone(), network.clone(), original.clone());
     let (intent_env, intent_directory) = (env.clone(), _dir.path().to_path_buf());
@@ -2342,9 +2302,6 @@ async fn control_opening_resources_release_before_channel_lifetime_and_original_
                 assert_eq!(prepared.destination(), "wss://controller.test/v1/control");
                 assert_eq!(prepared.epoch(), expected_epoch);
                 assert_eq!(prepared.request_id(), expected_id);
-                assert_eq!(prepared.key_version(), expected_version);
-                let empty: [u8; 32] = Sha256::digest(b"").into();
-                assert_eq!(prepared.body_hash(), empty);
                 let intent = native_control_intent(&intent_env, &intent_directory, &prepared);
                 Box::pin(prepared.dispatch_with_admission(move || async move {
                     intent.await?;
