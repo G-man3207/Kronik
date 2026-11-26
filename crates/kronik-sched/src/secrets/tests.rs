@@ -1373,39 +1373,6 @@ async fn bao_node_allowing(
         .unwrap();
     (data, node, bao)
 }
-async fn begin(node: &Node) {
-    node.commit(Record::TurnBegin(pb::TurnBegin {
-        execution_id: "0123456789abcdef0123456789abcdef".into(),
-        actor: Some(pb::ActorRef {
-            kind: "test".into(),
-            key: "one".into(),
-        }),
-        code_hash: vec![1; 32],
-        engine_version: kronik_runtime::ENGINE_VERSION.into(),
-        causal_key: Some(pb::CausalKey {
-            root: "root".into(),
-            path: Vec::new(),
-        }),
-        logical_time_ms: 1,
-        random_seed: vec![2; 32],
-        input: Some(pb::Input {
-            kind: Some(pb::input::Kind::Http(pb::HttpInput {
-                method: "GET".into(),
-                path: "/".into(),
-                body: Some(pb::Body {
-                    value: Some(pb::body::Value::Inline(pb::Sealable {
-                        subject: None,
-                        value: Some(pb::sealable::Value::Plain(Vec::new())),
-                    })),
-                }),
-                ..Default::default()
-            })),
-        }),
-        config_epoch: node.epoch(),
-    }))
-    .await
-    .unwrap();
-}
 
 /// Link and resolve of a ref outside `allowed_refs` must not ask the provider.
 /// An empty allowlist denies every ref. A ref under the prefix still links.
@@ -1606,7 +1573,9 @@ async fn actual_provider_initialization_is_offline_and_cold_io_follows_begin_whi
     )
     .await
     .unwrap();
-    begin(&node).await;
+    node.commit(Record::TurnBegin(super::certification_tests::begin(&node)))
+        .await
+        .unwrap();
     bao.require_begin.store(true, Ordering::SeqCst);
     let config = node.config_now();
     let cold = node
