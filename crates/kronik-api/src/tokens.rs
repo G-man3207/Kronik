@@ -22,13 +22,9 @@ use zeroize::Zeroizing;
 use crate::ApiRequest;
 use crate::auth::{Authenticator, Caller, Scope};
 
-mod metadata;
+mod capture;
 mod native_fleet;
-use metadata::MetadataState;
-pub use metadata::{
-    ExpectedRevision, ForwardedPrincipal, MetadataSource, MetadataToken, OidcSessionProof,
-    PreparedMetadata,
-};
+pub use capture::OidcSessionProof;
 
 /// What every token starts with, so that secret scanners can find one.
 pub const PREFIX: &str = "kronik_";
@@ -91,13 +87,12 @@ pub struct Change<'a> {
 
 /// `keys/tokens.db`, with the live tokens' hashes in memory.
 pub struct TokenStore {
-    inner: Option<Mutex<Inner>>,
-    /// One fence for token, session, fleet and durable metadata publication.
+    inner: Mutex<Inner>,
+    /// One fence for token, session and fleet publication.
     publication: Arc<Mutex<()>>,
     live: Mutex<Live>,
     managed: Mutex<HashMap<String, Arc<FleetToken>>>,
     changed: Arc<tokio::sync::Notify>,
-    metadata: Mutex<MetadataState>,
     issuer_started: AtomicBool,
     domain_bound: bool,
     execution: OnceLock<kronik_core::authority::AuthLease>,
@@ -122,13 +117,6 @@ fn new_secret(random: [u8; 32]) -> Zeroizing<String> {
         "{PREFIX}{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random)
     ))
-}
-
-fn metadata_unavailable() -> ApiError {
-    ApiError::new(
-        ErrorCode::Unavailable,
-        "committed metadata token projection unavailable",
-    )
 }
 
 /// Token names: a lowercase letter, then up to 62 lowercase letters, digits
@@ -357,32 +345,15 @@ impl TokenStore {
             (live, managed)
         };
         Ok(TokenStore {
-            inner: Some(Mutex::new(Inner { conn })),
+            inner: Mutex::new(Inner { conn }),
             publication: Arc::new(Mutex::new(())),
             live: Mutex::new(live),
             managed: Mutex::new(managed),
             changed: Arc::new(tokio::sync::Notify::new()),
-            metadata: Mutex::new(MetadataState::Native),
             issuer_started: AtomicBool::new(false),
             domain_bound: false,
             execution: OnceLock::new(),
         })
-    }
-
-    /// A member authenticates only from its committed metadata projection.
-    /// No native database is opened or inspected, including during startup.
-    pub fn for_member(domain: Arc<Mutex<()>>) -> TokenStore {
-        TokenStore {
-            inner: None,
-            publication: domain,
-            live: Mutex::new(HashMap::new()),
-            managed: Mutex::new(HashMap::new()),
-            changed: Arc::new(tokio::sync::Notify::new()),
-            metadata: Mutex::new(MetadataState::Pending),
-            issuer_started: AtomicBool::new(false),
-            domain_bound: true,
-            execution: OnceLock::new(),
-        }
     }
 
     /// Install the physical node's domain before constructing any principal lease.
@@ -447,9 +418,8 @@ impl TokenStore {
         Ok(execution.clone())
     }
 
-    fn inner(&self) -> Result<MutexGuard<'_, Inner>, ApiError> {
-        let inner = self.inner.as_ref().ok_or_else(metadata_unavailable)?;
-        Ok(inner.lock().unwrap_or_else(|e| e.into_inner()))
+    fn inner(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn live(&self) -> MutexGuard<'_, Live> {
@@ -480,14 +450,6 @@ impl TokenStore {
     /// Managed provenance, including revoked names, without SQLite I/O.
     pub fn fleet_token(&self, token_id: &str) -> Option<Arc<FleetToken>> {
         let name = token_id.strip_prefix("token:")?;
-        let state = self.metadata();
-        match &*state {
-            MetadataState::Ready(source) => {
-                source.tokens.get(name)?.meta.fleet.as_ref()?;
-            }
-            MetadataState::Native => {}
-            _ => return None,
-        }
         self.managed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -518,9 +480,6 @@ impl TokenStore {
         dry_run: bool,
         fleet: Option<FleetToken>,
     ) -> Result<(TokenMeta, Option<String>), ApiError> {
-        if self.metadata_revision()?.is_some() {
-            return Err(metadata_unavailable());
-        }
         let meta = self.preview_create(name, scopes, change, fleet)?;
         if dry_run {
             return Ok((meta, None));
@@ -582,10 +541,7 @@ impl TokenStore {
         mut secret: Zeroizing<String>,
         digest: [u8; 32],
     ) -> Result<(TokenMeta, Option<String>), ApiError> {
-        if self.metadata_revision()?.is_some() {
-            return Err(metadata_unavailable());
-        }
-        let inner = self.inner()?;
+        let inner = self.inner();
         let name = meta.name.as_str();
         let scopes = scopes_text(&meta.scopes);
         // Old readers require TEXT and fail before loading any managed bearer.
@@ -632,14 +588,7 @@ impl TokenStore {
 
     /// Every token, live and revoked, by name.
     pub fn list(&self) -> Result<Vec<TokenMeta>, ApiError> {
-        match &*self.metadata() {
-            MetadataState::Ready(source) => {
-                return Ok(source.tokens.values().map(|row| row.meta.clone()).collect());
-            }
-            MetadataState::Native => {}
-            _ => return Err(metadata::unavailable()),
-        }
-        let inner = self.inner()?;
+        let inner = self.inner();
         let mut stmt = inner
             .conn
             .prepare(&format!("SELECT {COLUMNS} FROM tokens ORDER BY name"))
@@ -656,12 +605,7 @@ impl TokenStore {
         change: &Change<'_>,
         dry_run: bool,
     ) -> Result<TokenMeta, ApiError> {
-        if self.metadata_revision()?.is_some() {
-            return Err(internal(
-                "member token revocation requires the metadata producer",
-            ));
-        }
-        let inner = self.inner()?;
+        let inner = self.inner();
         let mut token = inner
             .conn
             .query_row(
@@ -705,19 +649,8 @@ impl TokenStore {
 
     /// The caller a token stands for, if it is live.
     pub fn caller(&self, token: &str) -> Option<Caller> {
-        let state = self.metadata();
         let live = self.live();
         let (name, scopes) = live.get(&hash(token))?;
-        match &*state {
-            MetadataState::Ready(source) => {
-                let row = source.tokens.get(name)?;
-                if row.meta.revoked.is_some() || source.require_fleet(row).is_err() {
-                    return None;
-                }
-            }
-            MetadataState::Native => {}
-            _ => return None,
-        }
         Some(Caller {
             token_id: token_id(name),
             scopes: scopes.clone(),
@@ -726,21 +659,6 @@ impl TokenStore {
 
     /// A trusted OIDC mapping names a live token; it never supplies scopes.
     pub fn caller_for_name(&self, name: &str) -> Option<Caller> {
-        let state = self.metadata();
-        match &*state {
-            MetadataState::Ready(source) => {
-                let row = source.tokens.get(name)?;
-                if row.meta.revoked.is_some() || source.require_fleet(row).is_err() {
-                    return None;
-                }
-                return Some(Caller {
-                    token_id: row.meta.token_id(),
-                    scopes: row.meta.scopes.clone(),
-                });
-            }
-            MetadataState::Native => {}
-            _ => return None,
-        }
         let live = self.live();
         let (_, scopes) = live.values().find(|(live, _)| live == name)?;
         Some(Caller {
@@ -757,17 +675,6 @@ impl TokenStore {
         scopes: &[String],
         token_name: Option<&str>,
     ) -> bool {
-        let state = self.metadata();
-        match &*state {
-            MetadataState::Ready(source)
-                if source
-                    .current_fleet_receipt(epoch, request_id)
-                    .is_ok_and(|state| {
-                        state.phase == kronik_proto::log::v1::fleet_state::Phase::Active as i32
-                    }) => {}
-            MetadataState::Native => {}
-            _ => return false,
-        }
         let live = self.live();
         let managed = self.managed.lock().unwrap_or_else(|e| e.into_inner());
         live.values().any(|(name, current_scopes)| {
@@ -792,7 +699,6 @@ impl TokenStore {
         request_id: &str,
         scopes: &BTreeSet<Scope>,
     ) -> bool {
-        let state = self.metadata();
         let live = self.live();
         let Some((name, current_scopes)) = live.get(&hash(secret)) else {
             return false;
@@ -801,27 +707,11 @@ impl TokenStore {
             return false;
         }
         let matches = |fleet: &FleetToken| fleet.epoch == epoch && fleet.request_id == request_id;
-        match &*state {
-            MetadataState::Ready(source) => {
-                source
-                    .current_fleet_receipt(epoch, request_id)
-                    .is_ok_and(|state| {
-                        state.phase != kronik_proto::log::v1::fleet_state::Phase::Revoked as i32
-                    })
-                    && source.tokens.get(name).is_some_and(|row| {
-                        row.meta.revoked.is_none()
-                            && row.meta.scopes == *scopes
-                            && row.meta.fleet.as_ref().is_some_and(matches)
-                    })
-            }
-            MetadataState::Native => self
-                .managed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(name)
-                .is_some_and(|fleet| matches(fleet)),
-            _ => false,
-        }
+        self.managed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .is_some_and(|fleet| matches(fleet))
     }
 
     /// Register a notification before inspecting sticky live authentication state.
@@ -847,42 +737,19 @@ struct TokenAuthority {
     execution: kronik_core::authority::AuthLease,
     identity: TokenIdentity,
     required: Scope,
-    expected: Option<ExpectedRevision>,
-    peer: Option<kronik_core::authority::AuthLease>,
 }
 
 impl TokenAuthority {
     fn current(&self) -> Result<(), ApiError> {
         self.execution.check()?;
-        if let Some(peer) = &self.peer {
-            peer.check()?;
-        }
-        let metadata = self.store.metadata();
-        let live = self.store.live();
-        let token = match &self.identity {
-            TokenIdentity::Hash(hash) => live.get(hash),
-            TokenIdentity::Local => None,
-        };
-        match (&*metadata, self.expected) {
-            (MetadataState::Native, None) => {}
-            (MetadataState::Ready(source), Some(expected)) => {
-                let row = token.and_then(|(name, _)| source.tokens.get(name));
-                if !source.matches(expected, row) {
-                    return Err(unauthenticated(
-                        "the operation's original authority changed",
-                    ));
-                }
-                if let Some(row) = row {
-                    source.require_fleet(row)?;
-                }
-            }
-            _ => return Err(metadata::unavailable()),
-        }
-        if matches!(self.identity, TokenIdentity::Local) {
+        let TokenIdentity::Hash(hash) = &self.identity else {
             return Ok(());
-        }
-        let token = token.ok_or_else(|| unauthenticated("the operation's token is revoked"))?;
-        if token.1.contains(&self.required) || token.1.contains(&Scope::Admin) {
+        };
+        let live = self.store.live();
+        let (_, scopes) = live
+            .get(hash)
+            .ok_or_else(|| unauthenticated("the operation's token is revoked"))?;
+        if scopes.contains(&self.required) || scopes.contains(&Scope::Admin) {
             Ok(())
         } else {
             Err(ApiError::new(
@@ -910,15 +777,9 @@ impl kronik_core::authority::Authority for TokenAuthority {
                     return;
                 }
                 let execution = lease.execution.cancelled();
-                let peer = async {
-                    match &lease.peer {
-                        Some(peer) => peer.cancelled().await,
-                        None => std::future::pending::<()>().await,
-                    }
-                };
                 tokio::select! {
                 biased;
-                () = execution => return, () = peer => return, () = notified => {} }
+                () = execution => return, () = notified => {} }
             }
         })
     }
@@ -953,7 +814,6 @@ impl TokenAuthenticator {
 
 impl Authenticator for TokenAuthenticator {
     fn caller(&self, req: &ApiRequest) -> Result<Caller, ApiError> {
-        self.store.metadata_revision()?;
         match &req.bearer {
             Some(token) => self
                 .store
@@ -963,7 +823,6 @@ impl Authenticator for TokenAuthenticator {
                 crate::auth::local_uid(req)?;
                 let _publication = self.store.publication();
                 self.store.execution()?.check()?;
-                self.store.metadata_revision()?;
                 Ok(Caller::local(req.token_id.clone()))
             }
         }
@@ -1051,7 +910,7 @@ mod tests {
         };
         // Deliberate: the audit write must commit while the token store's
         // database lock is held by this test.
-        let database = store.inner().unwrap();
+        let database = store.inner();
         let accepted = node
             .record_audit_event_authorized(
                 "test.named",
@@ -1353,7 +1212,6 @@ mod tests {
             .unwrap();
         let (kind, actual): (String, Vec<u8>) = store
             .inner()
-            .unwrap()
             .conn
             .query_row(
                 "SELECT typeof(scopes),scopes FROM tokens WHERE name='managed-fixture'",
@@ -1363,192 +1221,6 @@ mod tests {
             .unwrap();
         assert_eq!(kind, "blob");
         assert_eq!(actual, expected);
-    }
-
-    fn metadata_source(token: &str) -> MetadataSource {
-        let meta = TokenMeta {
-            name: "metadata-reader".into(),
-            scopes: [Scope::Read].into(),
-            created_wall_ms: 1_000,
-            created_by: "operator".into(),
-            reason: "metadata fixture".into(),
-            revoked: None,
-            fleet: None,
-        };
-        MetadataSource {
-            revision: 1,
-            owner_member: 7,
-            auth_config_revision: 0,
-            auth_config: None,
-            fleet_revision: 0,
-            fleet: None,
-            tokens: [(
-                meta.name.clone(),
-                MetadataToken {
-                    meta,
-                    hash: hash(token),
-                    created_index: 1,
-                    revision: 1,
-                    revoked_index: None,
-                },
-            )]
-            .into(),
-        }
-    }
-
-    #[test]
-    fn member_authentication_never_falls_back_to_the_native_database() {
-        let store = Arc::new(TokenStore::open(Connection::open_in_memory().unwrap()).unwrap());
-        let (_, native) = store
-            .create(
-                "native-reader",
-                [Scope::Read].into(),
-                [9; 32],
-                &change("native"),
-                false,
-            )
-            .unwrap();
-        let native = native.unwrap();
-        assert!(store.caller(&native).is_some());
-        store.require_metadata().unwrap();
-        assert!(store.caller(&native).is_none());
-        assert_eq!(store.list().unwrap_err().code, ErrorCode::Unavailable);
-        assert_eq!(
-            store
-                .capture_token(&native, Scope::Read)
-                .err()
-                .unwrap()
-                .code,
-            ErrorCode::Unavailable,
-        );
-        let source = metadata_source("metadata-token");
-        store
-            .publish_prepared(TokenStore::prepare_metadata(source).unwrap())
-            .unwrap();
-        assert!(store.caller(&native).is_none());
-        assert_eq!(
-            store.caller("metadata-token").unwrap().token_id,
-            "token:metadata-reader"
-        );
-        assert_eq!(store.list().unwrap().len(), 1);
-        store.fail_metadata();
-        assert!(store.caller("metadata-token").is_none());
-        assert!(store.caller(&native).is_none());
-        assert_eq!(
-            store.metadata_revision().unwrap_err().code,
-            ErrorCode::Unavailable
-        );
-        assert!(
-            store
-                .revoke("native-reader", &change("no native fallback"), false)
-                .is_err()
-        );
-        let member = Arc::new(TokenStore::for_member(Arc::new(Mutex::new(()))));
-        assert!(member.inner.is_none());
-        assert_eq!(member.list().unwrap_err().code, ErrorCode::Unavailable);
-    }
-
-    #[test]
-    fn metadata_publication_rejects_stale_or_conflicting_images_without_reviving_tokens() {
-        let store = TokenStore::for_member(Arc::new(Mutex::new(())));
-        let source = metadata_source("metadata-token");
-        store
-            .publish_prepared(TokenStore::prepare_metadata(source.clone()).unwrap())
-            .unwrap();
-        store
-            .publish_prepared(TokenStore::prepare_metadata(source.clone()).unwrap())
-            .unwrap();
-        let mut conflicting = source.clone();
-        conflicting
-            .tokens
-            .get_mut("metadata-reader")
-            .unwrap()
-            .meta
-            .scopes = [Scope::Admin].into();
-        assert!(
-            store
-                .publish_prepared(TokenStore::prepare_metadata(conflicting).unwrap())
-                .is_err()
-        );
-        assert_eq!(
-            store.caller("metadata-token").unwrap().scopes,
-            [Scope::Read].into()
-        );
-        let mut revoked = source.clone();
-        revoked.revision = 2;
-        let token = revoked.tokens.get_mut("metadata-reader").unwrap();
-        token.revision = 2;
-        token.revoked_index = Some(2);
-        token.meta.revoked = Some(Revocation {
-            wall_ms: 2_000,
-            by: "operator".into(),
-            reason: "revoke metadata token".into(),
-        });
-        store
-            .publish_prepared(TokenStore::prepare_metadata(revoked).unwrap())
-            .unwrap();
-        assert!(store.caller("metadata-token").is_none());
-        assert!(
-            store
-                .publish_prepared(TokenStore::prepare_metadata(source).unwrap())
-                .is_err()
-        );
-        assert!(store.caller("metadata-token").is_none());
-        assert!(
-            store
-                .lookup("metadata-reader")
-                .unwrap()
-                .unwrap()
-                .revoked
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn incomplete_metadata_sources_are_rejected_before_publication() {
-        let source = metadata_source("metadata-token");
-        let mut wrong_owner = source.clone();
-        wrong_owner.owner_member = 0;
-        let mut missing_auth_config = source.clone();
-        missing_auth_config.auth_config_revision = 1;
-        let mut missing_fleet = source.clone();
-        missing_fleet.fleet_revision = 1;
-        let mut missing_created_index = source.clone();
-        missing_created_index
-            .tokens
-            .get_mut("metadata-reader")
-            .unwrap()
-            .created_index = 0;
-        let mut missing_revocation = source;
-        missing_revocation
-            .tokens
-            .get_mut("metadata-reader")
-            .unwrap()
-            .revoked_index = Some(1);
-        for source in [
-            wrong_owner,
-            missing_auth_config,
-            missing_fleet,
-            missing_created_index,
-            missing_revocation,
-        ] {
-            assert!(TokenStore::prepare_metadata(source).is_err());
-        }
-    }
-
-    #[test]
-    fn metadata_cannot_reuse_a_revoked_bearer_hash_for_another_principal() {
-        let mut source = metadata_source("immutable-bearer");
-        let mut revoked = source.tokens["metadata-reader"].clone();
-        revoked.meta.name = "archived-reader".into();
-        revoked.meta.revoked = Some(Revocation {
-            wall_ms: 1_000,
-            by: "operator".into(),
-            reason: "old identity".into(),
-        });
-        revoked.revoked_index = Some(1);
-        source.tokens.insert(revoked.meta.name.clone(), revoked);
-        assert!(TokenStore::prepare_metadata(source).is_err());
     }
 
     fn change(reason: &str) -> Change<'_> {

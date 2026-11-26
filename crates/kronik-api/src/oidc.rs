@@ -2837,7 +2837,6 @@ mod tests {
         let req = request(credential.clone());
         let captured = auth.capture(&req, Scope::Read).unwrap();
         captured.require_scope(Scope::Read).unwrap();
-        assert!(captured.principal.is_none());
         let session = captured.session().unwrap();
         let caller = auth.caller(&req).unwrap();
         assert_eq!(
