@@ -524,14 +524,15 @@ pub(super) fn summary(out: &Path, bytes: &[u8]) {
     );
 }
 
-pub(super) fn write_output(out: &Path, bytes: &[u8]) -> Result<(), Failure> {
+/// Writes `bytes` to `out` through `<out>.tmp` and a rename, creating the
+/// parent directory.
+pub(crate) fn write_output(out: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = out.with_extension("wasm.tmp");
+    let tmp = out.with_added_extension("tmp");
     std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, out)?;
-    Ok(())
+    std::fs::rename(&tmp, out)
 }
 
 /// The nearest `path` in `dir` or one of its parents.

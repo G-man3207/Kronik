@@ -39,7 +39,7 @@ mod supervisor;
 #[cfg(test)]
 mod test_support;
 
-pub use runtime::container_id;
+pub use runtime::{container_id, find_runc, is_executable};
 
 pub use checkpoint::Copy;
 pub use image::{ImageError, ImageRef};
