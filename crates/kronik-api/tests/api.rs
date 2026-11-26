@@ -1262,3 +1262,17 @@ async fn a_plus_in_a_path_segment_is_a_plus() {
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["reply"]["text"], "2", "{v}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cluster_status_is_the_native_non_member_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::real(tokio::runtime::Handle::current());
+    let node = start_local(env, dir.path(), NodeConfig::default())
+        .await
+        .unwrap();
+    let api = Arc::new(Api::new(node));
+
+    let (s, v) = call(&api, "GET", "/v1/cluster/status", Value::Null).await;
+    assert_eq!(s, 200);
+    assert_eq!(v, json!({"member": false}));
+}

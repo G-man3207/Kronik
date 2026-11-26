@@ -312,8 +312,9 @@ There is no frontend build/install or additional UI service. The embedded app
 uses the same published API, scopes, PII projection and policy as CLI and MCP.
 It shows actor history, turn details/causal trees, proposal response, effect and
 state differences, grounding per target, approvals, dead letters, deployments
-and cluster observations. A native node reports `member: false`; an installed
-member status producer's error is never replaced with a healthy native result.
+and cluster observations. A native node reports `member: false`; this release
+has no Member runtime, so that is the only answer the cluster status endpoint
+gives.
 
 Register an OIDC **public authorization-code + S256 PKCE client**, with one
 exact redirect URI. The admin certificate must cover its hostname. Provision
