@@ -26,7 +26,9 @@ use kronik_runtime::{
     CallOutcome, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchBody, FetchHeader, FetchOutcome,
     FetchRequest, GateError, Program, SendNowOutcome, SendNowRequest, TurnLimits, TurnRequest,
 };
-use kronik_sched::effects::{map_call_outcome, outcome_of_fetch, outcome_of_send_now};
+use kronik_sched::effects::{
+    map_call_outcome, outcome_of_fetch, outcome_of_send_now, plain, tagged,
+};
 use kronik_sched::host::{SqlHandle, SqlTurn};
 use kronik_store::Store;
 use kronik_store::sql::TurnOpts;
@@ -1857,19 +1859,6 @@ struct ReplayGate {
 }
 
 struct GateHandle(Arc<ReplayGate>);
-
-fn plain(bytes: Vec<u8>) -> Option<pb::Sealable> {
-    tagged(&None, bytes)
-}
-
-/// A recorded value of `subject`, as production records it
-/// (kronik-sched's effects): the fork's log seals it, its diff redacts it.
-fn tagged(subject: &Option<String>, bytes: Vec<u8>) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: subject.clone(),
-        value: Some(pb::sealable::Value::Plain(bytes)),
-    })
-}
 
 fn prepared_plain(value: &pb::Sealable) -> Result<&[u8], GateError> {
     match value.value.as_ref() {
