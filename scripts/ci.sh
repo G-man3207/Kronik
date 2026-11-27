@@ -300,9 +300,10 @@ step_ts() {
 
 # M15: the Python and Go SDKs (ADR 0030, docs/design/m15-sdks.md). Installs
 # the pinned toolchains (scripts/install-sdk-tools.sh, once per version),
-# checks that both SDKs carry the actor WIT unchanged and that the Go
-# bindings are generated from it, runs the SDKs' unit tests, builds the
-# examples with kronik build, lists their imports against the allowlist,
+# checks that the Go SDK carries the actor WIT unchanged (Go module zips
+# leave out symbolic links; the Python SDK's `wit` links to `wit/`) and that
+# the Go bindings are generated from it, runs the SDKs' unit tests, builds
+# the examples with kronik build, lists their imports against the allowlist,
 # runs the examples' tests in test hosts and the determinism test on them,
 # and new projects from kronik init in both languages (scripts/e2e-init.sh).
 # Then scripts/acceptance-m15.sh runs the M1 to M3 commands in
@@ -316,7 +317,6 @@ step_sdks() {
     tools="${KRONIK_SDK_TOOLS:-$HOME/.cache/kronik/sdk-tools}"
     scripts/install-sdk-tools.sh "$tools"
     export KRONIK_SDK_TOOLS="$tools"
-    cmp wit/kronik-actor.wit sdk/python/wit/kronik-actor.wit
     cmp wit/kronik-actor.wit sdk/go/wit/deps/kronik-actor/kronik-actor.wit
     (cd sdk/go && PATH="$tools/bin:$PATH" ./generate.sh && git diff --exit-code -- internal/wit)
     python3 -m unittest discover -s sdk/python/tests
