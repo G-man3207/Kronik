@@ -1,5 +1,6 @@
-//! Shared helpers of the API integration tests: a request and its JSON
-//! answer, a read-only caller, a guest's bytes and a plain HTTP target.
+//! Shared helpers of the API integration tests: a default local node, a
+//! request and its JSON answer, a read-only caller, a guest's bytes and a
+//! plain HTTP target.
 
 // Each test binary uses only part of this module.
 #![allow(dead_code)]
@@ -8,13 +9,15 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::Path;
 use std::sync::Arc;
 
 use base64::Engine as _;
 use kronik_api::auth::{Authenticator, Caller, Scope};
 use kronik_api::{Api, ApiRequest};
+use kronik_core::env::Env;
 use kronik_core::error::ApiError;
-use kronik_sched::Node;
+use kronik_sched::{Node, NodeConfig, start_local};
 use serde_json::Value;
 
 /// The test guests, built by `tests/guests/build.sh`.
@@ -88,4 +91,16 @@ pub fn http_target() -> String {
         }
     });
     addr
+}
+
+/// A local node on `dir` with the default configuration, on the current
+/// Tokio runtime.
+pub async fn start_node(dir: &Path) -> Arc<Node> {
+    start_local(
+        Env::real(tokio::runtime::Handle::current()),
+        dir,
+        NodeConfig::default(),
+    )
+    .await
+    .unwrap()
 }

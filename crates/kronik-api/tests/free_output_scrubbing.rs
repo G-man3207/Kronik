@@ -6,10 +6,8 @@ mod common;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use common::wasm;
+use common::{start_node, wasm};
 use kronik_api::Api;
-use kronik_core::env::Env;
-use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
 
 async fn call(api: &Api, method: &str, path: &str, body: Value) -> Value {
@@ -25,13 +23,7 @@ fn decoded(value: &Value) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retained_free_data_is_scrubbed_without_corrupting_typed_api_fields() {
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Api::new(node);
 
     call(
@@ -162,13 +154,7 @@ async fn retained_free_data_is_scrubbed_without_corrupting_typed_api_fields() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persisted_audit_reasons_withhold_ambiguous_markers_and_later_secret_matches() {
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let mut tokens =
         kronik_api::tokens::TokenStore::open_file(&dir.path().join("tokens.db")).unwrap();
     tokens

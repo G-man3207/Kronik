@@ -6,10 +6,8 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{call, wasm};
+use common::{call, start_node, wasm};
 use kronik_api::Api;
-use kronik_core::env::Env;
-use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -18,10 +16,7 @@ async fn snapshots_and_integrity() {
         .prefix("api-m6-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(env, dir.path(), NodeConfig::default())
-        .await
-        .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Arc::new(Api::new(node.clone()));
     let (s, v) = call(
         &api,

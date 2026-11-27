@@ -11,13 +11,12 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Reader, call, wasm};
+use common::{Reader, call, start_node, wasm};
 use kronik_api::Api;
-use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
+use kronik_sched::Node;
 use kronik_sched::connections::RecordingTransport;
-use kronik_sched::{Node, NodeConfig, start_local};
 use serde_json::{Value, json};
 
 async fn get(api: &Api, path: &str) -> Value {
@@ -35,13 +34,7 @@ struct Room {
 
 async fn room() -> Room {
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Api::new(node.clone());
     let reader = Api::new(node.clone()).with_authenticator(Arc::new(Reader(node.clone())));
     let (status, v) = call(

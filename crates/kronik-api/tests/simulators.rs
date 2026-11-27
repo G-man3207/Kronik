@@ -9,10 +9,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 
-use common::{call, wasm};
+use common::{call, start_node, wasm};
 use kronik_api::Api;
-use kronik_core::env::Env;
-use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
 
 /// An HTTP server answering 200 "ok" to everything.
@@ -49,10 +47,7 @@ fn server() -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trace_shows_simulator_labels() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(env, dir.path(), NodeConfig::default())
-        .await
-        .unwrap();
+    let node = start_node(dir.path()).await;
     let proposals =
         kronik_fork::proposal::Proposals::open(node.clone(), dir.path().to_path_buf()).unwrap();
     let api = Arc::new(Api::new(node.clone()).with_proposals(Arc::new(proposals)));
