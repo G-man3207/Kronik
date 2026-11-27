@@ -19,12 +19,11 @@ use std::collections::BTreeSet;
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::time::Duration;
+use std::process::{Command, Output, Stdio};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use common::free_port;
+use common::Daemon;
 use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams, ResourceContents};
 use rmcp::service::{RoleClient, RunningService, ServiceExt as _};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -41,62 +40,17 @@ fn guest(name: &str) -> PathBuf {
     PathBuf::from(format!("{GUESTS}{name}.wasm"))
 }
 
-/// `kronik serve` with its socket in a temporary directory; killed when
-/// dropped.
-struct Daemon {
-    child: Child,
-    socket: PathBuf,
-    gateway: String,
-    dir: tempfile::TempDir,
-}
-
 impl Daemon {
-    fn start() -> Daemon {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("api.sock");
-        let gateway = format!("127.0.0.1:{}", free_port());
-        let log = std::fs::File::create(dir.path().join("serve.log")).unwrap();
-        let child = Command::new(KRONIK)
-            .arg("serve")
-            .env("KRONIK_DISK_RESERVE", "0B")
-            .arg("--data-dir")
-            .arg(dir.path().join("data"))
-            .args(["--http-listen", &gateway])
-            .args(["--admin-listen", &format!("127.0.0.1:{}", free_port())])
-            .arg("--api-socket")
-            .arg(&socket)
-            .env_remove("KRONIK_CONFIG")
-            .env("KRONIK_LOG", "warn")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        let d = Daemon {
-            child,
-            socket,
-            gateway,
-            dir,
-        };
-        let up = (0..600).any(|_| {
-            let ok = d
-                .cli(None, &["--json", "actors", "list"], None)
-                .status
-                .success();
-            if !ok {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            ok
-        });
-        assert!(up, "kronik serve did not start:\n{}", d.log());
-        d
+    /// `kronik serve` in `dir`.
+    fn start(dir: &Path) -> Daemon {
+        Daemon::spawn(dir, Daemon::command(KRONIK, dir, None))
     }
 
     /// `kronik --socket <socket> <args>`, as `token` when given.
     fn cli(&self, token: Option<&str>, args: &[&str], stdin: Option<&[u8]>) -> Output {
         let mut c = Command::new(KRONIK);
         c.arg("--socket")
-            .arg(&self.socket)
+            .arg(self.socket())
             .args(args)
             .env_remove("KRONIK_API_SOCKET")
             .env_remove("KRONIK_TOKEN")
@@ -121,17 +75,6 @@ impl Daemon {
     fn operator(&self, args: &[&str]) {
         let out = self.cli(None, args, None);
         assert!(out.status.success(), "{args:?}: {}", text(&out));
-    }
-
-    fn log(&self) -> String {
-        std::fs::read_to_string(self.dir.path().join("serve.log")).unwrap_or_default()
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -245,7 +188,8 @@ impl Agent {
 
 #[test]
 fn an_agent_runs_the_golden_path_with_only_the_guide() {
-    let d = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
     let (target, _) = common::http_target("127.0.0.1", "ok");
 
     // The operator: two kinds, their grants, a signing secret, and tokens
@@ -314,7 +258,7 @@ fn an_agent_runs_the_golden_path_with_only_the_guide() {
     // payment call, which fails (payments.internal does not resolve here)
     // and is recorded all the same.
     for i in 0..WEBHOOKS {
-        let status = post(&d.gateway, "/hooks/shop", &format!("{{\"order\":{i}}}"));
+        let status = post(&d.http, "/hooks/shop", &format!("{{\"order\":{i}}}"));
         assert_eq!(status, 200, "webhook {i}:\n{}", d.log());
     }
     d.operator(&[
@@ -332,7 +276,7 @@ fn an_agent_runs_the_golden_path_with_only_the_guide() {
         .build()
         .unwrap();
     let proposal = runtime.block_on(async {
-        let mut agent = Agent::connect(&d.socket, &agent_token).await;
+        let mut agent = Agent::connect(&d.socket(), &agent_token).await;
         // The agent starts from the guide, and uses only the tools it names.
         let guide = agent.resource("kronik://agent-guide").await;
         agent.allowed = guide_tools(&guide);
@@ -467,12 +411,12 @@ fn an_agent_runs_the_golden_path_with_only_the_guide() {
     assert!(promoted.status.success(), "{}", text(&promoted));
 
     // Everyone's part is recorded with their token.
-    let shown = api_get(&d.socket, &format!("/v1/proposals/{proposal}"));
+    let shown = api_get(&d.socket(), &format!("/v1/proposals/{proposal}"));
     assert_eq!(shown["status"], "promoted", "{shown}");
     let request = &shown["approval_requests"][0];
     assert_eq!(request["token_id"], "token:agent-1", "{shown}");
     assert_eq!(request["pending"], false, "{shown}");
-    let deployments = api_get(&d.socket, "/v1/deployments");
+    let deployments = api_get(&d.socket(), "/v1/deployments");
     let last = deployments["deployments"]
         .as_array()
         .unwrap()
