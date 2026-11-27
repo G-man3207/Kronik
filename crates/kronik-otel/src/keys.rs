@@ -8,6 +8,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
 
+use kronik_privacy::keystore::keyed_hash;
 use kronik_privacy::sealer::Sealer;
 
 use crate::spans::{ID_KEY_PURPOSE, IdKey, KEY_HASH_PURPOSE, key_label};
@@ -77,19 +78,6 @@ impl KeyHasher {
             KeyHasher::Local(k) => keyed_hash(k, ID_KEY_PURPOSE, &[]),
         })
     }
-}
-
-/// `Pseudonyms::keyed_hash`'s construction: purpose, NUL, then each part
-/// with its length.
-fn keyed_hash(key: &[u8; 32], purpose: &str, parts: &[&[u8]]) -> [u8; 32] {
-    let mut h = blake3::Hasher::new_keyed(key);
-    h.update(purpose.as_bytes());
-    h.update(b"\0");
-    for p in parts {
-        h.update(&(p.len() as u64).to_le_bytes());
-        h.update(p);
-    }
-    *h.finalize().as_bytes()
 }
 
 #[cfg(test)]
