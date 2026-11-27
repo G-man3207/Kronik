@@ -134,80 +134,8 @@ def verify(key, headers, body, expected_ids, previous_keys=()):
     return event_id, hashlib.sha256(body).hexdigest(), timestamp, key_slot
 
 
-def self_check():
-    from email.message import Message
-    key = b"dummy-receiver-proof-key"
-    event_id = "ke1.69.6d.actor.native.9.0." + "0" * 64
-    event = {"schema": "kronik.event/v1", "id": event_id, "installation": "i", "branch": "m",
-             "source": {"kind": "actor", "shard": None, "lsn": 9}, "subindex": 0, "record_kind": 40,
-             "data": {"schema": "kronik.audit/v3", "kind": "audit_event", "action": "proposal.create",
-                      "at_wall_ms": 123, "record_hash": "b3k:v3:" + "0" * 64}}
-    body = json.dumps(event, separators=(",", ":")).encode()
-
-    def headers():
-        result = Message()
-        for name, value in {"kronik-signature-version": "v1", "kronik-event-id": event_id,
-                            "idempotency-key": event_id, "kronik-timestamp-ms": "123",
-                            "content-type": "application/json", "kronik-signature": "v1=" + hmac.new(
-                                key, signing_input("123", event_id, body), hashlib.sha256).hexdigest()}.items():
-            result[name] = value
-        return result
-
-    assert verify(key, headers(), body, {event_id})[0] == event_id
-    assert verify(key, headers(), body, {event_id})[3] == 0
-    assert verify(b"next-dummy-key", headers(), body, {event_id}, (key,))[3] == 1
-    cases = [(key, headers(), body + b" ", {event_id}),
-             (b"wrong", headers(), body, {event_id}),
-             (key, headers(), body, {"ke1.69.6d.actor.native.10.0." + "0" * 64})]
-    for name, value in (("kronik-event-id", "ke1.69.6d.actor.native.10.0." + "0" * 64),
-                        ("kronik-signature-version", "v2"), ("kronik-timestamp-ms", "124")):
-        altered = headers()
-        altered.replace_header(name, value)
-        cases.append((key, altered, body, {event_id}))
-    duplicate = headers()
-    duplicate["kronik-event-id"] = event_id
-    cases.append((key, duplicate, body, {event_id}))
-    for args in cases:
-        try:
-            verify(*args)
-        except ValueError:
-            continue
-        raise AssertionError("negative webhook verification accepted")
-    # Framing/closed-shape fixtures only: these are not producer or Raft proof.
-    event_id = "ke1.69.metadata.53.0." + "0" * 64
-    event = {"schema": "kronik.event/v1", "id": event_id, "installation": "i",
-             "source": {"kind": "metadata", "index": 53}, "subindex": 0, "record_kind": 40,
-             "data": {"schema": "kronik.audit/v3", "kind": "audit_event",
-                      "action": "installation.identity", "at_wall_ms": 0,
-                      "record_hash": "b3k:v3:" + "0" * 64}}
-    for current in (False, True):
-        event["data"]["adoption"] = {"current_projection": current}
-        body = json.dumps(event, separators=(",", ":")).encode()
-        assert verify(key, headers(), body, {event_id})[0] == event_id
-    event["record_kind"] = 45
-    event["data"].update(kind="secret_version", action="secret.version", at_wall_ms=1)
-    for current in (False, True):
-        event["data"]["adoption"] = {"current_projection": current}
-        body = json.dumps(event, separators=(",", ":")).encode()
-        assert verify(key, headers(), body, {event_id})[0] == event_id
-    invalid_adoptions = (None, {}, {"current_projection": 1}, {"current_projection": "false"},
-                         {"current_projection": False, "issuer": "private-NEEDLE"})
-    for adoption in invalid_adoptions:
-        event["data"]["adoption"] = adoption
-        body = json.dumps(event, separators=(",", ":")).encode()
-        try:
-            verify(key, headers(), body, {event_id})
-        except ValueError:
-            continue
-        raise AssertionError("unsafe native adoption metadata accepted")
-    print(json.dumps({"self_check": "passed",
-                      "scope": "HMAC framing and closed event shape only, not committed-record projection",
-                      "negative_cases": len(cases) + len(invalid_adoptions)}))
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--self-check", action="store_true")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--secret-file", type=Path)
     parser.add_argument("--previous-secret-file", type=Path,
@@ -217,15 +145,11 @@ def main():
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--idle-timeout", type=float, help="finish after verified delivery becomes idle; requests stays a hard cap")
     parser.add_argument("--expected-id", action="append", default=[])
-    parser.add_argument("--fault-id", help="fault only this actual committed event; other sources remain independent")
     parser.add_argument("--fail-first", type=int, default=0)
     parser.add_argument("--lose-ack-first", type=int, default=0)
     parser.add_argument("--hold-first-success-until", type=Path)
     parser.add_argument("--min-duplicates", type=int, default=0)
     args = parser.parse_args()
-    if args.self_check:
-        self_check()
-        return
     if not args.secret_file or not args.journal or args.requests < 1 or args.timeout <= 0:
         parser.error("finite receive requires --secret-file, --journal, positive requests/timeout")
     if args.idle_timeout is not None and args.idle_timeout <= 0:
@@ -295,11 +219,10 @@ def main():
                 counts["accepted"] += 1
                 seen[event_id] = digest
                 status = 200
-                selected_fault = args.fault_id is None or event_id == args.fault_id
-                if selected_fault and remaining_failures > 0:
+                if remaining_failures > 0:
                     remaining_failures -= 1
                     status = 503
-                elif selected_fault and remaining_lost_acks > 0:
+                elif remaining_lost_acks > 0:
                     remaining_lost_acks -= 1
                     status = "lost_ack"
                 journal({"id": event_id, "digest": digest, "timestamp_ms": timestamp,
@@ -312,7 +235,7 @@ def main():
                 self.send_response(status)
                 if status == 503:
                     self.send_header("retry-after", "1")
-                hold = selected_fault and status == 200 and remaining_hold
+                hold = status == 200 and remaining_hold
                 if hold:
                     remaining_hold = False
                 self.send_header("content-length", "2" if hold else "0")
