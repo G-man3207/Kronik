@@ -17,13 +17,12 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{Proc, audit, msg, start_proc};
+use common::{Proc, audit, http, msg, start_proc};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
@@ -48,15 +47,27 @@ struct Server {
 
 impl Server {
     fn start() -> Server {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let log = seen.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let log = log.clone();
-                std::thread::spawn(move || serve(stream, log));
+        let addr = http::serve(move |req, w| {
+            log.lock().unwrap().push(req.path.clone());
+            if req.path == "/hang" {
+                std::thread::sleep(Duration::from_secs(60));
+                // Then the connection closes, as before.
+                let _ = w.shutdown(std::net::Shutdown::Both);
+                return;
             }
+            let reply = match req.path.strip_prefix("/big/") {
+                Some(n) => "b".repeat(n.parse().unwrap_or(0)),
+                None => "ok".to_owned(),
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n\r\n",
+                reply.len()
+            );
+            let _ = w
+                .write_all(head.as_bytes())
+                .and_then(|()| w.write_all(reply.as_bytes()));
         });
         Server { addr, seen }
     }
@@ -67,54 +78,6 @@ impl Server {
 
     fn seen(&self) -> Vec<String> {
         self.seen.lock().unwrap().clone()
-    }
-}
-
-fn serve(stream: TcpStream, seen: Arc<Mutex<Vec<String>>>) {
-    let mut w = stream.try_clone().unwrap();
-    let mut r = BufReader::new(stream);
-    loop {
-        let mut line = String::new();
-        if r.read_line(&mut line).unwrap_or(0) == 0 {
-            return;
-        }
-        let path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
-        let mut len = 0usize;
-        loop {
-            let mut h = String::new();
-            if r.read_line(&mut h).unwrap_or(0) == 0 {
-                return;
-            }
-            let h = h.trim_end();
-            if h.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = h.split_once(':')
-                && k.trim().eq_ignore_ascii_case("content-length")
-            {
-                len = v.trim().parse().unwrap_or(0);
-            }
-        }
-        let mut body = vec![0; len];
-        if r.read_exact(&mut body).is_err() {
-            return;
-        }
-        seen.lock().unwrap().push(path.clone());
-        if path == "/hang" {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            return;
-        }
-        let reply = match path.strip_prefix("/big/") {
-            Some(n) => "b".repeat(n.parse().unwrap_or(0)),
-            None => "ok".to_owned(),
-        };
-        let head = format!(
-            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n\r\n",
-            reply.len()
-        );
-        if w.write_all(head.as_bytes()).is_err() || w.write_all(reply.as_bytes()).is_err() {
-            return;
-        }
     }
 }
 
