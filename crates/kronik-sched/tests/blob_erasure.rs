@@ -82,31 +82,7 @@ impl Proc {
     /// A blob the media guest writes as the response of a request of
     /// `subject`: the default subject of its turn, so the blob's.
     fn write(&self, subject: &str) -> pb::BlobRef {
-        let input = pb::HttpInput {
-            method: "POST".into(),
-            path: "/media/a/write".into(),
-            query: "size=200000&chunk=65536".into(),
-            body: Some(pb::Body {
-                value: Some(pb::body::Value::Inline(pb::Sealable {
-                    subject: Some(subject.into()),
-                    value: Some(pb::sealable::Value::Plain(Vec::new())),
-                })),
-            }),
-            ..Default::default()
-        };
-        let r: TurnResult = self.rt.block_on(async {
-            wait_turn(
-                self.node
-                    .ingress(
-                        ActorRef::parse("media/a").unwrap(),
-                        input,
-                        Some(subject.into()),
-                    )
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-        });
+        let r = self.run("write", "size=200000&chunk=65536", subject);
         assert!(r.committed(), "{r:?}");
         http_blob(&r)
     }

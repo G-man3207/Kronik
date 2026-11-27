@@ -157,24 +157,15 @@ fn assert_blob_reply(call: &pb::EffectRecord, blob: &pb::BlobRef) {
 impl Proc {
     /// Runs `op` on `media/<key>` over HTTP with an inline body.
     fn run(&self, key: &str, op: &str, query: &str, body: &[u8]) -> TurnResult {
-        let input = pb::HttpInput {
-            method: "POST".into(),
-            path: format!("/media/{key}/{op}"),
-            query: query.into(),
-            body: Some(pb::Body {
-                value: Some(pb::body::Value::Inline(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(body.to_vec())),
-                })),
+        self.run_with(
+            key,
+            op,
+            query,
+            pb::body::Value::Inline(pb::Sealable {
+                subject: None,
+                value: Some(pb::sealable::Value::Plain(body.to_vec())),
             }),
-            ..Default::default()
-        };
-        self.rt.block_on(async {
-            let actor = ActorRef::parse(&format!("media/{key}")).unwrap();
-            wait_turn(self.node.ingress(actor, input, None).unwrap())
-                .await
-                .unwrap()
-        })
+        )
     }
 
     /// Runs `op` on `media/<key>` over HTTP with `body`.

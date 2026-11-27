@@ -305,10 +305,10 @@ impl Proc {
     }
 }
 
-fn setup() -> (Server, tempfile::TempDir, Proc) {
+fn setup(limit: u32) -> (Server, tempfile::TempDir, Proc) {
     let server = Server::start();
     let dir = tempfile::tempdir().unwrap();
-    let p = start_limit(dir.path(), kronik_log::MAX_RECORD);
+    let p = start_limit(dir.path(), limit);
     p.deploy();
     p.grant("http:127.0.0.1");
     (server, dir, p)
@@ -360,11 +360,7 @@ fn a_turn_whose_output_does_not_fit_fails_and_every_record_fits() {
 /// the first effect, and no `TurnBegin` stays open to run it again.
 #[test]
 fn an_effect_that_does_not_fit_never_happens_and_the_turn_closes() {
-    let server = Server::start();
-    let dir = tempfile::tempdir().unwrap();
-    let p = start(dir.path());
-    p.deploy();
-    p.grant("http:127.0.0.1");
+    let (server, dir, p) = setup(LIMIT);
     let body = "a".repeat(150 << 10);
     let spec = format!(
         "POST {}\n\n{body}\n---\nPOST {}\n\n{body}",
@@ -404,11 +400,7 @@ fn an_effect_that_does_not_fit_never_happens_and_the_turn_closes() {
 /// effect_response_bytes is: the record keeps a result without its body.
 #[test]
 fn a_response_over_what_is_left_is_too_large_and_the_record_fits() {
-    let server = Server::start();
-    let dir = tempfile::tempdir().unwrap();
-    let p = start(dir.path());
-    p.deploy();
-    p.grant("http:127.0.0.1");
+    let (server, dir, p) = setup(LIMIT);
     let spec = format!("GET {}", server.url(&format!("/big/{}", 2 << 20)));
     let r = p.send("counter/c", msg("fetch", spec.as_bytes()));
     assert!(!r.committed());
@@ -443,11 +435,7 @@ fn a_response_over_what_is_left_is_too_large_and_the_record_fits() {
 /// takes the closing record.
 #[test]
 fn an_open_turn_whose_input_no_longer_fits_is_closed_not_rerun_for_ever() {
-    let server = Server::start();
-    let dir = tempfile::tempdir().unwrap();
-    let p = start(dir.path());
-    p.deploy();
-    p.grant("http:127.0.0.1");
+    let (server, dir, p) = setup(LIMIT);
     let spec = format!("POST {}\n\n{}", server.url("/hang"), "a".repeat(200 << 10));
     let node = p.node.clone();
     let owner = p.owner();
@@ -733,7 +721,7 @@ fn the_default_is_32_mib_and_a_set_limit_is_in_the_log() {
         kronik_effects::KindLimits::default().effect_bytes_per_turn,
         32 << 20
     );
-    let (_server, _dir, p) = setup();
+    let (_server, _dir, p) = setup(kronik_log::MAX_RECORD);
     p.effect_bytes(1 << 20);
     let config = p.node.config_now();
     assert_eq!(config.limits("counter").effect_bytes_per_turn, 1 << 20);
@@ -746,7 +734,7 @@ fn the_default_is_32_mib_and_a_set_limit_is_in_the_log() {
 /// counter guest then fails its turn, as for any failed fetch).
 #[test]
 fn a_response_past_the_effect_bytes_is_sent_and_not_recorded() {
-    let (server, _dir, p) = setup();
+    let (server, _dir, p) = setup(kronik_log::MAX_RECORD);
     p.effect_bytes(64 << 10);
     let (r, effect) = p.fetch("a", &format!("GET {}", server.url("/big/100000")));
     assert!(!r.committed());
@@ -764,7 +752,7 @@ fn a_response_past_the_effect_bytes_is_sent_and_not_recorded() {
 /// A request that alone would pass what is left is not sent.
 #[test]
 fn a_request_past_the_effect_bytes_is_not_sent() {
-    let (server, _dir, p) = setup();
+    let (server, _dir, p) = setup(kronik_log::MAX_RECORD);
     p.effect_bytes(64 << 10);
     let spec = format!("POST {}\n\n{}", server.url("/post"), "a".repeat(100 << 10));
     let (r, effect) = p.fetch("a", &spec);
@@ -779,7 +767,7 @@ fn a_request_past_the_effect_bytes_is_not_sent() {
 /// no longer fits in what the first left is not sent.
 #[test]
 fn what_earlier_effects_recorded_counts() {
-    let (server, _dir, p) = setup();
+    let (server, _dir, p) = setup(kronik_log::MAX_RECORD);
     p.effect_bytes(200 << 10);
     let body = "a".repeat(150 << 10);
     let spec = format!(
@@ -804,7 +792,7 @@ fn what_earlier_effects_recorded_counts() {
 /// one byte less does not.
 #[test]
 fn the_limit_is_exact() {
-    let (server, _dir, p) = setup();
+    let (server, _dir, p) = setup(kronik_log::MAX_RECORD);
     let spec = format!("GET {}", server.url("/big/1000"));
     let (r, effect) = p.fetch("a", &spec);
     assert!(r.committed(), "{:?}", r.outcome);
@@ -829,7 +817,7 @@ fn the_limit_is_exact() {
 /// result, so the turn ends the same way after a restart).
 #[test]
 fn the_failure_survives_a_restart() {
-    let (server, dir, p) = setup();
+    let (server, dir, p) = setup(kronik_log::MAX_RECORD);
     p.effect_bytes(64 << 10);
     let (r, effect) = p.fetch("a", &format!("GET {}", server.url("/big/100000")));
     assert!(!r.committed());

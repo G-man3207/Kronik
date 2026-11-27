@@ -130,6 +130,13 @@ impl Proc {
             .filter(|c| matches!(c.record, Record::SnapshotMarker(_)))
             .count()
     }
+
+    /// Deploys the test guest `name`.
+    fn deploy(&self, name: &str) {
+        self.rt
+            .block_on(self.node.deploy(&guest(name), audit(), false, self.owner()))
+            .unwrap();
+    }
 }
 
 /// Spawns `notes/n`'s `add-call` "in the turn" on a fresh lease, and waits
@@ -177,10 +184,8 @@ fn rebuilt_hash(records: &[kronik_log::Committed]) -> String {
 fn snapshots_are_consistent_under_concurrent_turns_and_startup_uses_them() {
     let dir = tempdir();
     let p = start(dir.path(), 48);
-    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false, p.owner()))
-        .unwrap();
-    p.rt.block_on(p.node.deploy(&guest("notes"), audit(), false, p.owner()))
-        .unwrap();
+    p.deploy("counter");
+    p.deploy("notes");
     for i in 0..20 {
         p.send(&format!("counter/c{}", i % 4), "increment", "");
         p.send(&format!("notes/n{}", i % 3), "add", &format!("note {i}"));
@@ -273,8 +278,7 @@ fn a_snapshot_during_an_open_sql_turn_succeeds() {
     });
     let p = Proc { rt, node };
     for g in ["counter", "notes-sql-call"] {
-        p.rt.block_on(p.node.deploy(&guest(g), audit(), false, p.owner()))
-            .unwrap();
+        p.deploy(g);
     }
     p.send("notes/n", "add", "applied");
     let held = park_sql_call(&p);
@@ -315,8 +319,7 @@ fn copies_an_interrupted_state_hash_left_are_swept_at_start() {
     let sql = dir.path().join("branches/main/sql");
     {
         let p = start(dir.path(), 5);
-        p.rt.block_on(p.node.deploy(&guest("notes"), audit(), false, p.owner()))
-            .unwrap();
+        p.deploy("notes");
         p.send("notes/n", "add", "kept");
     }
     let db = std::fs::read_dir(&sql)
@@ -350,8 +353,7 @@ fn copies_an_interrupted_state_hash_left_are_swept_at_start() {
 fn an_erasure_whose_snapshot_fails_succeeds_and_retries_it() {
     let dir = tempdir();
     let p = start(dir.path(), 5);
-    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false, p.owner()))
-        .unwrap();
+    p.deploy("counter");
     p.send("counter/a", "increment", "");
     // Snapshots cannot be written while their directory is a file.
     let snapshots = kronik_sched::snapshots::snapshots_dir(dir.path(), "main");
@@ -383,8 +385,7 @@ fn an_erasure_whose_snapshot_fails_succeeds_and_retries_it() {
 fn old_snapshots_are_pruned_to_the_number_kept() {
     let dir = tempdir();
     let p = start(dir.path(), 2);
-    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false, p.owner()))
-        .unwrap();
+    p.deploy("counter");
     let mut lsns = Vec::new();
     for i in 0..4 {
         p.send(&format!("counter/k{i}"), "increment", "");
@@ -416,8 +417,7 @@ fn old_snapshots_are_pruned_to_the_number_kept() {
 fn an_idle_restart_takes_no_shutdown_snapshot() {
     let dir = tempdir();
     let p = start(dir.path(), 48);
-    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false, p.owner()))
-        .unwrap();
+    p.deploy("counter");
     p.send("counter/a", "increment", "");
     let first = p.rt.block_on(p.node.shutdown_snapshot()).unwrap().unwrap();
     drop(p);
@@ -443,8 +443,7 @@ fn an_idle_node_takes_no_interval_snapshot() {
     let dir = tempdir();
     // The setup runs before the task's first tick (the default is an hour).
     let p = start(dir.path(), 48);
-    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false, p.owner()))
-        .unwrap();
+    p.deploy("counter");
     p.send("counter/a", "increment", "");
     drop(p);
 
@@ -472,8 +471,7 @@ fn retention_deletes_old_segments_a_snapshot_covers() {
     let dir = tempdir();
     let log_dir = dir.path().join("branches/main/log");
     let p = start_with(dir.path(), 2, Some(Duration::ZERO), Some(4096), None);
-    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false, p.owner()))
-        .unwrap();
+    p.deploy("counter");
     for i in 0..80 {
         p.send(&format!("counter/k{}", i % 5), "increment", "");
         if i % 20 == 19 {
@@ -587,8 +585,7 @@ fn held_on(dir: &Path, disk_reserve: u64, free: Option<Arc<AtomicU64>>) -> Proc 
         .unwrap()
     });
     let p = Proc { rt, node };
-    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false, p.owner()))
-        .unwrap();
+    p.deploy("counter");
     for i in 0..80 {
         p.send(&format!("counter/k{}", i % 5), "increment", "");
         if i % 20 == 19 {
@@ -973,10 +970,8 @@ const SEGMENT: Option<u64> = Some(256 * 1024);
 /// removed.
 fn record_long_gap(dir: &Path) -> Vec<String> {
     let p = start_with(dir, 2, None, SEGMENT, None);
-    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false, p.owner()))
-        .unwrap();
-    p.rt.block_on(p.node.deploy(&guest("notes"), audit(), false, p.owner()))
-        .unwrap();
+    p.deploy("counter");
+    p.deploy("notes");
     let snapshot = p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
     for round in 0.. {
         if round >= 40 && a_turn_spans_segments(&p, dir) {
@@ -1274,8 +1269,7 @@ fn below_the_disk_reserve_incident_actions_and_retention_still_work() {
     let dir = tempfile::tempdir().unwrap();
     {
         let p = start_reserving(dir.path(), 10, 0);
-        p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false, p.owner()))
-            .unwrap();
+        p.deploy("counter");
         for _ in 0..3 {
             p.send("counter/a", "increment", "");
             p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
@@ -1386,8 +1380,7 @@ fn partial_snapshots_are_swept() {
     };
     {
         let p = start_reserving(dir.path(), 10, 0);
-        p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false, p.owner()))
-            .unwrap();
+        p.deploy("counter");
         p.send("counter/a", "increment", "");
         p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
         leave_partials();
@@ -1456,10 +1449,8 @@ fn reply(p: &Proc, actor: &str, name: &str) -> String {
 /// first LSN afterwards. The node is stopped.
 fn compacted_past_an_idle_actor(dir: &Path) -> (u64, u64) {
     let p = compacting(dir);
-    p.rt.block_on(p.node.deploy(&guest("counter"), audit(), false, p.owner()))
-        .unwrap();
-    p.rt.block_on(p.node.deploy(&guest("notes"), audit(), false, p.owner()))
-        .unwrap();
+    p.deploy("counter");
+    p.deploy("notes");
     p.send("notes/n", "add", "hello");
     for i in 0..80 {
         p.send(&format!("counter/k{}", i % 5), "increment", "");
@@ -1612,8 +1603,7 @@ fn the_read_only_plan_does_not_wait_for_a_node_that_holds_its_databases() {
     // A log that still starts at LSN 1 has nothing to ask of the actors.
     let young = tempdir();
     let p = compacting(young.path());
-    p.rt.block_on(p.node.deploy(&guest("notes"), audit(), false, p.owner()))
-        .unwrap();
+    p.deploy("notes");
     p.send("notes/n", "add", "hello");
     let plan = kronik_sched::snapshots::plan_state(young.path(), "main", true).unwrap();
     assert_eq!((plan.unread, plan.install.is_none()), (0, true));
@@ -1705,8 +1695,7 @@ fn a_compaction_waits_for_an_actor_database_a_turn_has_open() {
     });
     let p = Proc { rt, node };
     for g in ["counter", "notes-sql-call"] {
-        p.rt.block_on(p.node.deploy(&guest(g), audit(), false, p.owner()))
-            .unwrap();
+        p.deploy(g);
     }
     p.send("notes/n", "add", "applied");
     // Segments after the note and before the parked turn's begin.
