@@ -163,6 +163,24 @@ fn tokens_carry_scopes_on_every_listener_and_are_recorded() {
         .unwrap();
     assert!(ops.starts_with("kronik_"), "{shown}");
 
+    // `foreign add` needs `operate`, which `ops` has: the token reaches the
+    // same answer as the socket's own caller (port 0 is refused before
+    // anything is fetched or written), never UNAUTHENTICATED.
+    let add = r#"{"name":"echo","image":"x","port":0,"reason":"token test"}"#;
+    let foreign_add = |token: Option<&str>| {
+        let mut socket = std::os::unix::net::UnixStream::connect(d.socket()).unwrap();
+        let (status, _, body) = exchange(&mut socket, "POST", "/v1/foreign", token, add);
+        (status, serde_json::from_str::<Value>(&body).unwrap())
+    };
+    let (local_status, local) = foreign_add(None);
+    let (status, answer) = foreign_add(Some(ops.as_str()));
+    assert_ne!(local_status, 401, "{local}");
+    assert_eq!(
+        (status, &answer["error"]["code"]),
+        (local_status, &local["error"]["code"]),
+        "{answer}"
+    );
+
     // A dry run writes nothing; names are never reused; scopes are checked.
     let dry = d.cli(
         None,
