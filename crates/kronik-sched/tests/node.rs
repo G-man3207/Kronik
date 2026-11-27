@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Proc, audit, start_proc, wait_turn};
+use common::{Proc, audit, msg, start_proc, wait_turn};
 use kronik_core::env::Env;
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::ActorRef;
@@ -43,16 +43,6 @@ fn plain(b: &[u8]) -> Option<pb::Sealable> {
         subject: None,
         value: Some(pb::sealable::Value::Plain(b.to_vec())),
     })
-}
-
-fn msg(name: &str, body: &[u8]) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: plain(body),
-        blobs: vec![],
-        retained_compensation_source: None,
-    }
 }
 
 fn http(method: &str, path: &str, op: Option<&str>, key: &str, body: &[u8]) -> pb::HttpInput {

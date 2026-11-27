@@ -28,7 +28,7 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{Proc, audit, http, start_proc};
+use common::{Proc, audit, http, msg, start_proc};
 use kronik_core::error::ApiError;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
@@ -143,19 +143,6 @@ fn start(dir: &Path, hold_after_call: bool) -> Proc {
             ..NodeConfig::default()
         },
     )
-}
-
-fn msg(name: &str, body: &str) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-        }),
-        blobs: vec![],
-        retained_compensation_source: None,
-    }
 }
 
 fn reply_text(outcome: Option<&pb::Outcome>) -> String {
@@ -289,7 +276,7 @@ impl Proc {
     fn block(&self, server: &Server, key: &str) -> Pending {
         self.send_detached(
             &format!("counter/{key}"),
-            msg("fetch-ok", &format!("GET {}", server.url("/hang"))),
+            msg("fetch-ok", format!("GET {}", server.url("/hang"))),
         )
     }
 
