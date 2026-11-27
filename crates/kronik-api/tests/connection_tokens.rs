@@ -17,12 +17,10 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::{Reader, wasm};
+use common::{Reader, start_node, wasm};
 use kronik_api::{Api, ApiRequest};
-use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
 
 const TOKEN: &str = "bearer.tok-7c1f0e6a5b2d4c39";
@@ -79,13 +77,7 @@ fn files_containing(dir: &Path, needle: &[u8]) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_token_in_the_subprotocols_stays_sealed_and_redacted() {
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Api::new(node.clone());
     let reader = Api::new(node.clone()).with_authenticator(Arc::new(Reader(node.clone())));
     call(

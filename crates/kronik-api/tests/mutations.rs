@@ -20,7 +20,7 @@ mod oidc_provider;
 use std::sync::Arc;
 
 use base64::Engine as _;
-use common::{GUESTS, call, wasm};
+use common::{GUESTS, call, start_node, wasm};
 use kronik_api::openapi::OPERATIONS;
 use kronik_api::{Api, ApiRequest};
 use kronik_core::env::Env;
@@ -562,13 +562,7 @@ async fn every_mutation_requires_a_reason_and_a_dry_run_writes_nothing() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let proposals = Arc::new(
         kronik_fork::proposal::Proposals::open(node.clone(), dir.path().to_path_buf()).unwrap(),
     );
@@ -703,13 +697,7 @@ async fn every_mutation_requires_a_reason_and_a_dry_run_writes_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dry_run_deploy_writes_nothing_and_the_real_one_still_does() {
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Arc::new(Api::new(node));
 
     let (s, v) = call(
@@ -834,13 +822,7 @@ fn tree_snapshot(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fork_message_rejects_dry_run_and_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let proposals =
         kronik_fork::proposal::Proposals::open(node.clone(), dir.path().to_path_buf()).unwrap();
     let api = Arc::new(Api::new(node).with_proposals(Arc::new(proposals)));
@@ -983,13 +965,7 @@ const UNDRIVEN: &[(&str, &str)] = &[
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_mutation_writes_its_audited_record() {
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let proposals = Arc::new(
         kronik_fork::proposal::Proposals::open(node.clone(), dir.path().to_path_buf()).unwrap(),
     );
@@ -1395,13 +1371,7 @@ async fn every_mutation_writes_its_audited_record() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mutation_in_a_rebuild_window_waits_and_records_the_operators_reason() {
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Arc::new(Api::new(node.clone()));
     tokio::time::timeout(
         std::time::Duration::from_secs(60),
@@ -1459,13 +1429,7 @@ async fn a_mutation_in_a_rebuild_window_waits_and_records_the_operators_reason()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_token_create_writes_its_intent_and_failed() {
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let path = dir.path().join("tokens.db");
     drop(kronik_api::tokens::TokenStore::open_file(&path).unwrap());
     let read_only =
@@ -1527,13 +1491,7 @@ async fn events_of(node: &kronik_sched::Node, action: &str) -> Vec<(u64, pb::Aud
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_synchronous_watch_is_audited_before_its_guard_rolls_back() {
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let proposals = Arc::new(
         kronik_fork::proposal::Proposals::open(node.clone(), dir.path().to_path_buf()).unwrap(),
     );
@@ -1611,13 +1569,7 @@ async fn a_synchronous_watch_is_audited_before_its_guard_rolls_back() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_synchronous_propose_dropped_while_waiting_is_still_audited() {
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     // The test gate holds the job's replay at its first root input.
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let proposals = Arc::new(
@@ -1673,13 +1625,7 @@ async fn a_synchronous_propose_dropped_while_waiting_is_still_audited() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_proposal_dropped_during_its_audit_apply_still_starts() {
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let proposals = Arc::new(
         kronik_fork::proposal::Proposals::open(node.clone(), dir.path().to_path_buf())

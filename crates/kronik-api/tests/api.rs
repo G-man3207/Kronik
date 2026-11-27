@@ -8,21 +8,16 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use kronik_api::{Api, ApiRequest};
-use kronik_core::env::Env;
-use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
 
 mod common;
 
-use common::{call, wasm};
+use common::{call, start_node, wasm};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn endpoints() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(env, dir.path(), NodeConfig::default())
-        .await
-        .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Arc::new(Api::new(node));
 
     let (s, v) = call(&api, "GET", "/v1/health", Value::Null).await;
@@ -169,10 +164,7 @@ async fn endpoints() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m2_endpoints() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(env, dir.path(), NodeConfig::default())
-        .await
-        .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Arc::new(Api::new(node).with_http_listen("127.0.0.1:1".into()));
     let (_, v) = call(&api, "GET", "/v1/health", Value::Null).await;
     assert_eq!(v["http_listen"], "127.0.0.1:1");
@@ -418,10 +410,7 @@ async fn raw(api: &Api, method: &str, path: &str) -> (u16, &'static str, Vec<u8>
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m3_endpoints() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(env, dir.path(), NodeConfig::default())
-        .await
-        .unwrap();
+    let node = start_node(dir.path()).await;
     let proposals =
         kronik_fork::proposal::Proposals::open(node.clone(), dir.path().to_path_buf()).unwrap();
     let api = Arc::new(Api::new(node.clone()).with_proposals(Arc::new(proposals)));
@@ -755,10 +744,7 @@ async fn m3_endpoints() {
 async fn secret_values_are_scrubbed_from_base64_payloads_too() {
     const SECRET: &str = "hunter2-db-password";
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(env, dir.path(), NodeConfig::default())
-        .await
-        .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Arc::new(Api::new(node));
     call(
         &api,
@@ -806,10 +792,7 @@ async fn a_secret_deleted_before_the_export_is_not_in_the_audit_log() {
     const SECRET: &str = "hunter2-db-password";
     const OTHER: &str = "sk-live-other-9931";
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(env, dir.path(), NodeConfig::default())
-        .await
-        .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Arc::new(Api::new(node.clone()));
     for (method, path, body) in [
         (
@@ -859,10 +842,7 @@ async fn token_secrets_are_scrubbed_and_an_unloadable_scrub_withholds_the_reason
     const SECRET: &str = "hunter2-db-password";
     let token = format!("kronik_{}", "Ab-_".repeat(10) + "xyz");
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(env, dir.path(), NodeConfig::default())
-        .await
-        .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Arc::new(Api::new(node.clone()));
     let grant = |reason: String| json!({"kind": "counter", "capability": "http:example.com", "reason": reason});
     let log = || async {
@@ -963,13 +943,7 @@ async fn token_secrets_are_scrubbed_and_an_unloadable_scrub_withholds_the_reason
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_audit_positions_do_not_become_free_secret_text() {
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Api::new(node.clone());
     for (name, text) in [
         ("numeric-pin", "1234"),
@@ -1088,13 +1062,7 @@ async fn public_audit_positions_do_not_become_free_secret_text() {
 async fn incomplete_secret_inventory_blocks_disclosure_not_unrelated_turns() {
     const SECRET: &str = "retained-api-secret-c51b7093";
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Api::new(node.clone());
     for (path, body) in [
         (
@@ -1173,10 +1141,7 @@ async fn incomplete_secret_inventory_blocks_disclosure_not_unrelated_turns() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_orphan_of_a_sealed_call_keeps_the_callee_turn() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(env, dir.path(), NodeConfig::default())
-        .await
-        .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Arc::new(Api::new(node));
     call(
         &api,
@@ -1209,10 +1174,7 @@ async fn an_orphan_of_a_sealed_call_keeps_the_callee_turn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_status_is_the_native_non_member_answer() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::real(tokio::runtime::Handle::current());
-    let node = start_local(env, dir.path(), NodeConfig::default())
-        .await
-        .unwrap();
+    let node = start_node(dir.path()).await;
     let api = Arc::new(Api::new(node));
 
     let (s, v) = call(&api, "GET", "/v1/cluster/status", Value::Null).await;

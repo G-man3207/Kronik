@@ -18,10 +18,9 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{Reader, http_target, wasm};
+use common::{Reader, http_target, start_node, wasm};
 use kronik_api::{Api, ApiRequest};
-use kronik_core::env::Env;
-use kronik_sched::{Node, NodeConfig, start_local};
+use kronik_sched::Node;
 use serde_json::{Value, json};
 
 const FIRST: &str = "first-value-1111";
@@ -79,13 +78,7 @@ async fn read_only(api: &Api, path: &str) -> Value {
 
 /// A node with the counter deployed and the grants its effects need.
 async fn node_with_grants(dir: &std::path::Path) -> (Api, Arc<Node>) {
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir,
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir).await;
     let api = Api::new(node.clone());
     call(
         &api,

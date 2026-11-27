@@ -5,12 +5,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
+use common::start_node;
 use kronik_api::auth::Scope;
 use kronik_api::tokens::{Change, TokenStore};
 use kronik_api::{Api, ApiRequest};
-use kronik_core::env::Env;
 use kronik_proto::Record;
-use kronik_sched::{NodeConfig, start_local};
 use serde_json::{Value, json};
 
 async fn call(api: &Api, method: &str, path: &str, bearer: &str, body: Value) -> (u16, Value) {
@@ -69,13 +70,7 @@ async fn key_write_records(node: &kronik_sched::Node) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_operate_token_cannot_rewrap_keys_or_link_a_secret() {
     let dir = tempfile::tempdir().unwrap();
-    let node = start_local(
-        Env::real(tokio::runtime::Handle::current()),
-        dir.path(),
-        NodeConfig::default(),
-    )
-    .await
-    .unwrap();
+    let node = start_node(dir.path()).await;
     let mut tokens = TokenStore::open_file(&dir.path().join("tokens.db")).unwrap();
     tokens
         .bind_before_any_issuer(node.publication_domain())
