@@ -468,30 +468,6 @@ pub enum KeystoreRevision {
     },
 }
 
-impl KeystoreRevision {
-    /// An acknowledged change frontier, not proof that an erased key is available.
-    pub fn covers(self, required: Self) -> bool {
-        match (self, required) {
-            (
-                Self::V1 {
-                    revision,
-                    device,
-                    inode,
-                },
-                Self::V1 {
-                    revision: required_revision,
-                    device: required_device,
-                    inode: required_inode,
-                },
-            ) => {
-                device == required_device
-                    && inode == required_inode
-                    && revision >= required_revision
-            }
-        }
-    }
-}
-
 /// Reads a persistent semantic revision and its supported file lineage without KMS I/O.
 pub async fn current_keystore_revision(
     env: &Env,
