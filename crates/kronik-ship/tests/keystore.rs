@@ -285,17 +285,14 @@ fn semantic_revisions_ship_rotate_erase_and_import_with_identical_file_and_wal_m
     };
     assert_eq!(ship(&mut state, &store, wall, 14).unwrap().objects, 1);
     state = ShipState::load(source.path()).unwrap();
-    assert!(
-        state.keystore_revision.unwrap().covers(
-            runtime
-                .block_on(current_keystore_revision(
-                    &environment,
-                    source.path(),
-                    &store
-                ))
-                .unwrap()
-        )
-    );
+    let current = runtime
+        .block_on(current_keystore_revision(
+            &environment,
+            source.path(),
+            &store,
+        ))
+        .unwrap();
+    assert_eq!(state.keystore_revision, Some(current));
     assert_eq!(
         ship(&mut state, &store, wall + 60_000, 15).unwrap().objects,
         0

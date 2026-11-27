@@ -598,10 +598,7 @@ pub(crate) async fn stage(
             staged.erased += 1;
             continue;
         }
-        let path = stage
-            .join("blobs/objects")
-            .join(meta.id.shard())
-            .join(meta.id.file_name());
+        let path = local_path(stage, &meta.id);
         if !remote.get_to_file(&remote_name(&meta.id), &path).await? {
             staged.failed.push((hash, "it is not in the bucket".into()));
             continue;
