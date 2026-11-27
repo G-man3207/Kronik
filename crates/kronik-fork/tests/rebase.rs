@@ -120,20 +120,8 @@ fn setup_env(
     );
     let bytes = std::fs::read(guest("counter-schema1-extra")).unwrap();
     let (prop, _) =
-        p.rt.block_on(props.propose(
-            ProposeRequest {
-                wasm: vec![bytes],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
-            },
-            p.owner(),
-        ))
-        .unwrap();
+        p.rt.block_on(props.propose(propose_request(vec![bytes]), p.owner()))
+            .unwrap();
     let promoted =
         p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap();
@@ -645,16 +633,7 @@ fn rebased_turns(p: &Proc, id: &str) -> Vec<pb::TurnRecord> {
 fn propose(p: &Proc, props: &Arc<Proposals>, name: &str) -> kronik_fork::proposal::Proposal {
     p.settle();
     p.rt.block_on(props.propose(
-        ProposeRequest {
-            wasm: vec![std::fs::read(guest(name)).unwrap()],
-            names: Vec::new(),
-            window_ms: None,
-            at: None,
-            options: DiffOptions::default(),
-            workers: Some(2),
-            audit: audit(),
-            dry_run: false,
-        },
+        propose_request(vec![std::fs::read(guest(name)).unwrap()]),
         p.owner(),
     ))
     .unwrap()
@@ -1365,17 +1344,12 @@ fn a_message_pending_at_the_fork_point_is_replayed() {
     let (prop, _) =
         p.rt.block_on(props.propose(
             ProposeRequest {
-                wasm: vec![std::fs::read(guest("counter-fail-get")).unwrap()],
-                names: Vec::new(),
-                window_ms: None,
                 at: Some(at),
                 options: DiffOptions {
                     mode: Mode::Continuous,
                     ..DiffOptions::default()
                 },
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
+                ..propose_request(vec![std::fs::read(guest("counter-fail-get")).unwrap()])
             },
             p.owner(),
         ))
@@ -2186,20 +2160,8 @@ fn a_rebase_switch_closes_the_connections_of_the_rebased_kind() {
     );
     let bytes = std::fs::read(guest("room-fmt2")).unwrap();
     let (prop, _) =
-        p.rt.block_on(props.propose(
-            ProposeRequest {
-                wasm: vec![bytes],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
-            },
-            p.owner(),
-        ))
-        .unwrap();
+        p.rt.block_on(props.propose(propose_request(vec![bytes]), p.owner()))
+            .unwrap();
     let promoted =
         p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap();
