@@ -7,6 +7,15 @@ use crate::Record;
 use crate::log::v1 as pb;
 
 impl pb::Sealable {
+    /// An unsealed value with `bytes`, tagged with `subject` (`None`: a
+    /// value without a subject).
+    pub fn new_plain(subject: Option<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            subject,
+            value: Some(pb::sealable::Value::Plain(bytes.into())),
+        }
+    }
+
     /// The plain bytes, or `None` when the value is sealed or missing.
     pub fn plain(&self) -> Option<&[u8]> {
         match self.value.as_ref()? {
@@ -194,10 +203,7 @@ mod tests {
     use super::*;
 
     fn s(subject: &str, v: &[u8]) -> Option<pb::Sealable> {
-        Some(pb::Sealable {
-            subject: Some(subject.into()),
-            value: Some(pb::sealable::Value::Plain(v.to_vec())),
-        })
+        Some(pb::Sealable::new_plain(Some(subject.into()), v))
     }
 
     #[test]

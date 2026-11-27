@@ -340,10 +340,7 @@ mod tests {
     fn message_with(blobs: Vec<pb::BlobRef>) -> pb::Message {
         pb::Message {
             name: "m".into(),
-            body: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(vec![])),
-            }),
+            body: Some(pb::Sealable::new_plain(None, vec![])),
             blobs,
             ..Default::default()
         }

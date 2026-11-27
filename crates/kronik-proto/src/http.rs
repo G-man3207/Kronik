@@ -20,14 +20,6 @@ fn text(s: &pb::Sealable) -> String {
     }
 }
 
-/// A plain value tagged with `subject`.
-pub fn tagged(subject: &str, value: String) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: Some(subject.to_owned()),
-        value: Some(pb::sealable::Value::Plain(value.into_bytes())),
-    })
-}
-
 impl pb::HttpInput {
     /// The request path.
     pub fn path_text(&self) -> String {
@@ -88,12 +80,21 @@ mod tests {
     fn sealable_fields_win_and_sealed_values_stay_hidden() {
         let mut h = pb::HttpInput {
             path: String::new(),
-            sealed_path: tagged("user:1", "/notes/carol%40example.com".into()),
-            sealed_query: tagged("user:1", "reset_token=rt-5f3a9c".into()),
+            sealed_path: Some(pb::Sealable::new_plain(
+                Some("user:1".into()),
+                "/notes/carol%40example.com",
+            )),
+            sealed_query: Some(pb::Sealable::new_plain(
+                Some("user:1".into()),
+                "reset_token=rt-5f3a9c",
+            )),
             params: vec![pb::Param {
                 name: "key".into(),
                 value: String::new(),
-                sealed_value: tagged("user:1", "carol@example.com".into()),
+                sealed_value: Some(pb::Sealable::new_plain(
+                    Some("user:1".into()),
+                    "carol@example.com",
+                )),
             }],
             ..Default::default()
         };

@@ -78,10 +78,10 @@ fn effect_record_simulator_v1() {
         input: Some(pb::Input {
             kind: Some(pb::input::Kind::Http(pb::HttpInput {
                 body: Some(pb::Body {
-                    value: Some(pb::body::Value::Inline(pb::Sealable {
-                        subject: None,
-                        value: Some(pb::sealable::Value::Plain(vec![])),
-                    })),
+                    value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                        None,
+                        vec![],
+                    ))),
                 }),
                 ..Default::default()
             })),
@@ -121,10 +121,10 @@ fn turn() -> pb::TurnRecord {
                 method: "POST".into(),
                 path: "/billing/a/increment".into(),
                 body: Some(pb::Body {
-                    value: Some(pb::body::Value::Inline(pb::Sealable {
-                        subject: None,
-                        value: Some(pb::sealable::Value::Plain(vec![])),
-                    })),
+                    value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                        None,
+                        vec![],
+                    ))),
                 }),
                 ..Default::default()
             })),
@@ -132,10 +132,7 @@ fn turn() -> pb::TurnRecord {
         writes: vec![pb::StateWrite {
             op: pb::StateOp::Set as i32,
             key: "n".into(),
-            value: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(b"3".to_vec())),
-            }),
+            value: Some(pb::Sealable::new_plain(None, b"3")),
         }],
         outcome: Some(pb::Outcome {
             kind: pb::OutcomeKind::Committed as i32,
@@ -873,10 +870,7 @@ fn effect_record_http_v3_v1() {
         target: "http:payments.internal".into(),
         fingerprint: vec![7; 32],
         grounding: pb::Grounding::Live as i32,
-        request: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(request.encode_to_vec())),
-        }),
+        request: Some(pb::Sealable::new_plain(None, request.encode_to_vec())),
         ..Default::default()
     }];
     let record = Record::TurnRecord(turn);
@@ -900,10 +894,7 @@ fn effect_record_http_v3_v1() {
 const CONN: &str = "c-00112233445566778899aabbccddeeff";
 
 fn sealed_plain(subject: Option<&str>, bytes: &[u8]) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: subject.map(String::from),
-        value: Some(pb::sealable::Value::Plain(bytes.to_vec())),
-    })
+    Some(pb::Sealable::new_plain(subject.map(String::from), bytes))
 }
 
 fn connection_turn(event: pb::connection_input::Event) -> pb::TurnRecord {
@@ -1164,10 +1155,7 @@ fn blob_bodies_v1() {
         ordinal: 0,
         kind: "http.fetch".into(),
         fingerprint: vec![9; 32],
-        response: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(response.encode_to_vec())),
-        }),
+        response: Some(pb::Sealable::new_plain(None, response.encode_to_vec())),
         status: pb::EffectStatus::Ok as i32,
         grounding: pb::Grounding::Live as i32,
         target: "http:files.example.com".into(),
@@ -1230,10 +1218,7 @@ fn subject_blob_effect_result_v1() {
         body: vec![],
         body_blob: Some(received.clone()),
     };
-    let tagged = |bytes: Vec<u8>| pb::Sealable {
-        subject: Some("user:7".into()),
-        value: Some(pb::sealable::Value::Plain(bytes)),
-    };
+    let tagged = |bytes: Vec<u8>| pb::Sealable::new_plain(Some("user:7".into()), bytes);
     let record = Record::EffectResult(pb::EffectResult {
         execution_id: "00112233445566778899aabbccddeeff".into(),
         effect: Some(pb::EffectRecord {
