@@ -453,14 +453,14 @@ fn check_error(msg: String) -> ApiError {
 
 #[cfg(test)]
 mod order_tests {
-    /// Run as root over the data directory of another user, the command opens
-    /// nothing in it before it has given up root: the owner is looked at first
-    /// (and refused if it is not one to hand over to), the databases are asked
-    /// about only after the drop, and only a root installation, where there is
-    /// no drop, asks first. This reads the order out of the source of
-    /// `execute`, because the drop cannot be rehearsed in a test process.
+    /// Run as root over the data directory of another user, `execute` gives up
+    /// root before it opens that user's databases or checks that user's stores.
+    /// The root tests in `crates/kronik/tests/restore_drop.rs` rehearse the drop
+    /// and are the authoritative check. They need root and run only in the
+    /// `foreign` step, so this test is a quick tripwire for a developer without
+    /// root: inside `execute`, the drop comes before both openings.
     #[test]
-    fn the_databases_of_another_users_directory_are_opened_only_after_the_drop() {
+    fn the_drop_comes_before_another_users_databases_and_stores_are_opened() {
         let source = include_str!("upgrade.rs");
         let body = source
             .split("fn execute(")
@@ -471,80 +471,15 @@ mod order_tests {
             body.find(needle)
                 .unwrap_or_else(|| panic!("`{needle}` is not in execute"))
         };
-        let owner = at("data_dir_owner(&data)?");
-        let early = at("Some(ask_state(&data)?)");
-        let key_load = at("KeySource::load(");
         let drop_call = at("as_data_dir_owner(&data)");
-        let drop_checked = at("dropped?;");
-        let late = at("None => ask_state(&data)?");
         assert!(
-            owner < early,
-            "the owner is looked at before any question is asked"
+            drop_call < at("offline_sealer(&data, source)"),
+            "the stores are checked only after the drop"
         );
         assert!(
-            early < key_load,
-            "a root installation asks first, before the key"
+            drop_call < at("None => ask_state(&data)?"),
+            "another user's databases are asked about only after the drop"
         );
-        assert!(key_load < drop_call, "the key is read while root");
-        assert!(
-            drop_call < drop_checked && drop_checked < late,
-            "another user's databases are asked about only once the drop is known to have worked"
-        );
-        // The first question is asked only when there is no drop.
-        assert!(
-            body.contains("let early = if drops { None } else { Some(ask_state(&data)?) };"),
-            "the question may be asked before the drop only when there is none"
-        );
-        assert!(
-            body.contains("let drops = crate::cli::userns::data_dir_owner(&data)?.is_some();"),
-            "whether there is a drop is decided by the owner of the directory"
-        );
-        // And nowhere else.
-        assert_eq!(body.matches("ask_state(&data)").count(), 2);
-        assert!(!body.contains("plan_state("));
-    }
-
-    /// Over the directory of another user, root reads the key and nothing
-    /// else: the check of the stores against it and the opening of the
-    /// keystore are the owner's, after the drop. A root installation, where
-    /// there is no drop, loads and checks everything first, as it always did.
-    #[test]
-    fn the_stores_of_another_users_directory_are_checked_by_its_owner_after_the_drop() {
-        let source = include_str!("upgrade.rs");
-        let function = |header: &str| {
-            source
-                .split(header)
-                .nth(1)
-                .and_then(|rest| rest.split("\nfn ").next())
-                .unwrap_or_else(|| panic!("the source of {header}"))
-        };
-        let body = function("fn execute(");
-        let sealer = function("fn offline_sealer(");
-        let at = |needle: &str| {
-            body.find(needle)
-                .unwrap_or_else(|| panic!("`{needle}` is not in execute"))
-        };
-        let master = at("KeySource::load_master(");
-        let full = at("KeySource::load(");
-        let drop_call = at("as_data_dir_owner(&data)");
-        let sealed = at("offline_sealer(&data, source)");
-        assert!(
-            master < drop_call && full < drop_call,
-            "the key is read while root"
-        );
-        assert!(
-            drop_call < sealed,
-            "the stores are checked and the keystore opened after the drop"
-        );
-        // Only a directory of another user takes the key alone; the full load,
-        // which copies and opens the stores, is for the root installation.
-        assert!(body.contains("let source = if drops {"));
-        assert!(body.contains("} else if data.join(\"keys/keystore.db\").exists() {"));
-        // The stores are checked in `offline_sealer`, after the drop, and nowhere
-        // that runs before it.
-        assert!(!body.contains("validate_staged_stores"));
-        assert!(sealer.contains("validate_staged_stores"));
-        assert!(sealer.contains("offline_sealer_with("));
     }
 }
 
