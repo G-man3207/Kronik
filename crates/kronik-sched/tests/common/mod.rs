@@ -85,6 +85,35 @@ pub async fn wait_turn(ingress: Ingress) -> Result<TurnResult, ApiError> {
     }
 }
 
+/// The plain text of an HTTP answer's inline body; panics on any other answer.
+pub fn http_text(r: &TurnResult) -> String {
+    match &r.outcome.output {
+        Some(pb::outcome::Output::Http(h)) => {
+            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
+                Some(pb::body::Value::Inline(s)) => match &s.value {
+                    Some(pb::sealable::Value::Plain(b)) => String::from_utf8_lossy(b).into_owned(),
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The blob of an HTTP answer's body; panics on any other answer.
+pub fn http_blob(r: &TurnResult) -> pb::BlobRef {
+    match &r.outcome.output {
+        Some(pb::outcome::Output::Http(h)) => {
+            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
+                Some(pb::body::Value::Blob(blob)) => blob.clone(),
+                other => panic!("not a blob: {other:?}"),
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 impl Proc {
     /// A fresh live operator lease.
     pub fn owner(&self) -> AuthLease {
@@ -158,6 +187,26 @@ impl Proc {
                 .await
                 .unwrap()
                 .to_vec()
+        })
+    }
+
+    /// A blob of `bytes` written into the node's store as the gateway
+    /// writes an upload, made durable, its lease ended; no record
+    /// references it.
+    pub fn write_upload(&self, bytes: &[u8]) -> pb::BlobRef {
+        let store = self.node.blob_store().unwrap().clone();
+        self.rt.block_on(async move {
+            let mut w = store
+                .writer(Space::Main, None, u64::MAX, store.leases().take("upload"))
+                .await
+                .unwrap();
+            w.write(bytes).await.unwrap();
+            let meta = w.finish().await.unwrap();
+            store
+                .ensure_durable(&Space::Main, &[meta.id])
+                .await
+                .unwrap();
+            meta.to_pb()
         })
     }
 }

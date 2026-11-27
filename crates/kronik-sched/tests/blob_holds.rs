@@ -24,7 +24,7 @@ mod common;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{Proc, audit, msg, start_proc, wait_turn};
+use common::{Proc, audit, http_text, msg, start_proc, wait_turn};
 use kronik_blob::SweepOptions;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
@@ -107,22 +107,6 @@ fn retained_reply(answer: &str) -> pb::BlobRef {
             .and_then(|rest| rest.strip_suffix(" retained"))
             .unwrap_or_else(|| panic!("{answer}")),
     )
-}
-
-/// The text answer of a committed turn.
-fn text_of(r: &TurnResult) -> String {
-    match &r.outcome.output {
-        Some(pb::outcome::Output::Http(h)) => {
-            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
-                Some(pb::body::Value::Inline(s)) => match &s.value {
-                    Some(pb::sealable::Value::Plain(b)) => String::from_utf8_lossy(b).into_owned(),
-                    other => panic!("{other:?}"),
-                },
-                other => panic!("{other:?}"),
-            }
-        }
-        other => panic!("{other:?}"),
-    }
 }
 
 /// The recorded `actor.call` effects of `media/<key>`'s committed turns.
@@ -212,32 +196,14 @@ impl Proc {
 
     /// A blob of `size` bytes written as the gateway writes an upload.
     fn upload(&self, size: usize) -> pb::BlobRef {
-        let store = self.node.blob_store().unwrap().clone();
-        self.rt.block_on(async move {
-            let mut w = store
-                .writer(
-                    kronik_blob::Space::Main,
-                    None,
-                    u64::MAX,
-                    store.leases().take("upload"),
-                )
-                .await
-                .unwrap();
-            w.write(&vec![9u8; size]).await.unwrap();
-            let meta = w.finish().await.unwrap();
-            store
-                .ensure_durable(&kronik_blob::Space::Main, &[meta.id])
-                .await
-                .unwrap();
-            meta.to_pb()
-        })
+        self.write_upload(&vec![9u8; size])
     }
 
     /// [`Proc::run`] of a turn that commits; its text answer.
     fn ok(&self, key: &str, op: &str, query: &str) -> String {
         let r = self.run(key, op, query, b"");
         assert!(r.committed(), "{op}?{query}: {r:?}");
-        text_of(&r)
+        http_text(&r)
     }
 
     /// An operator's message `name` (`op?query`) to `media/<key>`, as
@@ -609,13 +575,13 @@ fn a_message_turn_calling_a_blob_writer_finishes() {
     let p = start(dir.path(), true);
     let r = p.send("m", "call?to=w&op=write?size=1000&keep=1");
     assert!(r.committed(), "{r:?}");
-    let blob = retained_reply(&text_of(&r));
+    let blob = retained_reply(&http_text(&r));
     assert_eq!(blob.size, 1000);
     assert!(p.held("m", &blob));
     assert_eq!(p.open_turns(), 0);
     assert_blob_reply(&calls_of(&p.records(), "m")[0], &blob);
     // The next message runs and reads the blob it retained.
-    assert_eq!(text_of(&p.send("m", "held-sum")), pattern_sum(1000));
+    assert_eq!(http_text(&p.send("m", "held-sum")), pattern_sum(1000));
 }
 
 /// A message turn that stopped after its call had its answer, a blob the
@@ -640,7 +606,7 @@ fn a_rerun_message_turn_takes_the_saved_blob_answer() {
     assert_blob_reply(&calls[0], &blob);
     assert!(p.held("m", &blob));
     assert_eq!(p.turns("w"), 1, "the callee ran once");
-    assert_eq!(text_of(&p.send("m", "held-sum")), pattern_sum(1000));
+    assert_eq!(http_text(&p.send("m", "held-sum")), pattern_sum(1000));
 }
 
 /// The state rebuilt from the log equals the live one, holds and pins
