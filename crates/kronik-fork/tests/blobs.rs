@@ -166,15 +166,7 @@ fn upload(p: &Proc, dir: &std::path::Path, bytes: &[u8]) -> pb::BlobRef {
 #[test]
 fn a_fork_replays_blob_turns_without_divergence() {
     let dir = tempdir();
-    let p = Proc::start_with(
-        dir.path(),
-        NodeConfig {
-            concurrency: 8,
-            blobs: Some(BlobsConfig::default()),
-            ..NodeConfig::default()
-        },
-    );
-    p.deploy("media");
+    let p = blob_node(dir.path());
     let owner = p.owner();
     p.rt.block_on(p.node.set_limits(
         pb::Limits {

@@ -1067,13 +1067,7 @@ fn identity_replay_over_turns_past_their_effect_bytes_is_empty() {
     use prost::Message as _;
     let (addr, hits) = server();
     let dir = tempdir();
-    let p = Proc::start_with(
-        dir.path(),
-        kronik_sched::NodeConfig {
-            concurrency: 8,
-            ..kronik_sched::NodeConfig::default()
-        },
-    );
+    let p = Proc::start(dir.path());
     p.grant("http:127.0.0.1");
     let fork_lsn = p.settle();
     let body = "a".repeat(20 << 10);
@@ -1593,13 +1587,7 @@ fn identity_replay_over_a_call_lost_to_a_restart_is_empty() {
     assert!(!r.committed(), "{:?}", r.outcome);
     // The queued call goes with the process.
     drop(p);
-    let p = Proc::open(
-        dir.path(),
-        kronik_sched::NodeConfig {
-            concurrency: 8,
-            ..kronik_sched::NodeConfig::default()
-        },
-    );
+    let p = Proc::reopen(dir.path());
     let closed: Vec<pb::TurnRecord> = turns_after(&p, fork_lsn)
         .into_iter()
         .map(|(_, t)| t)
