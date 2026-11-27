@@ -372,7 +372,8 @@ fn the_admin_listener_streams_a_blobs_bytes() {
 }
 
 /// A 401 from the TLS admin listener carries the bearer challenge RFC 9110
-/// §15.5.2 requires, as the other API listeners' do (issue #392).
+/// §15.5.2 requires, as the other API listeners' do (issue #392). The event
+/// endpoints answer their own errors the same way (issue #780).
 #[test]
 fn an_unauthorized_admin_response_carries_the_bearer_challenge() {
     let dir = tempfile::tempdir().unwrap();
@@ -386,6 +387,9 @@ fn an_unauthorized_admin_response_carries_the_bearer_challenge() {
         d.log()
     );
     assert_eq!(answer.header("www-authenticate"), Some("Bearer"));
+    let events = d.admin_get("/v1/events", "kronik_wrong", false);
+    assert_eq!(events.status, 401);
+    assert_eq!(events.header("www-authenticate"), Some("Bearer"));
 }
 
 /// `bytes` with every `secret` replaced by `[secret:name]`, as the output
