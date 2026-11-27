@@ -226,20 +226,11 @@ fn sensitive_exchange(
 }
 
 /// Ordered, hashed event trace: the determinism fingerprint of a run.
+#[derive(Default)]
 pub struct Trace {
     hasher: blake3::Hasher,
     pub events: u64,
     recent: std::collections::VecDeque<String>,
-}
-
-impl Default for Trace {
-    fn default() -> Self {
-        Self {
-            hasher: blake3::Hasher::new(),
-            events: 0,
-            recent: std::collections::VecDeque::new(),
-        }
-    }
 }
 
 impl Trace {
@@ -268,5 +259,35 @@ impl Trace {
 
     pub fn recent(&self) -> Vec<String> {
         self.recent.iter().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use std::time::Duration;
+
+    use super::Trace;
+
+    /// A derived `Default` must hash the same lines as the hand-written one:
+    /// `blake3::Hasher::default` is `Hasher::new`, and the counters start empty.
+    #[test]
+    fn a_new_trace_hashes_the_same_lines_as_a_fresh_hasher() {
+        let mut trace = Trace::default();
+        assert_eq!(trace.events, 0);
+        assert!(trace.recent().is_empty());
+        assert_eq!(
+            trace.hash(),
+            blake3::Hasher::new().finalize().to_hex()[..16].to_string()
+        );
+
+        trace.push(Duration::from_micros(12), "node started".to_string());
+        trace.push(Duration::from_millis(3), "drain quiet".to_string());
+        let mut hasher = blake3::Hasher::new();
+        for line in trace.recent() {
+            hasher.update(line.as_bytes());
+            hasher.update(b"\n");
+        }
+        assert_eq!(trace.events, 2);
+        assert_eq!(trace.hash(), hasher.finalize().to_hex()[..16].to_string());
     }
 }
