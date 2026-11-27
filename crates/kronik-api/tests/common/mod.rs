@@ -7,7 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
 use std::collections::BTreeSet;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
@@ -69,23 +69,33 @@ impl Authenticator for Reader {
     }
 }
 
-/// A plain HTTP server on a free port that answers every request with 200
-/// and the body `pong`, until the test process exits. Returns its address.
+/// A plain HTTP server on a free port that reads each request, body included,
+/// and answers every one with 200 and the body `pong`, until the test process
+/// exits. Returns its address.
 pub fn http_target() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut s) = stream else { continue };
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 1024];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                match s.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+        for stream in listener.incoming().flatten() {
+            let mut w = stream.try_clone().unwrap();
+            let mut r = BufReader::new(stream);
+            let mut len = 0usize;
+            loop {
+                let mut h = String::new();
+                if r.read_line(&mut h).unwrap_or(0) == 0 {
+                    break;
+                }
+                let h = h.trim_end().to_ascii_lowercase();
+                if h.is_empty() {
+                    break;
+                }
+                if let Some(v) = h.strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
                 }
             }
-            let _ = s.write_all(
+            let mut body = vec![0; len];
+            let _ = r.read_exact(&mut body);
+            let _ = w.write_all(
                 b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\npong",
             );
         }
@@ -103,4 +113,28 @@ pub async fn start_node(dir: &Path) -> Arc<Node> {
     )
     .await
     .unwrap()
+}
+
+/// A node over `dir` on a runtime of its own. Dropping the site drops the
+/// runtime with everything the node spawned: a crash.
+pub struct Site {
+    runtime: tokio::runtime::Runtime,
+    api: Arc<Api>,
+}
+
+impl Site {
+    pub fn start(dir: &Path) -> Site {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let api = runtime.block_on(async { Arc::new(Api::new(start_node(dir).await)) });
+        Site { runtime, api }
+    }
+
+    /// One call, as it answers: 503s are left to the caller.
+    pub fn call(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
+        self.runtime.block_on(call(&self.api, method, path, body))
+    }
 }

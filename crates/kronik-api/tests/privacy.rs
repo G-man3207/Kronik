@@ -4,53 +4,12 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::Path;
-use std::sync::Arc;
+mod common;
 
-use kronik_api::{Api, ApiRequest};
-use kronik_core::env::Env;
-use kronik_sched::{NodeConfig, start_local};
+use common::Site;
 use serde_json::{Value, json};
-use tokio::runtime::Runtime;
 
-/// A daemon on its own runtime; dropping it is a crash.
-struct Daemon {
-    rt: Runtime,
-    api: Arc<Api>,
-}
-
-impl Daemon {
-    fn start(dir: &Path) -> Daemon {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let api = rt.block_on(async {
-            let env = Env::real(tokio::runtime::Handle::current());
-            Arc::new(Api::new(
-                start_local(env, dir, NodeConfig::default()).await.unwrap(),
-            ))
-        });
-        Daemon { rt, api }
-    }
-
-    fn call(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
-        let r = self.rt.block_on(self.api.handle(ApiRequest {
-            method: method.into(),
-            path: path.into(),
-            query: String::new(),
-            body: if body.is_null() {
-                vec![]
-            } else {
-                body.to_string().into_bytes()
-            },
-            token_id: "unix:uid=0".into(),
-            bearer: None,
-        }));
-        (r.status, serde_json::from_slice(&r.body).unwrap())
-    }
-
+impl Site {
     fn status(&self) -> Value {
         let (s, v) = self.call("GET", "/v1/privacy", Value::Null);
         assert_eq!(s, 200, "{v}");
@@ -62,7 +21,7 @@ impl Daemon {
 fn the_privacy_mode_is_recorded_and_survives_restart_and_rebuild() {
     let dir = tempfile::tempdir().unwrap();
     let epoch = {
-        let d = Daemon::start(dir.path());
+        let d = Site::start(dir.path());
         assert_eq!(
             d.status(),
             json!({
@@ -151,7 +110,7 @@ fn the_privacy_mode_is_recorded_and_survives_restart_and_rebuild() {
         // The runtime and its tasks are dropped here: a crash.
     };
     {
-        let d = Daemon::start(dir.path());
+        let d = Site::start(dir.path());
         assert_eq!(
             (&d.status()["mode"], d.status()["epoch"].as_u64()),
             (&json!("on"), Some(epoch))
@@ -160,7 +119,7 @@ fn the_privacy_mode_is_recorded_and_survives_restart_and_rebuild() {
     // The materialized state is rebuilt from the log, the mode with it.
     std::fs::remove_file(dir.path().join("branches/main/state.db")).unwrap();
     let _ = std::fs::remove_file(dir.path().join("branches/main/state.db-wal"));
-    let d = Daemon::start(dir.path());
+    let d = Site::start(dir.path());
     assert_eq!(
         (&d.status()["mode"], d.status()["epoch"].as_u64()),
         (&json!("on"), Some(epoch))

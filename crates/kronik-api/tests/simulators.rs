@@ -5,44 +5,11 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
 use std::sync::Arc;
 
-use common::{call, start_node, wasm};
+use common::{call, http_target, start_node, wasm};
 use kronik_api::Api;
 use serde_json::{Value, json};
-
-/// An HTTP server answering 200 "ok" to everything.
-fn server() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let mut w = stream.try_clone().unwrap();
-            let mut r = BufReader::new(stream);
-            let mut len = 0usize;
-            loop {
-                let mut h = String::new();
-                if r.read_line(&mut h).unwrap_or(0) == 0 {
-                    break;
-                }
-                let h = h.trim_end().to_ascii_lowercase();
-                if h.is_empty() {
-                    break;
-                }
-                if let Some(v) = h.strip_prefix("content-length:") {
-                    len = v.trim().parse().unwrap_or(0);
-                }
-            }
-            let mut body = vec![0; len];
-            let _ = r.read_exact(&mut body);
-            let _ =
-                w.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
-        }
-    });
-    addr
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trace_shows_simulator_labels() {
@@ -51,7 +18,7 @@ async fn trace_shows_simulator_labels() {
     let proposals =
         kronik_fork::proposal::Proposals::open(node.clone(), dir.path().to_path_buf()).unwrap();
     let api = Arc::new(Api::new(node.clone()).with_proposals(Arc::new(proposals)));
-    let addr = server();
+    let addr = http_target();
     let (s, v) = call(
         &api,
         "POST",

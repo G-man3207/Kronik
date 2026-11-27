@@ -12,48 +12,17 @@
 mod common;
 
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{call, http_target, wasm};
-use kronik_api::Api;
-use kronik_core::env::Env;
-use kronik_sched::{NodeConfig, start_local};
+use common::{Site, http_target, wasm};
 use serde_json::{Value, json};
 
 const COVERAGE: &str = "secret-coverage.json";
 const SECRET: &str = "the-value-of-the-api-key";
 
-/// A node over `dir` on a runtime of its own. Dropping the site drops the
-/// runtime with everything the node spawned: a crash.
-struct Site {
-    runtime: tokio::runtime::Runtime,
-    api: Arc<Api>,
-}
-
 type Answers = Vec<(&'static str, u16, Value)>;
 
 impl Site {
-    fn start(dir: &Path) -> Site {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let api = runtime.block_on(async {
-            let env = Env::real(tokio::runtime::Handle::current());
-            Arc::new(Api::new(
-                start_local(env, dir, NodeConfig::default()).await.unwrap(),
-            ))
-        });
-        Site { runtime, api }
-    }
-
-    /// One call, as it answers: the tests below look at 503s themselves.
-    fn call(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
-        self.runtime.block_on(call(&self.api, method, path, body))
-    }
-
     /// A call that has to succeed. A change of the inventory (a deployment, a
     /// grant, a secret, the privacy mode) answers 503 SECRET_UNAVAILABLE for a
     /// moment, in the documented coverage window (ADR 0108); a client retries
