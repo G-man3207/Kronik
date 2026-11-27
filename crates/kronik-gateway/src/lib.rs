@@ -134,10 +134,11 @@ fn unreadable(e: std::io::Error) -> ApiError {
 
 /// The request's `Content-Length`, when it has a valid one.
 fn content_length(req: &HttpRequest) -> Option<u64> {
-    req.headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.trim().parse().ok())
+    header_values(req, "content-length")
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// An address or a CIDR block, such as `192.0.2.7`, `10.0.0.0/8` or
@@ -368,12 +369,7 @@ fn preview_target(req: &HttpRequest, domain: Option<&str>) -> Option<(String, St
             .map_or((rest, "/"), |i| (&rest[..i], &rest[i..]));
         return Some((id.to_owned(), path.to_owned()));
     };
-    let host = req
-        .headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("host"))?
-        .1
-        .to_ascii_lowercase();
+    let host = header_values(req, "host").next()?.to_ascii_lowercase();
     let host = host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h);
     let host = host.strip_suffix('.').unwrap_or(host);
     let id = host.strip_suffix(domain)?.strip_suffix('.')?;
@@ -656,11 +652,7 @@ fn hash_request(
         Some(s) => [b"subject\0".as_slice(), s.as_bytes()].concat(),
         None => {
             let mut h = blake3::Hasher::new();
-            for (_, v) in req
-                .headers
-                .iter()
-                .filter(|(n, _)| n.eq_ignore_ascii_case("authorization"))
-            {
+            for v in header_values(req, "authorization") {
                 h.update(&(v.len() as u64).to_le_bytes());
                 h.update(v.as_bytes());
             }
@@ -704,20 +696,11 @@ fn strip_admin_cookies(headers: &mut Vec<(String, String)>) {
             return true;
         }
         // Cookies cross ports on the same hostname; never admit admin credentials to a guest.
-        let mut kept = String::new();
-        for cookie in value
+        *value = value
             .split(';')
-            .filter(|cookie| !reserved_admin_cookie(cookie))
-        {
-            if cookie.trim().is_empty() {
-                continue;
-            }
-            if !kept.is_empty() {
-                kept.push(';');
-            }
-            kept.push_str(cookie);
-        }
-        *value = kept;
+            .filter(|cookie| !cookie.trim().is_empty() && !reserved_admin_cookie(cookie))
+            .collect::<Vec<_>>()
+            .join(";");
         !value.is_empty()
     });
 }
@@ -1750,13 +1733,10 @@ impl Gateway {
             kind: m.kind.clone(),
             key: key.to_owned(),
         };
-        let header = self.cfg.idempotency_header.as_str();
-        let idempotency_key = req
-            .headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(header))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
+        let idempotency_key = header_values(req, &self.cfg.idempotency_header)
+            .next()
+            .unwrap_or_default()
+            .to_owned();
         let subject = match &self.cfg.subject_from {
             None => None,
             Some(from) => {
