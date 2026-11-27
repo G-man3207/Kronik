@@ -310,13 +310,7 @@ pub fn is_blob_content(request: &ApiRequest) -> bool {
 }
 
 /// The streamed answer for [`is_blob_content`].
-pub async fn serve_blob_content(
-    api: Arc<Api>,
-    request: ApiRequest,
-    captured: crate::CapturedRequest,
-) -> hyper::Response<Body> {
-    crate::blobs::serve_content(api, request, captured).await
-}
+pub use crate::blobs::serve_content as serve_blob_content;
 
 /// One connection: HTTP/1.1 requests to the JSON API or to `mount`.
 async fn serve_connection<S>(

@@ -15,7 +15,7 @@ use crate::{Api, ApiResponse, AuthorizedRequest, Query, Result};
 use crate::{json, ok, reason};
 
 #[cfg(feature = "server")]
-pub(crate) use content::serve_content;
+pub use content::serve_content;
 
 /// `GET /v1/blobs/{hash}/content`: the hash, when `path` is that route.
 #[cfg(feature = "server")]
@@ -404,7 +404,7 @@ mod content {
     /// response has its exact `Content-Length`, and a failure in the second
     /// pass shows as a cut stream, never as a short success. A subject's
     /// blob needs `pii:read`.
-    pub(crate) async fn serve_content(
+    pub async fn serve_content(
         api: Arc<Api>,
         request: ApiRequest,
         captured: CapturedRequest,

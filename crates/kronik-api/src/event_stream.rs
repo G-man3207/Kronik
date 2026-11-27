@@ -15,7 +15,7 @@ use kronik_core::error::{ApiError, ErrorCode};
 use kronik_fleet::events::{Page, ResumeCursor};
 use tokio_tungstenite::tungstenite::{Message, protocol::Role};
 
-use crate::server::Body;
+use crate::server::{Body, error_response};
 use crate::{Api, ApiRequest, CapturedRequest, Query};
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -160,18 +160,6 @@ async fn send_websocket(
     }
 }
 
-fn response(error: ApiError) -> hyper::Response<Body> {
-    let mut response =
-        hyper::Response::new(Full::new(Bytes::from(error.to_json().to_string())).boxed());
-    *response.status_mut() = hyper::StatusCode::from_u16(error.code.http_status())
-        .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
-    response.headers_mut().insert(
-        hyper::header::CONTENT_TYPE,
-        hyper::header::HeaderValue::from_static("application/json"),
-    );
-    response
-}
-
 /// Serve an actual event HTTP request, capturing its ordinary authority once
 /// before touching the body. A capture for another route is never accepted.
 pub async fn serve(
@@ -185,14 +173,14 @@ pub async fn serve(
         || !(crate::events::STREAM_PATHS.contains(&request.path.as_str())
             || request.path == "/v1/events")
     {
-        return response(ApiError::new(
+        return error_response(&ApiError::new(
             ErrorCode::BadRequest,
             "invalid event stream request",
         ));
     }
     let captured = match api.capture(&request) {
         Ok(captured) => captured,
-        Err(error) => return response(error),
+        Err(error) => return error_response(&error),
     };
     request.bearer = None;
     req.headers_mut().remove(hyper::header::AUTHORIZATION);
@@ -237,7 +225,7 @@ pub(crate) async fn serve_page_captured(
     .await;
     let (value, original) = match prepared {
         Ok(prepared) => prepared,
-        Err(error) => return response(error),
+        Err(error) => return error_response(&error),
     };
     let retained = Bytes::from_owner(RetainedFrameBytes {
         bytes: value.body,
@@ -285,7 +273,7 @@ pub(crate) async fn serve_captured(
     })();
     let (authority, feed, cursor, source, env) = match setup {
         Ok(value) => value,
-        Err(error) => return response(error),
+        Err(error) => return error_response(&error),
     };
     if req.uri().path() == "/v1/events/ws" {
         let upgrade = hyper::upgrade::on(&mut req);
@@ -295,7 +283,7 @@ pub(crate) async fn serve_captured(
             match tokio_tungstenite::tungstenite::handshake::server::create_response(&handshake) {
                 Ok(response) => response,
                 Err(_) => {
-                    return response(ApiError::new(
+                    return error_response(&ApiError::new(
                         ErrorCode::BadRequest,
                         "invalid event WebSocket handshake",
                     ));
@@ -303,7 +291,7 @@ pub(crate) async fn serve_captured(
             };
         let first = match first_page(&feed, &cursor, &authority, source.as_deref()).await {
             Ok(page) => page,
-            Err(error) => return response(error),
+            Err(error) => return error_response(&error),
         };
         let (parts, _) = handshake.into_parts();
         let response = hyper::Response::from_parts(parts, Full::new(Bytes::new()).boxed());
@@ -349,7 +337,7 @@ pub(crate) async fn serve_captured(
     }
     let first = match first_page(&feed, &cursor, &authority, source.as_deref()).await {
         Ok(page) => page,
-        Err(error) => return response(error),
+        Err(error) => return error_response(&error),
     };
     let (send, receive) = tokio::sync::mpsc::channel::<QueuedFrame>(1);
     let stream = body_stream(receive);
@@ -633,7 +621,7 @@ mod tests {
             .unwrap();
         assert_eq!(error.code, kronik_core::error::ErrorCode::BadRequest);
         assert_eq!(
-            super::response(error).status(),
+            crate::server::error_response(&error).status(),
             hyper::StatusCode::BAD_REQUEST
         );
         assert!(
