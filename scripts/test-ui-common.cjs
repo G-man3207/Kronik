@@ -7,13 +7,10 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
+const { setTimeout: sleep } = require('node:timers/promises');
 
 const ui = path.join(__dirname, '..', 'ui');
 const chromeBin = process.env.KRONIK_CHROME || '/usr/bin/google-chrome';
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 async function devtoolsPort(profile) {
   const file = path.join(profile, 'DevToolsActivePort');
