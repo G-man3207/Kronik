@@ -22,7 +22,7 @@ fn actor(name: &str) -> SqlActor {
 }
 
 /// Runs one turn and applies it when every statement succeeded; returns the
-/// turn as logged (without the unsplit changeset) and the results.
+/// turn and the results.
 fn commit(
     a: &mut SqlActor,
     o: &TurnOpts,
@@ -32,11 +32,10 @@ fn commit(
     a.begin_turn(o).unwrap();
     let res: Vec<_> = stmts.iter().map(|q| a.query(q, &[])).collect();
     let ok = res.iter().all(Result::is_ok);
-    let mut t = a.end_turn(ok).unwrap();
+    let t = a.end_turn(ok).unwrap();
     if ok {
         a.apply(&t, lsn, &BTreeSet::new()).unwrap();
     }
-    t.whole.clear();
     (t, res)
 }
 
@@ -1115,9 +1114,7 @@ fn the_first_write_that_sees_a_secret_scrubs_untouched_cells() {
     );
     let mut rebuilt = actor("once-rebuilt");
     for (i, t) in [&schema_turn, &seed, &scan].into_iter().enumerate() {
-        let mut t = t.clone();
-        t.whole.clear();
-        rebuilt.apply(&t, i as u64 + 1, &BTreeSet::new()).unwrap();
+        rebuilt.apply(t, i as u64 + 1, &BTreeSet::new()).unwrap();
     }
     rebuilt.begin_turn(&opts(5, 5, false)).unwrap();
     let again = rebuilt
@@ -1192,11 +1189,6 @@ fn a_seen_secret_is_scrubbed_from_written_cells_without_scanning() {
     );
     assert_eq!(a.last_scrub_fullscan_steps, 0, "SQL end scanned the table");
     let t = a.end_turn(true).unwrap();
-    assert!(
-        !holds(&t.whole, text.as_bytes()),
-        "the log holds the text secret"
-    );
-    assert!(!holds(&t.whole, binary), "the log holds the binary secret");
     for (_, cs) in &t.changesets {
         assert!(!holds(cs, text.as_bytes()), "the log holds the text secret");
         assert!(!holds(cs, binary), "the log holds the binary secret");
@@ -1302,7 +1294,7 @@ fn an_erasure_during_a_turn_is_not_rolled_back_by_its_end() {
         .unwrap();
     // The erasure's record is applied while the turn is open.
     a.erase_subject("user:1", 4).unwrap();
-    let mut t = a.end_turn(true).unwrap();
+    let t = a.end_turn(true).unwrap();
     assert!(
         t.changesets
             .iter()
@@ -1310,7 +1302,6 @@ fn an_erasure_during_a_turn_is_not_rolled_back_by_its_end() {
         "the erasure's deletes became the turn's changes: {t:?}"
     );
     assert_eq!(a.applied_lsn().unwrap(), 4, "the erasure was rolled back");
-    t.whole.clear();
     a.apply(&t, 5, &BTreeSet::new()).unwrap();
     a.begin_turn(&opts(6, 6, false)).unwrap();
     let rows = a

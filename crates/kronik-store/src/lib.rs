@@ -733,8 +733,6 @@ impl Store {
             ddl: t.sql_schema.iter().map(|s| s.statement.clone()).collect(),
             changesets,
             vm_steps: 0,
-            // Not in the log. apply combines `changesets` (ADR 0160).
-            whole: Vec::new(),
         };
         let applied = if let Some(rewrite) = self.sql_rewrite() {
             db.apply_rewriting(&turn, lsn, &BTreeSet::new(), rewrite.as_ref())

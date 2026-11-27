@@ -496,9 +496,9 @@ rebuilds, forks and replay apply the per-subject changesets from the log. M1
 built one path instead (`docs/design/m1-core.md` §7): the applier reads the
 turn record and applies its per-subject changesets, one
 `sqlite3changeset_apply_v2` call each, live as on a rebuild, so a live apply
-and a rebuild cannot differ. The unsplit changeset is not written to the log
-and only tests apply it. The one-call-each part is superseded by the
-amendment below.
+and a rebuild cannot differ. The unsplit changeset is not written to the log,
+and nothing applies it. The one-call-each part is superseded by the amendment
+below.
 
 ## Amendment (2026-11-19): one apply sees every subject's changes
 
