@@ -5,6 +5,11 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- Engine updated to Wasmtime 50.0.3 (RUSTSEC-2026-0566 through 0573 and
+  RUSTSEC-2026-0587), with the same features and configuration. The engine is
+  now `kronik-0.6.0-dev+wasmtime-50.0.3`; data written by an earlier engine
+  still needs a passing `kronik upgrade check` before the new daemon serves it
+  (ADR 0001). `url` moves to 2.5.9 (RUSTSEC-2026-0592).
 - A pre-commit hook runs formatting, the determinism hygiene and `cargo deny`.
   `npm ci` at the repository root installs the pinned Husky that points Git
   at it (ADR 0163). `git commit --no-verify` skips the hook. Hosted CI is

@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-10-24
 - **Updated:** 2026-10-30 (security patch and upgrade contract), 2026-11-25
-  (engine version literal)
+  (engine version literal), 2026-11-27 (security patch to 50.0.3)
 
 ## Context
 
@@ -380,3 +380,19 @@ the transitive `wasmtime-environ`, and
 `ENGINE_VERSION` names `KRONIK_VERSION` and `WASMTIME_VERSION`. A Wasmtime
 upgrade that moves the lockfile past the literal therefore fails the first
 test, and an edit to only one of the two literals fails the second.
+
+## Amendment (2026-11-27): security patch to Wasmtime 50.0.3
+
+The five Wasmtime packages move from 50.0.1 to 50.0.3, the first 50.x release
+for [RUSTSEC-2026-0566](https://rustsec.org/advisories/RUSTSEC-2026-0566)
+through [0573](https://rustsec.org/advisories/RUSTSEC-2026-0573) and
+[RUSTSEC-2026-0587](https://rustsec.org/advisories/RUSTSEC-2026-0587). It
+follows the §3 contract: the workspace pins and both literals above become
+`"50.0.3"`, features and the engine configuration are unchanged, and no
+advisory is ignored. The lockfile change is the Wasmtime and Cranelift
+families only; `wasmparser` stays at 0.261.0.
+
+The recorded engine identity changes with it, so data written by a 50.0.1
+engine needs a passing `kronik upgrade check` for the exact pair before the
+new daemon serves it. That check against data from a real 50.0.1 binary has
+not been run for this patch yet; it is required before the next release.

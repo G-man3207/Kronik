@@ -36,14 +36,14 @@ kronik-ui = { path = "crates/kronik-ui" }
 # therefore of replay identity. `kronik-runtime` repeats it as a literal and
 # checks that literal against the Wasmtime packages in Cargo.lock. Features
 # are enabled by the crates that use them.
-wasmtime = { version = "=50.0.1", default-features = false }
+wasmtime = { version = "=50.0.3", default-features = false }
 # Same version as Wasmtime 50 uses, for the deploy-time import check.
 wasmparser = { version = "0.261.0", default-features = false, features = ["std", "component-model"] }
-wasmtime-wasi = { version = "=50.0.1", default-features = false, features = ["p2"] }
-wasmtime-wasi-io = { version = "=50.0.1", default-features = false, features = ["std"] }
+wasmtime-wasi = { version = "=50.0.3", default-features = false, features = ["p2"] }
+wasmtime-wasi-io = { version = "=50.0.3", default-features = false, features = ["std"] }
 # Standard `fetch` (M22, ADR 0070): p2 only. Never `default-send-request`
 # (its own network stack and TLS roots) or `p3` (experimental in Wasmtime 50).
-wasmtime-wasi-http = { version = "=50.0.1", default-features = false, features = ["p2"] }
+wasmtime-wasi-http = { version = "=50.0.3", default-features = false, features = ["p2"] }
 
 clap = { version = "4.6.7", features = ["derive", "env"] }
 anyhow = "1"
@@ -136,7 +136,7 @@ aho-corasick = "1.1"
 ring = "0.17.14"
 jsonwebtoken = { version = "=10.4.0", default-features = false }
 signature = { version = "2.2.0", default-features = false, features = ["std"] }
-url = "2.5.8"
+url = "2.5.9"
 zeroize = "1.9.1"
 # Optional GNU-only PKCS#11 helper (ADR 0093); never linked into the daemon.
 cryptoki = { version = "=0.12.1", default-features = false }
