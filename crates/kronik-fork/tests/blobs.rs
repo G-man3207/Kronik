@@ -90,6 +90,36 @@ fn answer(r: &TurnResult) -> String {
     }
 }
 
+/// Raises the media kind's fuel for the blob-heavy operations.
+fn media_fuel(p: &Proc) {
+    p.rt.block_on(p.node.set_limits(
+        pb::Limits {
+            kind: "media".into(),
+            fuel: Some(2_000_000_000),
+            ..Default::default()
+        },
+        audit(),
+        false,
+        p.owner(),
+    ))
+    .unwrap();
+}
+
+/// The media code with a custom section added: another component, as
+/// a proposal needs, that runs the same.
+fn media_v2() -> Vec<u8> {
+    let mut v2 = std::fs::read(guest("media")).unwrap();
+    v2.extend_from_slice(&[0x00, 0x07, 0x04, b't', b'e', b's', b't', b'v', b'2']);
+    v2
+}
+
+/// A proposal of [`media_v2`].
+fn propose_media_v2(p: &Proc, props: &Arc<Proposals>) -> kronik_fork::proposal::Proposal {
+    p.rt.block_on(props.propose(propose_request(vec![media_v2()]), p.owner()))
+        .unwrap()
+        .0
+}
+
 /// A blob written into the node's store from outside, as the gateway
 /// writes an upload (slice B8).
 fn upload(p: &Proc, dir: &std::path::Path, bytes: &[u8]) -> pb::BlobRef {
@@ -348,41 +378,11 @@ fn a_preview_takes_uploads_and_streams_blob_answers_in_its_space() {
     use kronik_gateway::{Gateway, GatewayConfig, HttpRequest, PREVIEW_PREFIX};
     let dir = tempdir();
     let p = blob_node(dir.path());
-    p.rt.block_on(p.node.set_limits(
-        pb::Limits {
-            kind: "media".into(),
-            fuel: Some(2_000_000_000),
-            ..Default::default()
-        },
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
+    media_fuel(&p);
     ingress(&p, http("info", "", inline(b"x")));
     p.settle();
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
-    let (proposal, _) =
-        p.rt.block_on(props.propose(
-            kronik_fork::proposal::ProposeRequest {
-                // The same code with a custom section added: another
-                // component, as a proposal needs, that runs the same.
-                wasm: vec![{
-                    let mut v2 = std::fs::read(guest("media")).unwrap();
-                    v2.extend_from_slice(&[0x00, 0x07, 0x04, b't', b'e', b's', b't', b'v', b'2']);
-                    v2
-                }],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
-            },
-            p.owner(),
-        ))
-        .unwrap();
+    let proposal = propose_media_v2(&p, &props);
     let (preview, _) =
         p.rt.block_on(props.create_preview(&proposal.id, None, false, audit(), false, p.owner()))
             .unwrap();
@@ -476,25 +476,7 @@ fn a_preview_upload_creates_no_subject_key() {
     ingress(&p, http("info", "", inline(b"x")));
     p.settle();
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
-    let (proposal, _) =
-        p.rt.block_on(props.propose(
-            kronik_fork::proposal::ProposeRequest {
-                wasm: vec![{
-                    let mut v2 = std::fs::read(guest("media")).unwrap();
-                    v2.extend_from_slice(&[0x00, 0x07, 0x04, b't', b'e', b's', b't', b'v', b'2']);
-                    v2
-                }],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
-            },
-            p.owner(),
-        ))
-        .unwrap();
+    let proposal = propose_media_v2(&p, &props);
     let (preview, _) =
         p.rt.block_on(props.create_preview(&proposal.id, None, false, audit(), false, p.owner()))
             .unwrap();
@@ -554,17 +536,7 @@ fn a_rollback_by_replay_brings_its_blobs_into_main() {
     use kronik_fork::proposal::RebaseRequest;
     let dir = tempdir();
     let p = blob_node(dir.path());
-    p.rt.block_on(p.node.set_limits(
-        pb::Limits {
-            kind: "media".into(),
-            fuel: Some(2_000_000_000),
-            ..Default::default()
-        },
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
+    media_fuel(&p);
     ingress(&p, http("info", "", inline(b"x")));
     p.settle();
     p.rt.block_on(p.node.snapshot("before the deployment", p.owner()))
@@ -576,20 +548,8 @@ fn a_rollback_by_replay_brings_its_blobs_into_main() {
     );
     let alt = std::fs::read(guest("media-alt")).unwrap();
     let (prop, _) =
-        p.rt.block_on(props.propose(
-            kronik_fork::proposal::ProposeRequest {
-                wasm: vec![alt],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
-            },
-            p.owner(),
-        ))
-        .unwrap();
+        p.rt.block_on(props.propose(propose_request(vec![alt]), p.owner()))
+            .unwrap();
     let promoted =
         p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap();
@@ -672,17 +632,7 @@ fn a_previews_blob_space_is_capped_and_goes_with_the_preview() {
     use kronik_gateway::{Gateway, GatewayConfig, HttpRequest, PREVIEW_PREFIX};
     let dir = tempdir();
     let p = blob_node(dir.path());
-    p.rt.block_on(p.node.set_limits(
-        pb::Limits {
-            kind: "media".into(),
-            fuel: Some(2_000_000_000),
-            ..Default::default()
-        },
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
+    media_fuel(&p);
     ingress(&p, http("info", "", inline(b"x")));
     p.settle();
     let props = Arc::new(
@@ -690,25 +640,7 @@ fn a_previews_blob_space_is_capped_and_goes_with_the_preview() {
             .unwrap()
             .with_preview_blob_bytes(3_500_000),
     );
-    let (proposal, _) =
-        p.rt.block_on(props.propose(
-            kronik_fork::proposal::ProposeRequest {
-                wasm: vec![{
-                    let mut v2 = std::fs::read(guest("media")).unwrap();
-                    v2.extend_from_slice(&[0x00, 0x07, 0x04, b't', b'e', b's', b't', b'v', b'2']);
-                    v2
-                }],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
-            },
-            p.owner(),
-        ))
-        .unwrap();
+    let proposal = propose_media_v2(&p, &props);
     let create = |ttl: Option<Duration>| {
         p.rt.block_on(props.create_preview(&proposal.id, ttl, false, audit(), false, p.owner()))
             .unwrap()
@@ -796,41 +728,11 @@ fn a_preview_takes_uploads_as_blobs_after_a_restart() {
     let dir = tempdir();
     let preview = {
         let p = blob_node(dir.path());
-        p.rt.block_on(p.node.set_limits(
-            pb::Limits {
-                kind: "media".into(),
-                fuel: Some(2_000_000_000),
-                ..Default::default()
-            },
-            audit(),
-            false,
-            p.owner(),
-        ))
-        .unwrap();
+        media_fuel(&p);
         ingress(&p, http("info", "", inline(b"x")));
         p.settle();
         let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
-        let (proposal, _) =
-            p.rt.block_on(props.propose(
-                kronik_fork::proposal::ProposeRequest {
-                    wasm: vec![{
-                        let mut v2 = std::fs::read(guest("media")).unwrap();
-                        v2.extend_from_slice(&[
-                            0x00, 0x07, 0x04, b't', b'e', b's', b't', b'v', b'2',
-                        ]);
-                        v2
-                    }],
-                    names: Vec::new(),
-                    window_ms: None,
-                    at: None,
-                    options: DiffOptions::default(),
-                    workers: Some(2),
-                    audit: audit(),
-                    dry_run: false,
-                },
-                p.owner(),
-            ))
-            .unwrap();
+        let proposal = propose_media_v2(&p, &props);
         let (preview, _) = p
             .rt
             .block_on(props.create_preview(&proposal.id, None, false, audit(), false, p.owner()))
@@ -883,17 +785,7 @@ fn a_preview_seals_a_new_subjects_blobs_and_refuses_an_erased_ones() {
     const MARK: &[u8] = b"P1-PREVIEW-MARK-7f3a";
     let dir = tempdir();
     let p = blob_node(dir.path());
-    p.rt.block_on(p.node.set_limits(
-        pb::Limits {
-            kind: "media".into(),
-            fuel: Some(2_000_000_000),
-            ..Default::default()
-        },
-        audit(),
-        false,
-        p.owner(),
-    ))
-    .unwrap();
+    media_fuel(&p);
     p.rt.block_on(
         p.node
             .set_privacy_mode(pb::PrivacyState::On, audit(), false, p.owner()),
@@ -902,25 +794,7 @@ fn a_preview_seals_a_new_subjects_blobs_and_refuses_an_erased_ones() {
     ingress(&p, http("info", "", inline(b"x")));
     p.settle();
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
-    let (proposal, _) =
-        p.rt.block_on(props.propose(
-            kronik_fork::proposal::ProposeRequest {
-                wasm: vec![{
-                    let mut v2 = std::fs::read(guest("media")).unwrap();
-                    v2.extend_from_slice(&[0x00, 0x07, 0x04, b't', b'e', b's', b't', b'v', b'2']);
-                    v2
-                }],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
-            },
-            p.owner(),
-        ))
-        .unwrap();
+    let proposal = propose_media_v2(&p, &props);
     let (preview, _) =
         p.rt.block_on(props.create_preview(&proposal.id, None, false, audit(), false, p.owner()))
             .unwrap();
