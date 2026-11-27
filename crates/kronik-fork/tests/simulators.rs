@@ -12,7 +12,7 @@ use common::*;
 use kronik_core::error::ErrorCode;
 use kronik_effects::InForks;
 use kronik_fork::diff::DiffOptions;
-use kronik_fork::proposal::Proposals;
+use kronik_fork::proposal::{Proposals, ProposeRequest};
 use kronik_fork::simulators::{ModelAccess, ModelCache, ModelSecretSnapshot, SimulatorOverride};
 use kronik_fork::stubs::StubRule;
 use kronik_policy::{Action, RuleSet};
@@ -429,15 +429,10 @@ fn a_dry_run_proposal_calls_no_model_and_writes_nothing() {
     let before = branches(dir.path());
     let err =
         p.rt.block_on(props.propose(
-            kronik_fork::proposal::ProposeRequest {
-                wasm: vec![std::fs::read(guest("counter-fetch-extra")).unwrap()],
-                names: vec![],
-                window_ms: None,
+            ProposeRequest {
                 at: Some(fork_lsn),
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
                 dry_run: true,
+                ..propose_request(vec![std::fs::read(guest("counter-fetch-extra")).unwrap()])
             },
             p.owner(),
         ))
@@ -484,15 +479,9 @@ fn a_dry_run_promote_calls_no_model_and_writes_nothing() {
     );
     let (meta, _) =
         p.rt.block_on(props.propose(
-            kronik_fork::proposal::ProposeRequest {
-                wasm: vec![std::fs::read(guest("counter-fetch-extra")).unwrap()],
-                names: vec![],
-                window_ms: None,
+            ProposeRequest {
                 at: Some(fork_lsn),
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
+                ..propose_request(vec![std::fs::read(guest("counter-fetch-extra")).unwrap()])
             },
             p.owner(),
         ))

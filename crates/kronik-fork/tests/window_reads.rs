@@ -9,11 +9,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::{Proc, ShiftedClock, audit, guest, tempdir};
+use common::{Proc, ShiftedClock, guest, propose_request, tempdir};
 use kronik_core::env::test_fs::{FsCall, Then, hooked};
 use kronik_core::ids::Lsn;
 use kronik_fork::ProductionIndex;
-use kronik_fork::diff::DiffOptions;
 use kronik_fork::proposal::{Proposals, ProposeRequest};
 use kronik_sched::NodeConfig;
 use kronik_sched::snapshots::StorageConfig;
@@ -114,14 +113,8 @@ fn a_default_propose_does_not_read_the_retained_span() {
     let prop =
         p.rt.block_on(props.propose(
             ProposeRequest {
-                wasm: vec![wasm],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
                 workers: Some(1),
-                audit: audit(),
-                dry_run: false,
+                ..propose_request(vec![wasm])
             },
             p.owner(),
         ))
