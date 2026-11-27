@@ -20,7 +20,7 @@ use kronik_proto::log::v1 as pb;
 use kronik_sched::snapshots::StorageConfig;
 use kronik_sched::{Ingress, Node, NodeConfig, TurnResult, start_local};
 use kronik_store::Store;
-use kronik_store::sql::{Limits, MemOpener, SqlPool};
+use kronik_store::sql::{MemOpener, SqlPool};
 use tokio::runtime::Runtime;
 
 fn start(dir: &Path, kept: usize) -> Proc {
@@ -173,7 +173,7 @@ fn tempdir() -> tempfile::TempDir {
 fn rebuilt_hash(records: &[kronik_log::Committed]) -> String {
     let store = Store::open(
         rusqlite::Connection::open_in_memory().unwrap(),
-        SqlPool::new(Arc::new(MemOpener), Limits::default(), usize::MAX),
+        SqlPool::new(Arc::new(MemOpener), usize::MAX),
     )
     .unwrap();
     store.apply(records).unwrap();
@@ -1628,7 +1628,6 @@ fn a_read_only_plan_does_not_pass_when_an_actor_database_cannot_be_read() {
             Arc::new(kronik_store::sql::FileOpener {
                 root: branch.join("sql"),
             }),
-            Limits::default(),
             8,
         ),
     )

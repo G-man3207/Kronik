@@ -787,7 +787,7 @@ fn fk_runtime() -> tokio::runtime::Runtime {
 type SubjectChanges = Vec<(Option<String>, Vec<u8>)>;
 
 fn fk_changes(schema: &[&str], inserts: &[&str]) -> (Vec<String>, SubjectChanges) {
-    use kronik_store::sql::{Limits, MemOpener, SqlActor, TurnOpts};
+    use kronik_store::sql::{MemOpener, SqlActor, TurnOpts};
     let opts = |seed: u8, subject: Option<&str>, migrate: bool| TurnOpts {
         seed: [seed; 32],
         time_ms: i64::from(seed),
@@ -796,7 +796,7 @@ fn fk_changes(schema: &[&str], inserts: &[&str]) -> (Vec<String>, SubjectChanges
         sql_budget: 50_000_000,
         max_bytes: 0,
     };
-    let mut actor = SqlActor::open(&MemOpener, "notes/n", Limits::default()).unwrap();
+    let mut actor = SqlActor::open(&MemOpener, "notes/n").unwrap();
     actor.begin_turn(&opts(1, None, true)).unwrap();
     for statement in schema {
         actor.query(statement, &[]).unwrap();

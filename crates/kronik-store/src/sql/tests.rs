@@ -18,7 +18,7 @@ fn opts(seed: u8, time_ms: i64, migrate: bool) -> TurnOpts {
 }
 
 fn actor(name: &str) -> SqlActor {
-    SqlActor::open(&MemOpener, name, Limits::default()).unwrap()
+    SqlActor::open(&MemOpener, name).unwrap()
 }
 
 /// Runs one turn and applies it when every statement succeeded; returns the
@@ -189,12 +189,11 @@ fn physical_diagnostics_are_denied_in_guest_private_prepare_and_schema_replay() 
     }
     let root = tempfile::tempdir().unwrap();
     for pool in [
-        SqlPool::new(Arc::new(MemOpener), Limits::default(), 8),
+        SqlPool::new(Arc::new(MemOpener), 8),
         SqlPool::new(
             Arc::new(FileOpener {
                 root: root.path().to_owned(),
             }),
-            Limits::default(),
             8,
         ),
     ] {
@@ -340,6 +339,42 @@ fn a_caught_sql_error_without_tables_does_not_fail_the_turn() {
     assert!(t.changesets.is_empty());
 }
 
+/// ADR 0005 §5: a string or blob is at most 1 MiB (`SQLITE_LIMIT_LENGTH`),
+/// and so is `randomblob`.
+#[test]
+fn a_value_over_one_mib_is_too_large() {
+    let mut a = actor("value-size");
+    a.begin_turn(&opts(1, 1, false)).unwrap();
+    let mib = 1usize << 20;
+    let blob = |n: usize| Value::Blob(vec![0; n]);
+    let fits = a.query("SELECT length(?1)", &[blob(mib)]).unwrap();
+    assert_eq!(fits.values[0][0], Value::Integer(mib as i64));
+    let over = a.query("SELECT length(?1)", &[blob(mib + 1)]);
+    assert_eq!(over, Err(SqlError::TooLarge), "a blob of one byte more");
+    let over = a.query("SELECT length(?1)", &[Value::Text("x".repeat(mib + 1))]);
+    assert_eq!(over, Err(SqlError::TooLarge), "a string of one byte more");
+    let drawn = a.query("SELECT randomblob(?1)", &[Value::Integer(mib as i64 + 1)]);
+    assert_eq!(drawn, Err(SqlError::TooLarge));
+    a.end_turn(false).unwrap();
+}
+
+/// ADR 0005 §5: a turn that gives no size limit of its own gets 1 GiB.
+#[test]
+fn a_turn_without_a_size_limit_gets_one_gib() {
+    let mut a = actor("size-cap");
+    a.begin_turn(&opts(1, 1, false)).unwrap();
+    let page_size: i64 = a
+        .conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap();
+    let max_page_count: i64 = a
+        .conn
+        .query_row("PRAGMA max_page_count", [], |r| r.get(0))
+        .unwrap();
+    a.end_turn(false).unwrap();
+    assert_eq!(max_page_count, (1 << 30) / page_size);
+}
+
 /// R1 (v0.1 re-review): a snapshot copy is taken while an actor turn has
 /// `SAVEPOINT kronik_turn` open (between its statements). `VACUUM INTO`
 /// on the actor's own connection refused that ("cannot VACUUM from within
@@ -351,7 +386,7 @@ fn a_copy_during_an_open_turn_holds_the_applied_rows() {
     let opener = FileOpener {
         root: dir.path().to_path_buf(),
     };
-    let mut a = SqlActor::open(&opener, "notes/n", Limits::default()).unwrap();
+    let mut a = SqlActor::open(&opener, "notes/n").unwrap();
     commit_ok(&mut a, &opts(1, 1_000, true), &SCHEMA[..1], 1);
     commit_ok(
         &mut a,
@@ -1209,7 +1244,7 @@ fn reopening_an_actor_does_not_rescan_a_scrubbed_secret() {
     };
     let text: &[u8] = b"sk-live-0123456789";
     {
-        let mut a = SqlActor::open(&opener, "notes/n", Limits::default()).unwrap();
+        let mut a = SqlActor::open(&opener, "notes/n").unwrap();
         commit_ok(
             &mut a,
             &opts(1, 1, true),
@@ -1223,7 +1258,7 @@ fn reopening_an_actor_does_not_rescan_a_scrubbed_secret() {
         let t = a.end_turn(true).unwrap();
         a.apply(&t, 2, &BTreeSet::new()).unwrap();
     }
-    let mut a = SqlActor::open(&opener, "notes/n", Limits::default()).unwrap();
+    let mut a = SqlActor::open(&opener, "notes/n").unwrap();
     a.begin_turn(&opts(3, 3, false)).unwrap();
     a.execute("UPDATE notes SET body = 'later' WHERE id = 1", &[])
         .unwrap();
@@ -1646,7 +1681,7 @@ fn an_implicit_parent_key_erases_and_a_cross_subject_child_blocks() {
 
 #[test]
 fn a_small_pool_still_evicts_when_nothing_asks_it_to_grow() {
-    let pool = SqlPool::new(Arc::new(MemOpener), Limits::default(), 1);
+    let pool = SqlPool::new(Arc::new(MemOpener), 1);
     drop(pool.get("a/1").unwrap());
     drop(pool.get("b/1").unwrap());
     let open = &pool.inner.lock().unwrap().open;
@@ -1657,7 +1692,7 @@ fn a_small_pool_still_evicts_when_nothing_asks_it_to_grow() {
 
 #[test]
 fn the_live_pool_can_grow_past_256() {
-    let pool = SqlPool::for_node(Arc::new(MemOpener), Limits::default());
+    let pool = SqlPool::for_node(Arc::new(MemOpener));
     let g = pool.inner.lock().unwrap();
     assert_eq!(g.capacity, 256);
     assert!(g.retain_max.is_some_and(|n| n >= 256));

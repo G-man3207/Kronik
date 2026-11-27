@@ -21,7 +21,7 @@ use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_store::Store;
 use kronik_store::StoreError;
-use kronik_store::sql::{Limits, MemOpener, SqlActor, TurnOpts, TurnSql, changeset_rows};
+use kronik_store::sql::{MemOpener, SqlActor, TurnOpts, TurnSql, changeset_rows};
 
 const SCHEMA: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
      _subject TEXT DEFAULT (kronik_subject()))";
@@ -311,7 +311,7 @@ fn a_cross_subject_reference_is_not_a_corrupt_erasure() {
 type FkRows = (Vec<(i64, String)>, Vec<(i64, i64, String)>);
 
 fn guest_turns(turns: &[&[&str]]) -> Vec<TurnSql> {
-    let mut actor = SqlActor::open(&MemOpener, "notes/n", Limits::default()).unwrap();
+    let mut actor = SqlActor::open(&MemOpener, "notes/n").unwrap();
     let mut out = Vec::new();
     for (i, stmts) in turns.iter().enumerate() {
         let migrate = i == 0;

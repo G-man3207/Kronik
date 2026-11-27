@@ -634,11 +634,7 @@ impl Store {
         .map_err(sqlite)?;
         let store = Store::open(
             conn,
-            crate::sql::SqlPool::new(
-                std::sync::Arc::new(crate::sql::MemOpener),
-                crate::sql::Limits::default(),
-                usize::MAX,
-            ),
+            crate::sql::SqlPool::new(std::sync::Arc::new(crate::sql::MemOpener), usize::MAX),
         )?;
         let actors = store.db().sql_actors()?;
         for name in actors {
@@ -720,11 +716,7 @@ impl SnapshotImage {
         };
         Store::open_in(
             conn,
-            crate::sql::SqlPool::new(
-                std::sync::Arc::new(opener),
-                crate::sql::Limits::default(),
-                usize::MAX,
-            ),
+            crate::sql::SqlPool::new(std::sync::Arc::new(opener), usize::MAX),
             Some(self.share.clone()),
         )
     }

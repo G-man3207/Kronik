@@ -577,7 +577,7 @@ mod tests {
 
         use kronik_privacy::MasterKey;
         use kronik_privacy::keystore::Pseudonyms;
-        use kronik_store::sql::{Limits, MemOpener, SqlActor, TurnOpts};
+        use kronik_store::sql::{MemOpener, SqlActor, TurnOpts};
 
         const ROW: &str = "ROW-u1-5e2c";
         const NEXT: &str = "ROW-u1-5e2c-next";
@@ -585,7 +585,7 @@ mod tests {
         const SCHEMA: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
              payload BLOB, _subject TEXT DEFAULT (kronik_subject()))";
 
-        let mut live = SqlActor::open(&MemOpener, "notes/n", Limits::default()).unwrap();
+        let mut live = SqlActor::open(&MemOpener, "notes/n").unwrap();
         let opts = |seed: u8, migrate: bool| TurnOpts {
             seed: [seed; 32],
             time_ms: 1_000,
@@ -705,14 +705,14 @@ mod tests {
 
         use kronik_privacy::MasterKey;
         use kronik_privacy::keystore::{Keystore, Pseudonyms};
-        use kronik_store::sql::{Limits, MemOpener, SqlActor, TurnOpts};
+        use kronik_store::sql::{MemOpener, SqlActor, TurnOpts};
 
         const MINE: &str = "ROW-u1-3b7d";
         const THEIRS: &str = "ROW-u2-8e05";
         const SCHEMA: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
              payload BLOB, _subject TEXT DEFAULT (kronik_subject()))";
 
-        let mut live = SqlActor::open(&MemOpener, "notes/n", Limits::default()).unwrap();
+        let mut live = SqlActor::open(&MemOpener, "notes/n").unwrap();
         let opts = |seed: u8, subject: Option<&str>, migrate: bool| TurnOpts {
             seed: [seed; 32],
             time_ms: 1_000,

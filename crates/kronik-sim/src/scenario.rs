@@ -46,7 +46,7 @@ use kronik_proto::log::v1 as pb;
 use kronik_runtime::{CodeStore, PoolSize, build_engine};
 use kronik_sched::{Node, NodeConfig, NodeParts, StartError};
 use kronik_store::Store;
-use kronik_store::sql::{Limits, MemOpener, SqlPool};
+use kronik_store::sql::{MemOpener, SqlPool};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::bao::{SimBao, SimNet};
@@ -574,7 +574,7 @@ impl World {
 
     fn new_store() -> Result<Arc<Store>, String> {
         let conn = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
-        let pool = SqlPool::new(Arc::new(MemOpener), Limits::default(), usize::MAX);
+        let pool = SqlPool::new(Arc::new(MemOpener), usize::MAX);
         Store::open(conn, pool).map_err(|e| e.to_string())
     }
 

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use super::*;
 use crate::durable::test_ops::{Op, watch};
 use kronik_store::Store;
-use kronik_store::sql::{FileOpener, Limits, SqlPool};
+use kronik_store::sql::{FileOpener, SqlPool};
 
 fn snapshot_dir(data: &Path) -> PathBuf {
     let built = data.join("built");
@@ -19,7 +19,6 @@ fn snapshot_dir(data: &Path) -> PathBuf {
             Arc::new(FileOpener {
                 root: built.join("sql"),
             }),
-            Limits::default(),
             4,
         ),
     )
