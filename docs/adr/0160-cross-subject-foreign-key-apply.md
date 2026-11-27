@@ -25,8 +25,7 @@ The per-subject bytes are what erasure and sealing use. They stay in the log.
 - A conflict that remains after that combined apply still aborts. The
   savepoint rolls back. Nothing is applied.
 - The log is unchanged: one changeset per subject, sealed under that
-  subject. The unsplit changeset is still not written. Tests may still apply
-  it.
+  subject. The unsplit changeset is still not written.
 - A subject whose changeset cannot be opened is still omitted. The rest are
   combined.
 

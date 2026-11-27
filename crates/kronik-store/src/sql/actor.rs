@@ -76,10 +76,6 @@ pub struct TurnSql {
     pub changesets: Vec<(Option<String>, Vec<u8>)>,
     /// VM steps executed by the guest's statements.
     pub vm_steps: u64,
-    /// The unsplit changeset. Not written to the log. `apply` uses it when
-    /// it is set, which only tests do. Production combines `changesets`
-    /// (ADR 0160).
-    pub whole: Vec<u8>,
 }
 
 /// A turn's database size limit when its [`TurnOpts::max_bytes`] is 0.
@@ -1208,33 +1204,30 @@ impl SqlActor {
                 Ok(TurnSql::default())
             };
         }
-        let captured = if commit {
+        let changesets = if commit {
             self.capture()
         } else {
-            Ok((Vec::new(), Vec::new()))
+            Ok(Vec::new())
         };
         self.session = None;
         // Always roll back: the changeset (if any) is applied separately.
         self.host_batch("ROLLBACK TO kronik_turn; RELEASE kronik_turn")
             .map_err(|e| e.to_string())?;
-        let (changesets, whole) = captured?;
         Ok(TurnSql {
             ddl: std::mem::take(&mut self.ddl),
-            changesets,
+            changesets: changesets?,
             vm_steps: self.steps,
-            whole,
         })
     }
 
     /// Captures the turn's changeset and splits it per subject.
-    #[allow(clippy::type_complexity)]
-    fn capture(&mut self) -> Result<(Vec<(Option<String>, Vec<u8>)>, Vec<u8>), String> {
+    fn capture(&mut self) -> Result<LoggedChangesets, String> {
         let cs = match &self.session {
             Some(s) => s.changeset().map_err(|e| e.to_string())?,
-            None => return Ok((Vec::new(), Vec::new())),
+            None => return Ok(Vec::new()),
         };
         if cs.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Vec::new());
         }
         let tables = ffi::tables(&cs).map_err(|e| e.to_string())?;
         // A turn with a default subject may only write tables that have a
@@ -1268,7 +1261,7 @@ impl SqlActor {
                 .is_some();
         }
         if !any_subject_col {
-            return Ok((vec![(self.default_subject.clone(), cs.clone())], cs));
+            return Ok(vec![(self.default_subject.clone(), cs)]);
         }
         let decoded = ffi::changes(&cs).map_err(|e| e.to_string())?;
         let mut subjects = Vec::with_capacity(decoded.len());
@@ -1280,7 +1273,7 @@ impl SqlActor {
             next.next()
                 .ok_or_else(|| "changeset changed while splitting".to_string())
         })?;
-        Ok((split.into_iter().collect(), cs))
+        Ok(split.into_iter().collect())
     }
 
     /// Replaces text and blob cells of subject-tagged changesets. `_subject`,
@@ -1404,25 +1397,19 @@ impl SqlActor {
                 None => None,
             };
             let changesets = rewritten.as_deref().unwrap_or(t.changesets.as_slice());
-            // `whole` is the unsplit changeset tests set. A fork rewrite uses
-            // the per-subject bytes, which are what the log holds.
-            if rewrite.is_none() && erased.is_empty() && !t.whole.is_empty() {
-                ffi::apply(&self.conn, &t.whole)?;
-            } else {
-                // One apply: the foreign-key check runs after every subject.
-                // The log still holds the per-subject bytes (ADR 0160).
-                let parts: Vec<&[u8]> = changesets
-                    .iter()
-                    .filter(|(subject, cs)| {
-                        !cs.is_empty() && !subject.as_ref().is_some_and(|s| erased.contains(s))
-                    })
-                    .map(|(_, cs)| cs.as_slice())
-                    .collect();
-                match parts.as_slice() {
-                    [] => {}
-                    [one] => ffi::apply(&self.conn, one)?,
-                    many => ffi::apply(&self.conn, &ffi::combine(many)?)?,
-                }
+            // One apply: the foreign-key check runs after every subject.
+            // The log still holds the per-subject bytes (ADR 0160).
+            let parts: Vec<&[u8]> = changesets
+                .iter()
+                .filter(|(subject, cs)| {
+                    !cs.is_empty() && !subject.as_ref().is_some_and(|s| erased.contains(s))
+                })
+                .map(|(_, cs)| cs.as_slice())
+                .collect();
+            match parts.as_slice() {
+                [] => {}
+                [one] => ffi::apply(&self.conn, one)?,
+                many => ffi::apply(&self.conn, &ffi::combine(many)?)?,
             }
             self.conn
                 .prepare_cached("UPDATE _kronik_meta SET v = ?1 WHERE k = 'applied_lsn'")

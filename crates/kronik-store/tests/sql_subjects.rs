@@ -327,11 +327,10 @@ fn guest_turns(turns: &[&[&str]]) -> Vec<TurnSql> {
                 .query(statement, &[])
                 .unwrap_or_else(|e| panic!("{statement}: {e:?}"));
         }
-        let mut recorded = actor.end_turn(true).unwrap();
+        let recorded = actor.end_turn(true).unwrap();
         actor
             .apply(&recorded, (i + 1) as u64, &BTreeSet::new())
             .unwrap_or_else(|e| panic!("guest apply: {e}"));
-        recorded.whole.clear();
         out.push(recorded);
     }
     out
