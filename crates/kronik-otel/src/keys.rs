@@ -110,4 +110,24 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     }
+
+    #[test]
+    fn the_local_key_hashes_with_the_master_keys_construction() {
+        use kronik_core::ids::hex;
+        let local = KeyHasher::Local([7; 32]);
+        assert_eq!(
+            local.label("counter", "carol@example.com"),
+            "kh:e3035a08a182"
+        );
+        // Each part is length-prefixed: a byte moved across the boundary
+        // changes the label.
+        assert_eq!(
+            local.label("counterc", "arol@example.com"),
+            "kh:b0ae08679312"
+        );
+        assert_eq!(
+            hex(&local.id_key().0),
+            "b9640eba3e6838d976523ac2f2f34660158a3bd0fab87f2080a0c5aff41f4927"
+        );
+    }
 }
