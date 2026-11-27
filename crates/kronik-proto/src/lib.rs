@@ -958,10 +958,7 @@ mod tests {
     use super::*;
 
     fn plain(bytes: &[u8]) -> Option<pb::Sealable> {
-        Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(bytes.to_vec())),
-        })
+        Some(pb::Sealable::new_plain(None, bytes))
     }
 
     fn turn_record() -> pb::TurnRecord {
@@ -1322,10 +1319,7 @@ mod connection_tests {
     const CONN: &str = "c-0123456789abcdef0123456789abcdef";
 
     fn plain(bytes: &[u8]) -> Option<pb::Sealable> {
-        Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(bytes.to_vec())),
-        })
+        Some(pb::Sealable::new_plain(None, bytes))
     }
 
     fn text(t: &str) -> pb::Frame {
