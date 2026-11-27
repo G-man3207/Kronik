@@ -1692,36 +1692,12 @@ impl Authenticator for BrowserAuth {
         Ok(captured)
     }
 
-    fn token_source(&self, req: &ApiRequest) -> Result<Option<String>, ApiError> {
-        if let Some(credential) = req
-            .bearer
-            .as_ref()
-            .filter(|value| session_credential(value))
-        {
-            let session = self.session(credential)?;
-            return Ok(Some(crate::tokens::token_id(&session.token_name)));
-        }
-        self.ordinary.token_source(req)
-    }
-
     fn authority(
         &self,
         req: &ApiRequest,
         required: Scope,
     ) -> Result<kronik_core::authority::AuthLease, ApiError> {
         Ok(self.capture(req, required)?.authority)
-    }
-
-    fn changes(&self) -> Option<Arc<tokio::sync::Notify>> {
-        Some(self.tokens.changes())
-    }
-
-    fn expires_at_ms(&self, req: &ApiRequest) -> Option<u64> {
-        req.bearer
-            .as_ref()
-            .filter(|value| session_credential(value))
-            .and_then(|value| self.session(value).ok())
-            .map(|session| session.expires)
     }
 }
 
@@ -2574,11 +2550,6 @@ mod tests {
                 auth.caller(&ordinary).unwrap().token_id,
                 "token:prefix-collision"
             );
-            assert_eq!(
-                auth.token_source(&ordinary).unwrap().as_deref(),
-                Some("token:prefix-collision")
-            );
-            assert!(auth.expires_at_ms(&ordinary).is_none());
             let captured = api.capture(&ordinary).unwrap();
             assert!(captured.session().is_none());
             assert_eq!(
@@ -4328,7 +4299,12 @@ mod tests {
         let original = auth
             .session_authority(&auth.state(), key, &session, None)
             .unwrap();
-        assert_eq!(auth.expires_at_ms(&req), Some(expires));
+        assert_eq!(
+            auth.session(req.bearer.as_deref().unwrap())
+                .unwrap()
+                .expires,
+            expires
+        );
         assert!(auth.state().proof_for(key, &session, expires - 1).is_ok());
         assert!(
             auth.tokens
@@ -4347,7 +4323,7 @@ mod tests {
                 .is_err()
         );
         clock.wall_ms.store(expires, Ordering::SeqCst);
-        assert_eq!(auth.expires_at_ms(&req), None);
+        assert!(auth.session(req.bearer.as_deref().unwrap()).is_err());
         assert!(lease.check().is_err());
         assert!(kronik_core::authority::Authority::check(&exchange).is_err());
         assert!(auth.caller(&req).is_err());
