@@ -28,8 +28,8 @@ url = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-hmac = { workspace = true }
 kronik-core = { workspace = true, features = ["real"] }
+kronik-effects = { workspace = true }
 kronik-privacy = { workspace = true }
 prost = { workspace = true }
 rcgen = { workspace = true, features = ["x509-parser"] }
