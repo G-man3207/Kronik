@@ -14,6 +14,15 @@ change anything, read:
 4. `docs/adr/`: the decisions so far. Record new non-trivial decisions as ADRs
    based on `docs/adr/0000-template.md`.
 
+Guides, the introduction, the architecture page and the runbooks are on the
+[wiki](https://github.com/G-man3207/Kronik/wiki). This checkout keeps the
+documents tools read or check: `docs/AGENT_GUIDE.md` (embedded in the binary
+and served over MCP), the generated glossary and error catalog, the reference
+under `docs/reference/`, the operations and security guides, `docs/perf.md`,
+the design notes and the ADRs. `docs/introduction.md`,
+`docs/concepts/architecture.md` and `docs/guides/quickstart.md` are short
+pointers, because older links still use those paths.
+
 The build brief also sets out the project's conventions: follow the milestone
 order, verify changes against the tests and the demo scripts, and never change
 an invariant without a maintainer decision. If a change would alter an

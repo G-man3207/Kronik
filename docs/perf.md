@@ -778,7 +778,7 @@ the commands below. It does not run on a schedule.
   `scripts/runbook-drills.py --binary PATH --counter tests/guests/counter.wasm
   --notes tests/guests/notes.wasm --revision REVISION --workdir WORKDIR
   --port PORT` with the release binary. It follows the
-  [backup](runbooks/backup.md) and [restore](runbooks/restore.md) procedures
+  [backup](https://github.com/G-man3207/Kronik/wiki/Backup) and [restore](https://github.com/G-man3207/Kronik/wiki/Restore) procedures
   on a disposable fixture: known key-value and SQL state, a `SIGKILL` and
   restart, a dummy key-backed secret and reader-token rotation (the old token
   must be refused), a snapshot shipped to a same-host `file://` bucket,

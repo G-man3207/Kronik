@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Kronik GitHub Action (action.yml runs it; docs/guides/github-action.md).
+"""The Kronik GitHub Action (action.yml runs it; the guide is on the wiki).
 
 Installs kronik from a release after verifying its GitHub OIDC attestation, then:
 

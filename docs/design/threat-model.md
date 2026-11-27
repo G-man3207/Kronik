@@ -31,7 +31,7 @@ secret backends and the optional PKCS#11 helper introduce additional boundaries;
 only their observed baseline behavior or explicitly labeled integration
 contracts are described. Supported versions and private vulnerability handling
 remain in the root `SECURITY.md`. Operational guidance remains in the
-[security guide](../guides/security.md), [privacy guide](../guides/privacy.md)
+[security guide](../guides/security.md), [privacy guide](https://github.com/G-man3207/Kronik/wiki/Privacy)
 and [operations guide](../guides/operations.md).
 
 ## Principals and assets
@@ -209,10 +209,12 @@ No cluster/fleet security guarantee is established by this single-node baseline.
 The integration work must reconcile these boundaries before they can be
 advertised as protection:
 
-Work-in-progress source paths, **not baseline interfaces**, are
-`crates/kronik-cluster/src/{net,identity,admission,wal,meta,barrier,rate}.rs`
-and `crates/kronik-fleet/src/{enrollment,transport,events,webhook}.rs`.
-The cluster contract uses TLS 1.3 mutual authentication, committed membership
+There is no `kronik-cluster` crate and no cluster runtime in this tree
+([ADR 0162](../adr/0162-member-seams-wait-for-a-member-runtime.md)). The
+cluster boundaries below are what a future Member runtime has to meet. They
+are not implemented here. Partial fleet source, not a baseline interface, is
+`crates/kronik-fleet/src/{enrollment,identity,transport,events,webhook}.rs`.
+The intended cluster contract uses TLS 1.3 mutual authentication, committed membership
 and receiver-local revocable admission; its canonical endpoint/boot proof
 excludes compliant different-listener clones, not Byzantine holders of stolen
 keys. It assumes exclusive canonical routing and intact original durable state.

@@ -374,7 +374,7 @@ caller's token, so an agent has exactly its token's scopes. A token without
 `pii:read` always gets forks without personal data: the API records
 `no_pii` on every fork and proposal it makes, and in every privacy mode the
 fork's actors read each value tagged with a subject as a pseudonym (see
-[forks without personal data](privacy.md#forks-without-personal-data)).
+[forks without personal data](https://github.com/G-man3207/Kronik/wiki/Privacy#forks-without-personal-data)).
 Policy and approvals for proposals exist since M3.
 
 **Previews (M11)** run unapproved proposal code for anyone who reaches the
@@ -396,7 +396,7 @@ Prefer a preview domain wherever previews take traffic from browsers.
 
 ## WebSocket and SSE connections
 
-Long-lived connections ([Connections](connections.md), M24):
+Long-lived connections ([Connections](https://github.com/G-man3207/Kronik/wiki/Connections), M24):
 
 - **Owner-only sending.** Only the actor that accepted a connection sends
   on it or closes it: another actor's frames to it are recorded as dropped

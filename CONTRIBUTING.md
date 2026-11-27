@@ -149,14 +149,15 @@ that step's temporary parent directory. The same step builds `loadgen` and
 runs the M24 criteria 2 and 4 acceptance (`scripts/acceptance-m24.sh replay`,
 then `restart`) against `chat-ts`; its default ports 47510 and 47511 must be
 free, so two `ts` runs on one machine collide. See
-[compatibility](docs/guides/compatibility.md) and [performance](docs/perf.md)
+[compatibility](https://github.com/G-man3207/Kronik/wiki/Compatibility) and [performance](docs/perf.md)
 for the historical results and remaining physical gates.
 `hygiene` checks every argument of literal workflow `ci.sh` calls against
 the default step inventory; missing, unknown, duplicate or reordered steps
 fail. A change must keep it green; GitHub does not start CI on the pull request.
 
-The opt-in cluster server keeps its runtime/server dependencies behind the
-exact `server` feature; there is no whole-crate hygiene exemption. Vendored
+The HTTP listeners in `kronik-api` and `kronik-gateway` keep their runtime
+dependencies behind the `server` feature, which the `kronik` binary enables.
+There is no cluster crate, and no whole-crate hygiene exemption. Vendored
 third-party Rust is included in the unsafe scan and still needs a per-file
 justification. Release packaging treats local third-party path dependencies
 as third-party: an explicit, hash-checked upstream/ordered-patch/license origin

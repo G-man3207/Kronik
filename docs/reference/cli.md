@@ -535,7 +535,7 @@ unittest discover -s tests`, a Go project with `go test ./test`; both test
 and build with the pinned tools of `scripts/install-sdk-tools.sh` (from a
 Kronik checkout), which the next steps name first. The name may have lowercase letters, digits and dashes
 and starts with a letter; an existing directory must be empty. See
-[Writing actors](../guides/actors.md).
+[Writing actors](https://github.com/G-man3207/Kronik/wiki/Writing-actors).
 
 ```text
 $ kronik init --lang ts billing
@@ -1447,7 +1447,7 @@ enrollment, the probe's own output names the next step:
 `kronik keys wrap --source pkcs11`. `--source` accepts
 `openbao|aws|gcp|azure|pkcs11`, the same set as the wrap synopsis.
 `pkcs11` is the PKCS#11 helper, not a cloud KMS. See the installation guide's
-[PKCS#11 helper](../guides/install.md#optional-gnu-pkcs11-helper) section and
+[PKCS#11 helper](https://github.com/G-man3207/Kronik/wiki/Installing#optional-gnu-pkcs11-helper) section and
 the operations guide's master-key tables.
 
 ```sh
@@ -1469,7 +1469,7 @@ or before it. The name is generated without
 token without `pii:read` always gets one: the flag is recorded on the
 fork, and in every privacy mode its actors read each value tagged with a
 subject as a pseudonym (see
-[forks without personal data](../guides/privacy.md#forks-without-personal-data)).
+[forks without personal data](https://github.com/G-man3207/Kronik/wiki/Privacy#forks-without-personal-data)).
 
 ```text
 $ kronik fork create --at 1 --name try --reason "try step 2"

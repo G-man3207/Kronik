@@ -94,7 +94,8 @@ const SKIPPED_DIRS: [&str; 6] = [
 
 /// The oldest Node.js that runs the pinned TypeScript toolchain: every
 /// package's `engines` admits it (the strictest, `@napi-rs/lzma`, asks for
-/// `^22.20 || ^24.12 || >=25`). docs/guides/install.md gives the same.
+/// `^22.20 || ^24.12 || >=25`). The installation guide on the wiki gives
+/// the same.
 const MIN_NODE: (u32, u32) = (22, 20);
 
 impl From<serde_json::Error> for Failure {

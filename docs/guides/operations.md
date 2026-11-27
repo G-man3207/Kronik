@@ -4,7 +4,7 @@ This guide is for whoever runs `kronik serve` on a server: a single Linux
 host, normally a small VPS. It covers the first start, every setting in
 `kronik.toml`, the systemd unit, TLS, `kronik doctor`, metrics and logs, the
 master key, foreign actors, and what to do about each error. Installing the
-binary is in [Installing Kronik](install.md). The commands are in the
+binary is in [Installing Kronik](https://github.com/G-man3207/Kronik/wiki/Installing). The commands are in the
 [CLI reference](../reference/cli.md), and the trust boundaries are in the
 [security model](security.md).
 
@@ -286,7 +286,7 @@ release still parses; unknown keys are errors.
 | `api_socket` | `"/run/kronik/api.sock"` | The Unix socket of the JSON API, for the CLI and `kronik mcp` | `--api-socket`, `KRONIK_API_SOCKET` |
 | `http_listen` | `"0.0.0.0:443"` with TLS, `"127.0.0.1:8080"` without | The gateway's address | `--http-listen`, `KRONIK_HTTP_LISTEN` |
 | `admin_listen` | `"127.0.0.1:9464"` | With TLS: embedded `/ui/`, same-origin public `/v1`, `/metrics` and `/healthz`, using the gateway certificate. Plain loopback HTTP serves only metrics/health. A bind failure is fatal when OIDC is configured; otherwise the daemon warns and runs without this listener | `--admin-listen`, `KRONIK_ADMIN_LISTEN` |
-| `api_listen` | none (off) | The JSON API and MCP over TCP, where every request needs a bearer token (`kronik token`). Without TLS only a loopback address is accepted, so tokens never cross a network in the clear; with TLS the API uses the gateway's certificate. A remote CLI (CI, the [GitHub Action](github-action.md)) reaches it with `--url https://<name>:<port>` or `KRONIK_URL`, and `KRONIK_TOKEN` | `--api-listen`, `KRONIK_API_LISTEN` |
+| `api_listen` | none (off) | The JSON API and MCP over TCP, where every request needs a bearer token (`kronik token`). Without TLS only a loopback address is accepted, so tokens never cross a network in the clear; with TLS the API uses the gateway's certificate. A remote CLI (CI, the [GitHub Action](https://github.com/G-man3207/Kronik/wiki/GitHub-Action)) reaches it with `--url https://<name>:<port>` or `KRONIK_URL`, and `KRONIK_TOKEN` | `--api-listen`, `KRONIK_API_LISTEN` |
 
 ### [tls]
 
@@ -565,7 +565,7 @@ the script for the real clouds, are described in the design's §9.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `subject_from` | none | Where HTTP root inputs get their subject: `"header:<name>"` or `"jwt:<claim>"` (normally `"jwt:sub"`). **The JWT's signature is not verified**; the claim is only read. Requires a non-empty `[gateway] trusted_proxies`; an empty list is refused at start. See [Privacy mode](privacy.md) |
+| `subject_from` | none | Where HTTP root inputs get their subject: `"header:<name>"` or `"jwt:<claim>"` (normally `"jwt:sub"`). **The JWT's signature is not verified**; the claim is only read. Requires a non-empty `[gateway] trusted_proxies`; an empty list is refused at start. See [Privacy mode](https://github.com/G-man3207/Kronik/wiki/Privacy) |
 | `keystore_backup_retention` | `"30d"` | How long shipped keystore backups of an erasure are kept. `kronik serve` applies the file's value |
 
 ### [replay]
@@ -1882,7 +1882,7 @@ the same machine, and `kronik restore --from file:///dir` reads it back (into
 a nonroot installation's directory the `kronik` user reads it, so the
 directory must be readable by that user).
 That runs the whole flow without a bucket, as the
-[quickstart](quickstart.md)'s step 9 does, but it is not a backup: the
+[quickstart](https://github.com/G-man3207/Kronik/wiki/Quickstart)'s step 9 does, but it is not a backup: the
 copy does not leave the machine.
 
 The root service's unit makes the file system read-only for the daemon
@@ -1978,7 +1978,7 @@ megabytes, a fetched document, or an image an actor renders. A blob is a
 file of the node's blob store, `<data_dir>/blobs`, kept apart from the log.
 A log record names it by its identity, `b3:<hex>` (BLAKE3 of the content),
 or `b3s:<hex>` for a subject's blob (keyed per subject; see
-[the privacy guide](privacy.md)), together with its size. The bytes are
+[the privacy guide](https://github.com/G-man3207/Kronik/wiki/Privacy)), together with its size. The bytes are
 written once and never change; the daemon's memory stays flat whatever
 their size.
 
@@ -2055,7 +2055,7 @@ on. A lease ends after `[blobs] lease_ttl` (5 minutes) unless it is
 renewed; the daemon renews the leases it holds while it uses them. Nothing
 else keeps a blob, and no actor or operator deletes one directly, except
 that erasing a subject deletes its blobs' files whatever keeps them (see
-[the privacy guide](privacy.md#blobs)).
+[the privacy guide](https://github.com/G-man3207/Kronik/wiki/Privacy#blobs)).
 
 `kronik blobs inspect <hash>` lists what keeps one blob (MCP `inspect_blob`
 answers the same). `kronik blobs status` shows the store as a whole:
@@ -2335,7 +2335,7 @@ showed no change, and a key-backed effect gave its recorded result.
   cannot read the turns of WebSocket and SSE connections: on a log with one
   it stops with `STORAGE_CORRUPT` ("no input case set": the records are
   newer, not damaged), and going back means restoring the backup that [the
-  upgrade runbook](../runbooks/upgrade.md) asks for. Keep it until you are
+  upgrade runbook](https://github.com/G-man3207/Kronik/wiki/Upgrade) asks for. Keep it until you are
   sure.
 - **The backup for going back** must be one that v0.5.0 does not write
   into. v0.5.0 ships to the same `[ship] url`, and the log segment that was
@@ -2377,7 +2377,7 @@ same. The data directory of v0.4.0 upgraded without it. Each point says what was
 checked.
 
 **Before you upgrade.** Make the backup that [the upgrade
-runbook](../runbooks/upgrade.md) asks for, and keep it for as long as you may
+runbook](https://github.com/G-man3207/Kronik/wiki/Upgrade) asks for, and keep it for as long as you may
 want to go back:
 
 - Once a newer binary has served the data, the older one cannot start on it.
@@ -2830,7 +2830,7 @@ release compacted, at the next start, from the newest snapshot (it logs
 - `kronik upgrade check` passes on such a directory; do not read it as a
   promise that the start works.
 - A full restore from a backup or a shipped bucket that still has the
-  records ([Restore](../runbooks/restore.md)), or the release with the fix.
+  records ([Restore](https://github.com/G-man3207/Kronik/wiki/Restore)), or the release with the fix.
 - Before it happens: an actor with a single instance and an SQL database can
   be kept current by a heartbeat, a turn that changes its SQL more often than
   `history`. That does not scale to one instance per key.

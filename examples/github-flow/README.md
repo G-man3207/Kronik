@@ -1,7 +1,7 @@
 # The GitHub flow, as a repository
 
 This directory is what goes in a repository that runs Kronik's
-[GitHub Action](../../docs/guides/github-action.md):
+[GitHub Action](https://github.com/G-man3207/Kronik/wiki/GitHub-Action):
 - one Rust actor, `counter`, as `kronik init --lang rust counter` makes it;
 - the reference workflow in `.github/workflows/kronik.yml`.
 
@@ -157,7 +157,7 @@ sidecar, including the real license/notice files. Both supplemental archives
 are now public at the same `v0.3.0` release URL; no historical assets or Action
 pins were replaced. They retain the exact Wasmtime 50.0.0 binaries, not the
 current source's 50.0.1 security patch. See the
-[installation guide](../../docs/guides/install.md) before changing the pin.
+[installation guide](https://github.com/G-man3207/Kronik/wiki/Installing) before changing the pin.
 
 ## 4. A change, end to end
 
