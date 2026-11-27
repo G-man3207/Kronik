@@ -262,7 +262,7 @@ pub fn run(args: DoctorArgs, json: bool) -> ExitCode {
     checks.extend(wildcard_certificate(&config));
     checks.push(ship(&config));
     checks.push(export(&config));
-    checks.push(key_before_drop.unwrap_or_else(|| key_source(&config)));
+    checks.push(key_before_drop.unwrap_or_else(|| key_source(&config, KeyCheck::Full)));
     checks.push(secrets(&config));
     checks.push(retention(&config));
     let hard = rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum;
@@ -1468,67 +1468,70 @@ fn unit_cannot_write(show: &str, dir: &Path) -> Option<String> {
     }
 }
 
-/// The export streams of a running daemon (m28-otel §5, §6.2): its `GET
-/// /v1/export` on the configured API socket.
-fn export(config: &Config) -> Check {
+/// `GET path` on the configured API socket of a running daemon, decoded
+/// as `T` and judged by `judge`. Check `name` warns when the answer
+/// cannot be had, and passes unchecked when no daemon listens there.
+fn daemon_get<T: serde::de::DeserializeOwned>(
+    config: &Config,
+    name: &'static str,
+    path: &str,
+    judge: impl FnOnce(T) -> Check,
+) -> Check {
     let socket = &config.server.api_socket;
-    let token = match crate::cli::client_token_from(None) {
-        Ok(token) => token,
-        Err(_) => {
-            return check("export", Status::Warn, "cannot load the API token")
-                .hint("check KRONIK_TOKEN and its token file");
-        }
+    let Ok(token) = crate::cli::client_token_from(None) else {
+        return check(name, Status::Warn, "cannot load the API token")
+            .hint("check KRONIK_TOKEN and its token file");
     };
     let endpoint = crate::cli::http::Endpoint::Unix(socket.clone());
     match crate::cli::http::request(
         &endpoint,
         "GET",
-        "/v1/export",
+        path,
         None,
         token.as_deref(),
         None,
-        std::time::Duration::from_secs(5),
+        Duration::from_secs(5),
     ) {
-        Ok(r) if r.status == 200 => {
-            match serde_json::from_slice::<kronik_api::types::ExportStatusResponse>(&r.body) {
-                Ok(s) => export_streams(config, &s.streams),
-                Err(_) => check(
-                    "export",
-                    Status::Warn,
-                    "the API returned invalid export status",
-                )
-                .hint("check the selected API socket and daemon version"),
-            }
-        }
+        Ok(r) if r.status == 200 => match serde_json::from_slice(&r.body) {
+            Ok(answer) => judge(answer),
+            Err(_) => check(
+                name,
+                Status::Warn,
+                format!("the API returned an invalid answer to GET {path}"),
+            )
+            .hint("check the selected API socket and daemon version"),
+        },
         Ok(r) => check(
-            "export",
+            name,
             Status::Warn,
-            format!("cannot read the export status: HTTP {}", r.status),
+            format!("GET {path} answered HTTP {}", r.status),
         )
         .hint("set KRONIK_TOKEN to a token with the read scope"),
         Err(crate::cli::http::Failure::Connect(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             check(
-                "export",
+                name,
                 Status::Pass,
-                format!(
-                    "no daemon on {}: the export streams are not checked",
-                    socket.display()
-                ),
+                format!("no daemon on {}: not checked", socket.display()),
             )
         }
-        Err(e) => check(
-            "export",
+        Err(_) => check(
+            name,
             Status::Warn,
-            match e {
-                crate::cli::http::Failure::Connect(_) => "cannot connect to the API socket",
-                crate::cli::http::Failure::Tls(_) => "the API TLS handshake failed",
-                crate::cli::http::Failure::Io(_) => "the API connection broke",
-                crate::cli::http::Failure::Timeout => "the API request timed out",
-                crate::cli::http::Failure::Malformed(_) => "the API returned malformed HTTP",
-            },
+            "cannot reach the API socket: not checked",
         )
-        .hint("check the API socket and daemon; the export streams are not checked"),
+        .hint("check the API socket and the daemon"),
     }
+}
+
+/// The export streams of a running daemon (m28-otel §5, §6.2): its `GET
+/// /v1/export` on the configured API socket.
+fn export(config: &Config) -> Check {
+    daemon_get(
+        config,
+        "export",
+        "/v1/export",
+        |s: kronik_api::types::ExportStatusResponse| export_streams(config, &s.streams),
+    )
 }
 
 /// [`key_source`] for `sudo kronik doctor --rootless`, run as root before the
@@ -1541,13 +1544,13 @@ fn key_source_as_root(config: &Config) -> Check {
     use std::os::unix::fs::MetadataExt as _;
     let another_users = std::fs::metadata(&config.server.data_dir).is_ok_and(|m| m.uid() != 0);
     if another_users {
-        key_source_checked(config, KeyCheck::MasterOnly)
+        key_source(config, KeyCheck::MasterOnly)
     } else {
-        key_source(config)
+        key_source(config, KeyCheck::Full)
     }
 }
 
-/// How much of the key source `key_source_checked` loads.
+/// How much of the key source `key_source` loads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyCheck {
     /// The key, and the data directory's stores against it.
@@ -1556,11 +1559,7 @@ enum KeyCheck {
     MasterOnly,
 }
 
-fn key_source(config: &Config) -> Check {
-    key_source_checked(config, KeyCheck::Full)
-}
-
-fn key_source_checked(config: &Config, scope: KeyCheck) -> Check {
+fn key_source(config: &Config, scope: KeyCheck) -> Check {
     use kronik_privacy::key_source::KeySource;
     let source = config.keys.source.as_str();
     let data = &config.server.data_dir;
@@ -1670,116 +1669,24 @@ fn key_source_checked(config: &Config, scope: KeyCheck) -> Check {
 /// /v1/secrets/backends` on the configured API socket. Each backend's last
 /// answer, and the linked names an effect would have to fetch.
 fn secrets(config: &Config) -> Check {
-    let socket = &config.server.api_socket;
-    let token = match crate::cli::client_token_from(None) {
-        Ok(token) => token,
-        Err(_) => {
-            return check("secrets", Status::Warn, "cannot load the API token")
-                .hint("check KRONIK_TOKEN and its token file");
-        }
-    };
-    let endpoint = crate::cli::http::Endpoint::Unix(socket.clone());
-    match crate::cli::http::request(
-        &endpoint,
-        "GET",
+    daemon_get(
+        config,
+        "secrets",
         "/v1/secrets/backends",
-        None,
-        token.as_deref(),
-        None,
-        Duration::from_secs(5),
-    ) {
-        Ok(r) if r.status == 200 => {
-            match serde_json::from_slice::<kronik_api::types::SecretBackendsResponse>(&r.body) {
-                Ok(s) => secret_backends(&s.backends, now_ms()),
-                Err(_) => check(
-                    "secrets",
-                    Status::Warn,
-                    "the API returned an invalid list of secret backends",
-                )
-                .hint("check the selected API socket and daemon version"),
-            }
-        }
-        Ok(r) => check(
-            "secrets",
-            Status::Warn,
-            format!("cannot read the secret backends: HTTP {}", r.status),
-        )
-        .hint("set KRONIK_TOKEN to a token with the read scope"),
-        Err(crate::cli::http::Failure::Connect(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            check(
-                "secrets",
-                Status::Pass,
-                format!(
-                    "no daemon on {}: the secret backends are not checked",
-                    socket.display()
-                ),
-            )
-        }
-        Err(_) => check(
-            "secrets",
-            Status::Warn,
-            "cannot reach the API socket: the secret backends are not checked",
-        )
-        .hint("check the API socket and the daemon"),
-    }
+        |s: kronik_api::types::SecretBackendsResponse| secret_backends(&s.backends, now_ms()),
+    )
 }
 
 /// Whether an open turn keeps the log of a running daemon from retention:
 /// its `GET /v1/health` on the configured API socket, which carries what the
 /// last retention pass kept for one.
 fn retention(config: &Config) -> Check {
-    let socket = &config.server.api_socket;
-    let token = match crate::cli::client_token_from(None) {
-        Ok(token) => token,
-        Err(_) => {
-            return check("retention", Status::Warn, "cannot load the API token")
-                .hint("check KRONIK_TOKEN and its token file");
-        }
-    };
-    let endpoint = crate::cli::http::Endpoint::Unix(socket.clone());
-    match crate::cli::http::request(
-        &endpoint,
-        "GET",
+    daemon_get(
+        config,
+        "retention",
         "/v1/health",
-        None,
-        token.as_deref(),
-        None,
-        Duration::from_secs(5),
-    ) {
-        Ok(r) if r.status == 200 => {
-            match serde_json::from_slice::<kronik_api::types::HealthResponse>(&r.body) {
-                Ok(health) => retention_pin(health.retention_pin.as_ref(), now_ms()),
-                Err(_) => check(
-                    "retention",
-                    Status::Warn,
-                    "the API returned an invalid health answer",
-                )
-                .hint("check the selected API socket and daemon version"),
-            }
-        }
-        Ok(r) => check(
-            "retention",
-            Status::Warn,
-            format!("cannot read the daemon's health: HTTP {}", r.status),
-        )
-        .hint("set KRONIK_TOKEN to a token with the read scope"),
-        Err(crate::cli::http::Failure::Connect(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            check(
-                "retention",
-                Status::Pass,
-                format!(
-                    "no daemon on {}: retention is not checked",
-                    socket.display()
-                ),
-            )
-        }
-        Err(_) => check(
-            "retention",
-            Status::Warn,
-            "cannot reach the API socket: retention is not checked",
-        )
-        .hint("check the API socket and the daemon"),
-    }
+        |h: kronik_api::types::HealthResponse| retention_pin(h.retention_pin.as_ref(), now_ms()),
+    )
 }
 
 /// Warns when the last retention pass kept log segments for an open turn,
@@ -2201,16 +2108,109 @@ mod tests {
         config.server.data_dir = data;
         config.server.api_socket = dir.path().join("no-daemon.sock");
         config.keys.master_key_file = Some(key);
-        let only = key_source_checked(&config, KeyCheck::MasterOnly);
+        let only = key_source(&config, KeyCheck::MasterOnly);
         assert_eq!(only.status, Status::Pass, "{}", only.message);
         assert!(
             only.message.contains("checks its stores"),
             "{}",
             only.message
         );
-        let full = key_source_checked(&config, KeyCheck::Full);
+        let full = key_source(&config, KeyCheck::Full);
         assert_eq!(full.status, Status::Fail, "{}", full.message);
         assert!(full.code.is_some() && full.hint.is_some(), "{full:?}");
+    }
+
+    /// `export`, `secrets` and `retention` ask the API through one helper.
+    /// A missing socket passes unchecked with the same wording. A socket
+    /// file with nothing listening, a non-200 and a body that does not
+    /// decode all warn, and the message names that check's path.
+    #[test]
+    fn the_api_checks_share_one_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("api.sock");
+        let mut config = Config::default();
+        config.server.api_socket = socket.clone();
+        let missing = format!("no daemon on {}: not checked", socket.display());
+        for check in [export(&config), secrets(&config), retention(&config)] {
+            assert_eq!(
+                (check.status, check.message.as_str(), check.hint.as_deref()),
+                (Status::Pass, missing.as_str(), None),
+                "{check:?}"
+            );
+        }
+
+        // The socket file with nothing listening is a refused connection,
+        // not an absent daemon.
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let refused = export(&config);
+        assert_eq!(refused.status, Status::Warn, "{}", refused.message);
+        assert_eq!(refused.message, "cannot reach the API socket: not checked");
+        assert_eq!(
+            refused.hint.as_deref(),
+            Some("check the API socket and the daemon")
+        );
+        std::fs::remove_file(&socket).unwrap();
+
+        let once = |response: String, check: fn(&Config) -> Check| {
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "the check never queried the daemon"
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("{e}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request);
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let got = check(&config);
+            server.join().unwrap();
+            std::fs::remove_file(&socket).unwrap();
+            got
+        };
+        let http = |status: &str, body: &str| {
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        for (path, check) in [
+            ("/v1/export", export as fn(&Config) -> Check),
+            ("/v1/secrets/backends", secrets as fn(&Config) -> Check),
+            ("/v1/health", retention as fn(&Config) -> Check),
+        ] {
+            let denied = once(http("401 Unauthorized", ""), check);
+            assert_eq!(denied.status, Status::Warn, "{}", denied.message);
+            assert_eq!(denied.message, format!("GET {path} answered HTTP 401"));
+            assert_eq!(
+                denied.hint.as_deref(),
+                Some("set KRONIK_TOKEN to a token with the read scope")
+            );
+            let invalid = once(http("200 OK", "{}"), check);
+            assert_eq!(invalid.status, Status::Warn, "{}", invalid.message);
+            assert_eq!(
+                invalid.message,
+                format!("the API returned an invalid answer to GET {path}")
+            );
+            assert_eq!(
+                invalid.hint.as_deref(),
+                Some("check the selected API socket and daemon version")
+            );
+        }
     }
 
     fn expired_pem() -> (String, String) {
