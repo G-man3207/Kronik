@@ -257,11 +257,13 @@ def check_base_url(base_url):
 
 
 def timeout_seconds():
-    """The input timeout (kronik's duration: a number with ms, s, m or h)."""
-    m = re.fullmatch(r"(\d+)(ms|s|m|h)", inp("timeout", "45m"))
+    """The input timeout (kronik's duration: a number with ms, s, m, h or d)."""
+    m = re.fullmatch(r"(\d+)(ms|s|m|h|d)", inp("timeout", "45m"))
     if not m:
-        raise Failure(f"input timeout must be a number with ms, s, m or h, such as 45m, not {inp('timeout')!r}")
-    return int(m[1]) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[m[2]]
+        raise Failure(
+            f"input timeout must be a number with ms, s, m, h or d, such as 45m, not {inp('timeout')!r}"
+        )
+    return int(m[1]) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600, "d": 86400}[m[2]]
 
 
 # kronik

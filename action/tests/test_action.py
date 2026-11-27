@@ -476,8 +476,15 @@ class ProposeTest(ActionTest):
     def test_bad_timeout_fails(self):
         p, calls = self.run_action("propose", timeout="45")
         self.assertEqual(p.returncode, 1)
-        self.assertIn("input timeout must be a number with ms, s, m or h", p.stdout)
+        self.assertIn("input timeout must be a number with ms, s, m, h or d", p.stdout)
         self.assertEqual(calls, [])
+
+    def test_day_timeout_reaches_kronik(self):
+        p, calls = self.run_action("propose", timeout="1d")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        waits = [c["argv"] for c in calls if "wait" in c["argv"]]
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(waits[0][waits[0].index("--timeout") + 1], "1d")
 
     def test_unsafe_events_refused(self):
         for name in ("pull_request_target", "workflow_run", "issue_comment"):

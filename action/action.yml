@@ -39,7 +39,7 @@ inputs:
     required: false
     default: ""
   timeout:
-    description: "How long to wait for the proposal (kronik proposal wait --timeout), longer than the replay; every kronik call is also bounded by it."
+    description: "How long to wait for the proposal (kronik proposal wait --timeout): a number with ms, s, m, h or d, such as 45m. Longer than the replay. Every kronik call is also bounded by it."
     required: false
     default: "45m"
   allow-forks:
