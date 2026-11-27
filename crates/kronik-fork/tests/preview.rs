@@ -363,24 +363,10 @@ fn a_preview_uses_no_production_key() {
     assert_eq!(http_body(&r), "[secret:k1]");
 }
 
-/// P-F11: an erasure makes previews drop their state; the next request
-/// starts again from the fork point.
-#[test]
-fn forgotten_preview_states_start_again_from_the_fork_point() {
-    let dir = tempdir();
-    let p = Proc::start(dir.path());
-    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
-    let proposal = propose_step2(&p, &props);
-    let id = create(&p, &props, &proposal);
-    assert_eq!(http_body(&send(&p, &props, &id, "increment", "")), "3");
-    assert_eq!(http_body(&send(&p, &props, &id, "increment", "")), "5");
-    props.forget_preview_states();
-    assert_eq!(http_body(&send(&p, &props, &id, "increment", "")), "3");
-}
-
 /// N1: a preview's state takes at most `max_preview_requests` requests,
 /// then answers PREVIEW_FULL; a rebuilt state (after an erasure) counts
-/// again.
+/// again. P-F11: forgetting the preview states (as an erasure does) starts
+/// the next request again from the fork point.
 #[test]
 fn a_preview_takes_a_bounded_number_of_requests() {
     let dir = tempdir();
@@ -392,7 +378,7 @@ fn a_preview_takes_a_bounded_number_of_requests() {
     );
     let proposal = propose_step2(&p, &props);
     let id = create(&p, &props, &proposal);
-    send(&p, &props, &id, "increment", "");
+    assert_eq!(http_body(&send(&p, &props, &id, "increment", "")), "3");
     assert_eq!(http_body(&send(&p, &props, &id, "increment", "")), "5");
     let (actor, http) = Proc::http_input("x", "increment", "");
     let original = p.node.local_operator_authority().unwrap();
