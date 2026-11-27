@@ -226,15 +226,6 @@ impl Proc {
             .unwrap()
     }
 
-    /// Waits up to 30 s for `f`.
-    fn wait_until(&self, what: &str, f: impl Fn(&Proc) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !f(self) {
-            assert!(Instant::now() < deadline, "timed out waiting for {what}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
     /// How many turns `counter/<key>` committed or failed.
     fn turns(&self, key: &str) -> u64 {
         self.node
@@ -243,21 +234,6 @@ impl Proc {
             .actor("counter", key)
             .unwrap()
             .map_or(0, |a| a.turns)
-    }
-
-    fn open_turns(&self) -> usize {
-        self.node.store().db().open_turns().unwrap().len()
-    }
-
-    fn records(&self) -> Vec<Record> {
-        let mut out = Vec::new();
-        self.rt
-            .block_on(self.node.reader().read(1, self.node.applied_lsn(), |c| {
-                out.push(c.record);
-                Ok(())
-            }))
-            .unwrap();
-        out
     }
 
     /// The turn records of `counter/<key>`.

@@ -264,17 +264,6 @@ impl Proc {
         });
     }
 
-    /// Waits up to 20 s for `f`.
-    fn wait_until(&self, what: &str, f: impl Fn(&Proc) -> bool) {
-        for _ in 0..2000 {
-            if f(self) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("timed out waiting for {what}");
-    }
-
     /// How many turns `media/<key>` committed or failed.
     fn turns(&self, key: &str) -> u64 {
         self.node
@@ -283,11 +272,6 @@ impl Proc {
             .actor("media", key)
             .unwrap()
             .map_or(0, |a| a.turns)
-    }
-
-    /// Whether a turn is open: begun, and not ended by a record.
-    fn open_turns(&self) -> usize {
-        self.node.store().db().open_turns().unwrap().len()
     }
 
     /// Waits until no message to `media/<key>` waits in the mailbox: its
@@ -381,17 +365,6 @@ impl Proc {
                 }))
                 .unwrap();
         }
-    }
-
-    fn records(&self) -> Vec<Record> {
-        let mut out = Vec::new();
-        self.rt
-            .block_on(self.node.reader().read(1, self.node.applied_lsn(), |c| {
-                out.push(c.record);
-                Ok(())
-            }))
-            .unwrap();
-        out
     }
 
     /// The blob of a turn's HTTP answer whose body is a blob.

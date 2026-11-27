@@ -131,16 +131,6 @@ impl Proc {
             .unwrap()
     }
 
-    fn kv(&self, actor: &str, k: &str) -> Option<String> {
-        let a = ActorRef::parse(actor).unwrap();
-        self.node
-            .store()
-            .db()
-            .kv_get(&a.kind, &a.key, k)
-            .unwrap()
-            .map(|v| String::from_utf8(v).unwrap())
-    }
-
     fn wait_kv(&self, actor: &str, k: &str, want: &str) {
         for _ in 0..500 {
             if self.kv(actor, k).as_deref() == Some(want) {
