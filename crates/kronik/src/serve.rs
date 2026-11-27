@@ -1082,7 +1082,7 @@ async fn serve(args: ServeArgs, config: Config, early: Early) -> anyhow::Result<
     let served = tokio::select! {
         biased;
         msg = node.wait_fatal() => Err(anyhow::anyhow!("storage failure: {msg}")),
-        r = kronik_gateway::server::serve_with_tls(tcp, gateway, tls, gateway_connections) => r.context("gateway listener failed"),
+        r = kronik_gateway::server::serve(tcp, gateway, tls, gateway_connections) => r.context("gateway listener failed"),
         r = unix_api => r.context("API listener failed"),
         r = api_tcp => r.context("TCP API listener failed"),
         r = admin => r.context("admin listener failed"),

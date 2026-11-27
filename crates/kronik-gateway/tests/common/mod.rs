@@ -116,6 +116,7 @@ pub async fn until(
 #[cfg(feature = "server")]
 pub async fn serve(
     node: &Arc<Node>,
+    tls: Option<Arc<rustls::ServerConfig>>,
     max_connections: usize,
 ) -> (
     std::net::SocketAddr,
@@ -127,7 +128,12 @@ pub async fn serve(
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let task = tokio::spawn(kronik_gateway::server::serve(listener, gw, max_connections));
+    let task = tokio::spawn(kronik_gateway::server::serve(
+        listener,
+        gw,
+        tls,
+        max_connections,
+    ));
     (addr, task)
 }
 
@@ -142,7 +148,7 @@ pub struct Server {
 #[cfg(feature = "server")]
 pub async fn server(connections: ConnectionsConfig) -> Server {
     let (dir, node) = room_node(connections).await;
-    let (addr, task) = serve(&node, 64).await;
+    let (addr, task) = serve(&node, None, 64).await;
     Server {
         _dir: dir,
         node,

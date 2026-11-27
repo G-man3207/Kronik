@@ -286,7 +286,7 @@ async fn a_websocket_client_over_tcp_that_stops_reading_is_freed() {
         ..ConnectionsConfig::default()
     })
     .await;
-    let addr = common::serve(&node, 64).await.0;
+    let addr = common::serve(&node, None, 64).await.0;
     let req = format!("ws://{addr}/room/lobby/ws?user=slow")
         .into_client_request()
         .unwrap();
@@ -312,7 +312,7 @@ async fn an_sse_client_over_tcp_that_stops_reading_is_freed() {
         ..ConnectionsConfig::default()
     })
     .await;
-    let addr = common::serve(&node, 64).await.0;
+    let addr = common::serve(&node, None, 64).await.0;
     let mut stream = tiny_socket(addr).await;
     stream
         .write_all(
@@ -337,7 +337,7 @@ async fn an_sse_client_over_tcp_that_stops_reading_is_freed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_over_tcp_that_leaves_mid_open_is_freed() {
     let (_dir, node) = room_node(ConnectionsConfig::default()).await;
-    let addr = common::serve(&node, 64).await.0;
+    let addr = common::serve(&node, None, 64).await.0;
     for query in ["user=ghost", "user=ghost&call=1"] {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
@@ -478,7 +478,7 @@ async fn a_long_burst_does_not_starve_the_reader() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sse_streams_do_not_hold_http_slots() {
     let (_dir, node) = room_node(ConnectionsConfig::default()).await;
-    let (addr, _) = common::serve(&node, 4).await;
+    let (addr, _) = common::serve(&node, None, 4).await;
     let mut streams = Vec::new();
     for i in 0..4 {
         let mut s = TcpStream::connect(addr).await.unwrap();
