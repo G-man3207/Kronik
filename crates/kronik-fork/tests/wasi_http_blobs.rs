@@ -9,7 +9,7 @@
 
 mod common;
 
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -21,39 +21,16 @@ use kronik_sched::{BlobsConfig, NodeConfig};
 
 /// An HTTP peer that answers every request with its body; counts them.
 fn echo() -> (String, Arc<AtomicUsize>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
     let served = Arc::new(AtomicUsize::new(0));
     let count = served.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let count = count.clone();
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let (mut head, mut line) = (String::new(), String::new());
-                while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
-                    head.push_str(&line);
-                    line.clear();
-                }
-                let len: usize = head
-                    .lines()
-                    .find_map(|l| {
-                        let (name, value) = l.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse().unwrap())
-                    })
-                    .unwrap_or(0);
-                let mut body = vec![0; len];
-                reader.read_exact(&mut body).unwrap();
-                count.fetch_add(1, Ordering::SeqCst);
-                let mut stream = stream;
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
-                );
-                let _ = stream.write_all(&body);
-            });
-        }
+    let addr = common::http::serve(move |req, stream| {
+        count.fetch_add(1, Ordering::SeqCst);
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            req.body.len()
+        );
+        let _ = stream.write_all(&req.body);
     });
     (addr, served)
 }

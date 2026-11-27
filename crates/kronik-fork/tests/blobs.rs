@@ -33,34 +33,22 @@ fn document(n: u64) -> Vec<u8> {
 
 /// Serves `GET /doc/<n>` and counts the requests.
 fn document_server() -> (String, Arc<AtomicUsize>) {
-    use std::io::{BufRead as _, BufReader, Write as _};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
+    use std::io::Write as _;
     let count = Arc::new(AtomicUsize::new(0));
     let seen = count.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut head = String::new();
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
-                head.push_str(&line);
-                line.clear();
-            }
-            seen.fetch_add(1, Ordering::SeqCst);
-            let path = head.split_whitespace().nth(1).unwrap_or("").to_owned();
-            let n: u64 = path
-                .strip_prefix("/doc/")
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(0);
-            let mut stream = stream;
-            let _ = write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: {n}\r\n\
-                 Connection: close\r\n\r\n"
-            );
-            let _ = stream.write_all(&document(n));
-        }
+    let addr = common::http::serve(move |req, stream| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        let n: u64 = req
+            .path
+            .strip_prefix("/doc/")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: {n}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let _ = stream.write_all(&document(n));
     });
     (addr, count)
 }

@@ -4,8 +4,7 @@
 
 #![allow(dead_code)]
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -25,6 +24,10 @@ use kronik_runtime::TurnLimits;
 use kronik_sched::{Ingress, Node, NodeConfig, TurnResult, start_local};
 use serde_json::Value;
 use tokio::runtime::Runtime;
+
+/// The HTTP test server shared with kronik-sched's tests.
+#[path = "../../../kronik-sched/tests/common/http.rs"]
+pub mod http;
 
 /// Data directories live under the target directory, not /tmp (a shared
 /// RAM-backed tmpfs on the build machines).
@@ -581,106 +584,45 @@ impl Proc {
 
 // A tiny HTTP server counting requests (to prove replay sends none, I7).
 pub fn server() -> (String, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
     let hits = Arc::new(AtomicUsize::new(0));
     let h = hits.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let h = h.clone();
-            std::thread::spawn(move || serve(stream, h));
-        }
-    });
-    (addr, hits)
-}
-
-fn serve(stream: TcpStream, hits: Arc<AtomicUsize>) {
-    let mut w = stream.try_clone().unwrap();
-    let mut r = BufReader::new(stream);
-    loop {
-        let mut line = String::new();
-        if r.read_line(&mut line).unwrap_or(0) == 0 {
-            return;
-        }
-        let mut len = 0usize;
-        loop {
-            let mut h = String::new();
-            if r.read_line(&mut h).unwrap_or(0) == 0 {
-                return;
-            }
-            let h = h.trim_end().to_ascii_lowercase();
-            if h.is_empty() {
-                break;
-            }
-            if let Some(v) = h.strip_prefix("content-length:") {
-                len = v.trim().parse().unwrap_or(0);
-            }
-        }
-        let mut body = vec![0; len];
-        if r.read_exact(&mut body).is_err() {
-            return;
-        }
-        let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+    let addr = http::serve(move |_, w| {
+        let n = h.fetch_add(1, Ordering::SeqCst) + 1;
         let reply = format!("charged {n}");
-        let resp = format!(
+        let _ = write!(
+            w,
             "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{reply}",
             reply.len()
         );
-        if w.write_all(resp.as_bytes()).is_err() {
-            return;
-        }
-    }
+    });
+    (addr, hits)
 }
 
 /// A fake OpenAI-compatible model: every call gets a different answer, so
 /// a second call would change the diff. Keeps every request body.
 pub fn model_server() -> (String, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let s = seen.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let mut w = stream.try_clone().unwrap();
-            let mut r = BufReader::new(stream);
-            let mut len = 0usize;
-            loop {
-                let mut h = String::new();
-                if r.read_line(&mut h).unwrap_or(0) == 0 {
-                    break;
-                }
-                let h = h.trim_end().to_ascii_lowercase();
-                if h.is_empty() {
-                    break;
-                }
-                if let Some(v) = h.strip_prefix("content-length:") {
-                    len = v.trim().parse().unwrap_or(0);
-                }
-            }
-            let mut body = vec![0; len];
-            if r.read_exact(&mut body).is_err() {
-                continue;
-            }
-            let n = {
-                let mut seen = s.lock().unwrap();
-                seen.push(body);
-                seen.len()
-            };
-            let content = serde_json::json!({"status": 200,
-                "headers": {"content-type": "text/plain"},
-                "body": format!("model answer {n}")})
-            .to_string();
-            let reply =
-                serde_json::json!({"choices": [{"message": {"role": "assistant", "content": content}}]})
-                    .to_string();
-            let _ = w.write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
-                    reply.len()
-                )
-                .as_bytes(),
-            );
-        }
+    let addr = http::serve(move |req, w| {
+        let n = {
+            let mut seen = s.lock().unwrap();
+            seen.push(req.body);
+            seen.len()
+        };
+        let content = serde_json::json!({"status": 200,
+            "headers": {"content-type": "text/plain"},
+            "body": format!("model answer {n}")})
+        .to_string();
+        let reply =
+            serde_json::json!({"choices": [{"message": {"role": "assistant", "content": content}}]})
+                .to_string();
+        let _ = w.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                reply.len()
+            )
+            .as_bytes(),
+        );
     });
     (addr, seen)
 }
