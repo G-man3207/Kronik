@@ -1280,11 +1280,7 @@ impl World {
             let webhook = self.cfg.effects.is_some_and(|fx| fx.webhook);
             if let Some(n) = n
                 && n.fatal().is_none()
-                && n.store()
-                    .db()
-                    .mailbox()
-                    .map(|m| m.is_empty())
-                    .unwrap_or(false)
+                && n.store().db().mailbox().is_ok_and(|m| m.is_empty())
                 // Webhook retries wait on timers.
                 && (!webhook || n.store().db().timers(None).is_ok_and(|t| t.is_empty()))
                 // The last start's own work is in no mailbox: its re-runs,
