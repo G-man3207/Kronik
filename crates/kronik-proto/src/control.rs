@@ -4,7 +4,7 @@ use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 use x509_parser::prelude::{FromDer as _, X509Certificate, X509CertificationRequest};
 
-use crate::{DecodeError, log::v1 as pb};
+use crate::{DecodeError, hex, log::v1 as pb};
 use pb::audit_event::Operation;
 
 pub const MAX_PUBLIC_DER_BYTES: usize = 65_536;
@@ -21,11 +21,7 @@ pub fn fleet_token_name(epoch: u64, request: &[u8]) -> Result<String, DecodeErro
     if epoch == 0 || request.len() != 32 {
         return Err(invalid("FleetToken.identity"));
     }
-    let mut name = String::with_capacity(59);
-    std::fmt::Write::write_fmt(&mut name, format_args!("fleet-{epoch}-"))
-        .map_err(|_| invalid("FleetToken.name"))?;
-    name.push_str(&hex(&request[..16]));
-    Ok(name)
+    Ok(format!("fleet-{epoch}-{}", hex(&request[..16])))
 }
 
 #[cfg(test)]
@@ -153,16 +149,6 @@ pub fn validate_fleet_plan(
     }
     validate_scopes(scopes)?;
     Ok(())
-}
-
-fn hex(request: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut text = String::with_capacity(request.len() * 2);
-    for byte in request {
-        text.push(HEX[(byte >> 4) as usize] as char);
-        text.push(HEX[(byte & 15) as usize] as char);
-    }
-    text
 }
 
 fn matches_hex(value: &str, bytes: &[u8]) -> bool {
@@ -768,7 +754,7 @@ mod tests {
             "../tests/fixtures/control-fleet-pending-v1.json"
         ))
         .unwrap();
-        let bytes = |field: &str| crate::unhex(fixture[field].as_str().unwrap());
+        let bytes = |field: &str| crate::unhex(fixture[field].as_str().unwrap()).unwrap();
         pb::FleetState {
             installation: fixture["installation"].as_str().unwrap().into(),
             node: None,
@@ -793,7 +779,7 @@ mod tests {
             include_str!("../tests/fixtures/auth-session-revoked-native-v1.json")
         })
         .unwrap();
-        let bytes = |value: &serde_json::Value| crate::unhex(value.as_str().unwrap());
+        let bytes = |value: &serde_json::Value| crate::unhex(value.as_str().unwrap()).unwrap();
         let config_source = if member {
             pb::auth_session_revoked::ConfigSource::MetadataIndex(
                 fixture["config_source"]["metadata_index"].as_u64().unwrap(),
@@ -879,7 +865,7 @@ mod tests {
                 include_str!("../tests/fixtures/auth-oidc-login-native-v1.json")
             })
             .unwrap();
-            let wire = crate::unhex(fixture["wire_hex"].as_str().unwrap());
+            let wire = crate::unhex(fixture["wire_hex"].as_str().unwrap()).unwrap();
             assert_eq!(login.encode_to_vec(), wire);
             let operation = Operation::AuthOidcLogin(login);
             assert_eq!(
