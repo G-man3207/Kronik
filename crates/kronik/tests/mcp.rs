@@ -5,14 +5,17 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::io::{BufRead as _, BufReader, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use common::Daemon;
 use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams, ResourceContents};
 use rmcp::service::{RoleClient, RunningService, ServiceExt as _};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -30,43 +33,11 @@ const COUNTER_STEP2: &str = concat!(
 );
 const ENDPOINT: &str = "http://localhost/mcp";
 
-/// `kronik serve` on a free port with its socket in a temporary directory,
-/// with the counter deployed and `counter/a` incremented once; killed when
-/// dropped.
-struct Daemon {
-    child: Child,
-    socket: PathBuf,
-    dir: tempfile::TempDir,
-}
-
 impl Daemon {
-    fn start() -> Daemon {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("api.sock");
-        let log = std::fs::File::create(dir.path().join("serve.log")).unwrap();
-        let child = Command::new(KRONIK)
-            .arg("serve")
-            .env("KRONIK_DISK_RESERVE", "0B")
-            .arg("--data-dir")
-            .arg(dir.path().join("data"))
-            // The tests never call the gateway: port 0, which nothing can take first.
-            .args(["--http-listen", "127.0.0.1:0", "--api-socket"])
-            .arg(&socket)
-            .env("KRONIK_LOG", "warn")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        let d = Daemon { child, socket, dir };
-        let started = (0..600).any(|_| {
-            let up = d.cli(&["--json", "actors", "list"]).status.success();
-            if !up {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            up
-        });
-        assert!(started, "kronik serve did not start:\n{}", d.log());
+    /// `kronik serve` in `dir`, with the counter deployed and `counter/a`
+    /// incremented once.
+    fn start(dir: &Path) -> Daemon {
+        let d = Daemon::spawn(dir, Daemon::command(KRONIK, dir, None));
         assert!(
             d.cli(&["deploy", COUNTER, "--reason", "mcp test"])
                 .status
@@ -80,24 +51,13 @@ impl Daemon {
     fn cli(&self, args: &[&str]) -> std::process::Output {
         Command::new(KRONIK)
             .arg("--socket")
-            .arg(&self.socket)
+            .arg(self.socket())
             .args(args)
             .env_remove("KRONIK_API_SOCKET")
             .env_remove("KRONIK_TOKEN")
             .stdin(Stdio::null())
             .output()
             .unwrap()
-    }
-
-    fn log(&self) -> String {
-        std::fs::read_to_string(self.dir.path().join("serve.log")).unwrap_or_default()
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -177,7 +137,8 @@ const TOOLS: [&str; 16] = [
 
 #[test]
 fn tools_and_resources_over_streamable_http() {
-    let daemon = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -186,7 +147,7 @@ fn tools_and_resources_over_streamable_http() {
 }
 
 async fn over_streamable_http(daemon: &Daemon) {
-    let client = connect(&daemon.socket).await;
+    let client = connect(&daemon.socket()).await;
 
     let info = client.peer_info().unwrap();
     assert_eq!(info.server_info.as_ref().unwrap().name, "kronik");
@@ -370,7 +331,7 @@ async fn over_streamable_http(daemon: &Daemon) {
     .await
     .unwrap();
     assert_eq!(plan["dry_run"], true, "{plan}");
-    let forks = api_get(&daemon.socket, "/v1/forks");
+    let forks = api_get(&daemon.socket(), "/v1/forks");
     assert_eq!(
         forks["forks"],
         json!([]),
@@ -389,7 +350,7 @@ async fn over_streamable_http(daemon: &Daemon) {
     );
     // by_replay goes to the rollback via replay: the counter's first
     // deployment has no code before it to replay.
-    let deployments = api_get(&daemon.socket, "/v1/deployments");
+    let deployments = api_get(&daemon.socket(), "/v1/deployments");
     let first = deployments["deployments"][0]["epoch"].as_u64().unwrap();
     let rebase = call(
         &client,
@@ -429,7 +390,7 @@ async fn over_streamable_http(daemon: &Daemon) {
         "{sent}"
     );
     assert_eq!(sent["reply"]["text"], "2", "{sent}");
-    let main = api_get(&daemon.socket, "/v1/actors/counter/a/history?limit=10");
+    let main = api_get(&daemon.socket(), "/v1/actors/counter/a/history?limit=10");
     assert_eq!(main["turns"].as_array().unwrap().len(), 1, "{main}");
     let no_fork = call(
         &client,
@@ -465,7 +426,7 @@ async fn over_streamable_http(daemon: &Daemon) {
         format!("kronik approve {id} --reason '...'"),
         "{asked}"
     );
-    let shown = api_get(&daemon.socket, &format!("/v1/proposals/{id}"));
+    let shown = api_get(&daemon.socket(), &format!("/v1/proposals/{id}"));
     let request = &shown["approval_requests"][0];
     assert_eq!(request["reason"], evidence, "{shown}");
     assert_eq!(request["pending"], true, "{shown}");
@@ -637,8 +598,9 @@ impl Bridge {
 
 #[test]
 fn the_stdio_bridge_forwards_to_the_daemon() {
-    let daemon = Daemon::start();
-    let mut bridge = Bridge::start(&daemon.socket);
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    let mut bridge = Bridge::start(&daemon.socket());
 
     let init = bridge.request(
         1,
@@ -720,8 +682,9 @@ fn the_stdio_bridge_forwards_to_the_daemon() {
 /// that is longer instead of dropping it in silence.
 #[test]
 fn the_stdio_bridge_answers_large_requests() {
-    let daemon = Daemon::start();
-    let mut bridge = Bridge::start(&daemon.socket);
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    let mut bridge = Bridge::start(&daemon.socket());
     let limit = Duration::from_secs(120);
     bridge.request(
         1,
@@ -778,7 +741,8 @@ fn token(daemon: &Daemon, name: &str, scopes: &str) -> String {
 
 #[test]
 fn tools_and_resources_take_the_tokens_scopes() {
-    let daemon = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
     let agent = token(&daemon, "agent-1", "read,fork,propose");
     let approver = token(&daemon, "approver", "approve");
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -788,7 +752,7 @@ fn tools_and_resources_take_the_tokens_scopes() {
     runtime.block_on(async {
         // An agent reads and forks, always without personal data, and
         // cannot promote.
-        let client = connect_as(&daemon.socket, Some(&agent)).await.unwrap();
+        let client = connect_as(&daemon.socket(), Some(&agent)).await.unwrap();
         let actors = call(&client, "list_actors", json!({})).await.unwrap();
         assert_eq!(actors["actors"][0]["key"], "a", "{actors}");
         let fork = call(
@@ -820,7 +784,7 @@ fn tools_and_resources_take_the_tokens_scopes() {
         client.cancel().await.unwrap();
 
         // Without `read`, neither explain nor the resources answer.
-        let client = connect_as(&daemon.socket, Some(&approver)).await.unwrap();
+        let client = connect_as(&daemon.socket(), Some(&approver)).await.unwrap();
         let explain = call(&client, "explain", json!({"topic": "fork"}))
             .await
             .unwrap_err();
@@ -836,11 +800,11 @@ fn tools_and_resources_take_the_tokens_scopes() {
         client.cancel().await.unwrap();
 
         // An unknown token gets no session at all.
-        let refused = connect_as(&daemon.socket, Some("kronik_nope")).await;
+        let refused = connect_as(&daemon.socket(), Some("kronik_nope")).await;
         assert!(refused.is_err());
     });
     // The stdio bridge sends $KRONIK_TOKEN.
-    let mut bridge = Bridge::start_with_token(&daemon.socket, Some(&agent));
+    let mut bridge = Bridge::start_with_token(&daemon.socket(), Some(&agent));
     bridge.request(
         1,
         "initialize",
@@ -938,11 +902,12 @@ fn the_stdio_bridge_reports_startup_errors_as_json() {
 /// with every scope; `--url` is refused with the way to a remote `/mcp`.
 #[test]
 fn the_stdio_bridge_takes_the_token_flag_and_refuses_a_url() {
-    let daemon = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
     let reader = token(&daemon, "reader", "read");
     let mut child = Command::new(KRONIK)
         .arg("--socket")
-        .arg(&daemon.socket)
+        .arg(daemon.socket())
         .args(["mcp", "--token", &reader])
         .env_remove("KRONIK_API_SOCKET")
         .env_remove("KRONIK_TOKEN")
@@ -1012,7 +977,7 @@ fn the_stdio_bridge_takes_the_token_flag_and_refuses_a_url() {
     // N2: a blank --token is refused, not taken as no token (every scope).
     let out = Command::new(KRONIK)
         .arg("--socket")
-        .arg(&daemon.socket)
+        .arg(daemon.socket())
         .args(["mcp", "--token", " "])
         .env_remove("KRONIK_API_SOCKET")
         .env_remove("KRONIK_TOKEN")
@@ -1033,7 +998,7 @@ fn the_stdio_bridge_takes_the_token_flag_and_refuses_a_url() {
         }
         let out = command
             .arg("--socket")
-            .arg(&daemon.socket)
+            .arg(daemon.socket())
             .args(["mcp", "--token", "kronik_not_a_live_token"])
             .env_remove("KRONIK_API_SOCKET")
             .env_remove("KRONIK_TOKEN")

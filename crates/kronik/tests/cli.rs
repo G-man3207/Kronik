@@ -7,11 +7,11 @@
 mod common;
 
 use std::io::{Read as _, Write as _};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use common::{Out, free_port};
+use common::{Daemon, Out};
 use kronik_runtime::{KRONIK_VERSION, WASMTIME_VERSION};
 use serde_json::{Value, json};
 
@@ -110,66 +110,23 @@ fn assert_json_error(o: &Out, code: &str) {
     assert!(v["error"]["hint"].is_string(), "{o:?}");
 }
 
-/// `kronik serve` on a free port with its socket in a temporary directory;
-/// killed when dropped.
-struct Daemon {
-    child: Child,
-    socket: PathBuf,
-    http: String,
-    dir: tempfile::TempDir,
-}
-
 impl Daemon {
-    fn start() -> Daemon {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("api.sock");
-        let http = format!("127.0.0.1:{}", free_port());
-        let log = std::fs::File::create(dir.path().join("serve.log")).unwrap();
-        let child = Command::new(KRONIK)
-            .arg("serve")
-            .env("KRONIK_DISK_RESERVE", "0B")
-            .arg("--data-dir")
-            .arg(dir.path().join("data"))
-            .args(["--http-listen", &http, "--api-socket"])
-            .arg(&socket)
-            .env("KRONIK_LOG", "warn")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        let d = Daemon {
-            child,
-            socket,
-            http,
-            dir,
-        };
-        for _ in 0..600 {
-            if d.run(&["--json", "actors", "list"]).code == 0 {
-                return d;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        panic!("kronik serve did not start:\n{}", d.log());
+    /// `kronik serve` in `dir`.
+    fn start(dir: &Path) -> Daemon {
+        Daemon::spawn(dir, Daemon::command(KRONIK, dir, None))
     }
 
     fn run(&self, args: &[&str]) -> Out {
-        kronik(&self.socket, args, Some(&self.http))
+        kronik(&self.socket(), args, Some(&self.http))
     }
 
     fn run_with_input(&self, args: &[&str], input: &str) -> Out {
-        kronik_with(&self.socket, args, Some(&self.http), Some(input.as_bytes()))
-    }
-
-    fn log(&self) -> String {
-        std::fs::read_to_string(self.dir.path().join("serve.log")).unwrap_or_default()
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        kronik_with(
+            &self.socket(),
+            args,
+            Some(&self.http),
+            Some(input.as_bytes()),
+        )
     }
 }
 
@@ -535,7 +492,8 @@ fn build_checks_node_before_the_typescript_toolchain() {
 
 #[test]
 fn every_command_against_a_daemon() {
-    let d = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
 
     // An empty system.
     let o = d.run(&["actors", "list"]);
@@ -623,7 +581,7 @@ fn every_command_against_a_daemon() {
         (&v["outcome"]["kind"], &v["reply"]["text"]),
         (&json!("committed"), &json!("2"))
     );
-    let note = d.dir.path().join("note.txt");
+    let note = d.dir.join("note.txt");
     std::fs::write(&note, "from a file").unwrap();
     for body in [["--text", "hello"], ["--file", note.to_str().unwrap()]] {
         let mut args = vec!["send", "notes/n", "add"];
@@ -874,7 +832,8 @@ fn every_command_against_a_daemon() {
 
 #[test]
 fn m3_commands_against_a_daemon() {
-    let d = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
     let deploy = d.run(&["deploy", COUNTER, "--reason", "first deploy"]);
     assert_eq!(deploy.code, 0, "{deploy:?}");
     // Fresh logs begin with the startup SecretVersion/AuditEvent records, so
@@ -1012,7 +971,7 @@ fn m3_commands_against_a_daemon() {
             .stdout
             .contains("\nPolicy   ALLOW\n")
     );
-    let strict = d.dir.path().join("strict.toml");
+    let strict = d.dir.join("strict.toml");
     std::fs::write(
         &strict,
         "[[rule]]\nname = \"any-change\"\nwhen = \"diff.summary.changed\"\naction = \"require_approval\"\n",
@@ -1177,7 +1136,8 @@ fn m3_commands_against_a_daemon() {
 /// a component main already runs is skipped.
 #[test]
 fn propose_takes_a_directory_of_components() {
-    let d = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
     for wasm in [COUNTER, NOTES, WEBHOOK_RELAY] {
         assert_eq!(d.run(&["deploy", wasm, "--reason", "first deploy"]).code, 0);
     }
@@ -1185,7 +1145,7 @@ fn propose_takes_a_directory_of_components() {
         let o = d.run(&["send", "counter/a", "increment", "--reason", "traffic"]);
         assert_eq!(o.code, 0, "{o:?}");
     }
-    let dist = d.dir.path().join("dist");
+    let dist = d.dir.join("dist");
     std::fs::create_dir(&dist).unwrap();
     for (name, from) in [
         ("counter.wasm", "counter-calls-tally"),
@@ -1232,7 +1192,7 @@ fn propose_takes_a_directory_of_components() {
         &d.run(&["propose", COUNTER, NOTES, "--reason", "same"]),
         "NOTHING_TO_PROPOSE",
     );
-    let empty = d.dir.path().join("empty");
+    let empty = d.dir.join("empty");
     std::fs::create_dir(&empty).unwrap();
     assert_error(
         &d.run(&["propose", empty.to_str().unwrap(), "--reason", "x"]),
@@ -1242,7 +1202,8 @@ fn propose_takes_a_directory_of_components() {
 
 #[test]
 fn deploy_names_the_grants_a_component_asks_for() {
-    let d = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
     let o = d.run(&["deploy", WEBHOOK_RELAY, "--reason", "relay webhooks"]);
     assert_eq!(o.code, 0, "{o:?}");
     for want in [
@@ -1286,7 +1247,8 @@ fn deploy_names_the_grants_a_component_asks_for() {
 
 #[test]
 fn m2_commands_against_a_daemon() {
-    let d = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
     let (target, _) = common::http_target("127.0.0.1", "pong");
     assert_eq!(
         d.run(&["deploy", COUNTER, "--reason", "first deploy"]).code,
@@ -1744,7 +1706,8 @@ fn m2_commands_against_a_daemon() {
 
 #[test]
 fn privacy_mode_status_and_erase() {
-    let d = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
     let o = d.run(&["privacy", "status"]);
     assert_eq!(o.code, 0, "{o:?}");
     assert!(
@@ -1820,7 +1783,8 @@ fn privacy_mode_status_and_erase() {
 /// is not wired.
 #[test]
 fn privacy_reseal_is_wired() {
-    let d = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
 
     let off = d.run(&["privacy", "reseal", "--reason", "too soon"]);
     assert_eq!(off.code, 1, "{off:?}");
@@ -1885,7 +1849,8 @@ fn gateway_post(addr: &str, path: &str, body: &str) -> String {
 /// counts as synthetic grounding, and the diff records the rules.
 #[test]
 fn replay_and_propose_take_stub_rules() {
-    let d = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
     let (target, _) = common::http_target("127.0.0.1", "pong");
     assert_eq!(d.run(&["deploy", COUNTER, "--reason", "stub test"]).code, 0);
     let o = d.run(&[
@@ -1906,7 +1871,7 @@ fn replay_and_propose_take_stub_rules() {
     }
 
     // fetch-extra also GETs <url>/extra, which was never recorded.
-    let toml = d.dir.path().join("stubs.toml");
+    let toml = d.dir.join("stubs.toml");
     std::fs::write(
         &toml,
         format!(
@@ -1951,7 +1916,7 @@ fn replay_and_propose_take_stub_rules() {
     assert!(diff.to_string().contains("replay: no recording"), "{diff}");
 
     // replay takes the same rules, here as a JSON array.
-    let json_rules = d.dir.path().join("stubs.json");
+    let json_rules = d.dir.join("stubs.json");
     std::fs::write(
         &json_rules,
         format!(r#"[{{"url_prefix": "http://{target}/items/", "error": "timeout"}}]"#),
@@ -2037,7 +2002,8 @@ fn watch_rolls_back_a_failing_build_against_a_daemon() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/guests/counter-fail-get.wasm"
     );
-    let d = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
     assert_eq!(d.run(&["deploy", COUNTER, "--reason", "v1"]).code, 0);
     let send = |op: &str| d.run(&["send", "counter/a", op, "--reason", "traffic"]);
     for _ in 0..25 {
@@ -2054,7 +2020,7 @@ fn watch_rolls_back_a_failing_build_against_a_daemon() {
     assert!(first.starts_with("Promoted proposal "), "{o:?}");
     let epoch = first.rsplit(' ').next().unwrap().to_owned();
 
-    let (socket, http) = (d.socket.clone(), d.http.clone());
+    let (socket, http) = (d.socket(), d.http.clone());
     let watch = std::thread::spawn({
         let epoch = epoch.clone();
         move || {
@@ -2101,8 +2067,9 @@ fn watch_rolls_back_a_failing_build_against_a_daemon() {
 /// --json); a rule off the target is refused with BAD_REQUEST.
 #[test]
 fn stubs_set_and_simulators_list_against_a_daemon() {
-    let d = Daemon::start();
-    let rules = d.dir.path().join("rules.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
+    let rules = d.dir.join("rules.toml");
     std::fs::write(
         &rules,
         "neighbor = true\n\n[[stub]]\nmethod = \"GET\"\nurl_prefix = \"https://api.example.com/v1/\"\nbody = \"stubbed\"\n",
@@ -2176,14 +2143,15 @@ fn stubs_set_and_simulators_list_against_a_daemon() {
 #[test]
 fn rollback_by_replay_against_a_daemon() {
     let (target, _) = common::http_target("127.0.0.1", "pong");
-    let d = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
     assert_eq!(
         d.run(&["deploy", COUNTER, "--reason", "first deploy"]).code,
         0
     );
     let o = d.run(&["grant", "counter", "http:127.0.0.1", "--reason", "fetch"]);
     assert_eq!(o.code, 0, "{o:?}");
-    let quiet = d.dir.path().join("quiet.toml");
+    let quiet = d.dir.join("quiet.toml");
     std::fs::write(
         &quiet,
         "[[rule]]\nname = \"quiet\"\nwhen = \"false\"\naction = \"allow\"\n",

@@ -14,87 +14,37 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Output, Stdio};
-use std::time::Duration;
+use std::path::Path;
+use std::process::Output;
 
-use common::{command, free_port};
+use common::{Daemon, command};
 use serde_json::Value;
 
-/// `kronik serve` with every directory in a temporary one; killed when
-/// dropped.
-struct Daemon {
-    child: Child,
-    socket: PathBuf,
-    dir: tempfile::TempDir,
-}
-
 impl Daemon {
-    fn start() -> Daemon {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("api.sock");
-        let config = dir.path().join("kronik.toml");
-        std::fs::write(
-            &config,
-            format!(
-                "[server]\ndata_dir = {:?}\n\n[foreign]\nrun_dir = {:?}\nmicrovm_dir = {:?}\n",
-                dir.path().join("data"),
-                dir.path().join("run"),
-                dir.path().join("no-tools"),
-            ),
-        )
-        .unwrap();
-        let log = std::fs::File::create(dir.path().join("serve.log")).unwrap();
-        let child = command()
-            // Hide the host's KVM from the daemon's admission (a debug build
-            // reads it; see the module's documentation).
-            .env("KRONIK_TEST_KVM_DEVICE", dir.path().join("no-kvm"))
-            .arg("serve")
-            .arg("--config")
-            .arg(&config)
-            .args(["--http-listen", &format!("127.0.0.1:{}", free_port())])
-            .args(["--admin-listen", &format!("127.0.0.1:{}", free_port())])
-            .arg("--api-socket")
-            .arg(&socket)
-            .env("KRONIK_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        let d = Daemon { child, socket, dir };
-        let up = (0..600).any(|_| {
-            let ok = d.cli(&["--json", "actors", "list"]).status.success();
-            if !ok {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            ok
-        });
-        assert!(up, "kronik serve did not start:\n{}", d.log());
-        d
+    /// `kronik serve` in `dir`, with the foreign directories in it and the
+    /// host's KVM hidden from admission (a debug build reads it; see the
+    /// module's documentation).
+    fn start(dir: &Path) -> Daemon {
+        let mut serve = Daemon::command(
+            env!("CARGO_BIN_EXE_kronik"),
+            dir,
+            Some(&format!(
+                "[foreign]\nrun_dir = {:?}\nmicrovm_dir = {:?}\n",
+                dir.join("run"),
+                dir.join("no-tools"),
+            )),
+        );
+        serve.env("KRONIK_TEST_KVM_DEVICE", dir.join("no-kvm"));
+        Daemon::spawn(dir, serve)
     }
 
     fn cli(&self, args: &[&str]) -> Output {
         command()
             .arg("--socket")
-            .arg(&self.socket)
+            .arg(self.socket())
             .args(args)
             .output()
             .unwrap()
-    }
-
-    fn log(&self) -> String {
-        std::fs::read_to_string(self.dir.path().join("serve.log")).unwrap_or_default()
-    }
-
-    fn path(&self) -> &Path {
-        self.dir.path()
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -104,8 +54,9 @@ fn microvm_without_kvm_is_a_503_with_the_gvisor_suggestion_and_declares_nothing(
         eprintln!("skipped: a release daemon sees this host's /dev/kvm");
         return;
     }
-    let d = Daemon::start();
-    assert!(!d.path().join("no-kvm").exists());
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path());
+    assert!(!d.dir.join("no-kvm").exists());
     let head_before = d.cli(&["--json", "foreign", "list"]);
     assert!(head_before.status.success(), "{head_before:?}");
     let out = d.cli(&[
@@ -114,11 +65,7 @@ fn microvm_without_kvm_is_a_503_with_the_gvisor_suggestion_and_declares_nothing(
         "add",
         "vm",
         "--image",
-        &format!(
-            "oci-layout:{}@sha256:{}",
-            d.path().display(),
-            "0".repeat(64)
-        ),
+        &format!("oci-layout:{}@sha256:{}", d.dir.display(), "0".repeat(64)),
         "--port",
         "8080",
         "--isolation",
