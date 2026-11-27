@@ -27,16 +27,20 @@ use serde_json::json;
 /// The receiver's keyed check of a delivery, recomputed here as the tests
 /// sign: the crate itself signs through the key resolver.
 fn signature(key: &[u8], timestamp_ms: u64, event_id: &str, body: &[u8]) -> Result<String, String> {
-    use hmac::{KeyInit as _, Mac as _};
     let input = kronik_fleet::webhook::signing_input(timestamp_ms, event_id, body)?;
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key)
-        .map_err(|_| "webhook_signature".to_owned())?;
-    mac.update(&input);
     Ok(format!(
         "{}={}",
         kronik_fleet::webhook::SIGNATURE_VERSION,
-        kronik_core::ids::hex(&mac.finalize().into_bytes())
+        kronik_core::ids::hex(&hmac_sha256(key, &input))
     ))
+}
+
+/// HMAC-SHA256 of `data` under `key`, computed with the daemon's own
+/// `kronik_effects::crypto::hmac_sha256` and sized as a `Resolver` answers.
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    kronik_effects::crypto::hmac_sha256(key, data)
+        .try_into()
+        .unwrap()
 }
 
 fn identity() -> Identity {
@@ -189,7 +193,6 @@ async fn certified_catalogue(
 
 #[tokio::test]
 async fn revoked_original_disclosure_creates_no_pending_manifest_or_transport() {
-    use hmac::{KeyInit as _, Mac as _};
     use std::sync::atomic::{AtomicUsize, Ordering};
     let directory = tempfile::tempdir().unwrap();
     let mut env = Env::real(tokio::runtime::Handle::current());
@@ -208,11 +211,7 @@ async fn revoked_original_disclosure_creates_no_pending_manifest_or_transport() 
         let counted = counted.clone();
         Box::pin(async move {
             counted.fetch_add(1, Ordering::SeqCst);
-            let mut mac =
-                hmac::Hmac::<sha2::Sha256>::new_from_slice(b"dummy-revoked-before-pending")
-                    .unwrap();
-            mac.update(&input);
-            Ok(mac.finalize().into_bytes().into())
+            Ok(hmac_sha256(b"dummy-revoked-before-pending", &input))
         })
     });
     let mapper = Arc::new(Mapper {
@@ -724,7 +723,6 @@ fn signing_input_is_versioned_exact_and_refuses_a_bad_event_id() {
 
 #[tokio::test]
 async fn committed_pages_restart_rewind_and_prepared_webhook_survive_durable_reload() {
-    use hmac::{KeyInit as _, Mac as _};
     let dir = tempfile::tempdir().unwrap();
     let mut env = Env::real(tokio::runtime::Handle::current());
     let network = Arc::new(RecordingNetwork::default());
@@ -841,9 +839,7 @@ async fn committed_pages_restart_rewind_and_prepared_webhook_survive_durable_rel
                 }
                 _ => panic!("unexpected immutable version"),
             };
-            let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
-            mac.update(&input);
-            Ok(mac.finalize().into_bytes().into())
+            Ok(hmac_sha256(key, &input))
         })
     });
     let mut sink = Webhook::open(
@@ -1058,7 +1054,6 @@ async fn age_and_compact(node: &Node, execution: &AuthLease) {
 
 #[tokio::test]
 async fn compacted_actor_pending_survives_restart_and_holds_gap_until_ack() {
-    use hmac::{KeyInit as _, Mac as _};
     use kronik_otel::cursor::{Control, Entry};
     use kronik_sched::snapshots::StorageConfig;
     use std::time::Duration;
@@ -1141,11 +1136,7 @@ async fn compacted_actor_pending_survives_restart_and_holds_gap_until_ack() {
     let pins = observed_pins.clone();
     let resolver: Arc<webhook::Resolver> = Arc::new(move |pin, input, _original| {
         pins.lock().unwrap().push(pin);
-        Box::pin(async move {
-            let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"pending-gap-key").unwrap();
-            mac.update(&input);
-            Ok(mac.finalize().into_bytes().into())
-        })
+        Box::pin(async move { Ok(hmac_sha256(b"pending-gap-key", &input)) })
     });
     let mut sink = Webhook::open(
         node.clone(),
@@ -2564,7 +2555,6 @@ async fn approval_wire_records_keep_protected_identity_private_and_value_only_re
 
 #[tokio::test]
 async fn real_http_execution_fence_rejects_after_mac_and_owns_already_admitted_delivery() {
-    use hmac::{KeyInit as _, Mac as _};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -2657,9 +2647,7 @@ async fn real_http_execution_fence_rejects_after_mac_and_owns_already_admitted_d
         let resolver: Arc<webhook::Resolver> = Arc::new(move |_, message, _original| {
             let node = signing_node.clone();
             Box::pin(async move {
-                let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(KEY).unwrap();
-                mac.update(&message);
-                let result = mac.finalize().into_bytes().into();
+                let result = hmac_sha256(KEY, &message);
                 // Real physical publication occurs AFTER computing the MAC and
                 // before returning it: a check-before-sign implementation loses.
                 if revoke_after_mac {
@@ -2773,14 +2761,16 @@ async fn real_http_execution_fence_rejects_after_mac_and_owns_already_admitted_d
             assert_eq!(headers["content-type"], "application/json");
             let timestamp: u64 = headers["kronik-timestamp-ms"].parse().unwrap();
             assert_eq!(timestamp.to_string(), headers["kronik-timestamp-ms"]);
-            let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(KEY).unwrap();
-            mac.update(format!("kronik.webhook/v1\n{timestamp}\n{expected}\n").as_bytes());
-            mac.update(&body);
-            mac.verify_slice(
-                &kronik_core::ids::unhex(headers["kronik-signature"].strip_prefix("v1=").unwrap())
+            let input = [
+                format!("kronik.webhook/v1\n{timestamp}\n{expected}\n").as_bytes(),
+                &body[..],
+            ]
+            .concat();
+            assert_eq!(
+                kronik_core::ids::unhex(headers["kronik-signature"].strip_prefix("v1=").unwrap())
                     .unwrap(),
-            )
-            .unwrap();
+                hmac_sha256(KEY, &input)
+            );
             assert_eq!(started_jobs.load(Ordering::SeqCst), 1);
             // Dropping the waiter must not cancel the admitted owned HTTP job.
             sending.abort();

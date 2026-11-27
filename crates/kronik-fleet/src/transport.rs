@@ -219,13 +219,6 @@ impl PreparedControl {
                                     hint: None,
                                 });
                             }
-                            if ready.is_some() {
-                                return Err(ApiError {
-                                    code: ErrorCode::Internal,
-                                    message: std::mem::take(&mut duplicate),
-                                    hint: None,
-                                });
-                            }
                             let command = pending.take().ok_or_else(|| ApiError {
                                 code: ErrorCode::Internal,
                                 message: std::mem::take(&mut duplicate),
@@ -411,4 +404,91 @@ where
     let _ = env.timeout(Duration::from_secs(2), socket.close()).await;
     check_control(&original, &guard)?;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// An authority that breaks its contract and asks for the hand-off twice,
+    /// keeping what each one answered.
+    struct TwiceHanded(Arc<Mutex<Vec<Result<(), ApiError>>>>);
+
+    impl kronik_core::authority::Authority for TwiceHanded {
+        fn check(&self) -> Result<(), ApiError> {
+            Ok(())
+        }
+        fn cancelled(&self) -> BoxFuture<'static, ()> {
+            Box::pin(std::future::pending())
+        }
+        fn admit(&self, effect: &mut dyn FnMut() -> Result<(), ApiError>) -> Result<(), ApiError> {
+            let answers = [effect(), effect()];
+            lock(&self.0).extend(answers.iter().cloned());
+            answers[1].clone()
+        }
+    }
+
+    /// Only the first hand-off takes the command. A second is refused, and the
+    /// job ends revoked before it opens anything.
+    #[tokio::test]
+    async fn a_second_hand_off_is_refused() {
+        let env = Env::real(tokio::runtime::Handle::current());
+        let epoch = EpochAuthority::new(1);
+        epoch
+            .publish(&EnrollmentRecord {
+                plan: crate::enrollment::EnrollmentPlan {
+                    controller_url: "https://controller.test".into(),
+                    identity: crate::enrollment::FleetIdentity {
+                        installation: "installation-1".into(),
+                        node: None,
+                        cluster: None,
+                    },
+                    scopes: vec!["read".into()],
+                    ca_sha256: "b".repeat(64),
+                },
+                request_id: "request-1".into(),
+                epoch: 1,
+                phase: EnrollmentPhase::Active,
+                controller_id: None,
+                csr_der: Vec::new(),
+                client_key_sha256: String::new(),
+                client_cert_der: None,
+            })
+            .unwrap();
+        let answers = Arc::new(Mutex::new(Vec::new()));
+        let original: AuthLease = Arc::new(TwiceHanded(answers.clone()));
+        let command = ConnectCommand {
+            env: env.clone(),
+            net: env.net.clone(),
+            request: WebSocketRequest {
+                url: "wss://controller.test/v1/control".into(),
+                headers: Vec::new(),
+                max_message_bytes: TUNNEL_CHUNK_BYTES,
+            },
+            original,
+            guard: epoch.guard(),
+            request_id: Arc::from("request-1"),
+            permit: Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .unwrap(),
+        };
+        let refused = PreparedControl { command }
+            .dispatch_with_admission(|| std::future::ready(Ok(())))
+            .await;
+        assert!(matches!(refused, Err(FleetError::Revoked)));
+        assert_eq!(
+            *lock(&answers),
+            vec![
+                Ok(()),
+                Err(ApiError {
+                    code: ErrorCode::Internal,
+                    message: "fleet control opening was handed off twice".into(),
+                    hint: None,
+                })
+            ]
+        );
+    }
 }
