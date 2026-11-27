@@ -121,18 +121,8 @@ impl Mapper {
         record: &Record,
         secrets: &[(&str, &[u8])],
     ) -> Result<Vec<Line>, ApiError> {
-        source
-            .validate()
-            .map_err(|_| corruption(LogError::Corrupt("invalid actor source".into())))?;
-        self.lines_in(
-            SourcePos::Actor {
-                shard: source.shard,
-                lsn: source.lsn,
-            },
-            &source.branch,
-            record,
-            secrets,
-        )
+        let (source, branch) = actor_source(source)?;
+        self.lines_in(source, branch, record, secrets)
     }
 
     fn lines_in(
@@ -171,27 +161,7 @@ impl Mapper {
         record: &Record,
         secrets: &[(&str, &[u8])],
     ) -> Result<Vec<Line>, ApiError> {
-        source
-            .validate()
-            .map_err(|_| corruption(LogError::Corrupt("invalid actor source".into())))?;
-        self.operational_lines_in(
-            SourcePos::Actor {
-                shard: source.shard,
-                lsn: source.lsn,
-            },
-            &source.branch,
-            record,
-            secrets,
-        )
-    }
-
-    fn operational_lines_in(
-        &self,
-        source: SourcePos,
-        branch: &str,
-        record: &Record,
-        secrets: &[(&str, &[u8])],
-    ) -> Result<Vec<Line>, ApiError> {
+        let (source, branch) = actor_source(source)?;
         let mut out = self.lines_in(source, branch, record, secrets)?;
         let Record::TurnRecord(turn) = record else {
             return Ok(out);
@@ -268,20 +238,11 @@ impl Mapper {
         source: SourcePos,
         record: &Record,
     ) -> Result<Vec<Expected>, ApiError> {
-        self.expected_in(source, &self.branch, record)
-    }
-
-    fn expected_in(
-        &self,
-        source: SourcePos,
-        branch: &str,
-        record: &Record,
-    ) -> Result<Vec<Expected>, ApiError> {
         expected_at(
             source,
             record,
             &Ctx {
-                branch,
+                branch: &self.branch,
                 keys: &ActorKeys::Omit,
                 subject: &|s| subject_label(&self.sealer, s),
                 sealer: &self.sealer,
@@ -289,6 +250,21 @@ impl Mapper {
             },
         )
     }
+}
+
+/// The position and branch of an actor source; one that does not validate
+/// is corruption.
+fn actor_source(source: &pb::ActorSource) -> Result<(SourcePos, &str), ApiError> {
+    source
+        .validate()
+        .map_err(|_| corruption(LogError::Corrupt("invalid actor source".into())))?;
+    Ok((
+        SourcePos::Actor {
+            shard: source.shard,
+            lsn: source.lsn,
+        },
+        source.branch.as_str(),
+    ))
 }
 
 /// A subject as the diff shows it: `s:` + 12 hex of its keyed hash, `-`

@@ -8,6 +8,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
 
+use kronik_privacy::keystore::keyed_hash;
 use kronik_privacy::sealer::Sealer;
 
 use crate::spans::{ID_KEY_PURPOSE, IdKey, KEY_HASH_PURPOSE, key_label};
@@ -79,19 +80,6 @@ impl KeyHasher {
     }
 }
 
-/// `Pseudonyms::keyed_hash`'s construction: purpose, NUL, then each part
-/// with its length.
-fn keyed_hash(key: &[u8; 32], purpose: &str, parts: &[&[u8]]) -> [u8; 32] {
-    let mut h = blake3::Hasher::new_keyed(key);
-    h.update(purpose.as_bytes());
-    h.update(b"\0");
-    for p in parts {
-        h.update(&(p.len() as u64).to_le_bytes());
-        h.update(p);
-    }
-    *h.finalize().as_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +97,25 @@ mod tests {
         let meta = std::fs::metadata(dir.path().join(LOCAL_KEY_FILE)).unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn the_local_key_hashes_with_the_master_keys_construction() {
+        use kronik_core::ids::hex;
+        let local = KeyHasher::Local([7; 32]);
+        assert_eq!(
+            local.label("counter", "carol@example.com"),
+            "kh:e3035a08a182"
+        );
+        // Each part is length-prefixed: a byte moved across the boundary
+        // changes the label.
+        assert_eq!(
+            local.label("counterc", "arol@example.com"),
+            "kh:b0ae08679312"
+        );
+        assert_eq!(
+            hex(&local.id_key().0),
+            "b9640eba3e6838d976523ac2f2f34660158a3bd0fab87f2080a0c5aff41f4927"
+        );
     }
 }

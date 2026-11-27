@@ -1068,6 +1068,21 @@ pub fn unseal(
         .map_err(|_| PrivacyError::Decrypt(format!("a value of {subject}")))
 }
 
+/// A keyed BLAKE3 of `parts` for `purpose` (a fixed domain string) under
+/// `key`: each part is length-prefixed, so part boundaries can't be
+/// shifted. [`Pseudonyms::keyed_hash`] uses it with the master-derived
+/// key, kronik-otel's hashed actor keys with a node-local one.
+pub fn keyed_hash(key: &[u8; 32], purpose: &str, parts: &[&[u8]]) -> [u8; 32] {
+    let mut h = Zeroizing::new(blake3::Hasher::new_keyed(key));
+    h.update(purpose.as_bytes());
+    h.update(b"\0");
+    for p in parts {
+        h.update(&(p.len() as u64).to_le_bytes());
+        h.update(p);
+    }
+    *h.finalize().as_bytes()
+}
+
 /// The pseudonyms of `--no-pii` forks: `pii:` and 12 hex characters, from a
 /// keyed BLAKE3 of the subject and the value. Equal values get equal
 /// pseudonyms within an installation, so equality survives, while without
@@ -1105,14 +1120,7 @@ impl Pseudonyms {
     /// A keyed BLAKE3 of `parts` for `purpose` (a fixed domain string):
     /// each part is length-prefixed, so part boundaries can't be shifted.
     pub fn keyed_hash(&self, purpose: &str, parts: &[&[u8]]) -> [u8; 32] {
-        let mut h = Zeroizing::new(blake3::Hasher::new_keyed(self.hashes.bytes()));
-        h.update(purpose.as_bytes());
-        h.update(b"\0");
-        for p in parts {
-            h.update(&(p.len() as u64).to_le_bytes());
-            h.update(p);
-        }
-        *h.finalize().as_bytes()
+        keyed_hash(self.hashes.bytes(), purpose, parts)
     }
 }
 
@@ -1446,6 +1454,25 @@ mod tests {
             Pseudonyms::new(&MasterKey::from_bytes([2; 32]).unwrap())
                 .unwrap()
                 .of("user:1", b"alice@example.com")
+        );
+    }
+
+    #[test]
+    fn keyed_hash_is_fixed_and_keeps_part_boundaries() {
+        let key = [7; 32];
+        assert_eq!(
+            hex(&keyed_hash(
+                &key,
+                "kronik keyed hash test v1",
+                &[b"kind", b"key"]
+            )),
+            "c4a3f3887ba6390c9abdbed722242760e592a196b435d5f68b5369b1748417f5"
+        );
+        // Each part is length-prefixed: moving a byte across the boundary
+        // changes the hash.
+        assert_ne!(
+            keyed_hash(&key, "purpose", &[b"ab", b"c"]),
+            keyed_hash(&key, "purpose", &[b"a", b"bc"])
         );
     }
 }
