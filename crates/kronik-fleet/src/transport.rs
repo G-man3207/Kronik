@@ -219,13 +219,6 @@ impl PreparedControl {
                                     hint: None,
                                 });
                             }
-                            if ready.is_some() {
-                                return Err(ApiError {
-                                    code: ErrorCode::Internal,
-                                    message: std::mem::take(&mut duplicate),
-                                    hint: None,
-                                });
-                            }
                             let command = pending.take().ok_or_else(|| ApiError {
                                 code: ErrorCode::Internal,
                                 message: std::mem::take(&mut duplicate),
