@@ -24,7 +24,7 @@ use kronik_sim::fs::{CrashModel, Disk, DiskFaults, SimFs};
 use kronik_sim::scenario::COUNTER;
 use kronik_sim::{SimClock, SimEntropy, SimProcs, SimRng, SimSpawner};
 use kronik_store::Store;
-use kronik_store::sql::{Limits, MemOpener, SqlPool};
+use kronik_store::sql::{MemOpener, SqlPool};
 
 fn audit() -> pb::Audit {
     pb::Audit {
@@ -87,11 +87,7 @@ fn a_simulated_node_writes_nothing_on_the_host() {
     let code = Arc::new(CodeStore::new(engine, None).unwrap());
     code.add(COUNTER).unwrap();
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    let store = Store::open(
-        conn,
-        SqlPool::new(Arc::new(MemOpener), Limits::default(), usize::MAX),
-    )
-    .unwrap();
+    let store = Store::open(conn, SqlPool::new(Arc::new(MemOpener), usize::MAX)).unwrap();
     let parts = NodeParts {
         env: env.clone(),
         config: NodeConfig {

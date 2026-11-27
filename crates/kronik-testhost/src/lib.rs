@@ -37,7 +37,7 @@ use kronik_runtime::{CodeStore, PoolSize, build_engine};
 use kronik_sched::connections::ConnectionsConfig;
 use kronik_sched::{BlobsConfig, Node, NodeConfig, NodeParts};
 use kronik_store::Store;
-use kronik_store::sql::{Limits, MemOpener, SqlPool};
+use kronik_store::sql::{MemOpener, SqlPool};
 
 pub use clock::ManualClock;
 pub use connections::{CloseBy, Sent};
@@ -114,7 +114,7 @@ impl TestHost {
             procs: Arc::new(NoProcesses),
         };
         let conn = rusqlite::Connection::open_in_memory().map_err(|e| Error::new("state", e))?;
-        let pool = SqlPool::new(Arc::new(MemOpener), Limits::default(), usize::MAX);
+        let pool = SqlPool::new(Arc::new(MemOpener), usize::MAX);
         let store = Store::open(conn, pool).map_err(|e| Error::new("state", e))?;
         let concurrency = 4;
         let engine = build_engine(PoolSize { concurrency }).map_err(|e| Error::new("engine", e))?;

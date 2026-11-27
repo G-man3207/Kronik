@@ -453,8 +453,8 @@ from `[env]` in `.cargo/config.toml`, and sessions are called through
 ## Consequences
 
 - **`kronik-store`** gets a `sql` module modelled on `SqlActor`, with
-  `ffi.rs` allowlisted for `unsafe`. Its API: `open(opener, actor,
-  limits)`, `begin_turn`, `query`/`execute`, `end_turn -> TurnSql { ddl,
+  `ffi.rs` allowlisted for `unsafe`. Its API: `open(opener, actor)`,
+  `begin_turn`, `query`/`execute`, `end_turn -> TurnSql { ddl,
   changesets, vm_steps }`, `apply(turn_sql, lsn, erased)`,
   `erase_subject`, `canonical_hash`.
 - **`kronik-proto`:**

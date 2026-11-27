@@ -53,7 +53,7 @@ use kronik_core::env::Env;
 use kronik_log::LogConfig;
 use kronik_runtime::{CodeStore, PoolSize, build_engine};
 use kronik_store::Store;
-use kronik_store::sql::{FileOpener, Limits, SqlPool};
+use kronik_store::sql::{FileOpener, SqlPool};
 
 pub use erasure::Born;
 pub use gate::Drain;
@@ -428,12 +428,9 @@ pub async fn start_local_locked(
     snapshots::prepare_state(data, &config.branch).map_err(StartError::Corrupt)?;
     let state = rusqlite::Connection::open(branch_dir.join("state.db"))
         .map_err(|e| StartError::Store(e.into()))?;
-    let pool = SqlPool::for_node(
-        Arc::new(FileOpener {
-            root: branch_dir.join("sql"),
-        }),
-        Limits::default(),
-    );
+    let pool = SqlPool::for_node(Arc::new(FileOpener {
+        root: branch_dir.join("sql"),
+    }));
     let store = Store::open(state, pool)?;
     // Room for the node's turns, and for the forks, replays and previews
     // that run on the same pool with nested calls (pool::node_instances).

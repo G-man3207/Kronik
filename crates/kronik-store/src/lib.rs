@@ -127,7 +127,6 @@ pub(crate) fn file_store(dir: &std::path::Path, capacity: usize) -> Arc<Store> {
             Arc::new(crate::sql::FileOpener {
                 root: dir.join("sql"),
             }),
-            crate::sql::Limits::default(),
             capacity,
         ),
     )
@@ -297,7 +296,7 @@ impl Store {
         let conn = rusqlite::Connection::open_in_memory()?;
         Store::open(
             conn,
-            sql::SqlPool::new(Arc::new(sql::MemOpener), sql::Limits::default(), usize::MAX),
+            sql::SqlPool::new(Arc::new(sql::MemOpener), usize::MAX),
         )
     }
 
@@ -983,8 +982,6 @@ fn turn_committed(t: &pb::TurnRecord) -> bool {
 mod erasure_lock_tests {
     use super::*;
 
-    use crate::sql::Limits;
-
     /// The schema of the SQL actor the erasure tests erase.
     const CREATE_NOTES: &str =
         "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, _subject TEXT)";
@@ -1060,9 +1057,7 @@ mod erasure_lock_tests {
                 .unwrap();
         }
         let bytes = {
-            let mut side =
-                crate::sql::SqlActor::open(&crate::sql::MemOpener, "side", Limits::default())
-                    .unwrap();
+            let mut side = crate::sql::SqlActor::open(&crate::sql::MemOpener, "side").unwrap();
             let mut opts = crate::sql::TurnOpts {
                 seed: [1; 32],
                 time_ms: 1,
@@ -1261,7 +1256,7 @@ mod sql_pool_apply_tests {
     use rusqlite::Connection;
 
     use super::*;
-    use crate::sql::{Limits, MemOpener, SqlPool, SqliteOpener};
+    use crate::sql::{MemOpener, SqlPool, SqliteOpener};
 
     struct Counting {
         inner: MemOpener,
@@ -1313,7 +1308,7 @@ mod sql_pool_apply_tests {
             opens: AtomicUsize::new(0),
             opens_under_lock: AtomicUsize::new(0),
         });
-        let pool = SqlPool::new(counting.clone(), Limits::default(), capacity);
+        let pool = SqlPool::new(counting.clone(), capacity);
         (
             Store::open(Connection::open_in_memory().unwrap(), pool).unwrap(),
             counting,
@@ -1388,7 +1383,7 @@ mod sql_pool_apply_tests {
         });
         let store = Store::open(
             Connection::open_in_memory().unwrap(),
-            SqlPool::new(gate.clone(), Limits::default(), 8),
+            SqlPool::new(gate.clone(), 8),
         )
         .unwrap();
         store

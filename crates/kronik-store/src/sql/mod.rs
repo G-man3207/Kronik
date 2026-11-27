@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
 
 pub use actor::{
-    FileOpener, Limits, MemOpener, Rows, SqlActor, SqlError, SqlResult, SqliteOpener, TableRows,
-    TurnOpts, TurnSql, actor_file, canonical_hash_raw,
+    FileOpener, MemOpener, Rows, SqlActor, SqlError, SqlResult, SqliteOpener, TableRows, TurnOpts,
+    TurnSql, actor_file, canonical_hash_raw,
 };
 pub(crate) use ffi::{CowShare, arm_cow_vfs, cow_vfs_name};
 pub use rewrite::pseudonymize_changeset;
@@ -78,7 +78,6 @@ pub fn changeset_rows(cs: &[u8]) -> Result<Vec<RowChange>, String> {
 /// mutex: one actor's `open` does not stall another's `get`.
 pub struct SqlPool {
     opener: Arc<dyn SqliteOpener>,
-    limits: Limits,
     inner: Mutex<PoolInner>,
     /// Wakes a `get` waiting on another thread's open of the same actor.
     cv: Condvar,
@@ -122,10 +121,9 @@ fn live_pool_cap() -> usize {
 }
 
 impl SqlPool {
-    pub fn new(opener: Arc<dyn SqliteOpener>, limits: Limits, capacity: usize) -> SqlPool {
+    pub fn new(opener: Arc<dyn SqliteOpener>, capacity: usize) -> SqlPool {
         SqlPool {
             opener,
-            limits,
             inner: Mutex::new(PoolInner {
                 capacity: capacity.max(1),
                 ..PoolInner::default()
@@ -136,8 +134,8 @@ impl SqlPool {
 
     /// The live node's pool: 256 connections, growing with the actors opened
     /// until two descriptors per actor would leave fewer than 1024 (ADR 0156).
-    pub fn for_node(opener: Arc<dyn SqliteOpener>, limits: Limits) -> SqlPool {
-        let pool = SqlPool::new(opener, limits, 256);
+    pub fn for_node(opener: Arc<dyn SqliteOpener>) -> SqlPool {
+        let pool = SqlPool::new(opener, 256);
         pool.retain_opened(live_pool_cap());
         pool
     }
@@ -178,7 +176,7 @@ impl SqlPool {
             !crate::apply_lock_held(),
             "SQL open of {actor} ran under the apply lock"
         );
-        let opened = SqlActor::open(self.opener.as_ref(), actor, self.limits);
+        let opened = SqlActor::open(self.opener.as_ref(), actor);
 
         let mut g = lock(&self.inner);
         g.opening.remove(actor);

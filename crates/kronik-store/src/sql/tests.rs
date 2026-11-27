@@ -18,7 +18,7 @@ fn opts(seed: u8, time_ms: i64, migrate: bool) -> TurnOpts {
 }
 
 fn actor(name: &str) -> SqlActor {
-    SqlActor::open(&MemOpener, name, Limits::default()).unwrap()
+    SqlActor::open(&MemOpener, name).unwrap()
 }
 
 /// Runs one turn and applies it when every statement succeeded; returns the
@@ -189,12 +189,11 @@ fn physical_diagnostics_are_denied_in_guest_private_prepare_and_schema_replay() 
     }
     let root = tempfile::tempdir().unwrap();
     for pool in [
-        SqlPool::new(Arc::new(MemOpener), Limits::default(), 8),
+        SqlPool::new(Arc::new(MemOpener), 8),
         SqlPool::new(
             Arc::new(FileOpener {
                 root: root.path().to_owned(),
             }),
-            Limits::default(),
             8,
         ),
     ] {
@@ -385,7 +384,7 @@ fn a_copy_during_an_open_turn_holds_the_applied_rows() {
     let opener = FileOpener {
         root: dir.path().to_path_buf(),
     };
-    let mut a = SqlActor::open(&opener, "notes/n", Limits::default()).unwrap();
+    let mut a = SqlActor::open(&opener, "notes/n").unwrap();
     commit_ok(&mut a, &opts(1, 1_000, true), &SCHEMA[..1], 1);
     commit_ok(
         &mut a,
@@ -1243,7 +1242,7 @@ fn reopening_an_actor_does_not_rescan_a_scrubbed_secret() {
     };
     let text: &[u8] = b"sk-live-0123456789";
     {
-        let mut a = SqlActor::open(&opener, "notes/n", Limits::default()).unwrap();
+        let mut a = SqlActor::open(&opener, "notes/n").unwrap();
         commit_ok(
             &mut a,
             &opts(1, 1, true),
@@ -1257,7 +1256,7 @@ fn reopening_an_actor_does_not_rescan_a_scrubbed_secret() {
         let t = a.end_turn(true).unwrap();
         a.apply(&t, 2, &BTreeSet::new()).unwrap();
     }
-    let mut a = SqlActor::open(&opener, "notes/n", Limits::default()).unwrap();
+    let mut a = SqlActor::open(&opener, "notes/n").unwrap();
     a.begin_turn(&opts(3, 3, false)).unwrap();
     a.execute("UPDATE notes SET body = 'later' WHERE id = 1", &[])
         .unwrap();
@@ -1680,7 +1679,7 @@ fn an_implicit_parent_key_erases_and_a_cross_subject_child_blocks() {
 
 #[test]
 fn a_small_pool_still_evicts_when_nothing_asks_it_to_grow() {
-    let pool = SqlPool::new(Arc::new(MemOpener), Limits::default(), 1);
+    let pool = SqlPool::new(Arc::new(MemOpener), 1);
     drop(pool.get("a/1").unwrap());
     drop(pool.get("b/1").unwrap());
     let open = &pool.inner.lock().unwrap().open;
@@ -1691,7 +1690,7 @@ fn a_small_pool_still_evicts_when_nothing_asks_it_to_grow() {
 
 #[test]
 fn the_live_pool_can_grow_past_256() {
-    let pool = SqlPool::for_node(Arc::new(MemOpener), Limits::default());
+    let pool = SqlPool::for_node(Arc::new(MemOpener));
     let g = pool.inner.lock().unwrap();
     assert_eq!(g.capacity, 256);
     assert!(g.retain_max.is_some_and(|n| n >= 256));

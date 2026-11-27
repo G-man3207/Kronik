@@ -34,7 +34,7 @@ pub fn pseudonymize_changeset(
     let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
     create_tables(&conn, &changes)?;
     preinsert(&conn, &changes, skip, &mut rewrite)?;
-    let session = ffi::Session::new(&conn, true).map_err(|e| e.to_string())?;
+    let session = ffi::Session::new(&conn).map_err(|e| e.to_string())?;
     for change in &changes {
         replay(&conn, change, skip, &mut rewrite)?;
     }

@@ -189,7 +189,7 @@ pub struct Session {
 unsafe impl Send for Session {}
 
 impl Session {
-    pub fn new(conn: &Connection, track_rowid_tables: bool) -> rusqlite::Result<Self> {
+    pub fn new(conn: &Connection) -> rusqlite::Result<Self> {
         let mut raw = ptr::null_mut();
         // SAFETY: `conn.handle()` is a valid open connection; the session is
         // deleted in Drop before the connection is closed by our owner.
@@ -198,7 +198,8 @@ impl Session {
             if rc != ffi::SQLITE_OK {
                 return Err(rc_err(rc, "sqlite3session_create"));
             }
-            let mut on: c_int = c_int::from(track_rowid_tables);
+            // Tables without a primary key are tracked by rowid (ADR 0005 §3).
+            let mut on: c_int = 1;
             let rc = ffi::sqlite3session_object_config(
                 raw,
                 ffi::SQLITE_SESSION_OBJCONFIG_ROWID as c_int,

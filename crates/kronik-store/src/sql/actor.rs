@@ -49,8 +49,8 @@ pub struct TurnOpts {
     pub migrate: bool,
     /// SQL work budget in VM steps (deterministic, part of the turn's fuel).
     pub sql_budget: u64,
-    /// The kind's database size limit for this turn's writes (0: the
-    /// pool's default). Applies and rebuilds are never limited.
+    /// The kind's database size limit for this turn's writes (0: 1 GiB).
+    /// Applies and rebuilds are never limited.
     pub max_bytes: u64,
 }
 
@@ -82,23 +82,10 @@ pub struct TurnSql {
     pub whole: Vec<u8>,
 }
 
-/// Configuration of one actor database.
-#[derive(Clone, Copy)]
-pub struct Limits {
-    pub max_bytes: u64,
-    pub value_bytes: i32,
-    pub track_rowid_tables: bool,
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            max_bytes: 1 << 30,
-            value_bytes: 1 << 20,
-            track_rowid_tables: true,
-        }
-    }
-}
+/// A turn's database size limit when its [`TurnOpts::max_bytes`] is 0.
+const DEFAULT_MAX_BYTES: u64 = 1 << 30;
+/// The largest string or blob (`SQLITE_LIMIT_LENGTH`, `randomblob`).
+const VALUE_BYTES: i32 = 1 << 20;
 
 #[derive(Default)]
 struct Stmt {
@@ -478,7 +465,6 @@ pub struct SqlActor {
     pub conn: Connection,
     vfs: ffi::TimeVfs,
     shared: Arc<Mutex<Shared>>,
-    limits: Limits,
     ddl: Vec<String>,
     steps: u64,
     default_subject: Option<String>,
@@ -532,7 +518,7 @@ type LoggedChangesets = Vec<(Option<String>, Vec<u8>)>;
 type CellRewrite<'a> = &'a dyn Fn(&str, &[u8]) -> Vec<u8>;
 
 impl SqlActor {
-    pub fn open(opener: &dyn SqliteOpener, actor: &str, limits: Limits) -> rusqlite::Result<Self> {
+    pub fn open(opener: &dyn SqliteOpener, actor: &str) -> rusqlite::Result<Self> {
         let vfs = ffi::TimeVfs::new()?;
         let mut conn = opener.open(actor, vfs.name())?;
         // secure_delete (H11): deleted rows are zeroed in their pages, so an
@@ -567,7 +553,7 @@ impl SqlActor {
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)?;
         conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
         conn.set_limit(Limit::SQLITE_LIMIT_WORKER_THREADS, 0)?;
-        conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, limits.value_bytes)?;
+        conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, VALUE_BYTES)?;
         conn.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 1 << 20)?;
         conn.set_limit(Limit::SQLITE_LIMIT_TRIGGER_DEPTH, 32)?;
 
@@ -593,7 +579,7 @@ impl SqlActor {
             move |_| Ok(lock(&s).rng.next_u64() as i64),
         )?;
         let s = shared.clone();
-        let max_len = limits.value_bytes as i64;
+        let max_len = i64::from(VALUE_BYTES);
         conn.create_scalar_function(
             "randomblob",
             1,
@@ -680,7 +666,6 @@ impl SqlActor {
             conn,
             vfs,
             shared,
-            limits,
             ddl: Vec::new(),
             steps: 0,
             default_subject: None,
@@ -739,17 +724,14 @@ impl SqlActor {
         self.pending_scrub = None;
         ffi::reset_last_insert_rowid(&self.conn);
         let max = if opts.max_bytes == 0 {
-            self.limits.max_bytes
+            DEFAULT_MAX_BYTES
         } else {
             opts.max_bytes
         };
         self.conn
             .pragma_update(None, "max_page_count", (max / self.page_size).max(1) as i64)?;
         self.host_batch("SAVEPOINT kronik_turn")?;
-        self.session = Some(ffi::Session::new(
-            &self.conn,
-            self.limits.track_rowid_tables,
-        )?);
+        self.session = Some(ffi::Session::new(&self.conn)?);
         Ok(())
     }
 
@@ -905,7 +887,7 @@ impl SqlActor {
         let names: Vec<String> = st
             .query_map([table], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        let pk_rowid = self.limits.track_rowid_tables && !self.has_explicit_pk(table)?;
+        let pk_rowid = !self.has_explicit_pk(table)?;
         let col = names
             .iter()
             .position(|n| is_subject_column(n))
@@ -1180,10 +1162,9 @@ impl SqlActor {
         if change.op == Op::Delete {
             return Ok(None);
         }
-        let rowid_table = self.limits.track_rowid_tables
-            && !self
-                .has_explicit_pk(&change.table)
-                .map_err(|e| e.to_string())?;
+        let rowid_table = !self
+            .has_explicit_pk(&change.table)
+            .map_err(|e| e.to_string())?;
         let names = self.table_columns(&change.table)?;
         let mut key = Vec::new();
         for (index, is_pk) in change.pk.iter().enumerate() {
@@ -2002,8 +1983,7 @@ impl SqlActor {
                         c.table
                     ));
                 }
-                let rowid_table = self.limits.track_rowid_tables
-                    && !self.has_explicit_pk(&c.table).map_err(|e| e.to_string())?;
+                let rowid_table = !self.has_explicit_pk(&c.table).map_err(|e| e.to_string())?;
                 let names: Vec<String> = self
                     .conn
                     .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
@@ -2425,7 +2405,7 @@ mod tests {
             )
             .unwrap();
         }
-        let actor = SqlActor::open(&opener, "notes/old", Limits::default()).unwrap();
+        let actor = SqlActor::open(&opener, "notes/old").unwrap();
         let sql = subject_delete_sql("notes");
         crate::assert_search(&actor.conn, &sql, "user:1");
         let gone = actor.conn.execute(&sql, ["user:1"]).unwrap();
