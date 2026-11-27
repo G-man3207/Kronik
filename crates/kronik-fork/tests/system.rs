@@ -10,7 +10,6 @@ use std::sync::atomic::Ordering;
 
 use common::*;
 use kronik_core::error::{ApiError, ErrorCode};
-use kronik_fork::diff::DiffOptions;
 use kronik_fork::proposal::{Proposal, Proposals, ProposeRequest};
 use kronik_policy::RuleSet;
 use kronik_proto::log::v1 as pb;
@@ -19,17 +18,13 @@ use serde_json::Value;
 
 fn request(guests: &[&str]) -> ProposeRequest {
     ProposeRequest {
-        wasm: guests
-            .iter()
-            .map(|g| std::fs::read(guest(g)).unwrap())
-            .collect(),
         names: guests.iter().map(|g| (*g).to_owned()).collect(),
-        window_ms: None,
-        at: None,
-        options: DiffOptions::default(),
-        workers: Some(2),
-        audit: audit(),
-        dry_run: false,
+        ..propose_request(
+            guests
+                .iter()
+                .map(|g| std::fs::read(guest(g)).unwrap())
+                .collect(),
+        )
     }
 }
 
@@ -642,14 +637,8 @@ fn two_kinds_of_a_set_cannot_claim_one_route() {
         let err =
             p.rt.block_on(props.propose(
                 ProposeRequest {
-                    wasm,
-                    names: Vec::new(),
-                    window_ms: None,
-                    at: None,
-                    options: DiffOptions::default(),
-                    workers: Some(2),
-                    audit: audit(),
                     dry_run,
+                    ..propose_request(wasm)
                 },
                 p.owner(),
             ))

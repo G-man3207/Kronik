@@ -13,8 +13,7 @@ use std::time::Duration;
 
 use common::*;
 use kronik_core::error::ErrorCode;
-use kronik_fork::diff::DiffOptions;
-use kronik_fork::proposal::{Proposals, ProposeRequest};
+use kronik_fork::proposal::Proposals;
 use kronik_fork::watch::{EVAL_ERROR, MAX_FOR_MS, Triggered, Watch, Watches};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
@@ -35,20 +34,8 @@ fn promote_all(p: &Proc, props: &Arc<Proposals>, wasm: &[&str], before: usize) -
         .collect();
     p.settle();
     let (prop, _) =
-        p.rt.block_on(props.propose(
-            ProposeRequest {
-                wasm,
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
-            },
-            p.owner(),
-        ))
-        .unwrap();
+        p.rt.block_on(props.propose(propose_request(wasm), p.owner()))
+            .unwrap();
     assert_eq!(prop.policy["outcome"], "allow", "{}", prop.policy);
     p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
         .unwrap()

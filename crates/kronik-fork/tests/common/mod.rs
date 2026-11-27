@@ -15,7 +15,7 @@ use kronik_core::env::{BoxFuture, Clock, EntropySource, Env};
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
 use kronik_fork::diff::{DiffOptions, Mode};
-use kronik_fork::proposal::Proposals;
+use kronik_fork::proposal::{Proposals, ProposeRequest};
 use kronik_fork::replay::Progress;
 use kronik_fork::{ForkKind, ProductionIndex, ReplayOutput, ReplaySetup, config_at, fork_kinds};
 use kronik_proto::Record;
@@ -299,6 +299,22 @@ pub fn audit() -> pb::Audit {
         token_id: "test".into(),
         reason: "test".into(),
         wall_time_ms: 0,
+    }
+}
+
+/// A proposal of `wasm` as the tests make it: the default window and
+/// diff options, two workers, the test audit, not a dry run. Change a
+/// field with `ProposeRequest { at: Some(lsn), ..propose_request(wasm) }`.
+pub fn propose_request(wasm: Vec<Vec<u8>>) -> ProposeRequest {
+    ProposeRequest {
+        wasm,
+        names: Vec::new(),
+        window_ms: None,
+        at: None,
+        options: DiffOptions::default(),
+        workers: Some(2),
+        audit: audit(),
+        dry_run: false,
     }
 }
 
