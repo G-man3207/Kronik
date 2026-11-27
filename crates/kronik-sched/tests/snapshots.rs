@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use common::{Proc, audit, wait_turn};
+use common::{Proc, audit, guest, msg, wait_turn};
 use kronik_core::env::{BoxFuture, Env};
 use kronik_core::error::ApiError;
 use kronik_core::ids::ActorRef;
@@ -22,27 +22,6 @@ use kronik_sched::{Ingress, Node, NodeConfig, TurnResult, start_local};
 use kronik_store::Store;
 use kronik_store::sql::{Limits, MemOpener, SqlPool};
 use tokio::runtime::Runtime;
-
-fn guest(name: &str) -> Vec<u8> {
-    std::fs::read(format!(
-        "{}/../../tests/guests/{name}.wasm",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap()
-}
-
-fn msg(name: &str, body: &str) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-        }),
-        blobs: vec![],
-        retained_compensation_source: None,
-    }
-}
 
 fn start(dir: &Path, kept: usize) -> Proc {
     start_with(dir, kept, None, None, None)

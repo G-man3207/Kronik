@@ -15,7 +15,9 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{Proc, audit, http, install_component, log_records, point_open_turn_at, start_proc};
+use common::{
+    Proc, audit, http, install_component, log_records, msg, point_open_turn_at, start_proc,
+};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_effects::{Delivery, Rate};
@@ -162,19 +164,6 @@ fn start(dir: &Path) -> Proc {
             ..NodeConfig::default()
         },
     )
-}
-
-fn msg(name: &str, body: &str) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-        }),
-        blobs: vec![],
-        retained_compensation_source: None,
-    }
 }
 
 fn reply(r: &TurnResult) -> String {
@@ -510,7 +499,7 @@ fn turn_begin_is_durable_before_the_effect_and_replay_safe_reruns() {
     p.grant("http:127.0.0.1", None, None);
     p.send_detached(
         "counter/a",
-        msg("fetch", &format!("GET {}", server.url("/hang"))),
+        msg("fetch", format!("GET {}", server.url("/hang"))),
     );
     server.wait_for("/hang", 1);
     drop(p); // kill: the request is in flight, no result is recorded
@@ -810,7 +799,7 @@ fn effect_timeout_fires_when_the_server_hangs() {
     let started = Instant::now();
     let r = p.send(
         "counter/a",
-        msg("fetch-ok", &format!("GET {}", server.url("/hang"))),
+        msg("fetch-ok", format!("GET {}", server.url("/hang"))),
     );
     assert!(
         reply(&r).starts_with("error"),
@@ -859,7 +848,7 @@ fn unsafe_effect_is_not_retried_and_dead_letters_with_outcome_unknown() {
     p.grant("http:127.0.0.1", None, None);
     p.send_detached(
         "counter/a",
-        msg("fetch", &format!("POST {}\n\ncharge", server.url("/hang"))),
+        msg("fetch", format!("POST {}\n\ncharge", server.url("/hang"))),
     );
     server.wait_for("/hang", 1);
     drop(p);
@@ -1105,7 +1094,7 @@ fn secrets_never_leak_without_reveal() {
     // Without secret-reveal, every exfiltration path comes back empty.
     let r = p.send(
         "counter/a",
-        msg("exfiltrate", &format!("api-key {}", server.url("/echo"))),
+        msg("exfiltrate", format!("api-key {}", server.url("/echo"))),
     );
     let loot = reply(&r);
     assert!(
@@ -1173,11 +1162,11 @@ fn standard_fetch_secret_headers_never_reach_the_guest_or_the_log() {
         )
     };
     // Without `secret:api-key` the request is denied (a denied record).
-    let r = p.send("counter/a", msg("wfetch", &spec("api-key")));
+    let r = p.send("counter/a", msg("wfetch", spec("api-key")));
     assert_eq!(reply(&r), "error ErrorCode::HttpRequestDenied", "{r:?}");
     assert!(server.seen("/echo").is_empty());
     p.grant("secret:api-key", None, None);
-    let r = p.send("counter/a", msg("wfetch", &spec("api-key")));
+    let r = p.send("counter/a", msg("wfetch", spec("api-key")));
     let echo = reply(&r);
     assert!(echo.starts_with("200 "), "{echo}");
     assert!(echo.contains("Bearer [secret:api-key]"), "scrubbed: {echo}");
@@ -1191,7 +1180,7 @@ fn standard_fetch_secret_headers_never_reach_the_guest_or_the_log() {
     );
     // An unknown secret is denied too.
     p.grant("secret:missing", None, None);
-    let r = p.send("counter/a", msg("wfetch", &spec("missing")));
+    let r = p.send("counter/a", msg("wfetch", spec("missing")));
     assert_eq!(reply(&r), "error ErrorCode::HttpRequestDenied");
     assert_eq!(server.seen("/echo").len(), 1);
     drop(p);
@@ -1551,7 +1540,7 @@ fn a_revealed_value_in_a_fetch_is_not_written_anywhere() {
     p.leaky(SECRET, &["secret-reveal:k1", "http:127.0.0.1"]);
     let r = p.send(
         "leaky/a",
-        msg("reveal-fetch", &format!("k1 {}", server.url("/echo"))),
+        msg("reveal-fetch", format!("k1 {}", server.url("/echo"))),
     );
     assert!(r.committed(), "{r:?}");
     let seen = server.seen(&format!("/echo?key={SECRET}"));
@@ -1583,7 +1572,7 @@ fn a_rerun_after_an_echoed_revealed_value_does_not_diverge() {
         "leaky/a",
         msg(
             "reveal-echo-len",
-            &format!(
+            format!(
                 "k1 {} {} {}",
                 server.url("/echo"),
                 server.url("/next"),
@@ -1698,7 +1687,7 @@ fn a_snapshot_with_an_open_turn_stays_a_start_point_through_retention() {
     }
     p.send_detached(
         "counter/h",
-        msg("fetch", &format!("GET {}", server.url("/hang"))),
+        msg("fetch", format!("GET {}", server.url("/hang"))),
     );
     server.wait_for("/hang", 1);
     let open = p.node.store().db().open_turns().unwrap();

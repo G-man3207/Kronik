@@ -11,21 +11,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use common::{audit, open_request, text_frame};
+use common::{audit, guest, open_request, text_frame};
 use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Born, CodeSwitch, Node, NodeConfig, SwitchHold, start_local};
-
-fn guest(name: &str) -> Vec<u8> {
-    std::fs::read(format!(
-        "{}/../../tests/guests/{name}.wasm",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap()
-}
 
 /// A fresh live operator lease for the fixture's own operations.
 fn owner(node: &Node) -> kronik_core::authority::AuthLease {

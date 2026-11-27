@@ -38,6 +38,29 @@ pub fn audit() -> pb::Audit {
     }
 }
 
+/// An operator's plain-text message `name` with `body`.
+pub fn msg(name: &str, body: impl AsRef<[u8]>) -> pb::Message {
+    pb::Message {
+        name: name.into(),
+        content_type: "text/plain".into(),
+        body: Some(pb::Sealable {
+            subject: None,
+            value: Some(pb::sealable::Value::Plain(body.as_ref().to_vec())),
+        }),
+        blobs: vec![],
+        retained_compensation_source: None,
+    }
+}
+
+/// The bytes of the test guest `name` (`tests/guests/<name>.wasm`).
+pub fn guest(name: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/../../tests/guests/{name}.wasm",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
+}
+
 /// Starts a node with `config` in `dir` on a new two-worker runtime.
 pub fn start_proc(dir: &Path, config: NodeConfig) -> Proc {
     let rt = tokio::runtime::Builder::new_multi_thread()

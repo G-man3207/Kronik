@@ -23,7 +23,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{Proc, audit, start_proc};
+use common::{Proc, audit, msg, start_proc};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
@@ -146,19 +146,6 @@ fn start_with(
             ..NodeConfig::default()
         },
     )
-}
-
-fn msg(name: &str, body: &[u8]) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(body.to_vec())),
-        }),
-        blobs: vec![],
-        retained_compensation_source: None,
-    }
 }
 
 impl Proc {

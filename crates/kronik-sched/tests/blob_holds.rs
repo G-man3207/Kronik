@@ -24,7 +24,7 @@ mod common;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{Proc, audit, start_proc, wait_turn};
+use common::{Proc, audit, msg, start_proc, wait_turn};
 use kronik_blob::SweepOptions;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
@@ -122,19 +122,6 @@ fn text_of(r: &TurnResult) -> String {
             }
         }
         other => panic!("{other:?}"),
-    }
-}
-
-/// An operator's message named `name`, with an empty body.
-fn message(name: &str) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(Vec::new())),
-        }),
-        ..Default::default()
     }
 }
 
@@ -259,7 +246,7 @@ impl Proc {
         let actor = ActorRef::parse(&format!("media/{key}")).unwrap();
         let owner = self.node.local_operator_authority().unwrap();
         self.rt
-            .block_on(self.node.send(actor, message(name), audit(), false, owner))
+            .block_on(self.node.send(actor, msg(name, ""), audit(), false, owner))
             .unwrap_or_else(|e| panic!("{name}: {e}"))
             .unwrap()
     }
@@ -272,7 +259,7 @@ impl Proc {
         self.rt.spawn(async move {
             let owner = node.local_operator_authority().unwrap();
             let _ = node
-                .send(actor, message(&name), audit(), false, owner)
+                .send(actor, msg(&name, ""), audit(), false, owner)
                 .await;
         });
     }
