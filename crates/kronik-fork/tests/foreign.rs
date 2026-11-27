@@ -15,7 +15,7 @@ use common::*;
 use kronik_core::env::{BoxFuture, HttpRequest, HttpResponse, NetError};
 use kronik_effects::foreign::{Checkpoint, CopySpec, ForeignCopy, ForeignHost, ForeignSlot};
 use kronik_fork::diff::{DiffOptions, ForeignFork};
-use kronik_fork::proposal::Proposals;
+use kronik_fork::proposal::{Proposals, ProposeRequest};
 use kronik_proto::log::v1 as pb;
 use kronik_sched::NodeConfig;
 
@@ -340,15 +340,10 @@ fn propose_at(
     dry_run: bool,
 ) -> kronik_fork::proposal::Proposal {
     p.rt.block_on(props.propose(
-        kronik_fork::proposal::ProposeRequest {
-            wasm: vec![std::fs::read(guest(code)).unwrap()],
-            names: Vec::new(),
-            window_ms: None,
+        ProposeRequest {
             at: Some(at),
-            options: DiffOptions::default(),
-            workers: Some(2),
-            audit: audit(),
             dry_run,
+            ..propose_request(vec![std::fs::read(guest(code)).unwrap()])
         },
         p.owner(),
     ))

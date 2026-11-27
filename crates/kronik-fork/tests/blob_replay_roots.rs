@@ -123,17 +123,13 @@ fn a_replay_in_progress_keeps_the_blobs_it_reads() {
             props
                 .propose(
                     ProposeRequest {
-                        wasm: vec![v2],
-                        names: Vec::new(),
-                        window_ms: None,
                         at: Some(fork_at),
                         options: DiffOptions {
                             mode: Mode::Isolated,
                             ..DiffOptions::default()
                         },
                         workers: Some(1),
-                        audit: audit(),
-                        dry_run: false,
+                        ..propose_request(vec![v2])
                     },
                     owner,
                 )

@@ -17,7 +17,7 @@ use kronik_core::error::ErrorCode;
 use kronik_core::ids::ActorRef;
 use kronik_fork::diff::{DiffOptions, MAX_SAMPLES};
 use kronik_fork::proposal::preview::MAX_PREVIEWS;
-use kronik_fork::proposal::{Proposal, Proposals, ProposeRequest};
+use kronik_fork::proposal::{Proposal, Proposals};
 use kronik_gateway::PreviewRouter;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{NodeConfig, TurnResult};
@@ -29,20 +29,8 @@ fn propose_step2(p: &Proc, props: &Arc<Proposals>) -> String {
     p.settle();
     let bytes = std::fs::read(guest("counter-step2")).unwrap();
     let (prop, _) =
-        p.rt.block_on(props.propose(
-            ProposeRequest {
-                wasm: vec![bytes],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
-            },
-            p.owner(),
-        ))
-        .unwrap();
+        p.rt.block_on(props.propose(propose_request(vec![bytes]), p.owner()))
+            .unwrap();
     prop.id
 }
 
