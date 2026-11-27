@@ -1024,11 +1024,6 @@ impl Api {
         self
     }
 
-    /// The caller of a request.
-    pub fn caller(&self, req: &ApiRequest) -> Result<auth::Caller> {
-        self.auth.caller(req)
-    }
-
     fn request_scope(req: &ApiRequest) -> Result<auth::Scope> {
         let segments = req
             .path

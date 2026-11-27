@@ -262,7 +262,7 @@ impl Api {
                     memory_bytes: r.memory_bytes,
                     isolation: r.isolation.clone(),
                     secrets: r.secrets.clone(),
-                    any_layout_dir: self.caller(req)?.has(crate::auth::Scope::Admin),
+                    any_layout_dir: req.caller.has(crate::auth::Scope::Admin),
                     // The image's new layers must fit above the reserve.
                     max_new_bytes: self.node.disk_budget(),
                     fork_mode: r.fork_mode.clone(),
