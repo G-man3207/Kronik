@@ -943,13 +943,31 @@ fn turn_record(m: &pb::TurnRecord) -> Result<(), DecodeError> {
     Ok(())
 }
 
-/// Test fixtures: lowercase hex, surrounding whitespace ignored.
-#[cfg(test)]
-pub(crate) fn unhex(hex: &str) -> Vec<u8> {
-    let hex = hex.trim();
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+/// Lowercase hex.
+pub fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(DIGITS[usize::from(b >> 4)] as char);
+        s.push(DIGITS[usize::from(b & 15)] as char);
+    }
+    s
+}
+
+/// Parses lowercase or uppercase hex.
+pub fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let digit = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    s.as_bytes()
+        .chunks(2)
+        .map(|p| Some(digit(p[0])? << 4 | digit(p[1])?))
         .collect()
 }
 
@@ -1053,7 +1071,7 @@ mod tests {
     #[test]
     fn effect_record_fixture_with_offset_us_round_trips() {
         use prost::Message as _;
-        let bytes = unhex(include_str!("../tests/fixtures/effect-record-v2.hex"));
+        let bytes = unhex(include_str!("../tests/fixtures/effect-record-v2.hex").trim()).unwrap();
         let e = pb::EffectRecord::decode(bytes.as_slice()).unwrap();
         assert_eq!(
             (e.kind.as_str(), e.duration_us, e.offset_us),
@@ -1066,7 +1084,7 @@ mod tests {
     /// still writes exactly them (I16). Fixture: `tests/fixtures/audit-event-v1.hex`.
     #[test]
     fn audit_event_fixture_decodes_and_requires_action_and_audit() {
-        let bytes = unhex(include_str!("../tests/fixtures/audit-event-v1.hex"));
+        let bytes = unhex(include_str!("../tests/fixtures/audit-event-v1.hex").trim()).unwrap();
         let record = Record::decode(kind::AUDIT_EVENT, &bytes).unwrap();
         let Record::AuditEvent(e) = &record else {
             panic!("{record:?}")
@@ -1132,7 +1150,7 @@ mod tests {
     /// Fixture: `tests/fixtures/turn-record-v1.hex`.
     #[test]
     fn turn_records_from_before_duration_decode_with_zero() {
-        let bytes = unhex(include_str!("../tests/fixtures/turn-record-v1.hex"));
+        let bytes = unhex(include_str!("../tests/fixtures/turn-record-v1.hex").trim()).unwrap();
         let Record::TurnRecord(t) = Record::decode(kind::TURN_RECORD, &bytes).unwrap() else {
             panic!("not a TurnRecord");
         };
@@ -1176,7 +1194,7 @@ mod tests {
     /// Fixture: `tests/fixtures/guard-triggered-v1.hex`.
     #[test]
     fn guard_triggered_v1_decodes() {
-        let bytes = unhex(include_str!("../tests/fixtures/guard-triggered-v1.hex"));
+        let bytes = unhex(include_str!("../tests/fixtures/guard-triggered-v1.hex").trim()).unwrap();
         let record = Record::decode(kind::GUARD_TRIGGERED, &bytes).unwrap();
         assert_eq!(record, Record::GuardTriggered(guard_triggered()));
 

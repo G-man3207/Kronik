@@ -18,11 +18,7 @@ fn fixture(name: &str, record: &Record) -> Vec<u8> {
 }
 
 fn unhex(text: &str) -> Vec<u8> {
-    let text = text.trim();
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
-        .collect()
+    kronik_proto::unhex(text.trim()).unwrap()
 }
 
 /// The fixture `name`, decoded as `record`'s kind; it must decode to `record`.

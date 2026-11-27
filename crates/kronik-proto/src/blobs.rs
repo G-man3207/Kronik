@@ -46,18 +46,11 @@ pub fn parse_hash(hash: &str) -> Result<(bool, [u8; 32]), String> {
     if hex.len() != 64 {
         return Err(format!("{} hex characters, not 64", hex.len()));
     }
-    let nibble = |c: u8| match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        _ => None,
-    };
-    let mut digest = [0u8; 32];
-    for (i, pair) in hex.as_bytes().chunks(2).enumerate() {
-        match (nibble(pair[0]), nibble(pair[1])) {
-            (Some(high), Some(low)) => digest[i] = high << 4 | low,
-            _ => return Err("not lowercase hex".into()),
-        }
-    }
+    // `unhex` also accepts uppercase; an identity is lowercase only.
+    let digest = crate::unhex(hex)
+        .filter(|_| !hex.bytes().any(|c| c.is_ascii_uppercase()))
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| "not lowercase hex".to_string())?;
     Ok((keyed, digest))
 }
 
