@@ -16,8 +16,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{
-    Proc, audit, http, install_component, log_records, msg, point_open_turn_at, start_proc,
-    start_proc_env,
+    Proc, audit, http, log_records, msg, repoint_open_turn, start_proc, start_proc_env, wait_parked,
 };
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
@@ -592,45 +591,19 @@ fn a_crash_rerun_with_a_different_body_traps_and_is_not_sent_again() {
     let spec = format!("POST {}\n\nfirst", server.url("/ok"));
     p.send_detached("counter/a", msg("fetch", &spec));
 
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let open = loop {
-        // `db()`'s guard lives to the semicolon; locking it again here deadlocks.
-        let turns = p.node.store().db().open_turns().unwrap();
-        let ready = turns.into_iter().find(|t| {
-            reached.exists()
-                && p.node
-                    .store()
-                    .db()
-                    .open_effects(&t.execution_id)
-                    .unwrap()
-                    .iter()
-                    .any(|e| e.kind == "http.fetch" && e.status == pb::EffectStatus::Ok as i32)
-        });
-        if let Some(turn) = ready {
-            break turn;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the turn never parked with a recorded POST"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    let open = wait_parked(&p, &reached, "http.fetch");
     server.wait_for("/ok", 1);
     assert_eq!(server.seen("/ok")[0].body, b"first");
     let execution_id = open.execution_id.clone();
     drop(p);
 
-    let v2 = std::fs::read(COUNTER_BODY_V2).unwrap();
-    let hash = install_component(dir.path(), &v2);
-    point_open_turn_at(dir.path(), &execution_id, &hash, open.lsn, open.pos.segment);
-    let begin = log_records(dir.path())
-        .into_iter()
-        .find_map(|r| match r {
-            Record::TurnBegin(b) if b.execution_id == execution_id => Some(b),
-            _ => None,
-        })
-        .expect("the rewritten TurnBegin");
-    assert_eq!(begin.code_hash, hash);
+    repoint_open_turn(
+        dir.path(),
+        &execution_id,
+        &std::fs::read(COUNTER_BODY_V2).unwrap(),
+        open.lsn,
+        open.pos.segment,
+    );
 
     let p = start(dir.path());
     // Close, then assert the code. Waiting only for REPLAY_DIVERGED hides a

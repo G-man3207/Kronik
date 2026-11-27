@@ -310,6 +310,54 @@ pub fn point_open_turn_at(
     assert!(found, "open turn {execution_id} was not in the log");
 }
 
+/// Waits up to 20 s until a turn parked by an armed `BeforeCommit` hold
+/// (`reached` exists) has a recorded effect of `kind` with status `Ok`,
+/// and returns that open turn.
+pub fn wait_parked(p: &Proc, reached: &Path, kind: &str) -> kronik_store::db::OpenTurn {
+    for _ in 0..2000 {
+        // `db()`'s guard lives to the semicolon; locking it again here deadlocks.
+        let turns = p.node.store().db().open_turns().unwrap();
+        let ready = turns.into_iter().find(|t| {
+            reached.exists()
+                && p.node
+                    .store()
+                    .db()
+                    .open_effects(&t.execution_id)
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.kind == kind && e.status == pb::EffectStatus::Ok as i32)
+        });
+        if let Some(turn) = ready {
+            return turn;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the turn never parked with a recorded {kind}");
+}
+
+/// Installs `wasm` and points the open turn `execution_id` (its
+/// `TurnBegin` at `lsn` in `segment`) at it; checks the rewritten
+/// `TurnBegin` and returns the new code hash.
+pub fn repoint_open_turn(
+    dir: &Path,
+    execution_id: &str,
+    wasm: &[u8],
+    lsn: u64,
+    segment: u64,
+) -> Vec<u8> {
+    let hash = install_component(dir, wasm);
+    point_open_turn_at(dir, execution_id, &hash, lsn, segment);
+    let begin = log_records(dir)
+        .into_iter()
+        .find_map(|r| match r {
+            Record::TurnBegin(b) if b.execution_id == execution_id => Some(b),
+            _ => None,
+        })
+        .expect("the rewritten TurnBegin");
+    assert_eq!(begin.code_hash, hash);
+    hash
+}
+
 pub fn text_frame(text: &str) -> pb::Frame {
     pb::Frame {
         kind: pb::frame::Kind::Text as i32,

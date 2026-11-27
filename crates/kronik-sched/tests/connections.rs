@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    Proc, audit, install_component, log_records, open_request, point_open_turn_at, start_proc,
-    text_frame, wait_turn,
+    Proc, audit, log_records, open_request, repoint_open_turn, start_proc, text_frame, wait_parked,
+    wait_turn,
 };
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::ActorRef;
@@ -1240,30 +1240,7 @@ fn a_crash_rerun_with_a_different_send_now_frame_traps_and_is_not_written_again(
         std::fs::write(&armed, b"armed").unwrap();
         p.frame(&conn, "stream 1");
 
-        let mut open = None;
-        for _ in 0..500 {
-            // `db()`'s guard lives to the semicolon; locking it again here deadlocks.
-            let turns = p.node.store().db().open_turns().unwrap();
-            open = turns.into_iter().find(|t| {
-                reached.exists()
-                    && p.node
-                        .store()
-                        .db()
-                        .open_effects(&t.execution_id)
-                        .unwrap()
-                        .iter()
-                        .any(|e| {
-                            e.kind == "connection.send-now"
-                                && e.status == pb::EffectStatus::Ok as i32
-                        })
-            });
-            if open.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let open = open
-            .unwrap_or_else(|| panic!("{diverge}: the turn never parked with a recorded send-now"));
+        let open = wait_parked(&p, &reached, "connection.send-now");
         // The frame was handed to the client before the result was recorded.
         let seen = frames(&client.recording());
         assert_eq!(
@@ -1280,16 +1257,13 @@ fn a_crash_rerun_with_a_different_send_now_frame_traps_and_is_not_written_again(
         drop(p);
 
         if diverge {
-            let hash = install_component(dir.path(), &std::fs::read(ROOM_FRAME_V2).unwrap());
-            point_open_turn_at(dir.path(), &execution_id, &hash, lsn, segment);
-            let begin = log_records(dir.path())
-                .into_iter()
-                .find_map(|r| match r {
-                    Record::TurnBegin(b) if b.execution_id == execution_id => Some(b),
-                    _ => None,
-                })
-                .expect("the rewritten TurnBegin");
-            assert_eq!(begin.code_hash, hash);
+            repoint_open_turn(
+                dir.path(),
+                &execution_id,
+                &std::fs::read(ROOM_FRAME_V2).unwrap(),
+                lsn,
+                segment,
+            );
         }
         let before = send_now_results(&log_records(dir.path()), &execution_id);
         assert_eq!(before.len(), 1, "{diverge}");
