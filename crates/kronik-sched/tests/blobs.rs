@@ -10,16 +10,16 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::{Proc, audit, http, http_blob, http_text, slow_server, start_proc, wait_turn};
+use common::{
+    Proc, audit, http, http_blob, http_text, slow_server, start_proc, start_proc_env, wait_turn,
+};
 use kronik_blob::{BlobStore, Space, StoreConfig};
 use kronik_core::env::Env;
 use kronik_core::env::test_fs::{FsCall, Then, hooked};
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{
-    BlobsConfig, BodyPolicy, Ingress, IngressExtras, NodeConfig, TurnResult, start_local,
-};
+use kronik_sched::{BlobsConfig, BodyPolicy, Ingress, IngressExtras, NodeConfig, TurnResult};
 
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
 
@@ -624,22 +624,17 @@ fn start_on_objects_fs(
     events: Arc<std::sync::Mutex<Vec<String>>>,
     fail: Arc<std::sync::atomic::AtomicBool>,
 ) -> Proc {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let mut env = Env::real(tokio::runtime::Handle::current());
-        env.fs = objects_fs(env.fs.clone(), events, fail);
-        let config = NodeConfig {
+    let p = start_proc_env(
+        dir,
+        NodeConfig {
             concurrency: 8,
             blobs: Some(BlobsConfig::default()),
             ..NodeConfig::default()
-        };
-        start_local(env, dir, config).await.unwrap()
-    });
-    let p = Proc { rt, node };
+        },
+        |env| {
+            env.fs = objects_fs(env.fs.clone(), events, fail);
+        },
+    );
     p.deploy_file(MEDIA);
     p
 }

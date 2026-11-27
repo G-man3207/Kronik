@@ -6,13 +6,15 @@
 // Test helpers outside #[test] functions may unwrap too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::time::Duration;
 
-use kronik_core::env::Env;
+use common::{audit, open_request, start_proc};
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
+use kronik_sched::NodeConfig;
 use kronik_sched::connections::RecordingTransport;
-use kronik_sched::{NodeConfig, start_local};
 
 const ROOM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/room.wasm");
 
@@ -40,39 +42,17 @@ fn until(what: &str, f: impl Fn() -> bool) {
 #[test]
 fn the_open_gauge_counts_connections_past_their_open_turn() {
     let dir = tempfile::tempdir().unwrap();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        start_local(env, dir.path(), NodeConfig::default())
-            .await
-            .unwrap()
-    });
-    let owner = node.local_operator_authority().unwrap();
-    let audit = pb::Audit {
-        token_id: "t".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    };
-    rt.block_on(node.deploy(&std::fs::read(ROOM).unwrap(), audit, false, owner))
-        .unwrap();
+    let p = start_proc(dir.path(), NodeConfig::default());
+    let owner = p.node.local_operator_authority().unwrap();
+    p.rt.block_on(
+        p.node
+            .deploy(&std::fs::read(ROOM).unwrap(), audit(), false, owner),
+    )
+    .unwrap();
     let open = |user: &str| {
-        let request = pb::HttpInput {
-            method: "GET".into(),
-            path: "/room/lobby/ws".into(),
-            query: format!("user={user}"),
-            params: vec![pb::Param {
-                name: "key".into(),
-                value: "lobby".into(),
-                sealed_value: None,
-            }],
-            route: "/room/{key}/ws".into(),
-            ..Default::default()
-        };
-        let (id, waiter) = node
+        let request = open_request("lobby", &format!("user={user}"));
+        let (id, waiter) = p
+            .node
             .connection_open(
                 ActorRef::parse("room/lobby").unwrap(),
                 request,
@@ -82,8 +62,8 @@ fn the_open_gauge_counts_connections_past_their_open_turn() {
                 false,
             )
             .unwrap();
-        rt.block_on(waiter.wait()).unwrap();
-        let t = RecordingTransport::attach(node.hub(), &id).unwrap();
+        p.rt.block_on(waiter.wait()).unwrap();
+        let t = RecordingTransport::attach(p.node.hub(), &id).unwrap();
         (id, t)
     };
     let (_a, ta) = open("ada");
@@ -92,5 +72,5 @@ fn the_open_gauge_counts_connections_past_their_open_turn() {
     assert_eq!(open_gauge(), Some(2.0));
     ta.client_close(Some((1000, String::new())));
     until("the close", || open_gauge() == Some(1.0));
-    assert_eq!(node.hub().live(), 1);
+    assert_eq!(p.node.hub().live(), 1);
 }

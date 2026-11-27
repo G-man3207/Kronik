@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use common::{
     Proc, audit, http, install_component, log_records, msg, point_open_turn_at, start_proc,
+    start_proc_env,
 };
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
@@ -1949,33 +1950,23 @@ impl kronik_core::env::Clock for SteppedClock {
 #[test]
 fn a_clock_step_back_delays_no_timer() {
     let dir = tempfile::tempdir().unwrap();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
     let mut clock = None;
-    let node = rt.block_on(async {
-        let mut env = Env::real(tokio::runtime::Handle::current());
-        let stepped = Arc::new(SteppedClock {
-            real: env.clock.clone(),
-            offset_ms: std::sync::atomic::AtomicI64::new(0),
-        });
-        env.clock = stepped.clone();
-        clock = Some(stepped);
-        start_local(
-            env,
-            dir.path(),
-            NodeConfig {
-                concurrency: 8,
-                ..NodeConfig::default()
-            },
-        )
-        .await
-        .unwrap()
-    });
+    let p = start_proc_env(
+        dir.path(),
+        NodeConfig {
+            concurrency: 8,
+            ..NodeConfig::default()
+        },
+        |env| {
+            let stepped = Arc::new(SteppedClock {
+                real: env.clock.clone(),
+                offset_ms: std::sync::atomic::AtomicI64::new(0),
+            });
+            env.clock = stepped.clone();
+            clock = Some(stepped);
+        },
+    );
     let clock = clock.unwrap();
-    let p = Proc { rt, node };
     p.deploy();
     let started = Instant::now();
     p.send("counter/before", msg("schedule", "1000 increment"));

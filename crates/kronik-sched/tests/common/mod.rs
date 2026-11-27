@@ -65,13 +65,20 @@ pub fn guest(name: &str) -> Vec<u8> {
 
 /// Starts a node with `config` in `dir` on a new two-worker runtime.
 pub fn start_proc(dir: &Path, config: NodeConfig) -> Proc {
+    start_proc_env(dir, config, |_| {})
+}
+
+/// [`start_proc`], with `wrap` changing the node's environment first (a
+/// test clock or file system).
+pub fn start_proc_env(dir: &Path, config: NodeConfig, wrap: impl FnOnce(&mut Env)) -> Proc {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
     let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
+        let mut env = Env::real(tokio::runtime::Handle::current());
+        wrap(&mut env);
         start_local(env, dir, config).await.unwrap()
     });
     Proc { rt, node }

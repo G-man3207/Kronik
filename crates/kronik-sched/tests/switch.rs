@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use common::{audit, guest, open_request, text_frame};
+use common::{Proc, audit, guest, open_request, start_proc, text_frame};
 use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
@@ -605,21 +605,15 @@ async fn a_cancelled_configuration_change_is_still_applied() {
 /// One "process": its own runtime; dropping it cancels every task like a
 /// crash.
 fn process(dir: &std::path::Path) -> (tokio::runtime::Runtime, Arc<Node>, Arc<SwitchHold>) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
     let hold = Arc::new(SwitchHold::default());
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let config = NodeConfig {
+    let Proc { rt, node } = start_proc(
+        dir,
+        NodeConfig {
             concurrency: 8,
             test_hold_switch: Some(hold.clone()),
             ..NodeConfig::default()
-        };
-        start_local(env, dir, config).await.unwrap()
-    });
+        },
+    );
     (rt, node, hold)
 }
 
