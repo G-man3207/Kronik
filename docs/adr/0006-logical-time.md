@@ -48,7 +48,7 @@ That only needs the +1 ms at the point where a new process takes over.
 - `parent` is the starting message's `sent_logical_time_ms` or the timer's
   due time (0 for root inputs);
 - `hwm` is the largest logical time this process has handed out, updated
-  under one lock together with the assignment;
+  atomically together with the assignment;
 - at startup (and, from v0.4, when a node becomes leader of a shard) `hwm`
   starts at the largest logical time in the log plus 1 ms. `state.db` keeps
   it as `meta.time_hwm`, the maximum over all `TurnBegin` and `TurnRecord`

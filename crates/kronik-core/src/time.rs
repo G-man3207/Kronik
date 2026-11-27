@@ -8,13 +8,12 @@
 //! run several turns may share a millisecond (strictly increasing time would
 //! drift ahead of the wall clock above 1000 turns per second).
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::env::Clock;
-use crate::sync::lock;
 
 pub struct LogicalClock {
-    hwm: Mutex<u64>,
+    hwm: AtomicU64,
 }
 
 impl LogicalClock {
@@ -22,7 +21,7 @@ impl LogicalClock {
     /// empty log).
     pub fn new(recovered_max: u64) -> LogicalClock {
         LogicalClock {
-            hwm: Mutex::new(if recovered_max == 0 {
+            hwm: AtomicU64::new(if recovered_max == 0 {
                 0
             } else {
                 recovered_max + 1
@@ -33,16 +32,16 @@ impl LogicalClock {
     /// The logical time for a new turn whose triggering message or timer
     /// carries `parent` (0 for root inputs).
     pub fn next(&self, clock: &dyn Clock, parent: u64) -> u64 {
-        let wall = clock.wall_ms();
-        let mut hwm = lock(&self.hwm);
-        let t = wall.max(*hwm).max(parent);
-        *hwm = t;
-        t
+        let t = clock.wall_ms().max(parent);
+        // `fetch_max` returns the previous mark. The larger of that and `t`
+        // is the value now stored, including a higher mark a concurrent
+        // caller stored first.
+        self.hwm.fetch_max(t, Ordering::SeqCst).max(t)
     }
 
     /// The largest time handed out so far.
     pub fn high_water(&self) -> u64 {
-        *lock(&self.hwm)
+        self.hwm.load(Ordering::SeqCst)
     }
 }
 
@@ -94,6 +93,47 @@ mod tests {
         // After a restart with a clock behind the log.
         let lc = LogicalClock::new(2_000);
         assert_eq!(lc.next(&c, 0), 2_001);
+    }
+
+    /// Overlapping assignments must observe one maximum. `fetch_max` returns
+    /// the previous mark, so each caller still receives max(wall, mark, parent)
+    /// and a later read never sits below a time already handed out.
+    ///
+    /// The clock is the unit under test and has no `Env`. Real threads are
+    /// what races the atomic high-water mark (ADR 0004).
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn concurrent_assignments_stay_at_the_maximum() {
+        use std::sync::Arc;
+
+        let clock = Arc::new(Fixed(AtomicU64::new(1_000)));
+        let lc = Arc::new(LogicalClock::new(0));
+        let parents = [0_u64, 1_500, 2_500, 800];
+        let mut threads = Vec::new();
+        for parent in parents {
+            let clock = Arc::clone(&clock);
+            let lc = Arc::clone(&lc);
+            threads.push(std::thread::spawn(move || {
+                let mut seen = 0;
+                for _ in 0..64 {
+                    let t = lc.next(clock.as_ref(), parent);
+                    assert!(t >= seen, "logical time went backwards");
+                    assert!(t >= parent);
+                    assert!(t >= 1_000);
+                    seen = t;
+                }
+                seen
+            }));
+        }
+        let mut peak = 0;
+        for thread in threads {
+            peak = peak.max(thread.join().expect("clock thread"));
+        }
+        assert_eq!(peak, 2_500);
+        assert_eq!(lc.high_water(), 2_500);
+        clock.0.store(100, Ordering::SeqCst);
+        assert_eq!(lc.next(clock.as_ref(), 0), 2_500);
+        assert_eq!(lc.high_water(), 2_500);
     }
 
     #[test]
