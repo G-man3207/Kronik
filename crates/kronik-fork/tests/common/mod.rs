@@ -467,6 +467,18 @@ impl Proc {
         Proc::open_env(dir, cfg, |_| {})
     }
 
+    /// [`Proc::open`] with [`Proc::start`]'s configuration: the restart of
+    /// a node `Proc::start` made.
+    pub fn reopen(dir: &Path) -> Proc {
+        Proc::open(
+            dir,
+            NodeConfig {
+                concurrency: 8,
+                ..NodeConfig::default()
+            },
+        )
+    }
+
     fn open_env(dir: &Path, cfg: NodeConfig, wrap: impl FnOnce(&mut Env)) -> Proc {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)

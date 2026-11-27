@@ -32,19 +32,11 @@ use kronik_core::ids::{ActorRef, Lsn};
 use kronik_fork::ProductionIndex;
 use kronik_fork::diff::{FrameInputs, Mode};
 use kronik_proto::log::v1 as pb;
-use kronik_sched::NodeConfig;
 use kronik_sched::connections::RecordingTransport;
 use serde_json::Value;
 
 /// The said messages carry this word: a test checks where it may appear.
 const WORD: &str = "quokka";
-
-fn config() -> NodeConfig {
-    NodeConfig {
-        concurrency: 8,
-        ..NodeConfig::default()
-    }
-}
 
 fn plain_as(subject: Option<&str>, b: &[u8]) -> Option<pb::Sealable> {
     Some(pb::Sealable {
@@ -184,7 +176,7 @@ fn http_say(p: &Proc, text: &str) {
 fn session(dir: &Path) -> (Proc, Lsn, Vec<String>) {
     use pb::ConnectionProtocol::{Sse, Websocket};
     let (fork_lsn, ids) = {
-        let p = Proc::open(dir, config());
+        let p = Proc::reopen(dir);
         p.deploy("room");
         p.rt.block_on(p.node.grant(
             "room",
@@ -233,7 +225,7 @@ fn session(dir: &Path) -> (Proc, Lsn, Vec<String>) {
         (fork_lsn, vec![ada, bob, cid, dee])
         // The runtime drops here: a crash, with the follower still open.
     };
-    let p = Proc::open(dir, config());
+    let p = Proc::reopen(dir);
     wait_until("the restart close", || closed(&p, &ids[3]));
     p.settle();
     assert!(p.node.store().db().open_connections().unwrap().is_empty());
@@ -528,7 +520,7 @@ fn a_fork_that_refuses_the_opens_skips_their_connections() {
 fn another_rooms_connection_is_dropped_the_same_way_in_replay() {
     use pb::ConnectionProtocol::Websocket;
     let dir = tempdir();
-    let p = Proc::open(dir.path(), config());
+    let p = Proc::reopen(dir.path());
     p.deploy("room");
     p.rt.block_on(p.node.grant(
         "room",

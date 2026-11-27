@@ -1426,13 +1426,7 @@ fn a_resume_that_cannot_prove_its_staged_turns_is_refused() {
     drop(p);
     // The record of what was staged is gone.
     std::fs::remove_dir_all(dir.path().join("branches").join(&r.id).join("log")).unwrap();
-    let p = Proc::open(
-        dir.path(),
-        NodeConfig {
-            concurrency: 8,
-            ..NodeConfig::default()
-        },
-    );
+    let p = Proc::reopen(dir.path());
     let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
         .unwrap()
         .with_rebase(Duration::from_secs(2));
@@ -1722,13 +1716,7 @@ fn a_rebase_resumes_after_a_restart_with_privacy_on() {
     let Setup { p, props, .. } = s;
     drop(props);
     drop(p);
-    let p = Proc::open(
-        dir.path(),
-        NodeConfig {
-            concurrency: 8,
-            ..NodeConfig::default()
-        },
-    );
+    let p = Proc::reopen(dir.path());
     let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
         .unwrap()
         .with_rebase(Duration::from_secs(5));
@@ -1765,13 +1753,7 @@ fn a_rebase_promote_dry_run_writes_and_changes_nothing() {
     let Setup { p, props, .. } = s;
     drop(props);
     drop(p);
-    let p = Proc::open(
-        dir.path(),
-        NodeConfig {
-            concurrency: 8,
-            ..NodeConfig::default()
-        },
-    );
+    let p = Proc::reopen(dir.path());
     let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
         .unwrap()
         .with_rebase(Duration::from_secs(2));
@@ -2118,13 +2100,7 @@ fn room_frame(p: &Proc, conn: &str, text: &str) {
 #[test]
 fn a_rebase_switch_closes_the_connections_of_the_rebased_kind() {
     let dir = tempfile::tempdir().unwrap();
-    let p = Proc::start_with(
-        dir.path(),
-        NodeConfig {
-            concurrency: 8,
-            ..NodeConfig::default()
-        },
-    );
+    let p = Proc::start(dir.path());
     p.deploy("room");
     p.rt.block_on(p.node.set_policy(QUIET, audit(), false, p.owner()))
         .unwrap();
