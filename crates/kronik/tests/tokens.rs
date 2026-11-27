@@ -9,12 +9,12 @@
 mod common;
 
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::path::Path;
+use std::process::{Command, Output};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{command, free_port};
+use common::{Daemon, command, free_port};
 use serde_json::{Value, json};
 
 const COUNTER: &str = concat!(
@@ -22,57 +22,11 @@ const COUNTER: &str = concat!(
     "/../../tests/guests/counter.wasm"
 );
 
-/// `kronik serve` with its socket in a temporary directory and the API on
-/// TCP at `api`; killed when dropped.
-struct Daemon {
-    child: Child,
-    socket: PathBuf,
-    api: String,
-    dir: tempfile::TempDir,
-}
-
 impl Daemon {
-    fn start(extra: &[&str]) -> Daemon {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("api.sock");
-        let api = format!("127.0.0.1:{}", free_port());
-        let log = std::fs::File::create(dir.path().join("serve.log")).unwrap();
-        let child = command()
-            .arg("serve")
-            .arg("--data-dir")
-            .arg(dir.path().join("data"))
-            .args(["--http-listen", &format!("127.0.0.1:{}", free_port())])
-            .args(["--admin-listen", &format!("127.0.0.1:{}", free_port())])
-            .args(["--api-listen", &api])
-            .arg("--api-socket")
-            .arg(&socket)
-            .args(extra)
-            .env("KRONIK_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        let d = Daemon {
-            child,
-            socket,
-            api,
-            dir,
-        };
-        let up = (0..600).any(|_| {
-            let ok = d.cli(None, &["--json", "actors", "list"]).status.success();
-            if !ok {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            ok
-        });
-        assert!(up, "kronik serve did not start:\n{}", d.log());
-        d
-    }
-
     /// `kronik --socket <socket> <args>`, as `token` when given.
     fn cli(&self, token: Option<&str>, args: &[&str]) -> Output {
         let mut c = command();
-        c.arg("--socket").arg(&self.socket).args(args);
+        c.arg("--socket").arg(self.socket()).args(args);
         if let Some(token) = token {
             c.env("KRONIK_TOKEN", token);
         }
@@ -85,17 +39,6 @@ impl Daemon {
         let out = self.cli(token, &all);
         assert!(out.status.success(), "{args:?}: {out:?}");
         serde_json::from_slice(&out.stdout).unwrap()
-    }
-
-    fn log(&self) -> String {
-        std::fs::read_to_string(self.dir.path().join("serve.log")).unwrap_or_default()
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -163,7 +106,11 @@ fn socket_get(socket: &Path, path: &str) -> Value {
 
 #[test]
 fn tokens_carry_scopes_on_every_listener_and_are_recorded() {
-    let d = Daemon::start(&[]);
+    let dir = tempfile::tempdir().unwrap();
+    let api = format!("127.0.0.1:{}", free_port());
+    let mut serve = Daemon::command(env!("CARGO_BIN_EXE_kronik"), dir.path(), None);
+    serve.args(["--api-listen", &api]);
+    let d = Daemon::spawn(dir.path(), serve);
     let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout)
         .unwrap()
         .trim()
@@ -273,7 +220,7 @@ fn tokens_carry_scopes_on_every_listener_and_are_recorded() {
         .collect();
     assert_eq!(names, ["agent-1", "ops"]);
     // The data directory has the hashes, never the tokens.
-    let db = std::fs::read(d.dir.path().join("data/keys/tokens.db")).unwrap();
+    let db = std::fs::read(d.data().join("keys/tokens.db")).unwrap();
     let secret = &agent.as_bytes()["kronik_".len()..];
     assert!(!db.windows(secret.len()).any(|w| w == secret));
 
@@ -314,7 +261,7 @@ fn tokens_carry_scopes_on_every_listener_and_are_recorded() {
         &["send", "counter/a", "increment", "--reason", "ops message"],
     );
     let turn_id = sent["turn_id"].as_str().unwrap();
-    let turn = socket_get(&d.socket, &format!("/v1/turns/{turn_id}"));
+    let turn = socket_get(&d.socket(), &format!("/v1/turns/{turn_id}"));
     assert_eq!(turn["input"]["token_id"], "token:ops", "{turn}");
     assert_eq!(turn["input"]["reason"], "ops message", "{turn}");
     // Without a token the socket's caller is its user.
@@ -323,7 +270,7 @@ fn tokens_carry_scopes_on_every_listener_and_are_recorded() {
         &["send", "counter/a", "increment", "--reason", "local"],
     );
     let turn = socket_get(
-        &d.socket,
+        &d.socket(),
         &format!("/v1/turns/{}", local["turn_id"].as_str().unwrap()),
     );
     assert_eq!(
@@ -345,7 +292,7 @@ fn tokens_carry_scopes_on_every_listener_and_are_recorded() {
     assert_eq!(forked["fork"]["no_pii"], false, "{forked}");
 
     // Over TCP every request needs a token.
-    let (status, head, body) = tcp(&d.api, "GET", "/v1/actors", None, "");
+    let (status, head, body) = tcp(&api, "GET", "/v1/actors", None, "");
     assert_eq!(status, 401, "{body}");
     assert!(
         head.to_ascii_lowercase()
@@ -353,15 +300,15 @@ fn tokens_carry_scopes_on_every_listener_and_are_recorded() {
         "{head}"
     );
     assert_eq!(body["error"]["code"], "UNAUTHENTICATED", "{body}");
-    let (status, _, body) = tcp(&d.api, "GET", "/v1/actors", Some(&agent), "");
+    let (status, _, body) = tcp(&api, "GET", "/v1/actors", Some(&agent), "");
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["actors"][0]["key"], "a", "{body}");
-    let (status, _, body) = tcp(&d.api, "GET", "/v1/tokens", Some(&agent), "");
+    let (status, _, body) = tcp(&api, "GET", "/v1/tokens", Some(&agent), "");
     assert_eq!(
         (status, body["error"]["code"].as_str()),
         (403, Some("SCOPE_MISSING"))
     );
-    let (status, _, body) = tcp(&d.api, "GET", "/v1/actors", Some("kronik_wrong"), "");
+    let (status, _, body) = tcp(&api, "GET", "/v1/actors", Some("kronik_wrong"), "");
     assert_eq!(
         (status, body["error"]["code"].as_str()),
         (401, Some("UNAUTHENTICATED"))
@@ -373,9 +320,9 @@ fn tokens_carry_scopes_on_every_listener_and_are_recorded() {
                    "clientInfo": {"name": "kronik-test", "version": "0"}}
     })
     .to_string();
-    let (status, _, _) = tcp(&d.api, "POST", "/mcp", None, &init);
+    let (status, _, _) = tcp(&api, "POST", "/mcp", None, &init);
     assert_eq!(status, 401);
-    let (status, _, body) = tcp(&d.api, "POST", "/mcp", Some(&agent), &init);
+    let (status, _, body) = tcp(&api, "POST", "/mcp", Some(&agent), &init);
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["result"]["serverInfo"]["name"], "kronik", "{body}");
 
@@ -403,7 +350,7 @@ fn tokens_carry_scopes_on_every_listener_and_are_recorded() {
         "{}",
         text(&refused)
     );
-    let (status, _, _) = tcp(&d.api, "GET", "/v1/actors", Some(&agent), "");
+    let (status, _, _) = tcp(&api, "GET", "/v1/actors", Some(&agent), "");
     assert_eq!(status, 401);
     let listed = d.cli(None, &["token", "list"]);
     assert!(text(&listed).contains("revoked 20"), "{}", text(&listed));
@@ -454,46 +401,19 @@ fn with_tls_the_tcp_api_serves_https() {
         .unwrap();
     std::fs::write(dir.path().join("cert.pem"), cert.pem()).unwrap();
     std::fs::write(dir.path().join("key.pem"), key.serialize_pem()).unwrap();
-    let config = dir.path().join("kronik.toml");
     let port = free_port();
-    std::fs::write(
-        &config,
-        format!(
-            "[server]\nhttp_listen = \"127.0.0.1:{}\"\nadmin_listen = \"127.0.0.1:{}\"\n\
-             api_listen = \"0.0.0.0:{port}\"\n\n\
-             [tls]\nmode = \"files\"\ncert_file = {:?}\nkey_file = {:?}\n",
-            free_port(),
-            free_port(),
+    let mut serve = Daemon::command(
+        env!("CARGO_BIN_EXE_kronik"),
+        dir.path(),
+        Some(&format!(
+            "[tls]\nmode = \"files\"\ncert_file = {:?}\nkey_file = {:?}\n",
             dir.path().join("cert.pem"),
             dir.path().join("key.pem"),
-        ),
-    )
-    .unwrap();
-    let d = Daemon {
-        child: command()
-            .args(["serve", "--config"])
-            .arg(&config)
-            .arg("--data-dir")
-            .arg(dir.path().join("data"))
-            .arg("--api-socket")
-            .arg(dir.path().join("api.sock"))
-            .env("KRONIK_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-        socket: dir.path().join("api.sock"),
-        api: format!("127.0.0.1:{port}"),
-        dir,
-    };
-    let up = (0..600).any(|_| {
-        let ok = d.cli(None, &["--json", "actors", "list"]).status.success();
-        if !ok {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        ok
-    });
-    assert!(up);
+        )),
+    );
+    serve.args(["--api-listen", &format!("0.0.0.0:{port}")]);
+    let d = Daemon::spawn(dir.path(), serve);
+    let api = format!("127.0.0.1:{port}");
     let created = d.json(
         None,
         &[
@@ -514,7 +434,7 @@ fn with_tls_the_tcp_api_serves_https() {
     let https = |token: Option<&str>| {
         let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let mut conn = rustls::ClientConnection::new(Arc::new(tls_config.clone()), name).unwrap();
-        let mut sock = TcpStream::connect(&d.api).unwrap();
+        let mut sock = TcpStream::connect(&api).unwrap();
         let mut stream = rustls::Stream::new(&mut conn, &mut sock);
         let (status, _, body) = exchange(&mut stream, "GET", "/v1/health", token, "");
         (status, body)
@@ -525,7 +445,7 @@ fn with_tls_the_tcp_api_serves_https() {
     let (status, body) = https(None);
     assert_eq!(status, 401, "{body}");
     // Plain HTTP gets no answer from a TLS listener.
-    let mut plain = TcpStream::connect(&d.api).unwrap();
+    let mut plain = TcpStream::connect(&api).unwrap();
     plain
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();

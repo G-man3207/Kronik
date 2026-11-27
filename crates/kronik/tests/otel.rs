@@ -14,13 +14,13 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{command, free_port};
+use common::{Daemon, command};
 use http_body_util::{BodyExt as _, Full};
 use kronik_core::ids::hex;
 use kronik_otel::otlp::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -148,44 +148,12 @@ fn receiver() -> Receiver {
 
 // ---- the daemon ----
 
-/// `kronik serve` from a configuration file with `[otel]` pointing at the
-/// receiver; killed when dropped.
-struct Daemon {
-    child: Child,
-    dir: PathBuf,
-    socket: PathBuf,
-    gateway: String,
-}
-
-/// Writes `<dir>/kronik.toml` with `[server]` and `sections`, and runs
-/// `kronik serve` on it with `envs`, logging to `<dir>/serve.log`.
-fn serve(dir: &Path, socket: &Path, gateway: &str, sections: &str, envs: &[(&str, &str)]) -> Child {
-    let config = dir.join("kronik.toml");
-    std::fs::write(
-        &config,
-        format!(
-            "[server]\ndata_dir = {:?}\napi_socket = {socket:?}\nhttp_listen = \"{gateway}\"\n\
-             admin_listen = \"127.0.0.1:{}\"\n\n{sections}",
-            dir.join("data"),
-            free_port(),
-        ),
-    )
-    .unwrap();
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("serve.log"))
-        .unwrap();
-    command()
-        .arg("serve")
-        .arg("--config")
-        .arg(&config)
-        .env("KRONIK_LOG", "warn")
-        .envs(envs.iter().copied())
-        .stdout(Stdio::null())
-        .stderr(log)
-        .spawn()
-        .unwrap()
+/// `kronik serve` for `dir` with `sections` after `[server]` and `envs`
+/// set, logging at `warn` (the tests read the log).
+fn serve(dir: &Path, sections: &str, envs: &[(&str, &str)]) -> Command {
+    let mut c = Daemon::command(env!("CARGO_BIN_EXE_kronik"), dir, Some(sections));
+    c.env("KRONIK_LOG", "warn").envs(envs.iter().copied());
+    c
 }
 
 impl Daemon {
@@ -199,30 +167,13 @@ impl Daemon {
 
     /// `kronik serve` with `sections` after `[server]` and `envs` set.
     fn start_with(dir: &Path, sections: &str, envs: &[(&str, &str)]) -> Daemon {
-        let socket = dir.join("api.sock");
-        let gateway = format!("127.0.0.1:{}", free_port());
-        let child = serve(dir, &socket, &gateway, sections, envs);
-        let d = Daemon {
-            child,
-            dir: dir.to_owned(),
-            socket,
-            gateway,
-        };
-        let up = (0..600).any(|_| {
-            let ok = d.cli(&["--json", "actors", "list"]).status.success();
-            if !ok {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            ok
-        });
-        assert!(up, "kronik serve did not start:\n{}", d.log());
-        d
+        Daemon::spawn(dir, serve(dir, sections, envs))
     }
 
     fn cli(&self, args: &[&str]) -> std::process::Output {
         command()
             .arg("--socket")
-            .arg(&self.socket)
+            .arg(self.socket())
             .args(args)
             .output()
             .unwrap()
@@ -236,15 +187,11 @@ impl Daemon {
         serde_json::from_slice(&out.stdout).unwrap()
     }
 
-    fn log(&self) -> String {
-        std::fs::read_to_string(self.dir.join("serve.log")).unwrap_or_default()
-    }
-
     /// `POST /counter/a/call` with body `counter/b call`: counter/a calls
     /// counter/b, which calls counter/x. The root turn's id.
     fn three_actors(&self, headers: &[(&str, &str)]) -> String {
         let body = "counter/b call";
-        let mut s = TcpStream::connect(&self.gateway).unwrap();
+        let mut s = TcpStream::connect(&self.http).unwrap();
         let extra: String = headers
             .iter()
             .map(|(n, v)| format!("{n}: {v}\r\n"))
@@ -272,17 +219,10 @@ impl Daemon {
 
     /// The causal root of a turn, from `GET /v1/turns/{id}`.
     fn causal_root(&self, turn: &str) -> String {
-        let mut stream = std::os::unix::net::UnixStream::connect(&self.socket).unwrap();
-        write!(
-            stream,
-            "GET /v1/turns/{turn} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        let (_, body) = response.split_once("\r\n\r\n").unwrap();
-        let v: Value = serde_json::from_str(body).unwrap();
-        v["causal_key"]["root"].as_str().unwrap().to_owned()
+        self.api("GET", &format!("/v1/turns/{turn}"), Value::Null)["causal_key"]["root"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     fn traces_status(&self) -> Value {
@@ -311,13 +251,6 @@ impl Daemon {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -582,8 +515,8 @@ const NEEDLE: &str = "NEEDLE-7f3a";
 
 /// Runs `kronik serve` that must fail at start: its log.
 fn serve_fails(dir: &Path, sections: &str, envs: &[(&str, &str)]) -> String {
-    let gateway = format!("127.0.0.1:{}", free_port());
-    let mut child = serve(dir, &dir.join("api.sock"), &gateway, sections, envs);
+    let log = std::fs::File::create(dir.join("serve.log")).unwrap();
+    let mut child = serve(dir, sections, envs).stderr(log).spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
     while child.try_wait().unwrap().is_none() {
         if Instant::now() > deadline {

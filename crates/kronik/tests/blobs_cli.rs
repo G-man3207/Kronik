@@ -18,59 +18,26 @@ mod common;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use blob_fixtures::{hash, pattern};
-use common::{Out, command, free_port};
+use common::{Daemon, Out, command};
 use serde_json::Value;
 
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
 
-struct Serve {
-    child: Child,
-    socket: std::path::PathBuf,
-    http: String,
-}
-
-impl Serve {
-    fn start(dir: &Path) -> Serve {
-        let socket = dir.join("api.sock");
-        let http = format!("127.0.0.1:{}", free_port());
-        let config = dir.join("kronik.toml");
-        std::fs::write(
-            &config,
-            format!(
-                "[server]\ndata_dir = {:?}\napi_socket = {:?}\nhttp_listen = {http:?}\n\n\
-                 [blobs]\ngc_interval = \"0s\"\n",
-                dir.join("data"),
-                socket,
+impl Daemon {
+    /// `kronik serve` in `dir`, without the collector's timer.
+    fn start(dir: &Path) -> Daemon {
+        Daemon::spawn(
+            dir,
+            Daemon::command(
+                env!("CARGO_BIN_EXE_kronik"),
+                dir,
+                Some("[blobs]\ngc_interval = \"0s\"\n"),
             ),
         )
-        .unwrap();
-        let child = command()
-            .arg("serve")
-            .arg("--config")
-            .arg(&config)
-            .env("KRONIK_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let serve = Serve {
-            child,
-            socket,
-            http,
-        };
-        let up = (0..600).any(|_| {
-            if serve.run(&["--json", "actors", "list"]).code == 0 {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-            false
-        });
-        assert!(up, "the API did not come up on {}", serve.socket.display());
-        serve
     }
 
     fn run(&self, args: &[&str]) -> Out {
@@ -78,7 +45,8 @@ impl Serve {
     }
 
     fn run_with(&self, args: &[&str], stdin: Option<&[u8]>) -> Out {
-        let mut all = vec!["--socket", self.socket.to_str().unwrap()];
+        let socket = self.socket();
+        let mut all = vec!["--socket", socket.to_str().unwrap()];
         all.extend_from_slice(args);
         let mut command = command();
         command
@@ -135,17 +103,10 @@ impl Serve {
     }
 }
 
-impl Drop for Serve {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 #[test]
 fn blobs_status_inspect_get_and_gc() {
     let dir = tempfile::tempdir().unwrap();
-    let d = Serve::start(dir.path());
+    let d = Daemon::start(dir.path());
     let o = d.run(&["deploy", MEDIA, "--reason", "blob commands"]);
     assert_eq!(o.code, 0, "{o:?}");
     // A secret whose value the response blob holds (bytes 1000..1024).
@@ -330,7 +291,7 @@ fn blobs_status_inspect_get_and_gc() {
 #[test]
 fn holds_in_actors_inspect_blobs_list_inspect_and_the_plan() {
     let dir = tempfile::tempdir().unwrap();
-    let d = Serve::start(dir.path());
+    let d = Daemon::start(dir.path());
     let o = d.run(&["deploy", MEDIA, "--reason", "what actors hold"]);
     assert_eq!(o.code, 0, "{o:?}");
     // media/a puts two blobs and holds both.
