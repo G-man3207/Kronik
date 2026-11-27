@@ -350,7 +350,9 @@ fn a_value_over_one_mib_is_too_large() {
     let fits = a.query("SELECT length(?1)", &[blob(mib)]).unwrap();
     assert_eq!(fits.values[0][0], Value::Integer(mib as i64));
     let over = a.query("SELECT length(?1)", &[blob(mib + 1)]);
-    assert_eq!(over, Err(SqlError::TooLarge));
+    assert_eq!(over, Err(SqlError::TooLarge), "a blob of one byte more");
+    let over = a.query("SELECT length(?1)", &[Value::Text("x".repeat(mib + 1))]);
+    assert_eq!(over, Err(SqlError::TooLarge), "a string of one byte more");
     let drawn = a.query("SELECT randomblob(?1)", &[Value::Integer(mib as i64 + 1)]);
     assert_eq!(drawn, Err(SqlError::TooLarge));
     a.end_turn(false).unwrap();
