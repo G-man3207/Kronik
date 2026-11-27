@@ -11,7 +11,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use common::{Proc, audit, start_proc, wait_turn};
+use common::{Proc, audit, http_blob, http_text, start_proc, wait_turn};
 use kronik_blob::{BlobId, BlobStore, Space, StoreConfig};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
@@ -108,15 +108,7 @@ impl Proc {
             .unwrap()
         });
         assert!(r.committed(), "{r:?}");
-        match &r.outcome.output {
-            Some(pb::outcome::Output::Http(h)) => {
-                match h.body.as_ref().and_then(|b| b.value.clone()) {
-                    Some(pb::body::Value::Blob(blob)) => blob,
-                    other => panic!("not a blob: {other:?}"),
-                }
-            }
-            other => panic!("{other:?}"),
-        }
+        http_blob(&r)
     }
 
     fn path(&self, dir: &Path, space: &Space, blob: &pb::BlobRef) -> PathBuf {
@@ -546,20 +538,6 @@ fn an_erasure_is_pending_until_the_collector_is_done_with_its_subjects_loose_fil
     assert_eq!(pending, 0, "remembered over a restart");
 }
 
-/// The text of a turn's HTTP answer.
-fn answer_text(r: &TurnResult) -> String {
-    match &r.outcome.output {
-        Some(pb::outcome::Output::Http(h)) => match h.body.as_ref().and_then(|b| b.value.clone()) {
-            Some(pb::body::Value::Inline(s)) => match s.value {
-                Some(pb::sealable::Value::Plain(bytes)) => String::from_utf8(bytes).unwrap(),
-                other => panic!("not plain: {other:?}"),
-            },
-            other => panic!("not inline: {other:?}"),
-        },
-        other => panic!("{r:?}: {other:?}"),
-    }
-}
-
 /// Review of B19 (B14's quota across an erasure; ADR 0119 as amended
 /// 2026-11-14, second note): an actor keeps the hashes of what it holds in
 /// rows of their subject, which the erasure deletes, so it can never release
@@ -587,7 +565,7 @@ fn an_erased_subjects_blobs_stop_counting_against_the_holders_quota() {
     let put = |size: u64, subject: &str| {
         let r = p.run("put", &format!("size={size}"), subject);
         assert!(r.committed(), "{r:?}");
-        answer_text(&r)
+        http_text(&r)
     };
     // user:1's two blobs, about 2 MiB of the 2.5 MiB quota.
     let first = put(1 << 20, "user:1");

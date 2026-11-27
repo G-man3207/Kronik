@@ -10,7 +10,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::{Proc, audit, http, slow_server, start_proc, wait_turn};
+use common::{Proc, audit, http, http_blob, http_text, slow_server, start_proc, wait_turn};
 use kronik_blob::{BlobStore, Space, StoreConfig};
 use kronik_core::env::Env;
 use kronik_core::env::test_fs::{FsCall, Then, hooked};
@@ -111,31 +111,12 @@ impl Proc {
 
 fn answer(r: &TurnResult) -> String {
     assert!(r.committed(), "{r:?}");
-    match &r.outcome.output {
-        Some(pb::outcome::Output::Http(h)) => {
-            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
-                Some(pb::body::Value::Inline(s)) => match &s.value {
-                    Some(pb::sealable::Value::Plain(b)) => String::from_utf8_lossy(b).into_owned(),
-                    other => panic!("{other:?}"),
-                },
-                other => panic!("not inline: {other:?}"),
-            }
-        }
-        other => panic!("{other:?}"),
-    }
+    http_text(r)
 }
 
 fn blob_answer(r: &TurnResult) -> pb::BlobRef {
     assert!(r.committed(), "{r:?}");
-    match &r.outcome.output {
-        Some(pb::outcome::Output::Http(h)) => {
-            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
-                Some(pb::body::Value::Blob(blob)) => blob.clone(),
-                other => panic!("not a blob: {other:?}"),
-            }
-        }
-        other => panic!("{other:?}"),
-    }
+    http_blob(r)
 }
 
 /// A blob the guest writes is the response: the turn's record holds only
