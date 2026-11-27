@@ -10,12 +10,12 @@ mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
-use std::process::{Child, Output, Stdio};
+use std::path::Path;
+use std::process::{Output, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use common::{command, free_port};
+use common::{Daemon, command, free_port};
 use serde_json::Value;
 
 const GUESTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests");
@@ -24,31 +24,17 @@ fn guest(name: &str) -> String {
     format!("{GUESTS}/{name}.wasm")
 }
 
-struct Daemon {
-    child: Child,
-    dir: tempfile::TempDir,
-    /// `host:port` of the TCP API.
-    api: String,
-}
-
 impl Daemon {
-    /// `kronik serve` with the API on TCP; with TLS from a self-signed
-    /// certificate for `localhost` and 127.0.0.1 when `tls`.
-    fn start(tls: bool, extra: &[&str]) -> Daemon {
-        Daemon::start_with(tls.then_some(&["localhost", "127.0.0.1"][..]), extra)
+    /// `kronik serve` in `dir` with the API on TCP; with TLS from a
+    /// self-signed certificate for `localhost` and 127.0.0.1 when `tls`.
+    fn start(dir: &Path, tls: bool, extra: &[&str]) -> (Daemon, String) {
+        Daemon::start_with(dir, tls.then_some(&["localhost", "127.0.0.1"][..]), extra)
     }
 
     /// [`Daemon::start`] with TLS from a self-signed certificate for
-    /// `cert_names`, when given.
-    fn start_with(cert_names: Option<&[&str]>, extra: &[&str]) -> Daemon {
-        let dir = tempfile::tempdir().unwrap();
-        let port = free_port();
-        let mut config = format!(
-            "[server]\nhttp_listen = \"127.0.0.1:{}\"\nadmin_listen = \"127.0.0.1:{}\"\n\
-             api_listen = \"127.0.0.1:{port}\"\n",
-            free_port(),
-            free_port(),
-        );
+    /// `cert_names`, when given. The daemon and the `host:port` of its API.
+    fn start_with(dir: &Path, cert_names: Option<&[&str]>, extra: &[&str]) -> (Daemon, String) {
+        let mut tls = String::new();
         if let Some(names) = cert_names {
             let key = rcgen::KeyPair::generate().unwrap();
             let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
@@ -56,58 +42,25 @@ impl Daemon {
                 .unwrap()
                 .self_signed(&key)
                 .unwrap();
-            std::fs::write(dir.path().join("cert.pem"), cert.pem()).unwrap();
-            std::fs::write(dir.path().join("key.pem"), key.serialize_pem()).unwrap();
-            config.push_str(&format!(
-                "\n[tls]\nmode = \"files\"\ncert_file = {:?}\nkey_file = {:?}\n",
-                dir.path().join("cert.pem"),
-                dir.path().join("key.pem"),
-            ));
+            std::fs::write(dir.join("cert.pem"), cert.pem()).unwrap();
+            std::fs::write(dir.join("key.pem"), key.serialize_pem()).unwrap();
+            tls = format!(
+                "[tls]\nmode = \"files\"\ncert_file = {:?}\nkey_file = {:?}\n",
+                dir.join("cert.pem"),
+                dir.join("key.pem"),
+            );
         }
-        std::fs::write(dir.path().join("kronik.toml"), config).unwrap();
-        let log = std::fs::File::create(dir.path().join("serve.log")).unwrap();
-        let child = command()
-            .args(["serve", "--config"])
-            .arg(dir.path().join("kronik.toml"))
-            .arg("--data-dir")
-            .arg(dir.path().join("data"))
-            .arg("--api-socket")
-            .arg(dir.path().join("api.sock"))
-            .args(extra)
-            .env("KRONIK_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        let d = Daemon {
-            child,
-            dir,
-            api: format!("127.0.0.1:{port}"),
-        };
-        let up = (0..600).any(|_| {
-            let ok = d.local(&["--json", "actors", "list"]).status.success();
-            if !ok {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            ok
-        });
-        assert!(up, "kronik serve did not start:\n{}", d.log());
-        d
-    }
-
-    fn path(&self, name: &str) -> PathBuf {
-        self.dir.path().join(name)
-    }
-
-    fn log(&self) -> String {
-        std::fs::read_to_string(self.path("serve.log")).unwrap_or_default()
+        let api = format!("127.0.0.1:{}", free_port());
+        let mut serve = Daemon::command(env!("CARGO_BIN_EXE_kronik"), dir, Some(&tls));
+        serve.args(["--api-listen", &api]).args(extra);
+        (Daemon::spawn(dir, serve), api)
     }
 
     /// `kronik` on the daemon's socket.
     fn local(&self, args: &[&str]) -> Output {
         command()
             .arg("--socket")
-            .arg(self.path("api.sock"))
+            .arg(self.socket())
             .args(args)
             .output()
             .unwrap()
@@ -139,13 +92,6 @@ impl Daemon {
     }
 }
 
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 /// `kronik` with only environment variables (no --socket).
 fn remote(env: &[(&str, &str)], args: &[&str]) -> Output {
     let mut c = command();
@@ -166,11 +112,12 @@ fn error_code(out: &Output) -> String {
 /// `$KRONIK_TOKEN`, over TLS; plain HTTP only to this machine.
 #[test]
 fn the_cli_drives_a_remote_api_over_tls() {
-    let d = Daemon::start(true, &[]);
+    let dir = tempfile::tempdir().unwrap();
+    let (d, api) = Daemon::start(dir.path(), true, &[]);
     let token = d.token();
-    let port = d.api.rsplit(':').next().unwrap().to_owned();
+    let port = api.rsplit(':').next().unwrap().to_owned();
     let url = format!("https://localhost:{port}");
-    let ca = d.path("cert.pem");
+    let ca = d.dir.join("cert.pem");
     let ca = ca.to_str().unwrap();
     let env = [
         ("KRONIK_URL", url.as_str()),
@@ -219,12 +166,12 @@ fn the_cli_drives_a_remote_api_over_tls() {
         "{out:?}"
     );
     let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    std::fs::write(d.path("other.pem"), other.cert.pem()).unwrap();
+    std::fs::write(d.dir.join("other.pem"), other.cert.pem()).unwrap();
     let out = remote(
         &[
             ("KRONIK_URL", &url),
             ("KRONIK_TOKEN", &token),
-            ("SSL_CERT_FILE", d.path("other.pem").to_str().unwrap()),
+            ("SSL_CERT_FILE", d.dir.join("other.pem").to_str().unwrap()),
         ],
         &["--json", "actors", "list"],
     );
@@ -253,10 +200,11 @@ fn the_cli_drives_a_remote_api_over_tls() {
 /// … failed", and `proposal wait` does not retry it until its timeout.
 #[test]
 fn a_certificate_for_another_name_fails_at_once() {
-    let d = Daemon::start_with(Some(&["kronik.example"]), &[]);
+    let dir = tempfile::tempdir().unwrap();
+    let (d, api) = Daemon::start_with(dir.path(), Some(&["kronik.example"]), &[]);
     let token = d.token();
-    let url = format!("https://{}", d.api);
-    let ca = d.path("cert.pem");
+    let url = format!("https://{api}");
+    let ca = d.dir.join("cert.pem");
     let env = [
         ("KRONIK_URL", url.as_str()),
         ("KRONIK_TOKEN", token.as_str()),
@@ -293,13 +241,11 @@ fn a_certificate_for_another_name_fails_at_once() {
 /// looking it up (M2).
 #[test]
 fn plain_http_is_accepted_to_this_machine() {
-    let d = Daemon::start(false, &[]);
+    let dir = tempfile::tempdir().unwrap();
+    let (d, api) = Daemon::start(dir.path(), false, &[]);
     let token = d.token();
-    let port = d.api.rsplit(':').next().unwrap().to_owned();
-    for url in [
-        format!("http://{}", d.api),
-        format!("http://localhost:{port}"),
-    ] {
+    let port = api.rsplit(':').next().unwrap().to_owned();
+    for url in [format!("http://{api}"), format!("http://localhost:{port}")] {
         let out = remote(
             &[("KRONIK_URL", &url), ("KRONIK_TOKEN", &token)],
             &["--json", "actors", "list"],
@@ -340,14 +286,18 @@ fn a_proposal_outlives_its_client_and_wait_shows_progress() {
     let dir = tempfile::tempdir().unwrap();
     let permits = dir.path().join("permits");
     std::fs::write(&permits, "0").unwrap();
-    let d = Daemon::start(false, &["--test-replay-permits", permits.to_str().unwrap()]);
+    let (d, _) = Daemon::start(
+        dir.path(),
+        false,
+        &["--test-replay-permits", permits.to_str().unwrap()],
+    );
     d.local_json(&["deploy", &guest("counter"), "--reason", "jobs"]);
     for i in 0..20 {
         let key = format!("counter/k{}", i % 4);
         let out = d.local(&["send", &key, "increment", "--reason", "traffic"]);
         assert!(out.status.success(), "{out:?}");
     }
-    let socket = d.path("api.sock");
+    let socket = d.socket();
 
     // A plain (waiting) propose, killed while its replay is held.
     let mut client = command()
