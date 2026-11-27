@@ -330,7 +330,7 @@ async fn the_server_streams_uploads_and_blob_responses() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let dir = tempfile::tempdir().unwrap();
     let node = media_node(dir.path()).await;
-    let (addr, _) = common::serve(&node, 16).await;
+    let (addr, _) = common::serve(&node, None, 16).await;
     let upload = data(3 * MIB);
     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
     s.write_all(

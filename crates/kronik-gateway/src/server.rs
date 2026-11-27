@@ -559,83 +559,60 @@ async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) {
     }
 }
 
-/// Serves until the task is dropped, with at most `max_connections` open.
-/// Each connection is a task.
+/// Serves until the task is dropped, with at most `max_connections` open,
+/// over TLS with `tls` when given (from [`crate::tls::start`]). Each
+/// connection is a task. A TLS-ALPN-01 validation by an ACME CA ends after
+/// the handshake.
 pub async fn serve(
-    listener: TcpListener,
-    gateway: Arc<Gateway>,
-    max_connections: usize,
-) -> std::io::Result<()> {
-    let slots = Slots::new(max_connections);
-    loop {
-        match accept(&listener, &slots, &gateway.cfg.trusted_proxies).await {
-            Accepted::Served(stream, peer, slot) => {
-                let gw = gateway.clone();
-                tokio::spawn(serve_connection(stream, gw, peer.ip(), slot));
-            }
-            Accepted::Refused(stream, _, permit) => {
-                tokio::spawn(async move {
-                    refuse(stream).await;
-                    drop(permit);
-                });
-            }
-        }
-    }
-}
-
-/// [`serve_tls`] with a TLS configuration, else [`serve`].
-pub async fn serve_with_tls(
     listener: TcpListener,
     gateway: Arc<Gateway>,
     tls: Option<Arc<rustls::ServerConfig>>,
     max_connections: usize,
 ) -> std::io::Result<()> {
-    match tls {
-        Some(config) => serve_tls(listener, gateway, config, max_connections).await,
-        None => serve(listener, gateway, max_connections).await,
-    }
-}
-
-/// Like [`serve`], over TLS with `config` (from [`crate::tls::start`]). A
-/// TLS-ALPN-01 validation by an ACME CA ends after the handshake.
-pub async fn serve_tls(
-    listener: TcpListener,
-    gateway: Arc<Gateway>,
-    config: Arc<rustls::ServerConfig>,
-    max_connections: usize,
-) -> std::io::Result<()> {
-    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
     let slots = Slots::new(max_connections);
     loop {
-        let (stream, peer, slot) = match accept(&listener, &slots, &gateway.cfg.trusted_proxies)
-            .await
-        {
-            Accepted::Served(stream, peer, slot) => (stream, peer, slot),
+        match accept(&listener, &slots, &gateway.cfg.trusted_proxies).await {
+            Accepted::Served(stream, peer, slot) => {
+                let Some(acceptor) = acceptor.clone() else {
+                    tokio::spawn(serve_connection(stream, gateway.clone(), peer.ip(), slot));
+                    continue;
+                };
+                let gw = gateway.clone();
+                tokio::spawn(async move {
+                    match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream))
+                        .await
+                    {
+                        Ok(Ok(tls)) => {
+                            if tls.get_ref().1.alpn_protocol() != Some(ACME_TLS_ALPN) {
+                                serve_connection(tls, gw, peer.ip(), slot).await;
+                            }
+                        }
+                        Ok(Err(e)) => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
+                        Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
+                    }
+                });
+            }
             Accepted::Refused(stream, peer, permit) => {
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
-                    match tokio::time::timeout(REFUSAL_TIME, acceptor.accept(stream)).await {
-                        Ok(Ok(tls)) => refuse(tls).await,
-                        _ => tracing::debug!(%peer, "no TLS handshake from a refused connection"),
+                    match acceptor {
+                        None => refuse(stream).await,
+                        Some(acceptor) => {
+                            match tokio::time::timeout(REFUSAL_TIME, acceptor.accept(stream)).await
+                            {
+                                Ok(Ok(tls)) => refuse(tls).await,
+                                _ => tracing::debug!(
+                                    %peer,
+                                    "no TLS handshake from a refused connection"
+                                ),
+                            }
+                        }
                     }
                     drop(permit);
                 });
-                continue;
             }
-        };
-        let acceptor = acceptor.clone();
-        let gw = gateway.clone();
-        tokio::spawn(async move {
-            match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
-                Ok(Ok(tls)) => {
-                    if tls.get_ref().1.alpn_protocol() != Some(ACME_TLS_ALPN) {
-                        serve_connection(tls, gw, peer.ip(), slot).await;
-                    }
-                }
-                Ok(Err(e)) => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
-                Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
-            }
-        });
+        }
     }
 }
 
