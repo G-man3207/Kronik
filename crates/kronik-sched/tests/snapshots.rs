@@ -1070,20 +1070,6 @@ fn a_turn_spans_segments(p: &Proc, dir: &Path) -> bool {
     })
 }
 
-/// A gap past the bulk threshold replays to the state the live applier
-/// reached: segments of simple HTTP turns through the catch-up rows,
-/// segments with message and SQL turns the normal way.
-#[test]
-fn a_long_gap_replays_to_the_live_state() {
-    let dir = tempdir();
-    let live = record_long_gap(dir.path());
-    let p = start_with(dir.path(), 2, None, SEGMENT, None);
-    assert!(applied_state(&p) == live, "the replayed state differs");
-    assert!(has_actor_index(&p));
-    assert!(!dir.path().join("branches/main/state.db-bulk").exists());
-    p.send("counter/k0", "increment", "");
-}
-
 /// A bulk replay that fails partway (here at a damaged closed segment,
 /// after it applied the segments before it) keeps its marker: journaling
 /// was off, so the next start must rebuild state.db rather than trust it.
@@ -1119,7 +1105,8 @@ fn bulk_replay_child() {
 
 /// A crash during a bulk replay (journaling off) leaves its marker; the
 /// next start discards the half-applied, possibly torn state.db and gets
-/// the state a clean replay gives.
+/// the state a clean replay gives. That replay is the one a long gap gets:
+/// its state is the live state, with the actor index.
 #[test]
 fn a_crash_during_a_bulk_replay_rebuilds_on_the_next_start() {
     let dir = tempdir();
@@ -1196,6 +1183,7 @@ fn a_crash_during_a_bulk_replay_rebuilds_on_the_next_start() {
     let p = start_with(dir.path(), 2, None, SEGMENT, None);
     assert!(!marker.exists());
     assert!(applied_state(&p) == live, "the rebuilt state differs");
+    assert!(has_actor_index(&p));
     p.send("counter/k0", "increment", "");
 }
 
@@ -1259,8 +1247,9 @@ fn keyed_increment(
     })
 }
 
-/// Below `[log] disk_reserve` new work is refused, but what an incident
-/// needs still works: rollback, `foreign remove`, revoke, limits and an
+/// Below `[log] disk_reserve` new work is refused and a deploy is refused
+/// naming the setting, but what an incident needs still works: rollback,
+/// `foreign remove`, revoke, limits, erasure, a guard record and an
 /// idempotent retry (it writes nothing). Retention deletes old snapshots
 /// although no new one is taken, so the node can climb back above the
 /// reserve.
@@ -1352,6 +1341,21 @@ fn below_the_disk_reserve_incident_actions_and_retention_still_work() {
         .unwrap();
     p.rt.block_on(p.node.foreign_remove("pay", audit(), false, p.owner()))
         .unwrap();
+    let e =
+        p.rt.block_on(p.node.deploy(&guest("notes"), audit(), false, p.owner()))
+            .unwrap_err();
+    assert_eq!(e.code, kronik_core::error::ErrorCode::Unavailable, "{e}");
+    assert!(e.message.contains("disk_reserve"), "{e}");
+    p.rt.block_on(p.node.erase_subject("user:1", audit(), false, p.owner()))
+        .unwrap();
+    // A watch's guard record is an incident record too (W-M1).
+    p.rt.block_on(p.node.record_guard(pb::GuardTriggered {
+        audit: Some(audit()),
+        action: pb::GuardAction::Alert as i32,
+        outcome: pb::GuardOutcome::Alerted as i32,
+        ..Default::default()
+    }))
+    .unwrap();
     assert_eq!(p.node.fatal(), None);
 }
 
