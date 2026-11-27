@@ -229,6 +229,8 @@ scripts/ci.sh
 a subset. It needs rustup with the pinned toolchain, `cargo-deny`, Node.js 22.20
 or later and the pinned Python test runtime from
 [CONTRIBUTING.md](CONTRIBUTING.md), which also has the conventions.
+`npm ci` at the repository root installs a pre-commit hook that runs
+formatting, hygiene and `cargo deny`.
 [AGENTS.md](AGENTS.md) lists what each step needs and is the guide for automated
 and human contributors. A missing prerequisite normally fails its step;
 `foreign` without root and gVisor's `runsc`, and `s3` without Docker, skip with

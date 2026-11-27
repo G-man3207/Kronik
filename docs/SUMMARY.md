@@ -161,3 +161,4 @@
 - [ADR 0160: Apply a turn's SQL changesets together](adr/0160-cross-subject-foreign-key-apply.md)
 - [ADR 0161: A forked grounding row is a changed target for approvals](adr/0161-forked-grounding-changed-target.md)
 - [ADR 0162: Member-only seams wait for a Member runtime](adr/0162-member-seams-wait-for-a-member-runtime.md)
+- [ADR 0163: A pre-commit hook, and duplicate crates fail cargo-deny](adr/0163-commit-hook-and-duplicate-crates.md)

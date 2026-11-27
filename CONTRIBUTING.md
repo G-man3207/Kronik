@@ -46,6 +46,21 @@ scripts/ci.sh                # fmt, clippy, keyhelper, hygiene, test, docs, book
 scripts/ci.sh clippy test    # selected steps
 ```
 
+Formatting, the determinism hygiene and `cargo deny` also run before each
+commit, once the hook is installed. From the repository root, with Node.js
+22.20 or later:
+
+```sh
+npm ci
+```
+
+That installs the pinned Husky and points Git at `.husky/`. The pre-commit
+hook runs `scripts/ci.sh fmt hygiene deny`. It needs `cargo-deny` on `PATH`,
+as the deny step does. `git commit --no-verify` skips the hook. The hook is
+local: GitHub still does not start CI on a pull request
+([ADR 0110](docs/adr/0110-manual-github-workflows.md),
+[ADR 0163](docs/adr/0163-commit-hook-and-duplicate-crates.md)).
+
 `scripts/ci.sh` exits non-zero if any step fails. The M20 and M21 isolation
 checks are explicit and are not CI steps: they need root, runsc, systemd 255
 or newer and free numeric ids, the microVM ones also `/dev/kvm`, and the
@@ -237,7 +252,11 @@ public acceptance requirements are in `examples/github-flow/README.md`.
 - **Dependencies.** Justify every new dependency in the commit message. Avoid C
   dependencies beyond SQLite, which is bundled through `rusqlite`. Every
   dependency must pass `cargo deny --all-features check`; extend the license
-  allowlist in `deny.toml` only when a new dependency needs it.
+  allowlist in `deny.toml` only when a new dependency needs it. A second
+  version of a crate fails that check. An older version that is already
+  duplicated is an exact `skip` with a reason
+  ([ADR 0163](docs/adr/0163-commit-hook-and-duplicate-crates.md)); remove the
+  skip in the change that drops the version.
 - **Formats are versioned.** A change to a format (the Protobuf log schema, the
   diff schema or CLI JSON) requires a version bump and a compatibility fixture.
 - **Functional core, imperative shell.** tokio handles I/O in the shell. The

@@ -382,6 +382,19 @@ import pathlib, re, sys
 text = pathlib.Path("deny.toml").read_text()
 if not re.search(r'^unmaintained\s*=\s*"all"', text, re.M):
     sys.exit("error: deny.toml must keep unmaintained = \"all\"")
+# A new duplicate version fails. The baseline is exact older versions
+# with a reason, and a stale entry fails cargo deny (ADR 0163).
+if not re.search(r'^multiple-versions\s*=\s*"deny"', text, re.M):
+    sys.exit('error: deny.toml must keep multiple-versions = "deny"')
+skips = re.findall(
+    r'\{\s*crate\s*=\s*"([^"]+)"\s*,\s*reason\s*=\s*"([^"]*)"',
+    text,
+)
+if len(skips) < 1:
+    sys.exit("error: deny.toml has no duplicate-version baseline")
+for spec, reason in skips:
+    if "@=" not in spec or len(reason.strip()) < 20:
+        sys.exit(f"error: duplicate skip {spec!r} needs an exact version and a reason")
 for advisory in ("RUSTSEC-2026-0542", "RUSTSEC-2026-0543"):
     match = re.search(
         r'\{\s*id\s*=\s*"' + advisory + r'"\s*,\s*reason\s*=\s*"([^"]+)"',
@@ -390,13 +403,18 @@ for advisory in ("RUSTSEC-2026-0542", "RUSTSEC-2026-0543"):
     if not match or len(match.group(1).strip()) < 20:
         sys.exit(f"error: deny.toml has no reasoned exception for {advisory}")
 PY
-    cargo deny --locked --all-features check
+    # unmatched-skip / unnecessary-skip: a baseline entry whose version has
+    # left the graph, or which now applies to a crate with one version.
+    cargo deny --locked --all-features check \
+        -D unmatched-skip -D unnecessary-skip
     # The examples (with the Rust SDK) have a lockfile of their own, and their
     # few dependencies use only some of the licenses deny.toml allows. They
     # also do not resolve chrono or humantime, so the exceptions above are
-    # unused in that graph.
+    # unused in that graph. The duplicate baseline is for the daemon graph, so
+    # its skips are absent or single-version here.
     cargo deny --manifest-path examples/Cargo.toml --locked check \
-        -A license-not-encountered -A advisory-not-detected
+        -A license-not-encountered -A advisory-not-detected \
+        -A unmatched-skip -A unnecessary-skip
     # The same graph with an empty ignore list must still fail both
     # advisories. Reintroducing either crate without its exception fails
     # this step.

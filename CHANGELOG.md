@@ -5,6 +5,14 @@ formats, the API, the WIT interface and the CLI may change between releases
 until the v1.0 compatibility promise takes effect.
 
 ## Unreleased
+- A pre-commit hook runs formatting, the determinism hygiene and `cargo deny`.
+  `npm ci` at the repository root installs the pinned Husky that points Git
+  at it (ADR 0163). `git commit --no-verify` skips the hook. Hosted CI is
+  still started by hand.
+- `cargo deny` rejects a new duplicate version of a crate. Versions already
+  duplicated in the lockfile stay as exact, reasoned skips until that
+  version leaves the graph, and a skip that no longer matches fails the
+  check (ADR 0163).
 - Continuous replay no longer compiles an SQL statement for every fork turn
   it applies: the bulk applier's check for open turns now uses the statement
   cache. On the development machine's two-CPU control, continuous replay of

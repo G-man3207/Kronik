@@ -97,7 +97,9 @@ scripts/ci.sh clippy test    # selected steps
 ```
 
 It needs rustup, which installs the toolchain pinned in `rust-toolchain.toml`,
-and `cargo-deny`. Some steps need more:
+and `cargo-deny`. `npm ci` at the repository root installs a Husky pre-commit
+hook that runs `scripts/ci.sh fmt hygiene deny` (ADR 0163). Hosted CI stays
+manual. Some steps need more:
 
 - `test` needs the pinned Python runtime of the OIDC tests, prepared as
   `CONTRIBUTING.md` describes, in `KRONIK_TEST_PYTHON`. The step checks it

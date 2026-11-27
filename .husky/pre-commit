@@ -1,0 +1,3 @@
+# Cheap local gate: formatting, determinism hygiene and cargo-deny.
+# The full suite remains scripts/ci.sh. Skip this hook with --no-verify.
+scripts/ci.sh fmt hygiene deny
