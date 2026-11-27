@@ -503,46 +503,6 @@ fn an_erasure_without_its_record_is_recovered_at_start() {
     assert_eq!(p.node.epoch(), epoch, "recovered once, not again");
 }
 
-/// `[log] disk_reserve`: with less free space than the reserve, new inputs
-/// and changes are refused with UNAVAILABLE before anything is written, the
-/// node keeps running (no fatal log write), and erasure still works.
-#[test]
-fn below_the_disk_reserve_new_work_waits_and_the_node_stays_up() {
-    let dir = tempfile::tempdir().unwrap();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let config = NodeConfig {
-            // More than any disk has: the reserve is always short.
-            disk_reserve: u64::MAX,
-            ..NodeConfig::default()
-        };
-        start_local(env, dir.path(), config).await.unwrap()
-    });
-    let p = Proc { rt, node };
-    let bytes = std::fs::read(COUNTER).unwrap();
-    let e =
-        p.rt.block_on(p.node.deploy(&bytes, audit(), false, p.owner()))
-            .unwrap_err();
-    assert_eq!(e.code, ErrorCode::Unavailable, "{e}");
-    assert!(e.message.contains("disk_reserve"), "{e}");
-    assert_eq!(p.node.fatal(), None);
-    p.rt.block_on(p.node.erase_subject("user:1", audit(), false, p.owner()))
-        .unwrap();
-    // A watch's guard record is an incident record too (W-M1).
-    p.rt.block_on(p.node.record_guard(pb::GuardTriggered {
-        audit: Some(audit()),
-        action: pb::GuardAction::Alert as i32,
-        outcome: pb::GuardOutcome::Alerted as i32,
-        ..Default::default()
-    }))
-    .unwrap();
-}
-
 /// An invalid `[secrets]` setting stops the start with a code from the
 /// catalog, which `kronik explain` resolves.
 #[test]

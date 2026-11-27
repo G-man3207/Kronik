@@ -490,14 +490,6 @@ fn turn_begin_is_durable_before_the_effect_and_replay_safe_reruns() {
             .any(|t| t.execution_id == begin.execution_id)
     });
     let seen = server.seen("/hang");
-    assert_eq!(
-        seen[0].headers.get("idempotency-key"),
-        seen[1].headers.get("idempotency-key")
-    );
-    assert_eq!(
-        (seen[0].method.as_str(), &seen[0].body),
-        (seen[1].method.as_str(), &seen[1].body)
-    );
     assert_same_wire_request(&seen);
     let t = turn_records(&p.records())
         .into_iter()
@@ -539,11 +531,6 @@ fn recorded_result_is_not_requested_again_and_the_rerun_is_identical() {
     assert_eq!(server.seen("/ok").len(), 1);
     let hang = server.seen("/hang");
     assert_eq!(hang.len(), 2);
-    assert_eq!(hang[0].body, hang[1].body);
-    assert_eq!(
-        hang[0].headers.get("idempotency-key"),
-        hang[1].headers.get("idempotency-key")
-    );
     assert_same_wire_request(&hang);
     let t = turn_records(&p.records()).pop().unwrap();
     assert_eq!(t.effects.len(), 2);
