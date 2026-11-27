@@ -24,11 +24,8 @@ def positive(value):
 
 
 def digest(path):
-    result = hashlib.sha256()
     with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(65536), b""):
-            result.update(chunk)
-    return result.hexdigest()
+        return hashlib.file_digest(source, "sha256").hexdigest()
 
 
 def run_json(argv, directory, name, timeout=120, env=None):
