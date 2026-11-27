@@ -657,18 +657,7 @@ fn an_erased_subjects_open_turn_reruns_as_a_subject_erased_dead_letter() {
     // durable, sealed TurnBegin.
     p.send_detached(
         "counter/a",
-        pb::Message {
-            name: "fetch".into(),
-            content_type: "text/plain".into(),
-            body: Some(pb::Sealable {
-                subject: Some("user:1".into()),
-                value: Some(pb::sealable::Value::Plain(
-                    format!("GET {}", server.url("/hang")).into_bytes(),
-                )),
-            }),
-            blobs: vec![],
-            retained_compensation_source: None,
-        },
+        subject_msg("fetch", &format!("GET {}", server.url("/hang")), "user:1"),
     );
     server.wait_for("/hang", 1);
     // The subject is erased while the turn is open, then the daemon dies.

@@ -9,6 +9,7 @@ mod common;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::{
     Proc, audit, http, http_blob, http_text, slow_server, start_proc, start_proc_env, wait_turn,
@@ -811,7 +812,6 @@ fn version_3_rows_match_only_the_legacy_hash_of_an_inline_body() {
 /// M25 §6.2: an upload's lease lasts until the turn's result arrives (its
 /// record, which references the blob, is applied by then), and a saved
 /// answer ends it at once.
-#[allow(clippy::disallowed_methods)]
 #[test]
 fn an_upload_lease_lasts_until_the_turns_result() {
     let dir = tempfile::tempdir().unwrap();
@@ -827,22 +827,7 @@ fn an_upload_lease_lasts_until_the_turns_result() {
             .count()
     };
     // A server that answers after 500 ms keeps the turn running.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        use std::io::{BufRead as _, BufReader, Write as _};
-        for stream in listener.incoming().flatten() {
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
-                line.clear();
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let mut stream = stream;
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-        }
-    });
+    let addr = slow_server(Duration::from_millis(500));
     let mut slow = http(
         "fetch",
         "",
