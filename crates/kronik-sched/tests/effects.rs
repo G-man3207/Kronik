@@ -9,13 +9,15 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Write;
+use std::net::TcpStream;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{Proc, audit, install_component, log_records, point_open_turn_at, start_proc};
+use common::{
+    Proc, audit, http, log_records, msg, repoint_open_turn, start_proc, start_proc_env, wait_parked,
+};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_effects::{Delivery, Rate};
@@ -62,16 +64,9 @@ impl Server {
     }
 
     fn start_on(bind: &str) -> Server {
-        let listener = TcpListener::bind(bind).unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
         let state = Arc::new((Mutex::new(ServerState::default()), Condvar::new()));
         let st = state.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let st = st.clone();
-                std::thread::spawn(move || serve(stream, st));
-            }
-        });
+        let addr = http::serve_on(bind, move |req, w| serve(req, w, &st));
         Server { addr, state }
     }
 
@@ -107,79 +102,52 @@ impl Server {
     }
 }
 
-fn serve(stream: TcpStream, st: Arc<(Mutex<ServerState>, Condvar)>) {
-    let mut w = stream.try_clone().unwrap();
-    let mut r = BufReader::new(stream);
-    loop {
-        let mut line = String::new();
-        if r.read_line(&mut line).unwrap_or(0) == 0 {
-            return;
-        }
-        let mut parts = line.split_whitespace();
-        let method = parts.next().unwrap_or("").to_owned();
-        let path = parts.next().unwrap_or("").to_owned();
-        let mut headers = BTreeMap::new();
-        loop {
-            let mut h = String::new();
-            if r.read_line(&mut h).unwrap_or(0) == 0 {
-                return;
-            }
-            let h = h.trim_end();
-            if h.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = h.split_once(':') {
-                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_owned());
-            }
-        }
-        let len: usize = headers
-            .get("content-length")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let mut body = vec![0; len];
-        if r.read_exact(&mut body).is_err() {
-            return;
-        }
-        let (m, cv) = &*st;
-        let count = {
+fn serve(req: http::Request, w: &mut TcpStream, st: &(Mutex<ServerState>, Condvar)) {
+    let http::Request {
+        method,
+        path,
+        headers,
+        body,
+        ..
+    } = req;
+    let headers: BTreeMap<String, String> = headers.into_iter().collect();
+    let (m, cv) = st;
+    let count = {
+        let mut g = m.lock().unwrap();
+        g.seen.push(Seen {
+            method,
+            path: path.clone(),
+            headers: headers.clone(),
+            body: body.clone(),
+            at: Instant::now(),
+        });
+        cv.notify_all();
+        g.seen.iter().filter(|s| s.path == path).count()
+    };
+    let reply = match path.as_str() {
+        "/hang" => {
             let mut g = m.lock().unwrap();
-            g.seen.push(Seen {
-                method: method.clone(),
-                path: path.clone(),
-                headers: headers.clone(),
-                body: body.clone(),
-                at: Instant::now(),
-            });
-            cv.notify_all();
-            g.seen.iter().filter(|s| s.path == path).count()
-        };
-        let reply = match path.as_str() {
-            "/hang" => {
-                let mut g = m.lock().unwrap();
-                while !g.released {
-                    g = cv.wait(g).unwrap();
-                }
-                format!("released {count}")
+            while !g.released {
+                g = cv.wait(g).unwrap();
             }
-            p if p.starts_with("/echo") => {
-                format!("{headers:?} {}", String::from_utf8_lossy(&body))
-            }
-            _ => format!("ok {count}"),
-        };
-        // An echo server answers with the request's x-api-key as a header too.
-        let echo = headers
-            .get("x-api-key")
-            .filter(|_| path.starts_with("/echo"))
-            .map(|v| format!("x-echo: {v}\r\n"))
-            .unwrap_or_default();
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n{echo}\r\n{reply}",
-            reply.len()
-        );
-        if w.write_all(resp.as_bytes()).is_err() {
-            return;
+            format!("released {count}")
         }
-    }
+        p if p.starts_with("/echo") => {
+            format!("{headers:?} {}", String::from_utf8_lossy(&body))
+        }
+        _ => format!("ok {count}"),
+    };
+    // An echo server answers with the request's x-api-key as a header too.
+    let echo = headers
+        .get("x-api-key")
+        .filter(|_| path.starts_with("/echo"))
+        .map(|v| format!("x-echo: {v}\r\n"))
+        .unwrap_or_default();
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n{echo}\r\n{reply}",
+        reply.len()
+    );
+    let _ = w.write_all(resp.as_bytes());
 }
 
 // ---------------------------------------------------------------- daemon
@@ -196,19 +164,6 @@ fn start(dir: &Path) -> Proc {
             ..NodeConfig::default()
         },
     )
-}
-
-fn msg(name: &str, body: &str) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-        }),
-        blobs: vec![],
-        retained_compensation_source: None,
-    }
 }
 
 fn reply(r: &TurnResult) -> String {
@@ -309,37 +264,6 @@ impl Proc {
             let original = node.local_operator_authority().unwrap();
             let _ = node.send(actor, m, audit(), false, original).await;
         });
-    }
-
-    fn kv(&self, actor: &str, k: &str) -> Option<String> {
-        let a = ActorRef::parse(actor).unwrap();
-        self.node
-            .store()
-            .db()
-            .kv_get(&a.kind, &a.key, k)
-            .unwrap()
-            .map(|v| String::from_utf8(v).unwrap())
-    }
-
-    fn wait_until(&self, what: &str, f: impl Fn(&Proc) -> bool) {
-        for _ in 0..1000 {
-            if f(self) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("timed out waiting for {what}");
-    }
-
-    fn records(&self) -> Vec<Record> {
-        let mut out = Vec::new();
-        self.rt
-            .block_on(self.node.reader().read(1, self.node.applied_lsn(), |c| {
-                out.push(c.record);
-                Ok(())
-            }))
-            .unwrap();
-        out
     }
 }
 
@@ -544,7 +468,7 @@ fn turn_begin_is_durable_before_the_effect_and_replay_safe_reruns() {
     p.grant("http:127.0.0.1", None, None);
     p.send_detached(
         "counter/a",
-        msg("fetch", &format!("GET {}", server.url("/hang"))),
+        msg("fetch", format!("GET {}", server.url("/hang"))),
     );
     server.wait_for("/hang", 1);
     drop(p); // kill: the request is in flight, no result is recorded
@@ -566,14 +490,6 @@ fn turn_begin_is_durable_before_the_effect_and_replay_safe_reruns() {
             .any(|t| t.execution_id == begin.execution_id)
     });
     let seen = server.seen("/hang");
-    assert_eq!(
-        seen[0].headers.get("idempotency-key"),
-        seen[1].headers.get("idempotency-key")
-    );
-    assert_eq!(
-        (seen[0].method.as_str(), &seen[0].body),
-        (seen[1].method.as_str(), &seen[1].body)
-    );
     assert_same_wire_request(&seen);
     let t = turn_records(&p.records())
         .into_iter()
@@ -615,11 +531,6 @@ fn recorded_result_is_not_requested_again_and_the_rerun_is_identical() {
     assert_eq!(server.seen("/ok").len(), 1);
     let hang = server.seen("/hang");
     assert_eq!(hang.len(), 2);
-    assert_eq!(hang[0].body, hang[1].body);
-    assert_eq!(
-        hang[0].headers.get("idempotency-key"),
-        hang[1].headers.get("idempotency-key")
-    );
     assert_same_wire_request(&hang);
     let t = turn_records(&p.records()).pop().unwrap();
     assert_eq!(t.effects.len(), 2);
@@ -667,45 +578,19 @@ fn a_crash_rerun_with_a_different_body_traps_and_is_not_sent_again() {
     let spec = format!("POST {}\n\nfirst", server.url("/ok"));
     p.send_detached("counter/a", msg("fetch", &spec));
 
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let open = loop {
-        // `db()`'s guard lives to the semicolon; locking it again here deadlocks.
-        let turns = p.node.store().db().open_turns().unwrap();
-        let ready = turns.into_iter().find(|t| {
-            reached.exists()
-                && p.node
-                    .store()
-                    .db()
-                    .open_effects(&t.execution_id)
-                    .unwrap()
-                    .iter()
-                    .any(|e| e.kind == "http.fetch" && e.status == pb::EffectStatus::Ok as i32)
-        });
-        if let Some(turn) = ready {
-            break turn;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the turn never parked with a recorded POST"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    let open = wait_parked(&p, &reached, "http.fetch");
     server.wait_for("/ok", 1);
     assert_eq!(server.seen("/ok")[0].body, b"first");
     let execution_id = open.execution_id.clone();
     drop(p);
 
-    let v2 = std::fs::read(COUNTER_BODY_V2).unwrap();
-    let hash = install_component(dir.path(), &v2);
-    point_open_turn_at(dir.path(), &execution_id, &hash, open.lsn, open.pos.segment);
-    let begin = log_records(dir.path())
-        .into_iter()
-        .find_map(|r| match r {
-            Record::TurnBegin(b) if b.execution_id == execution_id => Some(b),
-            _ => None,
-        })
-        .expect("the rewritten TurnBegin");
-    assert_eq!(begin.code_hash, hash);
+    repoint_open_turn(
+        dir.path(),
+        &execution_id,
+        &std::fs::read(COUNTER_BODY_V2).unwrap(),
+        open.lsn,
+        open.pos.segment,
+    );
 
     let p = start(dir.path());
     // Close, then assert the code. Waiting only for REPLAY_DIVERGED hides a
@@ -759,18 +644,7 @@ fn an_erased_subjects_open_turn_reruns_as_a_subject_erased_dead_letter() {
     // durable, sealed TurnBegin.
     p.send_detached(
         "counter/a",
-        pb::Message {
-            name: "fetch".into(),
-            content_type: "text/plain".into(),
-            body: Some(pb::Sealable {
-                subject: Some("user:1".into()),
-                value: Some(pb::sealable::Value::Plain(
-                    format!("GET {}", server.url("/hang")).into_bytes(),
-                )),
-            }),
-            blobs: vec![],
-            retained_compensation_source: None,
-        },
+        subject_msg("fetch", &format!("GET {}", server.url("/hang")), "user:1"),
     );
     server.wait_for("/hang", 1);
     // The subject is erased while the turn is open, then the daemon dies.
@@ -844,7 +718,7 @@ fn effect_timeout_fires_when_the_server_hangs() {
     let started = Instant::now();
     let r = p.send(
         "counter/a",
-        msg("fetch-ok", &format!("GET {}", server.url("/hang"))),
+        msg("fetch-ok", format!("GET {}", server.url("/hang"))),
     );
     assert!(
         reply(&r).starts_with("error"),
@@ -893,7 +767,7 @@ fn unsafe_effect_is_not_retried_and_dead_letters_with_outcome_unknown() {
     p.grant("http:127.0.0.1", None, None);
     p.send_detached(
         "counter/a",
-        msg("fetch", &format!("POST {}\n\ncharge", server.url("/hang"))),
+        msg("fetch", format!("POST {}\n\ncharge", server.url("/hang"))),
     );
     server.wait_for("/hang", 1);
     drop(p);
@@ -1139,7 +1013,7 @@ fn secrets_never_leak_without_reveal() {
     // Without secret-reveal, every exfiltration path comes back empty.
     let r = p.send(
         "counter/a",
-        msg("exfiltrate", &format!("api-key {}", server.url("/echo"))),
+        msg("exfiltrate", format!("api-key {}", server.url("/echo"))),
     );
     let loot = reply(&r);
     assert!(
@@ -1207,11 +1081,11 @@ fn standard_fetch_secret_headers_never_reach_the_guest_or_the_log() {
         )
     };
     // Without `secret:api-key` the request is denied (a denied record).
-    let r = p.send("counter/a", msg("wfetch", &spec("api-key")));
+    let r = p.send("counter/a", msg("wfetch", spec("api-key")));
     assert_eq!(reply(&r), "error ErrorCode::HttpRequestDenied", "{r:?}");
     assert!(server.seen("/echo").is_empty());
     p.grant("secret:api-key", None, None);
-    let r = p.send("counter/a", msg("wfetch", &spec("api-key")));
+    let r = p.send("counter/a", msg("wfetch", spec("api-key")));
     let echo = reply(&r);
     assert!(echo.starts_with("200 "), "{echo}");
     assert!(echo.contains("Bearer [secret:api-key]"), "scrubbed: {echo}");
@@ -1225,7 +1099,7 @@ fn standard_fetch_secret_headers_never_reach_the_guest_or_the_log() {
     );
     // An unknown secret is denied too.
     p.grant("secret:missing", None, None);
-    let r = p.send("counter/a", msg("wfetch", &spec("missing")));
+    let r = p.send("counter/a", msg("wfetch", spec("missing")));
     assert_eq!(reply(&r), "error ErrorCode::HttpRequestDenied");
     assert_eq!(server.seen("/echo").len(), 1);
     drop(p);
@@ -1585,7 +1459,7 @@ fn a_revealed_value_in_a_fetch_is_not_written_anywhere() {
     p.leaky(SECRET, &["secret-reveal:k1", "http:127.0.0.1"]);
     let r = p.send(
         "leaky/a",
-        msg("reveal-fetch", &format!("k1 {}", server.url("/echo"))),
+        msg("reveal-fetch", format!("k1 {}", server.url("/echo"))),
     );
     assert!(r.committed(), "{r:?}");
     let seen = server.seen(&format!("/echo?key={SECRET}"));
@@ -1617,7 +1491,7 @@ fn a_rerun_after_an_echoed_revealed_value_does_not_diverge() {
         "leaky/a",
         msg(
             "reveal-echo-len",
-            &format!(
+            format!(
                 "k1 {} {} {}",
                 server.url("/echo"),
                 server.url("/next"),
@@ -1732,7 +1606,7 @@ fn a_snapshot_with_an_open_turn_stays_a_start_point_through_retention() {
     }
     p.send_detached(
         "counter/h",
-        msg("fetch", &format!("GET {}", server.url("/hang"))),
+        msg("fetch", format!("GET {}", server.url("/hang"))),
     );
     server.wait_for("/hang", 1);
     let open = p.node.store().db().open_turns().unwrap();
@@ -2025,33 +1899,23 @@ impl kronik_core::env::Clock for SteppedClock {
 #[test]
 fn a_clock_step_back_delays_no_timer() {
     let dir = tempfile::tempdir().unwrap();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
     let mut clock = None;
-    let node = rt.block_on(async {
-        let mut env = Env::real(tokio::runtime::Handle::current());
-        let stepped = Arc::new(SteppedClock {
-            real: env.clock.clone(),
-            offset_ms: std::sync::atomic::AtomicI64::new(0),
-        });
-        env.clock = stepped.clone();
-        clock = Some(stepped);
-        start_local(
-            env,
-            dir.path(),
-            NodeConfig {
-                concurrency: 8,
-                ..NodeConfig::default()
-            },
-        )
-        .await
-        .unwrap()
-    });
+    let p = start_proc_env(
+        dir.path(),
+        NodeConfig {
+            concurrency: 8,
+            ..NodeConfig::default()
+        },
+        |env| {
+            let stepped = Arc::new(SteppedClock {
+                real: env.clock.clone(),
+                offset_ms: std::sync::atomic::AtomicI64::new(0),
+            });
+            env.clock = stepped.clone();
+            clock = Some(stepped);
+        },
+    );
     let clock = clock.unwrap();
-    let p = Proc { rt, node };
     p.deploy();
     let started = Instant::now();
     p.send("counter/before", msg("schedule", "1000 increment"));

@@ -8,13 +8,13 @@ mod common;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::TcpListener;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::*;
-use kronik_core::env::{BoxFuture, Clock, Env, File, Fs, OpenMode, Spawner};
+use kronik_core::env::test_fs::{FsCall, Then, hooked};
+use kronik_core::env::{BoxFuture, Clock, Env, OpenMode, Spawner};
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::{ActorRef, Lsn};
 use kronik_fork::diff::{DiffOptions, Mode};
@@ -120,20 +120,8 @@ fn setup_env(
     );
     let bytes = std::fs::read(guest("counter-schema1-extra")).unwrap();
     let (prop, _) =
-        p.rt.block_on(props.propose(
-            ProposeRequest {
-                wasm: vec![bytes],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
-            },
-            p.owner(),
-        ))
-        .unwrap();
+        p.rt.block_on(props.propose(propose_request(vec![bytes]), p.owner()))
+            .unwrap();
     let promoted =
         p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap();
@@ -645,16 +633,7 @@ fn rebased_turns(p: &Proc, id: &str) -> Vec<pb::TurnRecord> {
 fn propose(p: &Proc, props: &Arc<Proposals>, name: &str) -> kronik_fork::proposal::Proposal {
     p.settle();
     p.rt.block_on(props.propose(
-        ProposeRequest {
-            wasm: vec![std::fs::read(guest(name)).unwrap()],
-            names: Vec::new(),
-            window_ms: None,
-            at: None,
-            options: DiffOptions::default(),
-            workers: Some(2),
-            audit: audit(),
-            dry_run: false,
-        },
+        propose_request(vec![std::fs::read(guest(name)).unwrap()]),
         p.owner(),
     ))
     .unwrap()
@@ -990,55 +969,6 @@ impl Spawner for PauseEnv {
     }
 }
 
-impl Fs for PauseEnv {
-    fn create_dir_all(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.fs.create_dir_all(p)
-    }
-
-    fn open(
-        &self,
-        p: PathBuf,
-        mode: OpenMode,
-    ) -> BoxFuture<'static, std::io::Result<Arc<dyn File>>> {
-        if matches!(mode, OpenMode::Read)
-            && self.pause.timer_started.load(Ordering::SeqCst)
-            && !self.pause.read_started.swap(true, Ordering::SeqCst)
-        {
-            let inner = self.inner.fs.clone();
-            let pause = self.pause.clone();
-            return Box::pin(async move {
-                pause.release_read.acquire().await.unwrap().forget();
-                inner.open(p, mode).await
-            });
-        }
-        self.inner.fs.open(p, mode)
-    }
-
-    fn exists(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<bool>> {
-        self.inner.fs.exists(p)
-    }
-
-    fn read_dir(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<Vec<String>>> {
-        self.inner.fs.read_dir(p)
-    }
-
-    fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.fs.rename(from, to)
-    }
-
-    fn remove_file(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.fs.remove_file(p)
-    }
-
-    fn sync_dir(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.fs.sync_dir(p)
-    }
-
-    fn available(&self, p: PathBuf) -> BoxFuture<'static, std::io::Result<u64>> {
-        self.inner.fs.available(p)
-    }
-}
-
 /// H5: a queued request is not admitted before the pause deadline and is
 /// admitted at it, even while the last round's log I/O cannot complete.
 #[test]
@@ -1067,13 +997,28 @@ fn a_pause_deadline_releases_admission_before_catch_up_io_finishes() {
             ..NodeConfig::default()
         },
         move |env| {
+            // Real files, but the first read-only open after the pause timer
+            // started waits for `release_read`.
+            let pause = control.clone();
+            env.fs = hooked(env.fs.clone(), move |call| match call {
+                FsCall::Open(_, OpenMode::Read)
+                    if pause.timer_started.load(Ordering::SeqCst)
+                        && !pause.read_started.swap(true, Ordering::SeqCst) =>
+                {
+                    let pause = pause.clone();
+                    Then::Wait(Box::pin(async move {
+                        pause.release_read.acquire().await.unwrap().forget();
+                        Ok(())
+                    }))
+                }
+                _ => Then::Forward,
+            });
             let wrapped = Arc::new(PauseEnv {
                 inner: env.clone(),
                 pause: control,
                 max_pause,
             });
             env.clock = wrapped.clone();
-            env.fs = wrapped.clone();
             env.spawner = wrapped;
         },
         |_| {},
@@ -1310,16 +1255,7 @@ fn a_rebase_uses_recordings_only_and_its_dry_run_writes_nothing() {
             .with_rebase(Duration::from_secs(2))
             .with_model(Some(model(&model_addr))),
     );
-    let branches = || {
-        let mut b: Vec<_> = std::fs::read_dir(dir.path().join("branches"))
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name())
-            .collect();
-        b.sort();
-        b
-    };
-    let before = branches();
+    let before = branch_names(dir.path());
     // Overrides would be ignored: they are refused, like stubs (H8).
     let err =
         p.rt.block_on(props.rebase(
@@ -1347,7 +1283,11 @@ fn a_rebase_uses_recordings_only_and_its_dry_run_writes_nothing() {
     assert!(err.message.contains("simulator overrides"), "{err}");
     let (_, dry) = rebase_of(&p, &props, epoch, true);
     assert!(dry);
-    assert_eq!(branches(), before, "the dry run wrote a branch directory");
+    assert_eq!(
+        branch_names(dir.path()),
+        before,
+        "the dry run wrote a branch directory"
+    );
     assert!(
         seen.lock().unwrap().is_empty(),
         "the dry run asked the model"
@@ -1399,17 +1339,12 @@ fn a_message_pending_at_the_fork_point_is_replayed() {
     let (prop, _) =
         p.rt.block_on(props.propose(
             ProposeRequest {
-                wasm: vec![std::fs::read(guest("counter-fail-get")).unwrap()],
-                names: Vec::new(),
-                window_ms: None,
                 at: Some(at),
                 options: DiffOptions {
                     mode: Mode::Continuous,
                     ..DiffOptions::default()
                 },
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
+                ..propose_request(vec![std::fs::read(guest("counter-fail-get")).unwrap()])
             },
             p.owner(),
         ))
@@ -1491,13 +1426,7 @@ fn a_resume_that_cannot_prove_its_staged_turns_is_refused() {
     drop(p);
     // The record of what was staged is gone.
     std::fs::remove_dir_all(dir.path().join("branches").join(&r.id).join("log")).unwrap();
-    let p = Proc::open(
-        dir.path(),
-        NodeConfig {
-            concurrency: 8,
-            ..NodeConfig::default()
-        },
-    );
+    let p = Proc::reopen(dir.path());
     let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
         .unwrap()
         .with_rebase(Duration::from_secs(2));
@@ -1787,13 +1716,7 @@ fn a_rebase_resumes_after_a_restart_with_privacy_on() {
     let Setup { p, props, .. } = s;
     drop(props);
     drop(p);
-    let p = Proc::open(
-        dir.path(),
-        NodeConfig {
-            concurrency: 8,
-            ..NodeConfig::default()
-        },
-    );
+    let p = Proc::reopen(dir.path());
     let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
         .unwrap()
         .with_rebase(Duration::from_secs(5));
@@ -1830,33 +1753,12 @@ fn a_rebase_promote_dry_run_writes_and_changes_nothing() {
     let Setup { p, props, .. } = s;
     drop(props);
     drop(p);
-    let p = Proc::open(
-        dir.path(),
-        NodeConfig {
-            concurrency: 8,
-            ..NodeConfig::default()
-        },
-    );
+    let p = Proc::reopen(dir.path());
     let props = Proposals::open(p.node.clone(), dir.path().to_path_buf())
         .unwrap()
         .with_rebase(Duration::from_secs(2));
     p.settle();
     let branch = dir.path().join("branches").join(&r.id);
-    let files = |d: &std::path::Path| {
-        let mut out = Vec::new();
-        let mut stack = vec![d.to_path_buf()];
-        while let Some(d) = stack.pop() {
-            for e in std::fs::read_dir(&d).unwrap().flatten() {
-                if e.path().is_dir() {
-                    stack.push(e.path());
-                } else {
-                    out.push((e.path(), std::fs::read(e.path()).unwrap()));
-                }
-            }
-        }
-        out.sort();
-        out
-    };
     let before = files(&branch);
     let meta = p.rt.block_on(props.get(&r.id)).unwrap();
     // Unapproved: the dry run answers APPROVAL_REQUIRED, without writing.
@@ -2198,13 +2100,7 @@ fn room_frame(p: &Proc, conn: &str, text: &str) {
 #[test]
 fn a_rebase_switch_closes_the_connections_of_the_rebased_kind() {
     let dir = tempfile::tempdir().unwrap();
-    let p = Proc::start_with(
-        dir.path(),
-        NodeConfig {
-            concurrency: 8,
-            ..NodeConfig::default()
-        },
-    );
+    let p = Proc::start(dir.path());
     p.deploy("room");
     p.rt.block_on(p.node.set_policy(QUIET, audit(), false, p.owner()))
         .unwrap();
@@ -2220,20 +2116,8 @@ fn a_rebase_switch_closes_the_connections_of_the_rebased_kind() {
     );
     let bytes = std::fs::read(guest("room-fmt2")).unwrap();
     let (prop, _) =
-        p.rt.block_on(props.propose(
-            ProposeRequest {
-                wasm: vec![bytes],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
-            },
-            p.owner(),
-        ))
-        .unwrap();
+        p.rt.block_on(props.propose(propose_request(vec![bytes]), p.owner()))
+            .unwrap();
     let promoted =
         p.rt.block_on(props.promote(&prop.id, audit(), false, p.owner()))
             .unwrap();

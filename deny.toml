@@ -50,10 +50,34 @@ unused-allowed-license = "deny"
 ignore = true
 
 [bans]
-multiple-versions = "warn"
+# A new duplicate fails. The versions below are the ones already in the
+# locked graph (ADR 0163). Each entry skips one older version, so the newer
+# one stays visible and a further version is still an error. Drop an entry
+# when that version leaves the graph: an unmatched or single-version skip
+# fails the deny step.
+multiple-versions = "deny"
 wildcards = "deny"
 # Internal path dependencies carry no version requirement.
 allow-wildcard-paths = true
+skip = [
+    { crate = "base64@=0.22.1", reason = "the workspace, instant-acme 0.8.5, jsonwebtoken 10.4.0 and oci-client 0.18 still resolve 0.22; hyper-util, reqwest, rmcp and object_store resolve 0.23" },
+    { crate = "block-buffer@=0.10.4", reason = "digest 0.10, pulled in by sha1 0.10 and cranelift's sha2 0.10, still resolves 0.10; cipher and digest 0.11 resolve 0.12" },
+    { crate = "cpufeatures@=0.2.17", reason = "sha1 0.10 and cranelift's sha2 0.10 still resolve 0.2; blake3, chacha20 and sha2 0.11 resolve 0.3" },
+    { crate = "crypto-common@=0.1.7", reason = "digest 0.10 still resolves 0.1; digest 0.11 and the AEAD stack resolve 0.2" },
+    { crate = "digest@=0.10.7", reason = "crc-fast, sha1 0.10 and cranelift's sha2 0.10 still resolve 0.10; the workspace sha2 is 0.11" },
+    { crate = "foldhash@=0.1.5", reason = "hashbrown 0.15, pulled in by petgraph 0.8, still resolves 0.1; hashbrown 0.17 resolves 0.2" },
+    { crate = "getrandom@=0.2.17", reason = "ring 0.17.14 still resolves 0.2; rand 0.9 resolves 0.3 and the workspace uses 0.4" },
+    { crate = "getrandom@=0.3.4", reason = "rand 0.9, pulled in by tungstenite 0.28, still resolves 0.3; the workspace uses 0.4" },
+    { crate = "hashbrown@=0.15.5", reason = "petgraph 0.8 still resolves 0.15; gimli resolves 0.16 and the rest of the graph resolves 0.17" },
+    { crate = "hashbrown@=0.16.1", reason = "gimli 0.33 still resolves 0.16; petgraph resolves 0.15 and the rest of the graph resolves 0.17" },
+    { crate = "itertools@=0.14.0", reason = "prost-build 0.14 and wasmtime's cranelift still resolve 0.14; object_store resolves 0.15" },
+    { crate = "rand@=0.9.5", reason = "tungstenite 0.28 still resolves 0.9; the rest of the graph resolves 0.10" },
+    { crate = "rand_core@=0.9.5", reason = "rand 0.9, pulled in by tungstenite 0.28, still resolves 0.9; chacha20 and rand 0.10 resolve 0.10" },
+    { crate = "sha2@=0.10.9", reason = "cranelift-codegen still resolves 0.10; the workspace depends on 0.11" },
+    { crate = "signature@=2.2.0", reason = "jsonwebtoken 10.4 and kronik-api still resolve 2.2; ed25519 3 resolves signature 3" },
+    { crate = "syn@=2.0.119", reason = "prost, tracing-attributes, zeroize_derive, asn1-rs and darling still resolve syn 2; serde_derive, thiserror, clap and tokio resolve syn 3" },
+    { crate = "synstructure@=0.13.2", reason = "asn1-rs-derive still resolves 0.13; yoke-derive and zerofrom-derive resolve 0.14" },
+]
 
 [sources]
 unknown-registry = "deny"

@@ -10,84 +10,12 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use common::{audit, guest, message, restore_two_phases, rt, tempdir};
+use common::{guest, restore_two_phases, rt, start, tempdir};
 use kronik_core::env::Env;
-use kronik_core::ids::ActorRef;
-use kronik_sched::snapshots::{Manifest, SnapshotFile, StorageConfig};
-use kronik_sched::{Node, NodeConfig, start_local};
-use kronik_ship::{KeystoreMode, Remote, RestoreReport, ShipError, ShipState, restore, ship_once};
+use kronik_sched::snapshots::{Manifest, SnapshotFile};
+use kronik_ship::{KeystoreMode, Remote, RestoreReport, ShipError, ShipState, restore};
 use tokio::runtime::Runtime;
-
-/// A node running on `dir`, with the runtime it runs on.
-struct Proc {
-    rt: Runtime,
-    node: Arc<Node>,
-}
-
-fn start(dir: &Path) -> Proc {
-    let rt = rt();
-    let node = rt.block_on(async {
-        let mut storage = StorageConfig::new(dir.to_path_buf());
-        storage.snapshots_kept = 2;
-        start_local(
-            Env::real(tokio::runtime::Handle::current()),
-            dir,
-            NodeConfig {
-                storage: Some(storage),
-                segment_max_bytes: Some(4096),
-                ..NodeConfig::default()
-            },
-        )
-        .await
-        .unwrap()
-    });
-    Proc { rt, node }
-}
-
-impl Proc {
-    fn operator(&self) -> kronik_core::authority::AuthLease {
-        self.node.local_operator_authority().unwrap()
-    }
-
-    fn deploy(&self, name: &str) {
-        self.rt
-            .block_on(
-                self.node
-                    .deploy(&guest(name), audit(), false, self.operator()),
-            )
-            .unwrap();
-    }
-
-    fn send(&self, actor: &str, name: &str, body: &str) {
-        let r = self
-            .rt
-            .block_on(self.node.send(
-                ActorRef::parse(actor).unwrap(),
-                message(name, body),
-                audit(),
-                false,
-                self.operator(),
-            ))
-            .unwrap()
-            .unwrap();
-        assert!(r.committed(), "{r:?}");
-    }
-
-    fn snapshot(&self) {
-        self.rt
-            .block_on(self.node.snapshot("manual", self.operator()))
-            .unwrap();
-    }
-
-    fn ship(&self, remote: &Remote, dir: &Path) {
-        let mut state = ShipState::load(dir).unwrap();
-        self.rt
-            .block_on(ship_once(remote, dir, "main", &mut state))
-            .unwrap();
-    }
-}
 
 /// What every test starts from: a bucket that holds one snapshot of a node
 /// with SQL state, its log and its components, the master key of that node,
@@ -116,7 +44,7 @@ fn shipped(flow: Flow) -> Shipped {
     let src = tempdir("names-src-");
     let bucket = tempdir("names-bucket-");
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
-    let p = start(src.path());
+    let p = start(src.path(), None);
     p.deploy("counter");
     p.deploy("notes");
     for i in 0..6 {
@@ -496,7 +424,7 @@ fn ship_a_manifest_with(
     let src = tempdir("names-ship-src-");
     let bucket = tempdir("names-ship-bucket-");
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
-    let p = start(src.path());
+    let p = start(src.path(), None);
     p.deploy("counter");
     p.send("counter/a", "increment", "");
     p.snapshot();
@@ -762,7 +690,7 @@ fn a_deployment_after_the_snapshot_names_its_component_from_the_segment(flow: Fl
     let src = tempdir("names-post-src-");
     let bucket = tempdir("names-post-bucket-");
     let remote = Remote::open(&format!("file://{}", bucket.path().display()), None).unwrap();
-    let p = start(src.path());
+    let p = start(src.path(), None);
     p.deploy("counter");
     p.send("counter/a", "increment", "");
     p.snapshot();

@@ -122,16 +122,6 @@ fn wasm(guest: &str) -> String {
         .encode(std::fs::read(Path::new(GUESTS).join(format!("{guest}.wasm"))).unwrap())
 }
 
-fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
-    for _ in 0..200 {
-        if ok() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("timed out waiting until {what}");
-}
-
 #[test]
 fn a_preview_runs_new_requests_on_the_new_code_without_live_effects() {
     let tmp = tempfile::tempdir().unwrap();
@@ -329,11 +319,11 @@ fn previews_are_deleted_after_their_ttl_also_across_a_restart() {
     assert!(d.fork_dir(&id).exists());
     let path = format!("/__preview/{id}/counter/x/increment");
     assert_eq!(d.request("POST", &path, "x", ""), (200, "2".into()));
-    wait_until("the preview expired", || {
+    d.wait_until("the preview expired", |_| {
         d.request("POST", &path, "x", "").0 == 404
     });
     assert!(!d.preview_ids().contains(&id));
-    wait_until("its directory is gone", || !d.fork_dir(&id).exists());
+    d.wait_until("its directory is gone", |_| !d.fork_dir(&id).exists());
     assert!(
         !d.api("GET", "/v1/forks", Value::Null)
             .to_string()
@@ -352,7 +342,7 @@ fn previews_are_deleted_after_their_ttl_also_across_a_restart() {
     d.term();
     std::thread::sleep(Duration::from_millis(2_000));
     let d = Daemon::start(tmp.path(), "");
-    wait_until("its directory is gone", || !d.fork_dir(&id).exists());
+    d.wait_until("its directory is gone", |_| !d.fork_dir(&id).exists());
     let (status, body) = d.request(
         "POST",
         &format!("/__preview/{id}/counter/x/increment"),

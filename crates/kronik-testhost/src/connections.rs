@@ -6,8 +6,9 @@
 //! answers, so by then the frames that their turns sent are recorded.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
+use kronik_core::sync::lock;
 use kronik_gateway::{HttpRequest, OpenAnswer};
 use kronik_proto::connection as conn;
 use kronik_proto::log::v1 as pb;
@@ -28,7 +29,7 @@ pub(crate) struct Connections(Mutex<HashMap<String, Opened>>);
 
 impl Connections {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Opened>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.0)
     }
 }
 

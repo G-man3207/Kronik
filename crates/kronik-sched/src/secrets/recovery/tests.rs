@@ -7,15 +7,12 @@ use super::super::Scope;
 use super::*;
 use crate::Ingress;
 use crate::secrets::certification_tests::{begin, config, env, install_file, plain, reveal, run};
+use crate::test_support::COUNTER;
 use kronik_core::env::{BoxFuture, HttpRequest, HttpResponse, Net, NetError, Spawner};
 use kronik_privacy::{SecretMeta, secret_backend::config::Definition};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-const COUNTER: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/guests/counter.wasm"
-);
 static TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 fn audit() -> pb::Audit {
     super::super::system_audit(&env(), "recorded secret recovery fixture")
@@ -1244,6 +1241,18 @@ fn shape(turn: &pb::TurnRecord) -> (Vec<(String, i32, String)>, Option<pb::Outco
     )
 }
 
+/// Waits up to 60 s until the node has no open turn; panics with `what`.
+async fn wait_no_open_turn(node: &Node, what: &str) {
+    node.env
+        .timeout(Duration::from_secs(60), async {
+            while !node.store().db().open_turns().unwrap().is_empty() {
+                node.env.clock.sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+}
+
 /// A node that dies after the error result of an effect and before the turn
 /// record leaves an open turn that holds the recorded error. The start runs it
 /// again while the provider is still down: the guest gets the very error it
@@ -1261,14 +1270,11 @@ fn a_crash_after_the_recorded_error_replays_it_while_the_backend_is_still_down()
         // The second life, with the provider still down.
         let second = run(async {
             let node = provider_node(data.path(), &bao).await;
-            node.env
-                .timeout(Duration::from_secs(60), async {
-                    while !node.store().db().open_turns().unwrap().is_empty() {
-                        node.env.clock.sleep(Duration::from_millis(20)).await;
-                    }
-                })
-                .await
-                .unwrap_or_else(|_| panic!("{}: the open turn waits for the provider", case.0));
+            wait_no_open_turn(
+                &node,
+                &format!("{}: the open turn waits for the provider", case.0),
+            )
+            .await;
             last_turn_of_h(&node).await
         });
         assert_eq!(second.execution_id, first.turn.execution_id, "{}", case.0);
@@ -1312,14 +1318,7 @@ fn a_crash_before_the_error_result_makes_the_re_run_wait_and_then_run_the_effect
             assert!(free.committed(), "{}: {:?}", case.0, free.outcome);
             // The provider returns: the effect is made, and the turn ends.
             bao.status.store(200, Ordering::Release);
-            node.env
-                .timeout(Duration::from_secs(60), async {
-                    while !node.store().db().open_turns().unwrap().is_empty() {
-                        node.env.clock.sleep(Duration::from_millis(50)).await;
-                    }
-                })
-                .await
-                .unwrap_or_else(|_| panic!("{}: the re-run never finished", case.0));
+            wait_no_open_turn(&node, &format!("{}: the re-run never finished", case.0)).await;
             last_turn_of_h(&node).await
         });
         assert_eq!(second.execution_id, first.turn.execution_id, "{}", case.0);
@@ -1375,16 +1374,11 @@ fn a_crash_before_the_error_result_makes_a_re_run_record_a_refusal_instead_of_wa
         bao.status.store(403, Ordering::Release);
         let second = run(async {
             let node = provider_node(data.path(), &bao).await;
-            node.env
-                .timeout(Duration::from_secs(60), async {
-                    while !node.store().db().open_turns().unwrap().is_empty() {
-                        node.env.clock.sleep(Duration::from_millis(20)).await;
-                    }
-                })
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("{}: the re-run waits for a provider that refuses", case.0)
-                });
+            wait_no_open_turn(
+                &node,
+                &format!("{}: the re-run waits for a provider that refuses", case.0),
+            )
+            .await;
             last_turn_of_h(&node).await
         });
         assert_eq!(second.execution_id, first.turn.execution_id, "{}", case.0);
@@ -1414,14 +1408,7 @@ fn a_crash_before_the_result_of_an_unsafe_fetch_ends_as_outcome_unknown_whatever
 
         let second = run(async {
             let node = provider_node(data.path(), &bao).await;
-            node.env
-                .timeout(Duration::from_secs(60), async {
-                    while !node.store().db().open_turns().unwrap().is_empty() {
-                        node.env.clock.sleep(Duration::from_millis(20)).await;
-                    }
-                })
-                .await
-                .unwrap_or_else(|_| panic!("{provider}: the re-run waits"));
+            wait_no_open_turn(&node, &format!("{provider}: the re-run waits")).await;
             last_turn_of_h(&node).await
         });
         assert_eq!(second.execution_id, first.turn.execution_id, "{provider}");

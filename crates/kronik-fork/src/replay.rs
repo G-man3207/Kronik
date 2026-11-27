@@ -26,9 +26,13 @@ use kronik_runtime::{
     CallOutcome, CryptoAlgorithm, CryptoOutcome, EffectGate, FetchBody, FetchHeader, FetchOutcome,
     FetchRequest, GateError, Program, SendNowOutcome, SendNowRequest, TurnLimits, TurnRequest,
 };
-use kronik_sched::effects::{map_call_outcome, outcome_of_fetch, outcome_of_send_now};
+use kronik_sched::body_subject;
+use kronik_sched::effects::{
+    map_call_outcome, outcome_of_fetch, outcome_of_send_now, plain, tagged,
+};
 use kronik_sched::host::{SqlHandle, SqlTurn};
 use kronik_store::Store;
+use kronik_store::db::message_input;
 use kronik_store::sql::TurnOpts;
 use prost::Message as _;
 
@@ -321,7 +325,7 @@ pub fn cursor(index: &ProductionIndex) -> Result<Arc<Store>, ReplayError> {
                 .sql
                 .get(&name)
                 .map_err(|e| ReplayError::Host(e.to_string()))?;
-            let mut actor = db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut actor = lock(&db);
             actor
                 .pseudonymize_subject_cells(|subject, value| {
                     crate::privacy::ForkPrivacy::sql_cell(&index.sealer, subject, value)
@@ -1004,13 +1008,12 @@ impl Runner {
         if !lock(&self.taint).has_sql(&name) && !self.setup.index.has_erased_sql(&name) {
             return Ok(false);
         }
-        let untagged = self
+        let db = self
             .store
             .sql
             .get(&name)
-            .map_err(|e| ReplayError::Host(e.to_string()))?
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .map_err(|e| ReplayError::Host(e.to_string()))?;
+        let untagged = lock(&db)
             .has_table_without_subject()
             .map_err(ReplayError::Host)?;
         Ok(lock(&self.taint).sql(&name, at, untagged)
@@ -1521,7 +1524,13 @@ impl Runner {
                     order,
                     Pending {
                         actor: to,
-                        input: message_input(pb::MessageSource::Actor, &p.actor, m, time, ""),
+                        input: message_input(
+                            pb::MessageSource::Actor,
+                            &p.actor.to_pb(),
+                            m,
+                            time,
+                            "",
+                        ),
                         key,
                         time,
                         subject,
@@ -1571,7 +1580,7 @@ impl Runner {
                         actor: to,
                         input: message_input(
                             pb::MessageSource::Compensation,
-                            &p.actor,
+                            &p.actor.to_pb(),
                             m,
                             time,
                             &compensates,
@@ -1609,33 +1618,6 @@ impl Runner {
         lock(&self.turns).push(turn.clone());
         Ok(turn)
     }
-}
-
-fn message_input(
-    source: pb::MessageSource,
-    sender: &ActorRef,
-    m: &pb::OutboundMessage,
-    sent: u64,
-    compensates: &str,
-) -> pb::Input {
-    pb::Input {
-        kind: Some(pb::input::Kind::Message(pb::MessageInput {
-            source: source as i32,
-            sender: Some(sender.to_pb()),
-            msg: m.msg.clone(),
-            message_id: m.message_id.clone(),
-            sent_logical_time_ms: sent,
-            compensates: compensates.to_owned(),
-            ..Default::default()
-        })),
-    }
-}
-
-/// The subject tag on a message body: live delivery uses it as the
-/// receiving turn's default subject, and so does replay.
-fn body_subject(msg: Option<&pb::Message>) -> Option<String> {
-    msg.and_then(|m| m.body.as_ref())
-        .and_then(|b| b.subject.clone())
 }
 
 /// Whether a turn's effects used a secret (ADR 0015): a `crypto.*` effect or
@@ -1859,19 +1841,6 @@ struct ReplayGate {
 
 struct GateHandle(Arc<ReplayGate>);
 
-fn plain(bytes: Vec<u8>) -> Option<pb::Sealable> {
-    tagged(&None, bytes)
-}
-
-/// A recorded value of `subject`, as production records it
-/// (kronik-sched's effects): the fork's log seals it, its diff redacts it.
-fn tagged(subject: &Option<String>, bytes: Vec<u8>) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: subject.clone(),
-        value: Some(pb::sealable::Value::Plain(bytes)),
-    })
-}
-
 fn prepared_plain(value: &pb::Sealable) -> Result<&[u8], GateError> {
     match value.value.as_ref() {
         Some(pb::sealable::Value::Plain(bytes)) => Ok(bytes.as_slice()),
@@ -2087,13 +2056,6 @@ fn disclose_prepared_neighbor(
     // skip the scan, and is not passed as a proved empty set.
     kronik_sched::scrub::prepared_fields_safe(current, Some(prefix), matcher, fields)
         .map_err(|_| GateError::Prerequisite(ErrorCode::SecretUnavailable))
-}
-
-fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
-    match s.and_then(|s| s.value.as_ref()) {
-        Some(pb::sealable::Value::Plain(b)) => b.clone(),
-        _ => Vec::new(),
-    }
 }
 
 /// The guest-visible text of a replay without a recording (FailClosed).
@@ -2680,7 +2642,13 @@ impl ReplayGate {
             .as_ref()
             .filter(|p| p.kind == kind && p.request.is_some())
             .and_then(|p| {
-                pb::HttpEffectRequest::decode(sealable_bytes(p.request.as_ref()).as_slice()).ok()
+                pb::HttpEffectRequest::decode(
+                    p.request
+                        .as_ref()
+                        .and_then(pb::Sealable::plain)
+                        .unwrap_or_default(),
+                )
+                .ok()
             });
         let mut headers = Vec::new();
         for (name, value) in &req.headers {
@@ -3581,7 +3549,13 @@ impl ReplayGate {
             let mut rec = p;
             rec.grounding = pb::Grounding::Exact as i32;
             let out = if rec.status == pb::EffectStatus::Ok as i32 {
-                CryptoOutcome::Ok(sealable_bytes(rec.response.as_ref()))
+                CryptoOutcome::Ok(
+                    rec.response
+                        .as_ref()
+                        .and_then(pb::Sealable::plain)
+                        .unwrap_or_default()
+                        .to_vec(),
+                )
             } else if rec.status == pb::EffectStatus::Denied as i32 {
                 CryptoOutcome::Denied(rec.error.clone())
             } else {

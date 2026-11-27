@@ -94,16 +94,6 @@ fn text(ws: &mut WebSocket<TcpStream>) -> String {
     }
 }
 
-fn until(what: &str, f: impl Fn() -> bool) {
-    for _ in 0..800 {
-        if f() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for {what}");
-}
-
 #[test]
 fn websocket_connections_with_a_real_daemon() {
     let dir = tempfile::tempdir().unwrap();
@@ -158,7 +148,9 @@ fn websocket_connections_with_a_real_daemon() {
     }
     let _ = bob.close(None);
     assert!(text(&mut ada).contains("\"left\""));
-    until("bob's close", || d.ask("closes").contains("actor 1000 bye"));
+    d.wait_until("bob's close", |_| {
+        d.ask("closes").contains("actor 1000 bye")
+    });
 
     // The client closes a third connection.
     let (mut cid, _) = d.connect("/room/lobby/ws?user=cid", None).unwrap();
@@ -170,7 +162,7 @@ fn websocket_connections_with_a_real_daemon() {
     }))
     .unwrap();
     while cid.read().is_ok() {}
-    until("cid's close", || {
+    d.wait_until("cid's close", |_| {
         d.ask("closes").contains("client 1001 tab closed")
     });
     assert!(text(&mut ada).contains("\"left\""));
@@ -189,7 +181,7 @@ fn websocket_connections_with_a_real_daemon() {
     // After the restart ada's connection gets its host close: `restart`,
     // 1012; the room keeps its messages, and new connections open.
     let d = Daemon::start(dir.path());
-    until("the restart close", || {
+    d.wait_until("the restart close", |_| {
         d.ask("closes").contains("host 1012 restart")
     });
     assert_eq!(d.ask("members"), "");
@@ -243,7 +235,7 @@ fn the_cli_lists_inspects_and_closes_connections() {
     let list = json(&["connections", "list", "--actor", "room/lobby"]);
     let id = list["connections"][0]["id"].as_str().unwrap().to_owned();
     assert_eq!(list["connections"][0]["state"], "open", "{list}");
-    until("ada's echo is counted", || {
+    d.wait_until("ada's echo is counted", |_| {
         let v = json(&["connections", "inspect", &id]);
         v["frames"]["in"] == 1 && v["frames"]["written"] == 2
     });
@@ -280,7 +272,7 @@ fn the_cli_lists_inspects_and_closes_connections() {
     // A frame turn that fails is a dead letter, listed as a connection
     // input.
     ada.send(Message::text("fail")).unwrap();
-    until("the dead letter", || {
+    d.wait_until("the dead letter", |_| {
         json(&["dead-letters", "list"])["dead_letters"]
             .as_array()
             .is_some_and(|d| !d.is_empty())
@@ -328,7 +320,7 @@ fn the_cli_lists_inspects_and_closes_connections() {
         other => panic!("expected a close, got {other:?}"),
     }
     let _ = ada.close(None);
-    until("the operator's close", || {
+    d.wait_until("the operator's close", |_| {
         json(&["connections", "inspect", &id])["state"] == "closed"
     });
     let v = json(&["connections", "inspect", &id]);

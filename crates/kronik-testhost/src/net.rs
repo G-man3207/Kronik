@@ -1,12 +1,13 @@
 //! Outgoing HTTP for tests: answers from stubs, every request recorded.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
 use kronik_core::env::{
     BoxFuture, BytesSource, HttpBody, HttpRequest, HttpResponse, HttpStreamRequest,
     HttpStreamResponse, Net, NetError,
 };
+use kronik_core::sync::lock;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::Body;
@@ -85,7 +86,7 @@ struct NetState {
 
 impl StubNet {
     fn state(&self) -> MutexGuard<'_, NetState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     pub fn stub(&self, stub: Stub) {
@@ -109,7 +110,7 @@ impl StubNet {
 
 /// Records `req` and answers it from the newest matching stub.
 fn answer(state: &Mutex<NetState>, req: &HttpRequest) -> Result<HttpResponse, NetError> {
-    let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut st = lock(state);
     st.recorded.push(Recorded {
         method: req.method.clone(),
         url: req.url.clone(),

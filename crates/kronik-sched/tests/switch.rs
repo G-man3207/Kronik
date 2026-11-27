@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use common::{audit, open_request, text_frame};
+use common::{Proc, audit, guest, open_request, start_proc, text_frame};
 use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
@@ -19,22 +19,14 @@ use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Born, CodeSwitch, Node, NodeConfig, SwitchHold, start_local};
 
-fn guest(name: &str) -> Vec<u8> {
-    std::fs::read(format!(
-        "{}/../../tests/guests/{name}.wasm",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap()
-}
-
 /// A fresh live operator lease for the fixture's own operations.
 fn owner(node: &Node) -> kronik_core::authority::AuthLease {
     node.local_operator_authority().unwrap()
 }
 
-/// A node whose code switches park on `hold` (deploys do not), with
-/// counter deployed (epoch 1).
-async fn node(dir: &std::path::Path) -> (Arc<Node>, Arc<SwitchHold>) {
+/// A node whose code switches park on `hold` (deploys do not), with `name`
+/// deployed (epoch 1).
+async fn node(dir: &std::path::Path, name: &str) -> (Arc<Node>, Arc<SwitchHold>) {
     let hold = Arc::new(SwitchHold::default());
     let env = Env::real(tokio::runtime::Handle::current());
     let config = NodeConfig {
@@ -43,7 +35,7 @@ async fn node(dir: &std::path::Path) -> (Arc<Node>, Arc<SwitchHold>) {
         ..NodeConfig::default()
     };
     let node = start_local(env, dir, config).await.unwrap();
-    node.deploy(&guest("counter"), audit(), false, owner(&node))
+    node.deploy(&guest(name), audit(), false, owner(&node))
         .await
         .unwrap();
     (node, hold)
@@ -167,7 +159,7 @@ async fn resend_parked_across_rebase(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_set_switch_still_installs_its_code() {
     let dir = tempfile::tempdir().unwrap();
-    let (node, hold) = node(dir.path()).await;
+    let (node, hold) = node(dir.path(), "counter").await;
     let v = version(&node, "counter-step2").await;
     let switch = {
         let node = node.clone();
@@ -198,7 +190,7 @@ async fn a_cancelled_set_switch_still_installs_its_code() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_rebase_switch_still_finishes() {
     let dir = tempfile::tempdir().unwrap();
-    let (node, hold) = node(dir.path()).await;
+    let (node, hold) = node(dir.path(), "counter").await;
     let old = deployed_hash(&node);
     let epoch = promote_now(&node, &hold, "counter-step2").await;
     let (sw, kinds, not_after) = prepare_rebase(&node, "r-cancel", epoch).await;
@@ -245,7 +237,7 @@ async fn a_cancelled_rebase_switch_still_finishes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rebase_switch_refuses_after_a_later_deployment() {
     let dir = tempfile::tempdir().unwrap();
-    let (node, hold) = node(dir.path()).await;
+    let (node, hold) = node(dir.path(), "counter").await;
     let epoch = promote_now(&node, &hold, "counter-step2").await;
     let (sw, kinds, not_after) = prepare_rebase(&node, "r-late", epoch).await;
     promote_now(&node, &hold, "counter-body-v2").await;
@@ -268,7 +260,7 @@ async fn a_rebase_switch_refuses_after_a_later_deployment() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nothing_is_staged_after_the_pause_bound() {
     let dir = tempfile::tempdir().unwrap();
-    let (node, hold) = node(dir.path()).await;
+    let (node, hold) = node(dir.path(), "counter").await;
     let epoch = promote_now(&node, &hold, "counter-step2").await;
     let (_, _, not_after) = prepare_rebase(&node, "r-late", epoch).await;
     let pause = node
@@ -310,7 +302,7 @@ async fn nothing_is_staged_after_the_pause_bound() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resend_queued_after_the_switch_for_a_dead_letter_it_removed_does_not_run() {
     let dir = tempfile::tempdir().unwrap();
-    let (node, hold) = node(dir.path()).await;
+    let (node, hold) = node(dir.path(), "counter").await;
     let epoch = promote_now(&node, &hold, "counter-step2").await;
     let failed = node
         .send(
@@ -346,7 +338,7 @@ async fn a_resend_queued_after_the_switch_for_a_dead_letter_it_removed_does_not_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_resend_of_a_dead_letter_gone_by_the_switch_is_dropped() {
     let dir = tempfile::tempdir().unwrap();
-    let (node, hold) = node(dir.path()).await;
+    let (node, hold) = node(dir.path(), "counter").await;
     let epoch = promote_now(&node, &hold, "counter-step2").await;
     // A dead letter after the fork point: the rebase (no turns) drops it.
     let failed = node
@@ -403,22 +395,6 @@ async fn a_held_resend_of_a_dead_letter_gone_by_the_switch_is_dropped() {
     assert!(node.store().db().dead_letters(0, 100).unwrap().is_empty());
 }
 
-/// Room deployed (epoch 1). Code switches park on `hold`; deploys do not.
-async fn room_node(dir: &std::path::Path) -> (Arc<Node>, Arc<SwitchHold>) {
-    let hold = Arc::new(SwitchHold::default());
-    let env = Env::real(tokio::runtime::Handle::current());
-    let config = NodeConfig {
-        concurrency: 8,
-        test_hold_switch: Some(hold.clone()),
-        ..NodeConfig::default()
-    };
-    let node = start_local(env, dir, config).await.unwrap();
-    node.deploy(&guest("room"), audit(), false, owner(&node))
-        .await
-        .unwrap();
-    (node, hold)
-}
-
 /// Opens a room connection and fails one frame; that dead letter's LSN.
 async fn fail_frame(node: &Node) -> Lsn {
     let (id, waiter) = node
@@ -472,7 +448,7 @@ async fn connection_resends(node: &Node, of: &str) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_connection_resend_queued_after_the_switch_does_not_run_when_the_letter_is_gone() {
     let dir = tempfile::tempdir().unwrap();
-    let (node, hold) = room_node(dir.path()).await;
+    let (node, hold) = node(dir.path(), "room").await;
     let epoch = promote_now(&node, &hold, "room-fmt2").await;
     let dead = fail_frame(&node).await;
     let (resend, started) = resend_parked_across_rebase(&node, &hold, "r-conn", epoch, dead).await;
@@ -495,7 +471,7 @@ async fn a_connection_resend_queued_after_the_switch_does_not_run_when_the_lette
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_connection_resend_queued_after_the_switch_runs_once_when_the_letter_remains() {
     let dir = tempfile::tempdir().unwrap();
-    let (node, hold) = room_node(dir.path()).await;
+    let (node, hold) = node(dir.path(), "room").await;
     let dead = fail_frame(&node).await;
     let epoch = promote_now(&node, &hold, "room-fmt2").await;
     let (resend, _started) = resend_parked_across_rebase(&node, &hold, "r-kept", epoch, dead).await;
@@ -613,21 +589,15 @@ async fn a_cancelled_configuration_change_is_still_applied() {
 /// One "process": its own runtime; dropping it cancels every task like a
 /// crash.
 fn process(dir: &std::path::Path) -> (tokio::runtime::Runtime, Arc<Node>, Arc<SwitchHold>) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
     let hold = Arc::new(SwitchHold::default());
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let config = NodeConfig {
+    let Proc { rt, node } = start_proc(
+        dir,
+        NodeConfig {
             concurrency: 8,
             test_hold_switch: Some(hold.clone()),
             ..NodeConfig::default()
-        };
-        start_local(env, dir, config).await.unwrap()
-    });
+        },
+    );
     (rt, node, hold)
 }
 
@@ -747,7 +717,7 @@ fn a_crash_between_the_switch_record_and_state_db_repeats_the_switch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_switch_sweeps_the_code_cache_and_old_code_reloads_from_disk() {
     let dir = tempfile::tempdir().unwrap();
-    let (node, hold) = node(dir.path()).await;
+    let (node, hold) = node(dir.path(), "counter").await;
     let old = CodeHash::from_slice(&deployed_hash(&node)).unwrap();
     promote_now(&node, &hold, "counter-step2").await;
 

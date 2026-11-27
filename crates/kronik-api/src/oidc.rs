@@ -15,6 +15,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use kronik_core::env::{Env, HttpRequest, OpenMode, TlsConfig};
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::SourcePos;
+use kronik_core::sync::lock;
 use kronik_proto::log::v1 as pb;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -340,11 +341,11 @@ impl ProviderAuthority {
 impl kronik_core::authority::Authority for ProviderAuthority {
     fn check(&self) -> Result<(), ApiError> {
         self.original.check()?;
-        self.current(&self.state.lock().unwrap_or_else(|error| error.into_inner()))
+        self.current(&lock(&self.state))
     }
     fn admit(&self, effect: &mut dyn FnMut() -> Result<(), ApiError>) -> Result<(), ApiError> {
         self.original.admit(&mut || {
-            self.current(&self.state.lock().unwrap_or_else(|error| error.into_inner()))?;
+            self.current(&lock(&self.state))?;
             effect()
         })
     }
@@ -768,7 +769,7 @@ impl BrowserAuth {
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
+        lock(&self.state)
     }
 
     fn session(&self, credential: &str) -> Result<Session, ApiError> {
@@ -1318,7 +1319,7 @@ impl BrowserAuth {
         session: Session,
         unpublished: &AtomicBool,
     ) -> Result<(), ApiError> {
-        let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = lock(state);
         if !unpublished.load(Ordering::Acquire) {
             return Err(denied());
         }
@@ -1608,11 +1609,7 @@ impl Drop for PendingSession {
         if let Some(key) = self.key {
             let _ = self.tokens.publish_auth_change(&mut || {
                 self.unpublished.store(false, Ordering::Release);
-                self.state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .sessions
-                    .remove(&key);
+                lock(&self.state).sessions.remove(&key);
                 Ok(())
             });
         }
@@ -1627,11 +1624,7 @@ fn logout_session(
 ) -> Result<Response, ApiError> {
     if !dry_run {
         tokens.publish_auth_change(&mut || {
-            state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .sessions
-                .remove(&key);
+            lock(state).sessions.remove(&key);
             Ok(())
         })?;
     }
@@ -1775,7 +1768,7 @@ impl SessionAuthority {
 
 impl kronik_core::authority::Authority for SessionAuthority {
     fn check(&self) -> Result<(), ApiError> {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = lock(&self.state);
         self.current(&state)?;
         drop(state);
         self.token.check()
@@ -1806,7 +1799,7 @@ impl kronik_core::authority::Authority for SessionAuthority {
     fn admit(&self, effect: &mut dyn FnMut() -> Result<(), ApiError>) -> Result<(), ApiError> {
         // The ordinary token's publication fence orders logout and final enqueue.
         self.token.admit(&mut || {
-            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let state = lock(&self.state);
             self.current(&state)?;
             drop(state);
             effect()

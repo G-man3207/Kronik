@@ -4,6 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use kronik_core::ids::ActorRef;
+use kronik_core::sync::lock;
 use kronik_privacy::sealer::Opened;
 use kronik_proto::log::v1 as pb;
 use kronik_runtime::{
@@ -123,8 +124,7 @@ impl SqlTurn {
             .sql
             .get(&self.name)
             .map_err(|e| SqlHostError::Host(format!("open SQL of {}: {e}", self.name)))?;
-        db.lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lock(&db)
             .begin_turn(&self.opts)
             .map_err(|e| SqlHostError::Host(format!("begin SQL turn of {}: {e}", self.name)))?;
         self.db = Some(db.clone());
@@ -149,7 +149,7 @@ impl SqlTurn {
         let Some(db) = self.db.take() else {
             return Ok(None);
         };
-        let mut g = db.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = lock(&db);
         if commit && !secrets.is_empty() {
             g.scrub(secrets)?;
         }
@@ -196,8 +196,8 @@ impl SqlHandle {
         subject: Option<&str>,
         f: impl FnOnce(&mut SqlActor) -> sql::SqlResult<T>,
     ) -> Result<Result<T, SqlError>, SqlHostError> {
-        let db = self.0.lock().unwrap_or_else(|e| e.into_inner()).begin()?;
-        let mut g = db.lock().unwrap_or_else(|e| e.into_inner());
+        let db = lock(&self.0).begin()?;
+        let mut g = lock(&db);
         g.set_subject(subject);
         match f(&mut g) {
             Ok(v) => Ok(Ok(v)),

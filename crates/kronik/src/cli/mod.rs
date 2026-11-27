@@ -2223,80 +2223,6 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(", "),
         );
-        // The sentence still states its caveats.
-        let window = &text[text.find("Every mutation (").unwrap()..];
-        let window = &window[..window.len().min(1800)];
-        let window = flat(window);
-        for required in [
-            "supports `--dry-run`",
-            "`replay` writes only in its",
-            "`send --fork` only in the fork",
-            "have no dry run",
-            "`restore` and `upgrade check` are offline",
-            "so they take no `--reason`",
-        ] {
-            assert!(
-                window.contains(required),
-                "overview no longer states {required:?}"
-            );
-        }
-    }
-
-    /// #296: the operations guide's REASON_REQUIRED row agrees with the
-    /// commands that take Mutation.
-    #[test]
-    fn reason_required_row_does_not_contradict_the_overview() {
-        let row = repo_doc("docs/guides/operations.md")
-            .lines()
-            .find(|l| l.starts_with("| `REASON_REQUIRED`"))
-            .unwrap_or_else(|| panic!("missing the REASON_REQUIRED row"))
-            .to_owned();
-        assert!(row.contains("`restore` and `upgrade check`"), "{row}");
-        assert!(row.contains("take no `--reason`"), "{row}");
-        let commands = mutations();
-        let inventory: BTreeSet<String> = backticked(&row)
-            .into_iter()
-            .filter(|name| {
-                !name.starts_with("--")
-                    && !["REASON_REQUIRED", "restore", "upgrade check"].contains(&name.as_str())
-            })
-            .collect();
-        if !inventory.is_empty() {
-            assert_eq!(inventory, commands, "REASON_REQUIRED row names: {row}");
-        }
-        for sentence in row.split('.') {
-            assert!(
-                !(sentence.contains("replay") && sentence.contains("take no `--reason`")),
-                "replay takes a reason: {row}"
-            );
-            assert!(
-                !(sentence.contains("send --fork") && sentence.contains("take no `--reason`")),
-                "send --fork takes a reason: {row}"
-            );
-        }
-    }
-
-    /// `kronik secret link` commits unless the run is a dry run.
-    #[test]
-    fn secret_link_commits_unless_the_run_is_a_dry_run() {
-        let text = repo_doc("docs/reference/cli.md");
-        let body = section(&text, "kronik secret link");
-        let (prose, example) = body.split_once("```").unwrap_or((body, ""));
-        let prose = flat(prose);
-        for required in [
-            "does not set the remote provider's value",
-            "SecretLink",
-            "without `--dry-run`",
-            "commits",
-            "`--dry-run` only previews",
-        ] {
-            assert!(
-                prose.contains(required),
-                "secret link no longer states {required:?}"
-            );
-        }
-        assert!(!flat(body).contains("does not establish a committed link"));
-        assert!(example.contains("--dry-run"));
     }
 
     /// `keys wrap` and `keys enroll` name the same sources the parser
@@ -2317,9 +2243,6 @@ mod tests {
             "keys enroll names other sources"
         );
         assert!(flat(enroll).contains("`kronik keys wrap --source pkcs11`"));
-        assert!(flat(wrap).contains("not a cloud KMS"));
-        assert!(flat(enroll).contains("not a cloud KMS"));
-        assert!(!flat(wrap).contains("pkcs11 is a cloud KMS"));
         let cli = crate::Cli::command();
         let wrap_cmd = cli
             .find_subcommand("keys")

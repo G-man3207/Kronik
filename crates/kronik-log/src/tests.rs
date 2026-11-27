@@ -3,6 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use kronik_core::env::test_fs::{FsCall, Then, hooked};
 use kronik_core::env::{BoxFuture, Fs};
 use kronik_proto::log::v1 as pb;
 
@@ -245,84 +246,22 @@ async fn native_positional_read_binds_the_actual_header_and_record() {
     ));
 }
 
-/// A file system that records the reads, `(offset, len)`, and the syncs:
-/// `("dir", path)` and `("data", path)`.
-struct RecordingFs {
-    inner: Arc<dyn Fs>,
+/// `fs`, recording the reads, `(offset, len)`, in `reads` and the syncs,
+/// `("dir", path)` and `("data", path)`, in `syncs`.
+fn recording(
+    fs: Arc<dyn Fs>,
     reads: Arc<Mutex<Vec<(u64, usize)>>>,
     syncs: Arc<Mutex<Vec<(&'static str, PathBuf)>>>,
-}
-
-impl Fs for RecordingFs {
-    fn create_dir_all(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.create_dir_all(path)
-    }
-
-    fn open(&self, path: PathBuf, mode: OpenMode) -> BoxFuture<'static, io::Result<Arc<dyn File>>> {
-        let opened = self.inner.open(path.clone(), mode);
-        let reads = self.reads.clone();
-        let syncs = self.syncs.clone();
-        Box::pin(async move {
-            Ok(Arc::new(RecordingFile {
-                inner: opened.await?,
-                path,
-                reads,
-                syncs,
-            }) as Arc<dyn File>)
-        })
-    }
-
-    fn exists(&self, path: PathBuf) -> BoxFuture<'static, io::Result<bool>> {
-        self.inner.exists(path)
-    }
-
-    fn read_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<Vec<String>>> {
-        self.inner.read_dir(path)
-    }
-
-    fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.rename(from, to)
-    }
-
-    fn remove_file(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.remove_file(path)
-    }
-
-    fn sync_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.syncs.lock().unwrap().push(("dir", path.clone()));
-        self.inner.sync_dir(path)
-    }
-}
-
-struct RecordingFile {
-    inner: Arc<dyn File>,
-    path: PathBuf,
-    reads: Arc<Mutex<Vec<(u64, usize)>>>,
-    syncs: Arc<Mutex<Vec<(&'static str, PathBuf)>>>,
-}
-
-impl File for RecordingFile {
-    fn len(&self) -> BoxFuture<'static, io::Result<u64>> {
-        self.inner.len()
-    }
-
-    fn read_at(&self, offset: u64, len: usize) -> BoxFuture<'static, io::Result<Vec<u8>>> {
-        self.reads.lock().unwrap().push((offset, len));
-        self.inner.read_at(offset, len)
-    }
-
-    fn write_at(&self, offset: u64, data: Bytes) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.write_at(offset, data)
-    }
-
-    fn set_len(&self, len: u64) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.set_len(len)
-    }
-
-    fn sync_data(&self) -> BoxFuture<'static, io::Result<()>> {
-        self.syncs.lock().unwrap().push(("data", self.path.clone()));
-        self.inner.sync_data()
-    }
+) -> Arc<dyn Fs> {
+    hooked(fs, move |call| {
+        match call {
+            FsCall::ReadAt { offset, len, .. } => reads.lock().unwrap().push((*offset, *len)),
+            FsCall::SyncDir(dir) => syncs.lock().unwrap().push(("dir", dir.clone())),
+            FsCall::SyncData(path) => syncs.lock().unwrap().push(("data", path.clone())),
+            _ => {}
+        }
+        Then::Forward
+    })
 }
 
 #[tokio::test]
@@ -342,11 +281,7 @@ async fn bounded_reads_stop_at_each_batch_and_resume_without_loss() {
     }
     std::fs::write(h.cfg.dir.join(segment_name(1)), &image).unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
-    h.env.fs = Arc::new(RecordingFs {
-        inner: h.env.fs.clone(),
-        reads: calls.clone(),
-        syncs: Default::default(),
-    });
+    h.env.fs = recording(h.env.fs.clone(), calls.clone(), Default::default());
     let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
     let mut consumed = Vec::new();
     while consumed.len() < 257 {
@@ -475,11 +410,7 @@ async fn bounded_reads_crc_check_large_skipped_payloads_in_small_chunks() {
     let path = h.cfg.dir.join(segment_name(1));
     std::fs::write(&path, &image).unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
-    h.env.fs = Arc::new(RecordingFs {
-        inner: h.env.fs.clone(),
-        reads: calls.clone(),
-        syncs: Default::default(),
-    });
+    h.env.fs = recording(h.env.fs.clone(), calls.clone(), Default::default());
     let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
     let mut seen = Vec::new();
     reader
@@ -1410,11 +1341,7 @@ async fn an_incomplete_entry_is_torn_and_its_length_sizes_no_read() {
     // than the file has.
     let calls = Arc::new(Mutex::new(Vec::new()));
     let plain_env = h.env.clone();
-    h.env.fs = Arc::new(RecordingFs {
-        inner: plain_env.fs.clone(),
-        reads: calls.clone(),
-        syncs: Default::default(),
-    });
+    h.env.fs = recording(plain_env.fs.clone(), calls.clone(), Default::default());
     let reader = LogReader::new(h.env.clone(), h.cfg.dir.clone(), "main");
     let pos = Position {
         segment: first.pos.segment,
@@ -1578,11 +1505,7 @@ async fn open_makes_what_the_last_process_left_durable() {
         let last = segments.last().unwrap().clone();
         let syncs = Arc::new(Mutex::new(Vec::new()));
         let mut env = h.env.clone();
-        env.fs = Arc::new(RecordingFs {
-            inner: h.env.fs.clone(),
-            reads: Default::default(),
-            syncs: syncs.clone(),
-        });
+        env.fs = recording(h.env.fs.clone(), Default::default(), syncs.clone());
         let (tx, _rx) = mpsc::unbounded_channel();
         let (ftx, _frx) = oneshot::channel();
         let (_log, opened) = Log::open(&env, h.cfg.clone(), tx, ftx).await.unwrap();

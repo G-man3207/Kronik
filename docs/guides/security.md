@@ -18,7 +18,7 @@ repository root says how to report a vulnerability.
 | Leaked secrets | Handles by default: the value is inserted at the effect boundary and never reaches the guest or the log. Revealing a value requires its own capability, and the value is scrubbed | All of them, since M2 |
 | Theft of the data directory | Sealed subject values and encrypted secrets, with their master seed held separately; encrypt the disk for plaintext log data | Privacy mode since M8; M23 B1 adds KMS-wrapped master seeds. This does not encrypt ordinary log inputs/metadata or protect a compromised live host |
 | Unauthorized API access | Unix socket with file permissions, TCP only with a token, TLS for external traffic | The Unix socket; TCP only with a bearer token and, off loopback, only with TLS (M5); scopes per token (M5); TLS for the gateway and the TCP API since M6 |
-| The supply chain | cargo-deny, SBOM and release builds that are as reproducible as possible | cargo-deny in CI, with recorded exceptions only for unmaintained chrono and humantime (ADR 0154). Static release binaries arrive with M6, and the SBOM with the v0.1.0 release |
+| The supply chain | cargo-deny, SBOM and release builds that are as reproducible as possible | cargo-deny in CI, with recorded exceptions for unmaintained chrono and humantime (ADR 0154). A new duplicate crate version fails the check; the exact versions already duplicated are recorded in `deny.toml` (ADR 0163). Static release binaries arrive with M6, and the SBOM with the v0.1.0 release |
 
 ## Actor code
 

@@ -34,6 +34,7 @@ use kronik_core::env::BoxFuture;
 use kronik_core::env::{BodySource, BytesSource};
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, valid_key};
+use kronik_core::sync::lock;
 use kronik_privacy::sealer::is_erased;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{BodyPolicy, Ingress, IngressExtras, Node, RouteEntry, TurnResult};
@@ -503,13 +504,6 @@ fn error(e: &ApiError) -> HttpResponse {
     }
 }
 
-fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
-    match s.and_then(|s| s.value.as_ref()) {
-        Some(pb::sealable::Value::Plain(b)) => b.clone(),
-        _ => Vec::new(),
-    }
-}
-
 /// Who a request is for and from ([`Gateway::identify`]).
 struct Identity {
     actor: ActorRef,
@@ -747,7 +741,13 @@ fn accept_headers(accept: &pb::ConnectionAccept) -> Vec<(String, String)> {
         .map(|h| {
             (
                 h.name.clone(),
-                String::from_utf8_lossy(&sealable_bytes(h.value.as_ref())).into_owned(),
+                String::from_utf8_lossy(
+                    h.value
+                        .as_ref()
+                        .and_then(pb::Sealable::plain)
+                        .unwrap_or_default(),
+                )
+                .into_owned(),
             )
         })
         .filter(|(name, value)| {
@@ -830,7 +830,13 @@ pub fn turn_response(r: &TurnResult) -> HttpResponse {
                 .map(|hd| {
                     (
                         hd.name.clone(),
-                        String::from_utf8_lossy(&sealable_bytes(hd.value.as_ref())).into_owned(),
+                        String::from_utf8_lossy(
+                            hd.value
+                                .as_ref()
+                                .and_then(pb::Sealable::plain)
+                                .unwrap_or_default(),
+                        )
+                        .into_owned(),
                     )
                 })
                 .collect();
@@ -839,7 +845,7 @@ pub fn turn_response(r: &TurnResult) -> HttpResponse {
             });
             headers.push(id);
             let body = match h.body.as_ref().and_then(|b| b.value.as_ref()) {
-                Some(pb::body::Value::Inline(s)) => sealable_bytes(Some(s)),
+                Some(pb::body::Value::Inline(s)) => s.plain().unwrap_or_default().to_vec(),
                 _ => Vec::new(),
             };
             HttpResponse {
@@ -874,7 +880,12 @@ pub fn turn_response(r: &TurnResult) -> HttpResponse {
                 ),
                 id,
             ],
-            body: sealable_bytes(m.body.as_ref()),
+            body: m
+                .body
+                .as_ref()
+                .and_then(pb::Sealable::plain)
+                .unwrap_or_default()
+                .to_vec(),
         },
         None => HttpResponse {
             status: 204,
@@ -908,7 +919,7 @@ impl Gateway {
     /// lock, which only a new epoch pays for, not every request.
     fn route_table(&self) -> Arc<Vec<Route>> {
         let epoch = self.node.epoch();
-        let mut cache = self.routes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = lock(&self.routes);
         if cache.0 != Some(epoch) {
             #[cfg(test)]
             self.route_reads

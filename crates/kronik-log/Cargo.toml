@@ -16,7 +16,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "macros"] }
 
 [dev-dependencies]
-kronik-core = { workspace = true, features = ["real"] }
+kronik-core = { workspace = true, features = ["real", "test-util"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 

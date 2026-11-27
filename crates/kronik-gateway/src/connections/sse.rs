@@ -21,6 +21,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kronik_core::sync::lock;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::connections::{FinishGuard, Hub, Outgoing, RESTART_CODE, Transport};
 use tokio::sync::{Notify, mpsc};
@@ -46,10 +47,14 @@ pub fn retry_after_restart(conn: &str) -> Vec<u8> {
 /// no line break (the runtime refuses one); any that slipped in would end
 /// the field, so it becomes a space.
 pub fn encode(frame: &pb::Frame) -> Vec<u8> {
-    let data = match frame.data.as_ref().and_then(|d| d.value.as_ref()) {
-        Some(pb::sealable::Value::Plain(b)) => String::from_utf8_lossy(b).into_owned(),
-        _ => String::new(),
-    };
+    let data = String::from_utf8_lossy(
+        frame
+            .data
+            .as_ref()
+            .and_then(pb::Sealable::plain)
+            .unwrap_or_default(),
+    )
+    .into_owned();
     let one_line = |s: &str| s.replace(['\r', '\n', '\0'], " ");
     let mut out = String::with_capacity(data.len() + 32);
     if frame.kind == pb::frame::Kind::Event as i32 {
@@ -87,14 +92,14 @@ impl Transport for SseTransport {
     }
 
     fn close(&self, code: u16, _reason: &str) {
-        *self.host_close.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
+        *lock(&self.host_close) = Some(code);
         self.notify.notify_one();
     }
 }
 
 impl SseTransport {
     fn host_close(&self) -> Option<u16> {
-        *self.host_close.lock().unwrap_or_else(|e| e.into_inner())
+        *lock(&self.host_close)
     }
 }
 

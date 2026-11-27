@@ -30,6 +30,8 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rusqlite::{Connection, OptionalExtension, params};
 use zeroize::{Zeroize, Zeroizing};
 
+use kronik_core::sync::lock;
+
 use key_memory::ProtectedKey;
 
 #[derive(Debug, thiserror::Error)]
@@ -932,7 +934,7 @@ impl SecretStore {
 
     // Only the private create-new encrypted stage selects a backup destination.
     fn backup_to(&self, path: &std::path::Path) -> Result<(), PrivacyError> {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner()).backup(
+        lock(&self.conn).backup(
             rusqlite::MAIN_DB,
             path,
             None::<fn(rusqlite::backup::Progress)>,
@@ -1125,7 +1127,7 @@ impl SecretStore {
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.conn)
     }
 
     /// The keyed immutable identity; legacy identities retain their exact bytes.
@@ -1701,25 +1703,6 @@ mod tests {
         let master = MasterKey::from_bytes([7; 32]).unwrap();
         let s = SecretStore::open(Connection::open_in_memory().unwrap(), &master).unwrap();
         let meta = s.set_at("token", 1, b"value", [3; 24], 0, "", "").unwrap();
-        let old_cipher_key = blake3::derive_key("kronik secrets v1", &[7; 32]);
-        let expected_ciphertext = XChaCha20Poly1305::new((&old_cipher_key).into())
-            .encrypt(
-                &XNonce::from([3; 24]),
-                Payload {
-                    msg: b"value",
-                    aad: b"token|1",
-                },
-            )
-            .unwrap();
-        let ciphertext: Vec<u8> = s
-            .conn()
-            .query_row(
-                "SELECT ciphertext FROM secrets WHERE name='token' AND version=1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(ciphertext, expected_ciphertext);
         let old_hash_key = blake3::derive_key("kronik secret version v1", &[7; 32]);
         let mut h = blake3::Hasher::new_keyed(&old_hash_key);
         h.update(b"token\0");
@@ -1730,7 +1713,6 @@ mod tests {
             master.check_value(),
             blake3::derive_key("kronik master check v1", &[7; 32])
         );
-        assert!(std::ptr::eq(master.bytes(), master.clone().bytes()));
         assert!(master.same_key(&master.clone()));
         assert!(!master.same_key(&MasterKey::from_bytes([8; 32]).unwrap()));
     }

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Proc, audit, diff_json, guest, tempdir};
+use common::{Proc, audit, branch_names, diff_json, guest, propose_request, tempdir};
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::Lsn;
 use kronik_fork::diff::DiffOptions;
@@ -45,15 +45,6 @@ fn first_turn(p: &Proc) -> Lsn {
     }))
     .unwrap();
     found.expect("a turn")
-}
-
-fn branch_names(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(dir.join("branches"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    names
 }
 
 /// Two turns whose logical times differ, without sleeping: a restart sets
@@ -169,14 +160,9 @@ fn propose_refuses_an_early_point_without_writing() {
     let err =
         p.rt.block_on(props.propose(
             ProposeRequest {
-                wasm: vec![wasm],
-                names: Vec::new(),
-                window_ms: None,
                 at: Some(early),
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
                 dry_run: true,
+                ..propose_request(vec![wasm])
             },
             p.owner(),
         ))
@@ -200,14 +186,8 @@ fn promote_is_stale_when_the_window_shrinks() {
     let (prop, _) =
         p.rt.block_on(props.propose(
             ProposeRequest {
-                wasm: vec![wasm],
-                names: Vec::new(),
-                window_ms: None,
                 at: Some(early),
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
+                ..propose_request(vec![wasm])
             },
             p.owner(),
         ))
@@ -253,14 +233,8 @@ fn promote_dry_run_of_an_aged_proposal_does_not_mark_it_stale() {
     let (prop, _) =
         p.rt.block_on(props.propose(
             ProposeRequest {
-                wasm: vec![wasm],
-                names: Vec::new(),
-                window_ms: None,
                 at: Some(early),
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
+                ..propose_request(vec![wasm])
             },
             p.owner(),
         ))
@@ -354,16 +328,7 @@ fn fork_create_refuses_a_point_the_log_no_longer_covers() {
 }
 
 fn window_request() -> ProposeRequest {
-    ProposeRequest {
-        wasm: vec![std::fs::read(guest("counter-step2")).unwrap()],
-        names: Vec::new(),
-        window_ms: None,
-        at: None,
-        options: DiffOptions::default(),
-        workers: Some(2),
-        audit: audit(),
-        dry_run: false,
-    }
+    propose_request(vec![std::fs::read(guest("counter-step2")).unwrap()])
 }
 
 fn propose_window(p: &Proc, props: &Arc<Proposals>) -> kronik_fork::proposal::Proposal {

@@ -24,7 +24,7 @@ mod common;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{Proc, audit, start_proc, wait_turn};
+use common::{Proc, audit, http_text, msg, start_proc, wait_turn};
 use kronik_blob::SweepOptions;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
@@ -109,35 +109,6 @@ fn retained_reply(answer: &str) -> pb::BlobRef {
     )
 }
 
-/// The text answer of a committed turn.
-fn text_of(r: &TurnResult) -> String {
-    match &r.outcome.output {
-        Some(pb::outcome::Output::Http(h)) => {
-            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
-                Some(pb::body::Value::Inline(s)) => match &s.value {
-                    Some(pb::sealable::Value::Plain(b)) => String::from_utf8_lossy(b).into_owned(),
-                    other => panic!("{other:?}"),
-                },
-                other => panic!("{other:?}"),
-            }
-        }
-        other => panic!("{other:?}"),
-    }
-}
-
-/// An operator's message named `name`, with an empty body.
-fn message(name: &str) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(Vec::new())),
-        }),
-        ..Default::default()
-    }
-}
-
 /// The recorded `actor.call` effects of `media/<key>`'s committed turns.
 fn calls_of(records: &[Record], key: &str) -> Vec<pb::EffectRecord> {
     records
@@ -186,24 +157,15 @@ fn assert_blob_reply(call: &pb::EffectRecord, blob: &pb::BlobRef) {
 impl Proc {
     /// Runs `op` on `media/<key>` over HTTP with an inline body.
     fn run(&self, key: &str, op: &str, query: &str, body: &[u8]) -> TurnResult {
-        let input = pb::HttpInput {
-            method: "POST".into(),
-            path: format!("/media/{key}/{op}"),
-            query: query.into(),
-            body: Some(pb::Body {
-                value: Some(pb::body::Value::Inline(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(body.to_vec())),
-                })),
+        self.run_with(
+            key,
+            op,
+            query,
+            pb::body::Value::Inline(pb::Sealable {
+                subject: None,
+                value: Some(pb::sealable::Value::Plain(body.to_vec())),
             }),
-            ..Default::default()
-        };
-        self.rt.block_on(async {
-            let actor = ActorRef::parse(&format!("media/{key}")).unwrap();
-            wait_turn(self.node.ingress(actor, input, None).unwrap())
-                .await
-                .unwrap()
-        })
+        )
     }
 
     /// Runs `op` on `media/<key>` over HTTP with `body`.
@@ -225,32 +187,14 @@ impl Proc {
 
     /// A blob of `size` bytes written as the gateway writes an upload.
     fn upload(&self, size: usize) -> pb::BlobRef {
-        let store = self.node.blob_store().unwrap().clone();
-        self.rt.block_on(async move {
-            let mut w = store
-                .writer(
-                    kronik_blob::Space::Main,
-                    None,
-                    u64::MAX,
-                    store.leases().take("upload"),
-                )
-                .await
-                .unwrap();
-            w.write(&vec![9u8; size]).await.unwrap();
-            let meta = w.finish().await.unwrap();
-            store
-                .ensure_durable(&kronik_blob::Space::Main, &[meta.id])
-                .await
-                .unwrap();
-            meta.to_pb()
-        })
+        self.write_upload(&vec![9u8; size])
     }
 
     /// [`Proc::run`] of a turn that commits; its text answer.
     fn ok(&self, key: &str, op: &str, query: &str) -> String {
         let r = self.run(key, op, query, b"");
         assert!(r.committed(), "{op}?{query}: {r:?}");
-        text_of(&r)
+        http_text(&r)
     }
 
     /// An operator's message `name` (`op?query`) to `media/<key>`, as
@@ -259,7 +203,7 @@ impl Proc {
         let actor = ActorRef::parse(&format!("media/{key}")).unwrap();
         let owner = self.node.local_operator_authority().unwrap();
         self.rt
-            .block_on(self.node.send(actor, message(name), audit(), false, owner))
+            .block_on(self.node.send(actor, msg(name, ""), audit(), false, owner))
             .unwrap_or_else(|e| panic!("{name}: {e}"))
             .unwrap()
     }
@@ -272,20 +216,9 @@ impl Proc {
         self.rt.spawn(async move {
             let owner = node.local_operator_authority().unwrap();
             let _ = node
-                .send(actor, message(&name), audit(), false, owner)
+                .send(actor, msg(&name, ""), audit(), false, owner)
                 .await;
         });
-    }
-
-    /// Waits up to 20 s for `f`.
-    fn wait_until(&self, what: &str, f: impl Fn(&Proc) -> bool) {
-        for _ in 0..2000 {
-            if f(self) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("timed out waiting for {what}");
     }
 
     /// How many turns `media/<key>` committed or failed.
@@ -296,11 +229,6 @@ impl Proc {
             .actor("media", key)
             .unwrap()
             .map_or(0, |a| a.turns)
-    }
-
-    /// Whether a turn is open: begun, and not ended by a record.
-    fn open_turns(&self) -> usize {
-        self.node.store().db().open_turns().unwrap().len()
     }
 
     /// Waits until no message to `media/<key>` waits in the mailbox: its
@@ -394,17 +322,6 @@ impl Proc {
                 }))
                 .unwrap();
         }
-    }
-
-    fn records(&self) -> Vec<Record> {
-        let mut out = Vec::new();
-        self.rt
-            .block_on(self.node.reader().read(1, self.node.applied_lsn(), |c| {
-                out.push(c.record);
-                Ok(())
-            }))
-            .unwrap();
-        out
     }
 
     /// The blob of a turn's HTTP answer whose body is a blob.
@@ -649,13 +566,13 @@ fn a_message_turn_calling_a_blob_writer_finishes() {
     let p = start(dir.path(), true);
     let r = p.send("m", "call?to=w&op=write?size=1000&keep=1");
     assert!(r.committed(), "{r:?}");
-    let blob = retained_reply(&text_of(&r));
+    let blob = retained_reply(&http_text(&r));
     assert_eq!(blob.size, 1000);
     assert!(p.held("m", &blob));
     assert_eq!(p.open_turns(), 0);
     assert_blob_reply(&calls_of(&p.records(), "m")[0], &blob);
     // The next message runs and reads the blob it retained.
-    assert_eq!(text_of(&p.send("m", "held-sum")), pattern_sum(1000));
+    assert_eq!(http_text(&p.send("m", "held-sum")), pattern_sum(1000));
 }
 
 /// A message turn that stopped after its call had its answer, a blob the
@@ -680,7 +597,7 @@ fn a_rerun_message_turn_takes_the_saved_blob_answer() {
     assert_blob_reply(&calls[0], &blob);
     assert!(p.held("m", &blob));
     assert_eq!(p.turns("w"), 1, "the callee ran once");
-    assert_eq!(text_of(&p.send("m", "held-sum")), pattern_sum(1000));
+    assert_eq!(http_text(&p.send("m", "held-sum")), pattern_sum(1000));
 }
 
 /// The state rebuilt from the log equals the live one, holds and pins

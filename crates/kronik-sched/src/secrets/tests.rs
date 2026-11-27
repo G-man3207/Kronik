@@ -11,9 +11,7 @@ use kronik_privacy::secret_backend::config::Definition;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use tokio::sync::Semaphore;
 
-fn env() -> Env {
-    Env::real(tokio::runtime::Handle::current())
-}
+use crate::test_support::env;
 
 fn audit() -> pb::Audit {
     pb::Audit {
@@ -1375,39 +1373,6 @@ async fn bao_node_allowing(
         .unwrap();
     (data, node, bao)
 }
-async fn begin(node: &Node) {
-    node.commit(Record::TurnBegin(pb::TurnBegin {
-        execution_id: "0123456789abcdef0123456789abcdef".into(),
-        actor: Some(pb::ActorRef {
-            kind: "test".into(),
-            key: "one".into(),
-        }),
-        code_hash: vec![1; 32],
-        engine_version: kronik_runtime::ENGINE_VERSION.into(),
-        causal_key: Some(pb::CausalKey {
-            root: "root".into(),
-            path: Vec::new(),
-        }),
-        logical_time_ms: 1,
-        random_seed: vec![2; 32],
-        input: Some(pb::Input {
-            kind: Some(pb::input::Kind::Http(pb::HttpInput {
-                method: "GET".into(),
-                path: "/".into(),
-                body: Some(pb::Body {
-                    value: Some(pb::body::Value::Inline(pb::Sealable {
-                        subject: None,
-                        value: Some(pb::sealable::Value::Plain(Vec::new())),
-                    })),
-                }),
-                ..Default::default()
-            })),
-        }),
-        config_epoch: node.epoch(),
-    }))
-    .await
-    .unwrap();
-}
 
 /// Link and resolve of a ref outside `allowed_refs` must not ask the provider.
 /// An empty allowlist denies every ref. A ref under the prefix still links.
@@ -1608,7 +1573,9 @@ async fn actual_provider_initialization_is_offline_and_cold_io_follows_begin_whi
     )
     .await
     .unwrap();
-    begin(&node).await;
+    node.commit(Record::TurnBegin(super::certification_tests::begin(&node)))
+        .await
+        .unwrap();
     bao.require_begin.store(true, Ordering::SeqCst);
     let config = node.config_now();
     let cold = node
@@ -2542,157 +2509,6 @@ async fn actual_aws_unending_catalogue_stops_at_the_page_budget_without_claiming
         MAX_CATALOGUE_PAGES
     );
     assert!(node.secret_values().is_err());
-}
-
-#[tokio::test]
-// The underlying feature is not implemented. Linking a secret to the
-// built-in "file" backend answers
-// SECRET_BACKEND_UNKNOWN; only file->external links are representable, so a
-// successful file->file link, its mutation refusals and its unlink cannot be
-// exercised yet. Restore this test when file->file links are implemented.
-#[ignore = "not implemented: FILE-to-FILE secret links answer SECRET_BACKEND_UNKNOWN; only file->external links are representable"]
-async fn file_links_refuse_mutation_without_touching_either_physical_name() {
-    let (_data, node) = node().await;
-    let original = node.local_operator_authority().unwrap();
-    let token = node
-        .secret_set(
-            "token",
-            b"unrelated-owned-token".to_vec(),
-            &audit(),
-            false,
-            original.clone(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    let alt = node
-        .secret_set(
-            "alt",
-            b"shared-live-alt".to_vec(),
-            &audit(),
-            false,
-            original.clone(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    let token_identity = node
-        .secret_identity(node.branch(), "token", token.version)
-        .await
-        .unwrap();
-    let alt_identity = node
-        .secret_identity(node.branch(), "alt", alt.version)
-        .await
-        .unwrap();
-    let token_physical = token_identity.source_version.parse().unwrap();
-    let alt_physical = alt_identity.source_version.parse().unwrap();
-    node.secret_link("token", "file", "alt", &audit(), false, original.clone())
-        .await
-        .unwrap();
-    node.secret_link("alias-b", "file", "alt", &audit(), false, original.clone())
-        .await
-        .unwrap();
-    node.secret_link("alt", "file", "alt", &audit(), false, original.clone())
-        .await
-        .unwrap();
-    let b = node
-        .resolve_secret("alias-b", None, &node.config_now(), original.clone())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(b.value, b"shared-live-alt");
-    let store = node.secrets().unwrap();
-    let rows = node.secret_rows(None).await.unwrap();
-    let through = node.applied_lsn();
-    for name in ["token", "alt"] {
-        for dry_run in [false, true] {
-            assert_eq!(
-                node.secret_set(
-                    name,
-                    b"refused-replacement".to_vec(),
-                    &audit(),
-                    dry_run,
-                    original.clone()
-                )
-                .await
-                .unwrap_err()
-                .code,
-                ErrorCode::SecretExternal
-            );
-            assert_eq!(
-                node.secret_delete(name, &audit(), dry_run, original.clone())
-                    .await
-                    .unwrap_err()
-                    .code,
-                ErrorCode::SecretExternal
-            );
-        }
-    }
-    assert_eq!(node.applied_lsn(), through);
-    assert_eq!(node.secret_rows(None).await.unwrap(), rows);
-    assert_eq!(
-        store.current("token").unwrap().unwrap().value.as_slice(),
-        b"unrelated-owned-token"
-    );
-    assert_eq!(
-        store.current("alt").unwrap().unwrap().value.as_slice(),
-        b"shared-live-alt"
-    );
-    assert!(store.stored_deletion_floor("token").unwrap().is_none());
-    assert!(store.stored_deletion_floor("alt").unwrap().is_none());
-    let still_b = node
-        .resolve_secret("alias-b", None, &node.config_now(), original.clone())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(still_b.value, b.value);
-    assert_eq!(still_b.meta.version, b.meta.version);
-
-    node.secret_unlink("token", &audit(), false, original.clone())
-        .await
-        .unwrap();
-    node.secret_set(
-        "token",
-        b"new-owned-token".to_vec(),
-        &audit(),
-        false,
-        original.clone(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(
-        store.current("token").unwrap().unwrap().value.as_slice(),
-        b"new-owned-token"
-    );
-    assert!(
-        node.secret_delete("token", &audit(), false, original.clone())
-            .await
-            .unwrap()
-            > 0
-    );
-    assert!(store.current("token").unwrap().is_none());
-    assert!(store.stored_deletion_floor("token").unwrap().is_some());
-    assert_eq!(
-        store
-            .retained_version_for_scrub("token", token_physical)
-            .unwrap()
-            .unwrap()
-            .value,
-        b"unrelated-owned-token"
-    );
-    assert_eq!(
-        store.version("alt", alt_physical).unwrap().unwrap().value,
-        b"shared-live-alt"
-    );
-    assert!(store.stored_deletion_floor("alt").unwrap().is_none());
-    let still_b = node
-        .resolve_secret("alias-b", None, &node.config_now(), original)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(still_b.value, b.value);
-    assert_eq!(still_b.meta.version, b.meta.version);
 }
 
 #[tokio::test]

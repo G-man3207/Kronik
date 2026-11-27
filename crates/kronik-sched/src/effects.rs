@@ -31,14 +31,14 @@ use crate::node::{Node, OperationOrigin};
 
 /// A recorded value of `subject` (the guest's default subject at the
 /// effect); sealed when the record is appended in privacy mode.
-fn tagged(subject: &Option<String>, bytes: Vec<u8>) -> Option<pb::Sealable> {
+pub fn tagged(subject: &Option<String>, bytes: Vec<u8>) -> Option<pb::Sealable> {
     Some(pb::Sealable {
         subject: subject.clone(),
         value: Some(pb::sealable::Value::Plain(bytes)),
     })
 }
 
-fn plain(bytes: Vec<u8>) -> Option<pb::Sealable> {
+pub fn plain(bytes: Vec<u8>) -> Option<pb::Sealable> {
     Some(pb::Sealable {
         subject: None,
         value: Some(pb::sealable::Value::Plain(bytes)),

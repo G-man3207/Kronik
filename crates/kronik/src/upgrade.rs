@@ -112,7 +112,7 @@ pub fn check(args: CheckArgs, json: bool) -> ExitCode {
 fn execute(args: CheckArgs) -> Result<Done, ApiError> {
     let window_ms = crate::cli::parse_duration_ms(&args.window).map_err(|m| {
         ApiError::new(ErrorCode::BadRequest, format!("--window: {m}"))
-            .with_hint("Give a duration with ms, s, m or h, e.g. 6h.")
+            .with_hint("Give a duration with ms, s, m, h or d, e.g. 6h.")
     })?;
     let (configuration, selected_config) =
         crate::restore::key_config(args.config.as_deref(), args.master_key_file.clone())?;
@@ -210,7 +210,7 @@ fn execute(args: CheckArgs) -> Result<Done, ApiError> {
             let _ = std::fs::remove_file(&diff_file);
             (Some(report_file.display().to_string()), None)
         } else {
-            write_diff(&diff_file, &checked.diff_bytes).map_err(|e| {
+            crate::project::build::write_output(&diff_file, &checked.diff_bytes).map_err(|e| {
                 ApiError::new(
                     ErrorCode::BadRequest,
                     format!("could not write the diff: {e}"),
@@ -417,16 +417,6 @@ fn render(
     }
     out.push_str(&next(&[next_cmd]));
     out
-}
-
-fn write_diff(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 fn default_workers() -> usize {

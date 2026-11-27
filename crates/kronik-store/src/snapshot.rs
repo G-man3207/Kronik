@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use kronik_core::ids::Lsn;
+use kronik_core::sync::lock;
 use rusqlite::limits::Limit;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, MAIN_DB};
@@ -500,9 +501,7 @@ impl Store {
                     break;
                 }
                 let db = self.sql.get(name)?;
-                db.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .backup_to(&dest)?;
+                lock(&db).backup_to(&dest)?;
                 files.push(rel);
             }
             if !complete {
@@ -584,7 +583,7 @@ impl Store {
 
     fn actor_db_path(&self, name: &str) -> Result<PathBuf, StoreError> {
         let db = self.sql.get(name).map_err(sqlite)?;
-        let guard = db.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = lock(&db);
         guard
             .conn
             .path()
@@ -617,10 +616,7 @@ impl Store {
         let actors = self.db().sql_actors()?;
         for name in actors {
             let db = self.sql.get(&name)?;
-            let hash = db
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .committed_hash()?;
+            let hash = lock(&db).committed_hash()?;
             h.update(format!("sql|{name}|{hash}\n").as_bytes());
         }
         Ok(format!("b3:{}", h.finalize().to_hex()))
@@ -648,9 +644,7 @@ impl Store {
         for name in actors {
             let file = actor_file(&dir.join("sql"), &name);
             let db = store.sql.get(&name)?;
-            db.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .restore_from(&file)?;
+            lock(&db).restore_from(&file)?;
         }
         Ok(store)
     }

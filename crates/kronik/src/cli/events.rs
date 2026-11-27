@@ -639,6 +639,25 @@ mod tests {
     use super::*;
     use clap::Parser as _;
 
+    /// [`follow`] of every source, never cancelled.
+    fn follow_any(
+        input: impl io::Read,
+        out: &mut impl io::Write,
+        json: bool,
+        limit: Option<u64>,
+        cursor: &mut Option<ResumeCursor>,
+    ) -> Result<(), ApiError> {
+        follow(
+            input,
+            out,
+            json,
+            limit,
+            cursor,
+            &AtomicBool::new(false),
+            None,
+        )
+    }
+
     #[test]
     fn source_options_are_canonical_bounded_and_local_to_list_and_tail() {
         let last = format!("actor-{}", kronik_proto::MAX_SHARD_COUNT - 1);
@@ -985,14 +1004,12 @@ mod tests {
         let combined = format!("{event_frame}{metadata_frame}");
         let mut checkpoint = Some(start);
         let mut output = Vec::new();
-        follow(
+        follow_any(
             combined.as_bytes(),
             &mut output,
             true,
             Some(2),
             &mut checkpoint,
-            &AtomicBool::new(false),
-            None,
         )
         .unwrap();
         let events: Vec<kronik_fleet::events::Event> = output
@@ -1228,14 +1245,12 @@ mod tests {
             let mut checkpoint = None;
             let mut output = Vec::new();
             assert!(
-                follow(
+                follow_any(
                     stream.as_bytes(),
                     &mut output,
                     true,
                     Some(2),
                     &mut checkpoint,
-                    &AtomicBool::new(false),
-                    None
                 )
                 .is_err()
             );
@@ -1285,14 +1300,12 @@ mod tests {
                 flushes: 0,
                 fail_write,
             };
-            let error = follow(
+            let error = follow_any(
                 stream.as_bytes(),
                 &mut output,
                 true,
                 Some(2),
                 &mut checkpoint,
-                &AtomicBool::new(false),
-                None,
             )
             .unwrap_err();
             assert!(error.message.contains(if fail_write {
@@ -1399,14 +1412,12 @@ mod tests {
         let stream = format!("{cursor_frame}{event_frame}");
         let mut output = Vec::new();
         let mut checkpoint = None;
-        follow(
+        follow_any(
             stream.as_bytes(),
             &mut output,
             true,
             Some(1),
             &mut checkpoint,
-            &AtomicBool::new(false),
-            None,
         )
         .unwrap();
         let resumed = checkpoint.unwrap();
@@ -1447,16 +1458,8 @@ mod tests {
         ];
         for case in cases {
             let mut out = Vec::new();
-            let error = follow(
-                case.as_bytes(),
-                &mut out,
-                true,
-                Some(1),
-                &mut None,
-                &AtomicBool::new(false),
-                None,
-            )
-            .unwrap_err();
+            let error =
+                follow_any(case.as_bytes(), &mut out, true, Some(1), &mut None).unwrap_err();
             assert!(out.is_empty());
             assert!(!error.message.contains("private"));
         }
@@ -1485,18 +1488,7 @@ mod tests {
             "event: unknown\ndata: {}\n\n",
         ] {
             let mut out = Vec::new();
-            assert!(
-                follow(
-                    stream.as_bytes(),
-                    &mut out,
-                    true,
-                    Some(1),
-                    &mut None,
-                    &AtomicBool::new(false),
-                    None
-                )
-                .is_err()
-            );
+            assert!(follow_any(stream.as_bytes(), &mut out, true, Some(1), &mut None).is_err());
             assert!(out.is_empty());
         }
         let error = ApiError::new(ErrorCode::ScopeMissing, "scope denied");
@@ -1505,17 +1497,9 @@ mod tests {
             serde_json::to_string(&error).unwrap()
         );
         assert_eq!(
-            follow(
-                stream.as_bytes(),
-                &mut Vec::new(),
-                true,
-                None,
-                &mut None,
-                &AtomicBool::new(false),
-                None
-            )
-            .unwrap_err()
-            .code,
+            follow_any(stream.as_bytes(), &mut Vec::new(), true, None, &mut None)
+                .unwrap_err()
+                .code,
             ErrorCode::ScopeMissing
         );
     }
@@ -1688,28 +1672,10 @@ mod tests {
             event.data.adoption = Some(kronik_fleet::events::NativeAdoption { current_projection });
             let stream = kronik_fleet::events::sse_event(&event, &cursor).unwrap();
             let mut human = Vec::new();
-            follow(
-                stream.as_bytes(),
-                &mut human,
-                false,
-                Some(1),
-                &mut None,
-                &AtomicBool::new(false),
-                None,
-            )
-            .unwrap();
+            follow_any(stream.as_bytes(), &mut human, false, Some(1), &mut None).unwrap();
             assert!(String::from_utf8(human).unwrap().contains(marker));
             let mut json = Vec::new();
-            follow(
-                stream.as_bytes(),
-                &mut json,
-                true,
-                Some(1),
-                &mut None,
-                &AtomicBool::new(false),
-                None,
-            )
-            .unwrap();
+            follow_any(stream.as_bytes(), &mut json, true, Some(1), &mut None).unwrap();
             let decoded: kronik_fleet::events::Event = serde_json::from_slice(&json).unwrap();
             assert_eq!(decoded, event);
         }
@@ -1722,16 +1688,7 @@ mod tests {
         let stream = format!(": heartbeat\n\n{encoded}data: incomplete private trailer");
         let mut out = Vec::new();
         let mut checkpoint = None;
-        follow(
-            stream.as_bytes(),
-            &mut out,
-            true,
-            Some(1),
-            &mut checkpoint,
-            &AtomicBool::new(false),
-            None,
-        )
-        .unwrap();
+        follow_any(stream.as_bytes(), &mut out, true, Some(1), &mut checkpoint).unwrap();
         let expected = kronik_fleet::events::resume_after(&event, &cursor).unwrap();
         assert_eq!(checkpoint, Some(expected.clone()));
         let rendered: kronik_fleet::events::Event = serde_json::from_slice(&out).unwrap();
@@ -1768,16 +1725,7 @@ mod tests {
             2
         );
         let mut human = Vec::new();
-        follow(
-            encoded.as_bytes(),
-            &mut human,
-            false,
-            Some(1),
-            &mut None,
-            &AtomicBool::new(false),
-            None,
-        )
-        .unwrap();
+        follow_any(encoded.as_bytes(), &mut human, false, Some(1), &mut None).unwrap();
         let human = String::from_utf8(human).unwrap();
         assert!(human.contains("actor-7:7"));
         assert!(!human.contains("rotate"));
@@ -1805,16 +1753,7 @@ mod tests {
             let (event, cursor) = projected_event_at(source);
             let stream = kronik_fleet::events::sse_event(&event, &cursor).unwrap();
             let mut human = Vec::new();
-            follow(
-                stream.as_bytes(),
-                &mut human,
-                false,
-                Some(1),
-                &mut None,
-                &AtomicBool::new(false),
-                None,
-            )
-            .unwrap();
+            follow_any(stream.as_bytes(), &mut human, false, Some(1), &mut None).unwrap();
             let human = String::from_utf8(human).unwrap();
             assert!(human.contains(expected));
             assert!(!human.contains("adoption="));
@@ -1823,16 +1762,7 @@ mod tests {
                 matches!(source, SourcePos::Actor { .. })
             );
             let mut json = Vec::new();
-            follow(
-                stream.as_bytes(),
-                &mut json,
-                true,
-                Some(1),
-                &mut None,
-                &AtomicBool::new(false),
-                None,
-            )
-            .unwrap();
+            follow_any(stream.as_bytes(), &mut json, true, Some(1), &mut None).unwrap();
             let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
             assert_eq!(value["source"], serde_json::to_value(source).unwrap());
             assert!(value.get("lsn").is_none());
@@ -1875,16 +1805,8 @@ mod tests {
         let stream = kronik_fleet::events::sse_cursor(&page).unwrap();
         let mut out = Vec::new();
         let mut checkpoint = None;
-        let error = follow(
-            stream.as_bytes(),
-            &mut out,
-            true,
-            Some(1),
-            &mut checkpoint,
-            &AtomicBool::new(false),
-            None,
-        )
-        .unwrap_err();
+        let error =
+            follow_any(stream.as_bytes(), &mut out, true, Some(1), &mut checkpoint).unwrap_err();
         assert!(out.is_empty());
         assert_eq!(checkpoint, Some(cursor));
         assert!(error.hint.unwrap().contains("--cursor - < checkpoint.json"));
@@ -1904,34 +1826,15 @@ mod tests {
             serde_json::to_string(&gapped).unwrap()
         );
         assert!(
-            follow(
-                stream.as_bytes(),
-                &mut Vec::new(),
-                true,
-                Some(1),
-                &mut None,
-                &AtomicBool::new(false),
-                None
-            )
-            .unwrap_err()
-            .message
-            .contains("gap")
+            follow_any(stream.as_bytes(), &mut Vec::new(), true, Some(1), &mut None)
+                .unwrap_err()
+                .message
+                .contains("gap")
         );
         let mut invalid = page.clone();
         invalid.cursor.schema = "unpublished".into();
         let stream = kronik_fleet::events::sse_cursor(&invalid).unwrap();
-        assert!(
-            follow(
-                stream.as_bytes(),
-                &mut Vec::new(),
-                true,
-                Some(1),
-                &mut None,
-                &AtomicBool::new(false),
-                None
-            )
-            .is_err()
-        );
+        assert!(follow_any(stream.as_bytes(), &mut Vec::new(), true, Some(1), &mut None).is_err());
         let mut mismatched = page.clone();
         let position = mismatched.cursor.streams.remove("actor-7").unwrap();
         mismatched
@@ -1939,18 +1842,7 @@ mod tests {
             .streams
             .insert("metadata".into(), position);
         let stream = kronik_fleet::events::sse_cursor(&mismatched).unwrap();
-        assert!(
-            follow(
-                stream.as_bytes(),
-                &mut Vec::new(),
-                true,
-                Some(1),
-                &mut None,
-                &AtomicBool::new(false),
-                None
-            )
-            .is_err()
-        );
+        assert!(follow_any(stream.as_bytes(), &mut Vec::new(), true, Some(1), &mut None).is_err());
         let wrong = ResumeCursor::new(page.cursor.identity.clone());
         let stream = format!(
             "id: {}\nevent: cursor\ndata: {}\n\n",
@@ -1958,14 +1850,12 @@ mod tests {
             serde_json::to_string(&page).unwrap()
         );
         let mut checkpoint = None;
-        let error = follow(
+        let error = follow_any(
             stream.as_bytes(),
             &mut Vec::new(),
             true,
             None,
             &mut checkpoint,
-            &AtomicBool::new(false),
-            None,
         )
         .unwrap_err();
         assert!(error.message.contains("disagree"));
@@ -1975,14 +1865,12 @@ mod tests {
             serde_json::to_string(&page).unwrap()
         );
         assert!(
-            follow(
+            follow_any(
                 stream.as_bytes(),
                 &mut Vec::new(),
                 true,
                 None,
                 &mut checkpoint,
-                &AtomicBool::new(false),
-                None
             )
             .is_err()
         );
@@ -2017,18 +1905,7 @@ mod tests {
             ),
         ] {
             let mut out = Vec::new();
-            assert!(
-                follow(
-                    stream.as_bytes(),
-                    &mut out,
-                    true,
-                    Some(1),
-                    &mut None,
-                    &AtomicBool::new(false),
-                    None
-                )
-                .is_err()
-            );
+            assert!(follow_any(stream.as_bytes(), &mut out, true, Some(1), &mut None).is_err());
             assert!(out.is_empty());
         }
         struct BrokenOutput;
@@ -2042,14 +1919,12 @@ mod tests {
         }
         let stream = kronik_fleet::events::sse_event(&event, &cursor).unwrap();
         assert!(
-            follow(
+            follow_any(
                 stream.as_bytes(),
                 &mut BrokenOutput,
                 true,
                 Some(1),
                 &mut None,
-                &AtomicBool::new(false),
-                None
             )
             .is_err()
         );

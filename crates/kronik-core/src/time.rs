@@ -11,6 +11,7 @@
 use std::sync::Mutex;
 
 use crate::env::Clock;
+use crate::sync::lock;
 
 pub struct LogicalClock {
     hwm: Mutex<u64>,
@@ -33,7 +34,7 @@ impl LogicalClock {
     /// carries `parent` (0 for root inputs).
     pub fn next(&self, clock: &dyn Clock, parent: u64) -> u64 {
         let wall = clock.wall_ms();
-        let mut hwm = self.hwm.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hwm = lock(&self.hwm);
         let t = wall.max(*hwm).max(parent);
         *hwm = t;
         t
@@ -41,7 +42,7 @@ impl LogicalClock {
 
     /// The largest time handed out so far.
     pub fn high_water(&self) -> u64 {
-        *self.hwm.lock().unwrap_or_else(|e| e.into_inner())
+        *lock(&self.hwm)
     }
 }
 

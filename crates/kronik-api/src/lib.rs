@@ -37,6 +37,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::{ActorRef, CodeHash, TurnId};
+use kronik_core::sync::lock;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{Node, TurnResult};
 use serde::Serialize;
@@ -236,13 +237,6 @@ mod reason_tests {
         let err = super::reason(&"r".repeat(4097)).unwrap_err();
         assert_eq!(err.code, kronik_core::error::ErrorCode::BadRequest);
         assert!(err.hint.unwrap().starts_with("Shorten the reason"));
-    }
-}
-
-fn sealable_bytes(s: Option<&pb::Sealable>) -> Vec<u8> {
-    match s.and_then(|s| s.value.as_ref()) {
-        Some(pb::sealable::Value::Plain(b)) => b.clone(),
-        _ => Vec::new(),
     }
 }
 
@@ -551,10 +545,8 @@ fn request_line(e: &pb::EffectRecord) -> Option<String> {
     if !matches!(e.kind.as_str(), "http.fetch" | "foreign.http") {
         return None;
     }
-    let Some(pb::sealable::Value::Plain(bytes)) = e.request.as_ref()?.value.as_ref() else {
-        return None;
-    };
-    let r = pb::HttpEffectRequest::decode(bytes.as_slice()).ok()?;
+    let bytes = e.request.as_ref()?.plain()?;
+    let r = pb::HttpEffectRequest::decode(bytes).ok()?;
     let rest = r
         .url
         .split_once("://")
@@ -616,7 +608,7 @@ fn payload_json(b: &[u8]) -> serde_json::Value {
 fn sealable_json(s: Option<&pb::Sealable>) -> serde_json::Value {
     serde_json::json!({
         "subject": s.and_then(|s| s.subject.clone()),
-        "value": payload_json(&sealable_bytes(s)),
+        "value": payload_json(s.and_then(pb::Sealable::plain).unwrap_or_default()),
     })
 }
 
@@ -814,9 +806,11 @@ pub(crate) fn accept_subprotocol(v: &mut serde_json::Value, t: &pb::TurnRecord, 
         .headers
         .iter()
         .filter(|h| h.name.eq_ignore_ascii_case("sec-websocket-protocol"))
-        .filter_map(|h| match h.value.as_ref().and_then(|v| v.value.as_ref()) {
-            Some(pb::sealable::Value::Plain(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-            _ => None,
+        .filter_map(|h| {
+            h.value
+                .as_ref()
+                .and_then(pb::Sealable::plain)
+                .map(|b| String::from_utf8_lossy(b).into_owned())
         })
         .collect();
     let offered =
@@ -932,7 +926,7 @@ fn turn_json(branch: &str, lsn: u64, t: &pb::TurnRecord) -> TurnJson {
         "sql_schema": t.sql_schema.iter().map(|s| s.statement.clone()).collect::<Vec<_>>(),
         "sql_changes": t.sql_changes.iter().map(|c| serde_json::json!({
             "subject": c.changeset.as_ref().and_then(|s| s.subject.clone()),
-            "bytes": sealable_bytes(c.changeset.as_ref()).len(),
+            "bytes": c.changeset.as_ref().and_then(pb::Sealable::plain).map_or(0, <[u8]>::len),
         })).collect::<Vec<_>>(),
         "fuel_used": t.fuel_used,
         "memory_peak_bytes": t.memory_peak_bytes,
@@ -1757,11 +1751,7 @@ impl Api {
                 .sql
                 .get(&actor.to_string())
                 .map_err(internal)?;
-            let rows = db
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .table_rows()
-                .map_err(internal)?;
+            let rows = lock(&db).table_rows().map_err(internal)?;
             Some(SqlSummary {
                 tables: rows
                     .into_iter()

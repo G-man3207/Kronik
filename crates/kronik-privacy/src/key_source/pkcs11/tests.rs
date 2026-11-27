@@ -32,6 +32,21 @@ fn envelope(cfg: &Pkcs11) -> Wrapped {
     }
 }
 
+/// `config()` with an owned PIN file at `dir/pin` (0600) and the shell
+/// script `script` as the helper at `dir/helper` (0700).
+#[cfg(target_os = "linux")]
+fn script_helper(dir: &Path, script: &str) -> Pkcs11 {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut cfg = config();
+    cfg.helper_path = dir.join("helper");
+    cfg.pin_file = dir.join("pin");
+    std::fs::write(&cfg.pin_file, b"owned-test-pin\n").unwrap();
+    std::fs::set_permissions(&cfg.pin_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(&cfg.helper_path, script).unwrap();
+    std::fs::set_permissions(&cfg.helper_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    cfg
+}
+
 #[test]
 fn identity_survives_module_and_helper_security_updates() {
     let cfg = config();
@@ -254,13 +269,7 @@ fn envelope_metadata_and_typed_payload_cannot_select_a_different_key() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn real_owned_failure_process_is_reaped_before_classification() {
-    use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = config();
-    cfg.helper_path = dir.path().join("failure-helper");
-    cfg.pin_file = dir.path().join("pin");
-    std::fs::write(&cfg.pin_file, b"owned-test-pin\n").unwrap();
-    std::fs::set_permissions(&cfg.pin_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     let pid_file = dir.path().join("pid");
     let env = Env::real(tokio::runtime::Handle::current());
     for (body, expected) in [
@@ -281,8 +290,7 @@ async fn real_owned_failure_process_is_reaped_before_classification() {
             pid_file.display(),
             body
         );
-        std::fs::write(&cfg.helper_path, script).unwrap();
-        std::fs::set_permissions(&cfg.helper_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cfg = script_helper(dir.path(), &script);
         let failure = decrypt(&env, &cfg, &envelope(&cfg)).await.unwrap_err();
         assert_eq!(failure, expected);
         let pid = std::fs::read_to_string(&pid_file).unwrap();
@@ -298,17 +306,12 @@ async fn real_owned_failure_process_is_reaped_before_classification() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn malformed_metadata_and_missing_probe_never_start_the_helper() {
-    use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = config();
-    cfg.helper_path = dir.path().join("must-not-start");
     let marker = dir.path().join("started");
-    std::fs::write(
-        &cfg.helper_path,
-        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&cfg.helper_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut cfg = script_helper(
+        dir.path(),
+        &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    );
     let env = Env::real(tokio::runtime::Handle::current());
     let mut wrapped = envelope(&cfg);
     wrapped.key_version = "untrusted".into();
@@ -331,19 +334,12 @@ async fn malformed_metadata_and_missing_probe_never_start_the_helper() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn existing_probe_enrollment_cannot_silently_replace_a_rejected_key() {
-    use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = config();
-    cfg.helper_path = dir.path().join("reject-replacement");
-    cfg.pin_file = dir.path().join("pin");
-    std::fs::write(&cfg.pin_file, b"owned-test-pin\n").unwrap();
-    std::fs::set_permissions(&cfg.pin_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     // A failure-process fixture, not an HSM or a successful-crypto substitute.
     let script = format!(
         "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{{\"schema\":\"{SCHEMA}\",\"ok\":false,\"code\":\"authentication\"}}'\n"
     );
-    std::fs::write(&cfg.helper_path, script).unwrap();
-    std::fs::set_permissions(&cfg.helper_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let cfg = script_helper(dir.path(), &script);
     let env = Env::real(tokio::runtime::Handle::current());
     let expected = cfg.probe.as_ref().unwrap().ciphertext.clone();
     assert_eq!(
@@ -360,21 +356,14 @@ async fn startup_pin_failure_is_not_retried_and_never_persists_a_seed() {
         KeySource, KeySourceError,
         config::{Keys, Source},
     };
-    use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = config();
-    cfg.helper_path = dir.path().join("pin-failure");
-    cfg.pin_file = dir.path().join("pin");
     let attempts = dir.path().join("attempts");
-    std::fs::write(&cfg.pin_file, b"owned-test-pin\n").unwrap();
-    std::fs::set_permissions(&cfg.pin_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     // Repeating a rejected PIN could lock the token; this child never claims crypto success.
     let script = format!(
         "#!/bin/sh\nprintf 'x' >> '{}'\ncat >/dev/null\nprintf '%s' '{{\"schema\":\"{SCHEMA}\",\"ok\":false,\"code\":\"pin\"}}'\n",
         attempts.display()
     );
-    std::fs::write(&cfg.helper_path, script).unwrap();
-    std::fs::set_permissions(&cfg.helper_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let cfg = script_helper(dir.path(), &script);
     let keys = Keys {
         source: Source::Pkcs11,
         pkcs11: Some(cfg),

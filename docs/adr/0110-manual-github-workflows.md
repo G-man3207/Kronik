@@ -53,7 +53,10 @@ proof, and the workflow must not grow a dispatch path that pretends to be one.
 ## Consequences
 
 - A pull request is not checked on GitHub unless someone starts CI on that
-  ref. `scripts/ci.sh` is the check to run before pushing.
+  ref. `scripts/ci.sh` is the check to run before pushing. A local
+  pre-commit hook runs formatting, hygiene and cargo-deny
+  ([ADR 0163](0163-commit-hook-and-duplicate-crates.md)). It does not start
+  a hosted run, and `git commit --no-verify` skips it.
 - The WASI 0.3 gate job no longer reports every night. It still runs when the
   nightly workflow is started, and its unit tests still run in `scripts/ci.sh
   action`. The job and its unit tests were later removed when the gate became

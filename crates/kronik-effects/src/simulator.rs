@@ -275,15 +275,10 @@ pub struct RecordedNeighbor {
     candidates: Vec<Neighbor>,
 }
 
-fn plain_bytes(s: Option<&pb::Sealable>) -> Option<&[u8]> {
-    let s = s?;
-    if s.subject.is_some() {
-        return None;
-    }
-    match s.value.as_ref()? {
-        pb::sealable::Value::Plain(b) => Some(b),
-        pb::sealable::Value::Sealed(_) => None,
-    }
+/// A plain value without a subject, else `None`: the model never sees a
+/// value with a subject, sealed or not.
+pub fn plain_bytes(s: Option<&pb::Sealable>) -> Option<&[u8]> {
+    s.filter(|s| s.subject.is_none())?.plain()
 }
 
 /// The comparable items of a request: path segments by position, query

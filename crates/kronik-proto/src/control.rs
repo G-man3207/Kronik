@@ -768,17 +768,7 @@ mod tests {
             "../tests/fixtures/control-fleet-pending-v1.json"
         ))
         .unwrap();
-        let bytes = |field: &str| {
-            fixture[field]
-                .as_str()
-                .unwrap()
-                .as_bytes()
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-                .collect()
-        };
+        let bytes = |field: &str| crate::unhex(fixture[field].as_str().unwrap());
         pb::FleetState {
             installation: fixture["installation"].as_str().unwrap().into(),
             node: None,
@@ -803,17 +793,7 @@ mod tests {
             include_str!("../tests/fixtures/auth-session-revoked-native-v1.json")
         })
         .unwrap();
-        let bytes = |value: &serde_json::Value| {
-            value
-                .as_str()
-                .unwrap()
-                .as_bytes()
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-                .collect()
-        };
+        let bytes = |value: &serde_json::Value| crate::unhex(value.as_str().unwrap());
         let config_source = if member {
             pb::auth_session_revoked::ConfigSource::MetadataIndex(
                 fixture["config_source"]["metadata_index"].as_u64().unwrap(),
@@ -899,15 +879,7 @@ mod tests {
                 include_str!("../tests/fixtures/auth-oidc-login-native-v1.json")
             })
             .unwrap();
-            let wire = fixture["wire_hex"]
-                .as_str()
-                .unwrap()
-                .as_bytes()
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-                .collect::<Vec<_>>();
+            let wire = crate::unhex(fixture["wire_hex"].as_str().unwrap());
             assert_eq!(login.encode_to_vec(), wire);
             let operation = Operation::AuthOidcLogin(login);
             assert_eq!(

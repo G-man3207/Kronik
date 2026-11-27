@@ -502,33 +502,6 @@ fn a_reader_that_is_overtaken_every_time_is_not_captured_in_a_hot_loop() {
     });
 }
 
-#[test]
-fn a_failed_cursor_save_cannot_escape_through_an_unrelated_stream_save() {
-    let dir = tempfile::tempdir().unwrap();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let env = Env::real(rt.handle().clone());
-    let cursors = rt.block_on(Cursors::load(env.clone(), dir.path())).unwrap();
-    let entry = |lsn| kronik_otel::cursor::Entry {
-        lsn,
-        state: serde_json::json!({"checkpoint": lsn}),
-        ..Default::default()
-    };
-    rt.block_on(cursors.save("traces", entry(1))).unwrap();
-    let temporary = dir.path().join("export.json.tmp");
-    std::fs::create_dir(&temporary).unwrap();
-    assert!(rt.block_on(cursors.save("traces", entry(2))).is_err());
-    assert_eq!(cursors.get("traces").unwrap().lsn, 1);
-    std::fs::remove_dir(temporary).unwrap();
-    rt.block_on(cursors.save("audit", entry(5))).unwrap();
-    let restored = rt.block_on(Cursors::load(env, dir.path())).unwrap();
-    assert_eq!(restored.get("traces").unwrap().lsn, 1);
-    assert_eq!(restored.get("traces").unwrap().state["checkpoint"], 1);
-    assert_eq!(restored.get("audit").unwrap().lsn, 5);
-}
-
 /// Review M3: a backlog of large records is read in batches of at most
 /// `BATCH_BYTES`, however many records the count allows.
 #[test]

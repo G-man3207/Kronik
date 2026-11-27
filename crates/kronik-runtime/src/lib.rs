@@ -31,14 +31,14 @@ pub const KRONIK_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `wasmtime` does not export its own version. This literal is the version the
 /// workspace pins; a test checks it against the Wasmtime packages in
 /// `Cargo.lock`, including the transitive `wasmtime-environ`.
-pub const WASMTIME_VERSION: &str = "50.0.1";
+pub const WASMTIME_VERSION: &str = "50.0.3";
 
 /// The engine version, `kronik-<Kronik version>+wasmtime-<Wasmtime version>`.
 ///
 /// The Wasmtime part repeats [`WASMTIME_VERSION`] because `concat!` cannot
 /// read a constant. A test checks that the two agree.
 pub const ENGINE_VERSION: &str =
-    concat!("kronik-", env!("CARGO_PKG_VERSION"), "+wasmtime-", "50.0.1",);
+    concat!("kronik-", env!("CARGO_PKG_VERSION"), "+wasmtime-", "50.0.3",);
 
 #[cfg(test)]
 mod tests {

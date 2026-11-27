@@ -587,8 +587,7 @@ mod tests {
             assert!(message.contains("microvm_dir"), "{message}");
         }
     }
-    use kronik_core::env::{BoxFuture, Fs, OpenMode};
-    use std::sync::Arc;
+    use kronik_core::env::test_fs::{FsCall, Then, hooked};
 
     const IMAGE_DIGEST: &str =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -787,37 +786,6 @@ mod tests {
         assert!(scan(root.path()).is_err());
     }
 
-    struct NoSpace(Arc<dyn Fs>);
-    impl Fs for NoSpace {
-        fn create_dir_all(&self, p: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-            self.0.create_dir_all(p)
-        }
-        fn open(
-            &self,
-            p: PathBuf,
-            m: OpenMode,
-        ) -> BoxFuture<'static, io::Result<Arc<dyn kronik_core::env::File>>> {
-            self.0.open(p, m)
-        }
-        fn exists(&self, p: PathBuf) -> BoxFuture<'static, io::Result<bool>> {
-            self.0.exists(p)
-        }
-        fn read_dir(&self, p: PathBuf) -> BoxFuture<'static, io::Result<Vec<String>>> {
-            self.0.read_dir(p)
-        }
-        fn rename(&self, p: PathBuf, q: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-            self.0.rename(p, q)
-        }
-        fn remove_file(&self, p: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-            self.0.remove_file(p)
-        }
-        fn sync_dir(&self, p: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-            self.0.sync_dir(p)
-        }
-        fn available(&self, _: PathBuf) -> BoxFuture<'static, io::Result<u64>> {
-            Box::pin(async { Err(io::Error::from_raw_os_error(libc::ENOSPC)) })
-        }
-    }
     #[tokio::test]
     async fn enospc_and_sparse_existing_data_never_modify_source_or_reformat() {
         let (_tools, assets) = fixture();
@@ -826,7 +794,11 @@ mod tests {
         fs::create_dir(&source).unwrap();
         tree(&source);
         let mut env = Env::real(tokio::runtime::Handle::current());
-        env.fs = Arc::new(NoSpace(env.fs.clone()));
+        // Real files, but no free space.
+        env.fs = hooked(env.fs.clone(), |call| match call {
+            FsCall::Available(_) => Then::Fail(io::Error::from_raw_os_error(libc::ENOSPC)),
+            _ => Then::Forward,
+        });
         let out = dir.path().join("data.ext4");
         assert!(
             data(&env, &assets, &source, &out, 123, 456, 0)

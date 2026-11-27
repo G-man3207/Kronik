@@ -34,7 +34,7 @@ prost-build = { workspace = true }
 protox = { workspace = true }
 
 [dev-dependencies]
-kronik-core = { workspace = true, features = ["real"] }
+kronik-core = { workspace = true, features = ["real", "test-util"] }
 protox = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

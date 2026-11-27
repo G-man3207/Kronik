@@ -44,11 +44,6 @@ async fn snapshots_and_integrity() {
 
     let (s, v) = call(&api, "GET", "/v1/snapshots", Value::Null).await;
     assert_eq!((s, v["snapshots"].as_array().unwrap().len()), (200, 0));
-    let (s, v) = call(&api, "POST", "/v1/snapshots", json!({"reason": ""})).await;
-    assert_eq!(
-        (s, v["error"]["code"].as_str()),
-        (400, Some("REASON_REQUIRED"))
-    );
     let (s, v) = call(
         &api,
         "POST",

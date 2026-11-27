@@ -7,7 +7,6 @@ mod common;
 
 use common::*;
 use kronik_core::ids::ActorRef;
-use kronik_fork::diff::DiffOptions;
 use kronik_fork::proposal::{Proposals, ProposeRequest};
 use kronik_privacy::sealer::Opened;
 use kronik_proto::Record;
@@ -70,14 +69,8 @@ fn a_fork_log_tombstones_plaintext_from_before_a_come_back_subjects_erasure() {
     let (prop, dry) =
         p.rt.block_on(props.propose(
             ProposeRequest {
-                wasm: vec![std::fs::read(guest("counter-step2")).unwrap()],
-                names: Vec::new(),
-                window_ms: None,
                 at: Some(fork_lsn),
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
+                ..propose_request(vec![std::fs::read(guest("counter-step2")).unwrap()])
             },
             p.owner(),
         ))

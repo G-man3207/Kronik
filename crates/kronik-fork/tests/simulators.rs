@@ -12,7 +12,7 @@ use common::*;
 use kronik_core::error::ErrorCode;
 use kronik_effects::InForks;
 use kronik_fork::diff::DiffOptions;
-use kronik_fork::proposal::Proposals;
+use kronik_fork::proposal::{Proposals, ProposeRequest};
 use kronik_fork::simulators::{ModelAccess, ModelCache, ModelSecretSnapshot, SimulatorOverride};
 use kronik_fork::stubs::StubRule;
 use kronik_policy::{Action, RuleSet};
@@ -421,23 +421,14 @@ fn a_dry_run_proposal_calls_no_model_and_writes_nothing() {
             .unwrap()
             .with_model(Some(model(&model_addr))),
     );
-    let branches = |p: &std::path::Path| {
-        std::fs::read_dir(p.join("branches"))
-            .map(|d| d.count())
-            .unwrap_or(0)
-    };
+    let branches = |p: &std::path::Path| branch_names(p).len();
     let before = branches(dir.path());
     let err =
         p.rt.block_on(props.propose(
-            kronik_fork::proposal::ProposeRequest {
-                wasm: vec![std::fs::read(guest("counter-fetch-extra")).unwrap()],
-                names: vec![],
-                window_ms: None,
+            ProposeRequest {
                 at: Some(fork_lsn),
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
                 dry_run: true,
+                ..propose_request(vec![std::fs::read(guest("counter-fetch-extra")).unwrap()])
             },
             p.owner(),
         ))
@@ -445,24 +436,6 @@ fn a_dry_run_proposal_calls_no_model_and_writes_nothing() {
     assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
     assert_eq!(seen.lock().unwrap().len(), 0, "no model call");
     assert_eq!(branches(dir.path()), before, "nothing under branches/");
-}
-
-/// Every file under `dir` with its bytes.
-fn files(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-    let mut out = Vec::new();
-    let mut todo = vec![dir.to_path_buf()];
-    while let Some(d) = todo.pop() {
-        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            let path = e.path();
-            if path.is_dir() {
-                todo.push(path);
-            } else {
-                out.push((path.clone(), std::fs::read(&path).unwrap()));
-            }
-        }
-    }
-    out.sort();
-    out
 }
 
 /// Review L1 (I12): `promote --dry-run` replays and catches up without
@@ -484,15 +457,9 @@ fn a_dry_run_promote_calls_no_model_and_writes_nothing() {
     );
     let (meta, _) =
         p.rt.block_on(props.propose(
-            kronik_fork::proposal::ProposeRequest {
-                wasm: vec![std::fs::read(guest("counter-fetch-extra")).unwrap()],
-                names: vec![],
-                window_ms: None,
+            ProposeRequest {
                 at: Some(fork_lsn),
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
+                ..propose_request(vec![std::fs::read(guest("counter-fetch-extra")).unwrap()])
             },
             p.owner(),
         ))
@@ -934,6 +901,14 @@ fn model_taint(
         })
         .collect();
     by_route.sort();
+    // Every synthetic answer has a simulator (review N12-6).
+    let labeled: u64 = d["summary"]["synthetic_by"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|n| n.as_u64().unwrap())
+        .sum();
+    assert_eq!(d["summary"]["synthetic"], labeled, "{d}");
     let requests = seen.lock().unwrap().len();
     (by_route, d["summary"]["synthetic_by"].clone(), requests)
 }
@@ -986,7 +961,8 @@ fn the_model_declines_after_personal_data_from_any_path() {
 /// turn, not only a signature the fork computed. With a `recorded` grant,
 /// the default of a new grant (ADR 0112), the unmatched HMAC is denied and
 /// graded `fail-closed` itself; a reveal answers its placeholder. Neither
-/// turn's extra GET is sent to the model; the plain turn's is.
+/// turn's extra GET is sent to the model; the plain turn's is. A reveal
+/// where production revealed nothing is labeled `placeholder` (review N12-6).
 #[test]
 fn the_model_declines_after_a_denied_signature_or_a_reveal() {
     let (by_route, synthetic_by, seen) = model_taint(
@@ -1012,39 +988,6 @@ fn the_model_declines_after_a_denied_signature_or_a_reveal() {
         "{by_route:?}"
     );
     assert_eq!(seen, 1);
-}
-
-/// Review N12-6: a fork's reveal where production revealed nothing is
-/// labeled `placeholder`, so every synthetic answer has a simulator and
-/// summary.synthetic is the sum of synthetic_by.
-#[test]
-fn an_unmatched_fork_reveal_is_labeled() {
-    let (addr, _hits) = server();
-    let dir = tempdir();
-    let p = Proc::start(dir.path());
-    p.grant("http:127.0.0.1");
-    p.grant("secret-reveal:k");
-    p.node
-        .secrets()
-        .unwrap()
-        .set_at("k", 1, b"v-1", [7; 24], 0, "t", "r")
-        .unwrap();
-    let fork_lsn = p.settle();
-    p.http(
-        "a",
-        "fetch-ok",
-        &format!("POST http://{addr}/v1/charges/a\nT reveal k\n\namount=1"),
-    );
-    p.settle();
-    let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
-    fork(&p, &props, "try", fork_lsn);
-    let d: Value = serde_json::from_slice(&replay(&p, &props, "try")).unwrap();
-    assert_eq!(
-        d["summary"]["synthetic_by"],
-        json!({"fail-closed": 1, "placeholder": 1}),
-        "{d}"
-    );
-    assert_eq!(d["summary"]["synthetic"], 2, "{d}");
 }
 
 /// Review N12-7: privacy mode in force at the fork point counts, also when

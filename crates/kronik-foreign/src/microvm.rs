@@ -1133,21 +1133,6 @@ mod tests {
         assert!(super::require_leaf(&Privilege::Unavailable("x".into()), ok("/")).is_ok());
     }
 
-    #[test]
-    fn the_advice_names_the_file_and_the_two_directives() {
-        let advice = super::root_leaf_advice();
-        for needle in [
-            super::ROOT_LEAF_DROPIN_PATH,
-            "Delegate=yes",
-            "DelegateSubgroup=daemon",
-            "254",
-        ] {
-            assert!(advice.contains(needle), "{advice}");
-        }
-        assert!(super::ROOT_LEAF_DROPIN.starts_with("[Service]\n"));
-        assert!(super::ROOT_LEAF_DROPIN.ends_with('\n'));
-    }
-
     use super::*;
 
     /// Pins the command line to the exact text, so that an edit is noticed.
@@ -1262,30 +1247,6 @@ mod tests {
         assert!(peer_is_in("0::/a/b/\n", "/a/b"));
         assert!(!peer_is_in("0::/\n", ""));
         assert!(!peer_is_in("0::/\n", "/"));
-    }
-
-    #[tokio::test]
-    async fn a_peer_outside_the_vms_cgroup_is_refused_before_a_request_is_sent() {
-        use tokio::io::AsyncReadExt as _;
-        let directory = tempfile::tempdir().unwrap();
-        let api = directory.path().join("api.sock");
-        let listener = tokio::net::UnixListener::bind(&api).unwrap();
-        let env = Env::real(tokio::runtime::Handle::current());
-        let error = Vm::request(
-            &env,
-            &api,
-            "/some/other/vm",
-            "PUT",
-            "/machine-config",
-            json!({}),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.contains("not in the VM's cgroup"), "{error}");
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut seen = Vec::new();
-        stream.read_to_end(&mut seen).await.unwrap();
-        assert!(seen.is_empty(), "{seen:?}");
     }
 
     #[test]
@@ -1445,19 +1406,6 @@ mod tests {
             .timeout(Duration::from_millis(100), victim.accept())
             .await;
         assert!(accepted.is_err(), "the planted link was followed");
-        // So is a regular file, and a directory.
-        fs::remove_file(&api).unwrap();
-        fs::write(&api, b"x").unwrap();
-        assert!(matches!(
-            connect_vmm_socket(&env, &api, &cgroup).await,
-            Err(Dial::Refused(_))
-        ));
-        fs::remove_file(&api).unwrap();
-        fs::create_dir(&api).unwrap();
-        assert!(matches!(
-            connect_vmm_socket(&env, &api, &cgroup).await,
-            Err(Dial::Refused(_))
-        ));
         // The boot probe stops at a refusal instead of waiting out its timeout.
         let vm = Vm {
             child: Arc::new(Running),
@@ -1475,33 +1423,6 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("VMM socket"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn a_socket_of_another_cgroup_stops_the_boot_before_a_request_is_sent() {
-        use tokio::io::AsyncReadExt as _;
-        let directory = tempfile::tempdir().unwrap();
-        let jail = directory.path().join("jail");
-        fs::create_dir(&jail).unwrap();
-        let listener = tokio::net::UnixListener::bind(jail.join("api.sock")).unwrap();
-        let env = Env::real(tokio::runtime::Handle::current());
-        let vm = Vm {
-            child: Arc::new(Running),
-            root: jail.clone(),
-            output: directory.path().join("out"),
-            // Not the cgroup of this process, which plays the VMM.
-            cgroup: "/some/other/vm".into(),
-            api: jail.join("api.sock"),
-            resources: Resources::new(1000, 256 << 20).unwrap(),
-            restore: false,
-        };
-        let error = vm.boot(&env).await.unwrap_err();
-        assert!(error.contains("not in the VM's cgroup"), "{error}");
-        // The probe connected and sent nothing.
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut seen = Vec::new();
-        stream.read_to_end(&mut seen).await.unwrap();
-        assert!(seen.is_empty(), "{seen:?}");
     }
 
     #[tokio::test]

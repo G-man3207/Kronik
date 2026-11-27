@@ -28,19 +28,6 @@ fn guest(name: &str) -> String {
     )
 }
 
-/// The settings `kronik serve` and the CLI read from the environment,
-/// cleared so that the developer's shell can't change the tests.
-const SETTINGS_ENV: [&str; 8] = [
-    "KRONIK_CONFIG",
-    "KRONIK_DATA_DIR",
-    "KRONIK_HTTP_LISTEN",
-    "KRONIK_ADMIN_LISTEN",
-    "KRONIK_API_SOCKET",
-    "KRONIK_MASTER_KEY_FILE",
-    "KRONIK_MASTER_KEY",
-    "KRONIK_TOKEN",
-];
-
 /// Where the API socket is: beside the data directory, inside it, or inside
 /// it in a directory that does not exist yet, both paths relative to the
 /// working directory.
@@ -89,7 +76,7 @@ impl Serve {
             }
             None => Command::new(KRONIK),
         };
-        for var in SETTINGS_ENV {
+        for var in common::SETTINGS_ENV {
             command.env_remove(var);
         }
         let log_file = std::fs::File::create(dir.path().join("serve.log")).unwrap();
@@ -128,11 +115,7 @@ impl Serve {
     }
 
     fn cli(&self, args: &[&str]) -> Output {
-        let mut command = Command::new(KRONIK);
-        for var in SETTINGS_ENV {
-            command.env_remove(var);
-        }
-        command
+        common::command()
             .arg("--socket")
             .arg(&self.socket)
             .args(args)

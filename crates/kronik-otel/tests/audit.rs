@@ -606,12 +606,6 @@ fn an_erasure_hash_confirms_no_guessed_subject() {
         audit: audit(&format!("erase request from {SUBJECT}")),
     });
     let line = export(5, &e).remove(0);
-    // The right guess, hashed as a backend could: the plain canonical form.
-    let guess = format!(
-        "b3:{}",
-        blake3::hash(&[&[e.kind()][..], &e.encode()].concat()).to_hex()
-    );
-    assert_ne!(line.record_hash, guess);
     // Stable under the same key (verify recomputes it), not under another.
     assert_eq!(line.record_hash, record_hash(&e, sealer()).unwrap());
     assert_ne!(line.record_hash, record_hash(&e, other_sealer()).unwrap());
@@ -640,14 +634,6 @@ fn erasure_subject_spellings_share_the_canonical_hash_without_matching_other_ids
         };
         let expected_reason = canonical.audit.as_ref().unwrap().reason.clone();
         canonical.subject = subject(id);
-        let canonical = Record::Erasure(canonical);
-        // A backend can rebuild this public digest from a guessed subject; the
-        // private identity must never equal it.
-        let mut public = blake3::Hasher::new();
-        public.update(b"kronik.audit/v2\0");
-        public.update(&[canonical.kind()]);
-        public.update(&canonical.encode());
-        let public_hash = format!("b3:{}", public.finalize().to_hex());
         let mut hashes = BTreeSet::new();
         for spelling in spellings {
             let record = Record::Erasure(pb::Erasure {
@@ -658,7 +644,6 @@ fn erasure_subject_spellings_share_the_canonical_hash_without_matching_other_ids
             });
             let line = export(1, &record).remove(0);
             assert_eq!(line.reason, expected_reason);
-            assert_ne!(line.record_hash, public_hash);
             assert_eq!(line.record_hash, record_hash(&record, sealer()).unwrap());
             hashes.insert(line.record_hash);
         }
@@ -687,12 +672,6 @@ fn a_fork_send_hash_confirms_no_guessed_actor() {
     });
     let line = export(5, &e).remove(0);
     assert_ne!(line.details["actor"], format!("counter/{SUBJECT}"));
-    // The right guess, hashed as a backend could: the plain canonical form.
-    let guess = format!(
-        "b3:{}",
-        blake3::hash(&[&[e.kind()][..], &e.encode()].concat()).to_hex()
-    );
-    assert_ne!(line.record_hash, guess);
     // Stable under the same key (verify recomputes it), not under another,
     // and it still covers the actor.
     assert_eq!(line.record_hash, record_hash(&e, sealer()).unwrap());

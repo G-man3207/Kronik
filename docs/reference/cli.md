@@ -1140,7 +1140,7 @@ configuration epoch. The output shows every limit in force afterwards.
   `100M`.
 - `<SIZE>` is bytes, optionally with `Ki`, `Mi`, `Gi` or `Ti` (powers of
   1024) or `k`, `M`, `G` or `T` (powers of 1000), e.g. `128Mi`.
-- `<DURATION>` is a number with `ms`, `s`, `m` or `h`, e.g. `10s`.
+- `<DURATION>` is a number with `ms`, `s`, `m`, `h` or `d`, e.g. `10s`.
 
 | Option | Limit | Default |
 | --- | --- | --- |

@@ -6,6 +6,16 @@
 use crate::Record;
 use crate::log::v1 as pb;
 
+impl pb::Sealable {
+    /// The plain bytes, or `None` when the value is sealed or missing.
+    pub fn plain(&self) -> Option<&[u8]> {
+        match self.value.as_ref()? {
+            pb::sealable::Value::Plain(bytes) => Some(bytes),
+            pb::sealable::Value::Sealed(_) => None,
+        }
+    }
+}
+
 /// A `Sealable` visitor.
 pub type Visit<'a> = &'a mut dyn FnMut(&mut pb::Sealable);
 

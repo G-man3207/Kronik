@@ -8,7 +8,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{Proc, audit, start_proc};
+use common::{Proc, audit, msg, start_proc};
 use kronik_proto::log::v1 as pb;
 use kronik_sched::NodeConfig;
 
@@ -19,19 +19,6 @@ const COUNTER: &str = concat!(
 
 fn start(dir: &Path) -> Proc {
     start_proc(dir, NodeConfig::default())
-}
-
-fn msg(name: &str) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(Vec::new())),
-        }),
-        blobs: vec![],
-        retained_compensation_source: None,
-    }
 }
 
 #[test]
@@ -45,9 +32,12 @@ fn erasure_replaces_older_snapshots_and_a_rebuild_drops_the_subject() {
             .unwrap();
         let actor = kronik_core::ids::ActorRef::parse("counter/a").unwrap();
         let turn =
-            p.rt.block_on(p.node.send(actor, msg("subject"), audit(), false, owner()))
-                .unwrap()
-                .unwrap();
+            p.rt.block_on(
+                p.node
+                    .send(actor, msg("subject", ""), audit(), false, owner()),
+            )
+            .unwrap()
+            .unwrap();
         assert!(turn.committed());
         let old = p.rt.block_on(p.node.snapshot("manual", owner())).unwrap();
         let old_dir = dir

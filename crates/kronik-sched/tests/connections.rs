@@ -15,16 +15,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    Proc, audit, install_component, log_records, open_request, point_open_turn_at, start_proc,
-    text_frame, wait_turn,
+    Proc, audit, log_records, open_request, repoint_open_turn, start_proc, text_frame, wait_parked,
+    wait_turn,
 };
-use kronik_core::env::Env;
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::connections::{Recording, RecordingTransport};
-use kronik_sched::{NodeConfig, TurnResult, start_local};
+use kronik_sched::{NodeConfig, TurnResult};
 
 const ROOM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/room.wasm");
 const ROOM_BARE: &str = concat!(
@@ -959,14 +958,9 @@ fn send_now_hands_frames_over_during_the_turn() {
 #[test]
 fn a_full_queue_times_out_send_now_and_closes_the_connection() {
     let dir = tempfile::tempdir().unwrap();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let config = NodeConfig {
+    let p = start_proc(
+        dir.path(),
+        NodeConfig {
             concurrency: 8,
             connections: kronik_sched::connections::ConnectionsConfig {
                 // The welcome (88 bytes) fits; 18 tokens fill the rest.
@@ -974,10 +968,8 @@ fn a_full_queue_times_out_send_now_and_closes_the_connection() {
                 ..Default::default()
             },
             ..NodeConfig::default()
-        };
-        start_local(env, dir.path(), config).await.unwrap()
-    });
-    let p = Proc { rt, node };
+        },
+    );
     p.deploy(ROOM, false).unwrap();
     grant_send_now(&p);
     p.rt.block_on(p.node.set_limits(
@@ -1035,21 +1027,14 @@ fn a_crash_after_send_now_gives_outcome_unknown_and_never_resends() {
     for (cmd, safe) in [("stream 3", false), ("stream-safe 3", true)] {
         let dir = tempfile::tempdir().unwrap();
         let a = {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .unwrap();
-            let node = rt.block_on(async {
-                let env = Env::real(tokio::runtime::Handle::current());
-                let config = NodeConfig {
+            let p = start_proc(
+                dir.path(),
+                NodeConfig {
                     concurrency: 8,
                     test_hold_after_send_now: true,
                     ..NodeConfig::default()
-                };
-                start_local(env, dir.path(), config).await.unwrap()
-            });
-            let p = Proc { rt, node };
+                },
+            );
             p.deploy(ROOM, false).unwrap();
             grant_send_now(&p);
             let (a, ta) = p.join("lobby", "ada");
@@ -1235,14 +1220,9 @@ fn a_crash_rerun_with_a_different_send_now_frame_traps_and_is_not_written_again(
         let armed = dir.path().join("hold-armed");
         let reached = dir.path().join("hold-reached");
 
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let node = rt.block_on(async {
-            let env = Env::real(tokio::runtime::Handle::current());
-            let config = NodeConfig {
+        let p = start_proc(
+            dir.path(),
+            NodeConfig {
                 concurrency: 8,
                 test_hold: Some(kronik_sched::TestHold {
                     point: kronik_sched::HoldPoint::BeforeCommit,
@@ -1250,10 +1230,8 @@ fn a_crash_rerun_with_a_different_send_now_frame_traps_and_is_not_written_again(
                     reached: reached.clone(),
                 }),
                 ..NodeConfig::default()
-            };
-            start_local(env, dir.path(), config).await.unwrap()
-        });
-        let p = Proc { rt, node };
+            },
+        );
         p.deploy(ROOM, false).unwrap();
         grant_send_now(&p);
         let (conn, client) = p.join("lobby", "ada");
@@ -1262,30 +1240,7 @@ fn a_crash_rerun_with_a_different_send_now_frame_traps_and_is_not_written_again(
         std::fs::write(&armed, b"armed").unwrap();
         p.frame(&conn, "stream 1");
 
-        let mut open = None;
-        for _ in 0..500 {
-            // `db()`'s guard lives to the semicolon; locking it again here deadlocks.
-            let turns = p.node.store().db().open_turns().unwrap();
-            open = turns.into_iter().find(|t| {
-                reached.exists()
-                    && p.node
-                        .store()
-                        .db()
-                        .open_effects(&t.execution_id)
-                        .unwrap()
-                        .iter()
-                        .any(|e| {
-                            e.kind == "connection.send-now"
-                                && e.status == pb::EffectStatus::Ok as i32
-                        })
-            });
-            if open.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let open = open
-            .unwrap_or_else(|| panic!("{diverge}: the turn never parked with a recorded send-now"));
+        let open = wait_parked(&p, &reached, "connection.send-now");
         // The frame was handed to the client before the result was recorded.
         let seen = frames(&client.recording());
         assert_eq!(
@@ -1302,16 +1257,13 @@ fn a_crash_rerun_with_a_different_send_now_frame_traps_and_is_not_written_again(
         drop(p);
 
         if diverge {
-            let hash = install_component(dir.path(), &std::fs::read(ROOM_FRAME_V2).unwrap());
-            point_open_turn_at(dir.path(), &execution_id, &hash, lsn, segment);
-            let begin = log_records(dir.path())
-                .into_iter()
-                .find_map(|r| match r {
-                    Record::TurnBegin(b) if b.execution_id == execution_id => Some(b),
-                    _ => None,
-                })
-                .expect("the rewritten TurnBegin");
-            assert_eq!(begin.code_hash, hash);
+            repoint_open_turn(
+                dir.path(),
+                &execution_id,
+                &std::fs::read(ROOM_FRAME_V2).unwrap(),
+                lsn,
+                segment,
+            );
         }
         let before = send_now_results(&log_records(dir.path()), &execution_id);
         assert_eq!(before.len(), 1, "{diverge}");

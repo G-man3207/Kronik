@@ -8,6 +8,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use kronik_core::causal;
 use kronik_core::ids::{ActorRef, CodeHash, Lsn};
+use kronik_core::sync::lock;
 use kronik_effects::http::target_of;
 use kronik_privacy::sealer::Sealer;
 use kronik_proto::Record;
@@ -914,17 +915,10 @@ fn bytes_json(b: &[u8]) -> Value {
     }
 }
 
-fn sealable_bytes(s: Option<&pb::Sealable>) -> Option<&[u8]> {
-    match s.and_then(|s| s.value.as_ref()) {
-        Some(pb::sealable::Value::Plain(b)) => Some(b),
-        _ => None,
-    }
-}
-
 /// A sealable value: redacted when it has a subject.
 fn sealable_json(sealer: &Sealer, s: Option<&pb::Sealable>) -> Value {
     let Some(s) = s else { return Value::Null };
-    let bytes = sealable_bytes(Some(s)).unwrap_or_default();
+    let bytes = s.plain().unwrap_or_default();
     if let Some(subject) = &s.subject {
         return redacted(sealer, subject, bytes);
     }
@@ -1106,7 +1100,7 @@ impl Norm {
     }
 
     fn body_key(&self, s: Option<&pb::Sealable>) -> Vec<u8> {
-        let Some(b) = sealable_bytes(s) else {
+        let Some(b) = s.and_then(pb::Sealable::plain) else {
             return s.map(|s| s.encode_to_vec()).unwrap_or_default();
         };
         match self.json_body(b) {
@@ -1123,7 +1117,9 @@ impl Norm {
                 continue;
             }
             out.entry(name).or_default().push(
-                sealable_bytes(x.value.as_ref())
+                x.value
+                    .as_ref()
+                    .and_then(pb::Sealable::plain)
                     .unwrap_or_default()
                     .to_vec(),
             );
@@ -1451,7 +1447,7 @@ impl ConnOp {
 /// (a denial).
 fn send_now_op(e: &pb::EffectRecord) -> Option<ConnOp> {
     let request = e.request.as_ref()?;
-    let r = pb::ConnectionSendRequest::decode(sealable_bytes(Some(request))?).ok()?;
+    let r = pb::ConnectionSendRequest::decode(request.plain()?).ok()?;
     let delivered = u64::from(e.status == pb::EffectStatus::Ok as i32);
     Some(ConnOp {
         send_now: true,
@@ -1550,7 +1546,8 @@ fn frame_value(sealer: &Sealer, s: Option<&pb::Sealable>, v: &Value) -> Value {
 /// operations when both sides are JSON, with the values of a side that has
 /// a subject redacted; otherwise one operation at `""` with each value.
 fn frame_data_ops(n: &Norm, p: Option<&pb::Sealable>, f: Option<&pb::Sealable>) -> Vec<BodyOp> {
-    let json = |s: Option<&pb::Sealable>| sealable_bytes(s).and_then(|b| n.json_body(b));
+    let json =
+        |s: Option<&pb::Sealable>| s.and_then(pb::Sealable::plain).and_then(|b| n.json_body(b));
     if let (Some(a), Some(b)) = (json(p), json(f)) {
         let mut out = Vec::new();
         json_diff("", Some(&a), Some(&b), &mut out);
@@ -1657,7 +1654,7 @@ fn http_request(e: &pb::EffectRecord) -> Option<pb::HttpEffectRequest> {
     if e.kind != "http.fetch" && e.kind != "foreign.http" {
         return None;
     }
-    pb::HttpEffectRequest::decode(sealable_bytes(e.request.as_ref())?).ok()
+    pb::HttpEffectRequest::decode(e.request.as_ref().and_then(pb::Sealable::plain)?).ok()
 }
 
 /// (kind, method, host, route) of an external effect.
@@ -1850,8 +1847,8 @@ fn json_diff(path: &str, a: Option<&Value>, b: Option<&Value>, out: &mut Vec<Bod
 }
 
 fn body_ops(n: &Norm, p: Option<&pb::Sealable>, f: Option<&pb::Sealable>) -> Vec<BodyOp> {
-    let pb_ = sealable_bytes(p).unwrap_or_default();
-    let fb = sealable_bytes(f).unwrap_or_default();
+    let pb_ = p.and_then(pb::Sealable::plain).unwrap_or_default();
+    let fb = f.and_then(pb::Sealable::plain).unwrap_or_default();
     let redacted = p.is_some_and(|s| s.subject.is_some()) || f.is_some_and(|s| s.subject.is_some());
     if !redacted && let (Some(a), Some(b)) = (n.json_body(pb_), n.json_body(fb)) {
         let mut out = Vec::new();
@@ -2178,7 +2175,9 @@ impl Acc {
                         && callee_key(e.ordinal).is_some_and(|k| callee_committed(&k)))
             })
             .filter(|e| {
-                sealable_bytes(e.request.as_ref())
+                e.request
+                    .as_ref()
+                    .and_then(pb::Sealable::plain)
                     .and_then(|b| pb::CallEffectRequest::decode(b).ok())
                     .is_none_or(|r| r.compensate.is_none())
             })
@@ -2931,7 +2930,7 @@ impl Acc {
                         .insert(x.key.clone(), (x.op, x.value.clone()));
                 }
                 for c in &t.sql_changes {
-                    if let Some(b) = sealable_bytes(c.changeset.as_ref())
+                    if let Some(b) = c.changeset.as_ref().and_then(pb::Sealable::plain)
                         && let Ok(mut rows) = changeset_rows(b)
                     {
                         // A subject's rows are its data: like state values,
@@ -3161,7 +3160,7 @@ fn actor_rows(store: &Store, actor: &str) -> Result<Vec<TableRows>, ReplayError>
         .sql
         .get(actor)
         .map_err(|e| ReplayError::Host(e.to_string()))?;
-    let g = db.lock().unwrap_or_else(|e| e.into_inner());
+    let g = lock(&db);
     g.canonical_rows()
         .map_err(|e| ReplayError::Host(e.to_string()))
 }
@@ -3213,7 +3212,7 @@ impl StateTouches {
             self.keys.insert((actor.clone(), w.key.clone()));
         }
         for c in &t.sql_changes {
-            let Some(b) = sealable_bytes(c.changeset.as_ref()) else {
+            let Some(b) = c.changeset.as_ref().and_then(pb::Sealable::plain) else {
                 continue;
             };
             let Ok(rows) = changeset_rows(b) else {

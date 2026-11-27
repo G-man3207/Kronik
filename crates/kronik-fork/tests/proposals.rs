@@ -28,14 +28,8 @@ fn propose(
     let (prop, dry) =
         p.rt.block_on(props.propose(
             ProposeRequest {
-                wasm: vec![bytes],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
                 options,
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
+                ..propose_request(vec![bytes])
             },
             p.owner(),
         ))
@@ -94,12 +88,11 @@ fn a_replay_asking_for_more_workers_than_the_pool_holds_is_clamped() {
         assert!(out.committed(), "counter/c{i}: {:?}", out.outcome);
     }
     p.settle();
+    let limit = kronik_sched::pool::replay_workers_in(p.node.instance_pool());
     assert!(
-        p.node.replay_worker_limit() < 64,
-        "the test needs a pool with less than 64 workers' room, it has {}",
-        p.node.replay_worker_limit()
+        limit < 64,
+        "the test needs a pool with less than 64 workers' room, it has {limit}"
     );
-    let limit = p.node.replay_worker_limit();
     let props = Arc::new(Proposals::open(p.node.clone(), dir.path().to_path_buf()).unwrap());
     assert_eq!(props.replay_workers(Some(64)), limit);
     assert_eq!(props.replay_workers(Some(usize::MAX)), limit);
@@ -112,14 +105,8 @@ fn a_replay_asking_for_more_workers_than_the_pool_holds_is_clamped() {
     let (prop, dry) =
         p.rt.block_on(props.propose(
             ProposeRequest {
-                wasm: vec![std::fs::read(guest("counter-step2")).unwrap()],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
                 workers: Some(64),
-                audit: audit(),
-                dry_run: false,
+                ..propose_request(vec![std::fs::read(guest("counter-step2")).unwrap()])
             },
             p.owner(),
         ))
@@ -803,16 +790,7 @@ fn held_job(
     );
     let (running, dry) =
         p.rt.block_on(props.propose_job(
-            ProposeRequest {
-                wasm: vec![std::fs::read(guest("counter-step2")).unwrap()],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
-                workers: Some(2),
-                audit: audit(),
-                dry_run: false,
-            },
+            propose_request(vec![std::fs::read(guest("counter-step2")).unwrap()]),
             false,
             p.owner(),
         ))
@@ -979,14 +957,8 @@ fn proposal_save_failure_never_publishes_or_starts_a_job() {
     let e =
         p.rt.block_on(props.propose_job(
             ProposeRequest {
-                wasm: vec![std::fs::read(guest("counter-step2")).unwrap()],
-                names: Vec::new(),
-                window_ms: None,
-                at: None,
-                options: DiffOptions::default(),
-                workers: Some(2),
                 audit: audit.clone(),
-                dry_run: false,
+                ..propose_request(vec![std::fs::read(guest("counter-step2")).unwrap()])
             },
             false,
             p.owner(),

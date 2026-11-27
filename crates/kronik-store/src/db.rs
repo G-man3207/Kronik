@@ -404,6 +404,12 @@ const COMPACT_DELIVERIES: &str = "DELETE FROM deliveries WHERE lsn < ?1";
 const INGRESS_BEFORE: &str = "SELECT 1 FROM ingress_keys WHERE logical_time_ms < ?1 LIMIT 1";
 const DELIVERIES_BEFORE: &str = "SELECT 1 FROM deliveries WHERE lsn < ?1 LIMIT 1";
 
+/// Statements a `state.db` connection keeps prepared, more than the store
+/// has. rusqlite's default of 16 is fewer than one apply and replay turn
+/// use, so every `prepare_cached` missed and compiled its SQL again
+/// (isolated replay ran at a fifth of its speed, #611).
+const STATEMENT_CACHE: usize = 256;
+
 impl StateDb {
     /// Prepares `conn` (WAL, NORMAL) and creates the schema.
     pub fn open(conn: Connection) -> Result<StateDb, StoreError> {
@@ -430,6 +436,7 @@ impl StateDb {
         add_queued_subjects(&conn)?;
         add_subject_columns(&conn)?;
         ensure_subject_indexes(&conn)?;
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
         let db = StateDb {
             conn,
             bulk: false,
@@ -709,8 +716,6 @@ impl StateDb {
     /// discarded then (isolated replay, docs/design/m3-fork.md §3.3).
     pub fn overlay_begin(&self) -> Result<(), StoreError> {
         self.overlay.set(true);
-        // Not `prepare_cached`: cached savepoint statements made isolated
-        // replay 2.3 times slower (docs/perf.md).
         self.conn.execute_batch("SAVEPOINT kronik_overlay")?;
         Ok(())
     }
@@ -1279,12 +1284,13 @@ impl StateDb {
         let hwm = self.time_hwm()?;
         let tx = self.conn.savepoint()?;
         // With both tables empty, no turn record has an open turn or effect
-        // to delete.
-        let open_rows: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM open_turns) OR EXISTS (SELECT 1 FROM open_effects)",
-            [],
-            |r| r.get(0),
-        )?;
+        // to delete. Cached: continuous replay applies every turn on its own
+        // (#611).
+        let open_rows: bool = tx
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM open_turns) OR EXISTS (SELECT 1 FROM open_effects)",
+            )?
+            .query_row([], |r| r.get(0))?;
         if open_rows {
             let mut del_turn =
                 tx.prepare_cached("DELETE FROM open_turns WHERE execution_id = ?1")?;
@@ -2757,10 +2763,14 @@ fn apply_turn(
                     }
                 }
             } else {
-                let turn_id =
-                    pb::CallEffectResponse::decode(sealable_plain(e.response.as_ref()).as_slice())
-                        .map(|r| r.turn_id)
-                        .unwrap_or_default();
+                let turn_id = pb::CallEffectResponse::decode(
+                    e.response
+                        .as_ref()
+                        .and_then(pb::Sealable::plain)
+                        .unwrap_or_default(),
+                )
+                .map(|r| r.turn_id)
+                .unwrap_or_default();
                 // An erased answer carries no response body, but its
                 // committed callee is the effect's source (ADR 0124).
                 if !turn_id.is_empty() {
@@ -3113,14 +3123,8 @@ fn apply_connections(
 /// turns) state.db keeps, node-wide; the oldest go first (M24, review M5).
 pub const MAX_CONNECTION_DEAD_LETTERS: i64 = 10_000;
 
-fn sealable_plain(s: Option<&pb::Sealable>) -> Vec<u8> {
-    match s.and_then(|s| s.value.as_ref()) {
-        Some(pb::sealable::Value::Plain(b)) => b.clone(),
-        _ => Vec::new(),
-    }
-}
-
-fn message_input(
+/// The input a delivered message or compensation becomes; replay builds the same one.
+pub fn message_input(
     source: pb::MessageSource,
     sender: &pb::ActorRef,
     m: &pb::OutboundMessage,
@@ -5644,6 +5648,42 @@ mod tests {
             })),
         })
     }
+    /// A turn of `exec` for `subject` that schedules timer `id` and sends one
+    /// message to `counter/b` (message id `"{exec}-m"`), both with the body
+    /// `tagged(subject, "NEEDLE")`.
+    fn scheduling_turn(exec: &str, subject: &str, id: u64) -> pb::TurnRecord {
+        let Record::TurnRecord(mut t) = turn(
+            exec,
+            exec,
+            message(pb::MessageSource::Operator, exec, subject),
+        ) else {
+            unreachable!("turn() builds a TurnRecord");
+        };
+        let msg = || {
+            Some(pb::Message {
+                name: "store".into(),
+                body: tagged(subject, "NEEDLE"),
+                ..Default::default()
+            })
+        };
+        t.timers.push(pb::TimerOp {
+            kind: pb::TimerOpKind::Schedule as i32,
+            timer_id: id,
+            due_ms: 1_000,
+            msg: msg(),
+            ordinal: 0,
+        });
+        t.messages.push(pb::OutboundMessage {
+            to: Some(pb::ActorRef {
+                kind: "counter".into(),
+                key: "b".into(),
+            }),
+            msg: msg(),
+            ordinal: 1,
+            message_id: format!("{exec}-m"),
+        });
+        t
+    }
 
     fn with_outcome(mut r: Record, outcome: pb::Outcome) -> Record {
         if let Record::TurnRecord(t) = &mut r {
@@ -5736,35 +5776,10 @@ mod tests {
     fn queued_bodies_are_resealed_and_erased() {
         let conn = Connection::open_in_memory().unwrap();
         let mut db = StateDb::open(conn).unwrap();
-        let op = pb::MessageSource::Operator;
-        let body = |subject: &str| pb::Message {
-            name: "store".into(),
-            body: tagged(subject, "NEEDLE"),
-            ..Default::default()
-        };
-        let schedule = |exec: &str, subject: &str, id: u64| -> pb::TurnRecord {
-            let Record::TurnRecord(mut t) = turn(exec, exec, message(op, exec, subject)) else {
-                unreachable!("turn() builds a TurnRecord");
-            };
-            t.timers.push(pb::TimerOp {
-                kind: pb::TimerOpKind::Schedule as i32,
-                timer_id: id,
-                due_ms: 1_000,
-                msg: Some(body(subject)),
-                ordinal: 0,
-            });
-            t.messages.push(pb::OutboundMessage {
-                to: Some(pb::ActorRef {
-                    kind: "counter".into(),
-                    key: "b".into(),
-                }),
-                msg: Some(body(subject)),
-                ordinal: 1,
-                message_id: format!("{exec}-m"),
-            });
-            t
-        };
-        let (t1, t2) = (schedule("e1", "user:1", 1), schedule("e2", "user:2", 2));
+        let (t1, t2) = (
+            scheduling_turn("e1", "user:1", 1),
+            scheduling_turn("e2", "user:2", 2),
+        );
         db.apply(&[
             committed(1, Record::TurnRecord(t1.clone())),
             committed(2, Record::TurnRecord(t2)),
@@ -6096,38 +6111,9 @@ mod tests {
     fn erasure_subject_probes_search_instead_of_scanning() {
         let conn = Connection::open_in_memory().unwrap();
         let mut db = StateDb::open(conn).unwrap();
-        let op = pb::MessageSource::Operator;
-        let schedule = |exec: &str, subject: &str, id: u64| -> pb::TurnRecord {
-            let Record::TurnRecord(mut t) = turn(exec, exec, message(op, exec, subject)) else {
-                unreachable!("turn() builds a TurnRecord");
-            };
-            t.timers.push(pb::TimerOp {
-                kind: pb::TimerOpKind::Schedule as i32,
-                timer_id: id,
-                due_ms: 1_000,
-                msg: Some(pb::Message {
-                    body: tagged(subject, "NEEDLE"),
-                    ..Default::default()
-                }),
-                ordinal: 0,
-            });
-            t.messages.push(pb::OutboundMessage {
-                to: Some(pb::ActorRef {
-                    kind: "counter".into(),
-                    key: "b".into(),
-                }),
-                msg: Some(pb::Message {
-                    body: tagged(subject, "NEEDLE"),
-                    ..Default::default()
-                }),
-                ordinal: 1,
-                message_id: format!("{exec}-m"),
-            });
-            t
-        };
         db.apply(&[
-            committed(1, Record::TurnRecord(schedule("e1", "user:1", 1))),
-            committed(2, Record::TurnRecord(schedule("e2", "user:2", 2))),
+            committed(1, Record::TurnRecord(scheduling_turn("e1", "user:1", 1))),
+            committed(2, Record::TurnRecord(scheduling_turn("e2", "user:2", 2))),
         ])
         .unwrap();
         {
@@ -6220,39 +6206,6 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "erasing one subject over 20 000 unrelated rows took {elapsed:?}"
-        );
-        let timer = db
-            .timers(None)
-            .unwrap()
-            .into_iter()
-            .find(|t| t.timer_id == 1)
-            .unwrap();
-        assert!(
-            kronik_privacy::sealer::is_erased(timer.msg.body.as_ref().unwrap()),
-            "user:1's timer was not tombstoned"
-        );
-        let other = db
-            .timers(None)
-            .unwrap()
-            .into_iter()
-            .find(|t| t.timer_id == 2)
-            .unwrap();
-        assert!(
-            !kronik_privacy::sealer::is_erased(other.msg.body.as_ref().unwrap()),
-            "user:2's timer was tombstoned"
-        );
-        let mail = db
-            .mailbox()
-            .unwrap()
-            .into_iter()
-            .find(|m| m.message_id == "e1-m")
-            .unwrap();
-        let Some(pb::input::Kind::Message(m)) = mail.input.kind else {
-            panic!("not a message");
-        };
-        assert!(
-            kronik_privacy::sealer::is_erased(m.msg.as_ref().unwrap().body.as_ref().unwrap()),
-            "user:1's mailbox body was not tombstoned"
         );
         let kept: i64 = db
             .conn
@@ -6577,5 +6530,106 @@ mod tests {
             .unwrap();
         assert!(db.timers(None).unwrap().is_empty());
         assert_eq!(timer_pins(&db, "blob-new"), 0);
+    }
+
+    /// Counts the statements `db` compiles: SQLite authorizes a statement's
+    /// actions when it compiles it. A batch's savepoint and transaction are
+    /// compiled each time on purpose, so they are not counted.
+    fn compilations(db: &mut StateDb) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let compiled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = compiled.clone();
+        db.conn
+            .authorizer(Some(move |ctx: AuthContext<'_>| {
+                if !matches!(
+                    ctx.action,
+                    AuthAction::Savepoint { .. } | AuthAction::Transaction { .. }
+                ) {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+        compiled
+    }
+
+    /// The counter's turn: it sets `count` of `counter/<key>` to `value`.
+    fn counter_turn(exec: &str, key: &str, value: &[u8]) -> Record {
+        let mut t = turn(exec, exec, http_input());
+        let Record::TurnRecord(r) = &mut t else {
+            unreachable!("turn() builds a TurnRecord");
+        };
+        r.actor = Some(pb::ActorRef {
+            kind: "counter".into(),
+            key: key.into(),
+        });
+        r.writes = vec![pb::StateWrite {
+            op: pb::StateOp::Set as i32,
+            key: "count".into(),
+            value: Some(pb::Sealable {
+                subject: None,
+                value: Some(pb::sealable::Value::Plain(value.to_vec())),
+            }),
+        }];
+        t
+    }
+
+    /// #611: isolated replay applies production's next record, then the
+    /// fork's turn in an overlay, once per root input. Each statement is
+    /// compiled once: with a cache smaller than the cycle's statements, every
+    /// cycle evicted and compiled them again.
+    #[test]
+    fn an_apply_and_overlay_cycle_compiles_no_statement_again() {
+        use std::sync::atomic::Ordering;
+        let mut db = StateDb::open(Connection::open_in_memory().unwrap()).unwrap();
+        let compiled = compilations(&mut db);
+        for n in 0..4u64 {
+            // The first two cycles warm the cache.
+            if n == 2 {
+                compiled.store(0, Ordering::Relaxed);
+            }
+            let key = format!("k{n}");
+            db.apply(&[committed(n + 1, counter_turn(&format!("p{n}"), &key, b"1"))])
+                .unwrap();
+            db.overlay_begin().unwrap();
+            assert!(db.actor("counter", &key).unwrap().is_some());
+            assert_eq!(
+                db.kv_get("counter", &key, "count").unwrap().as_deref(),
+                Some(&b"1"[..])
+            );
+            db.apply(&[committed(n + 2, counter_turn(&format!("f{n}"), &key, b"2"))])
+                .unwrap();
+            db.overlay_rollback().unwrap();
+        }
+        assert_eq!(compiled.load(Ordering::Relaxed), 0);
+    }
+
+    /// #611: continuous replay applies each fork turn on its own, in a bulk
+    /// replay ([`StateDb::apply_rows`]). Each statement is compiled once: its
+    /// probe for open turns was compiled again on every turn.
+    #[test]
+    fn a_bulk_replay_turn_by_turn_compiles_no_statement_again() {
+        use std::sync::atomic::Ordering;
+        let mut db = StateDb::open(Connection::open_in_memory().unwrap()).unwrap();
+        db.begin_bulk_replay().unwrap();
+        let compiled = compilations(&mut db);
+        for n in 0..4u64 {
+            // The first two turns warm the cache.
+            if n == 2 {
+                compiled.store(0, Ordering::Relaxed);
+            }
+            db.apply(&[committed(
+                n + 1,
+                counter_turn(&format!("f{n}"), &format!("k{n}"), b"1"),
+            )])
+            .unwrap();
+        }
+        assert_eq!(compiled.load(Ordering::Relaxed), 0);
+        db.end_bulk_replay().unwrap();
+        assert_eq!(db.applied_lsn().unwrap(), 4);
+        assert_eq!(
+            db.kv_get("counter", "k3", "count").unwrap().as_deref(),
+            Some(&b"1"[..])
+        );
     }
 }

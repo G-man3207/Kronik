@@ -9,16 +9,18 @@ mod common;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
-use common::{Proc, audit, slow_server, start_proc, wait_turn};
-use kronik_blob::{BlobMeta, BlobStore, NoKeys, Space, StoreConfig};
+use common::{
+    Proc, audit, http, http_blob, http_text, slow_server, start_proc, start_proc_env, wait_turn,
+};
+use kronik_blob::{BlobStore, Space, StoreConfig};
 use kronik_core::env::Env;
+use kronik_core::env::test_fs::{FsCall, Then, hooked};
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{
-    BlobsConfig, BodyPolicy, Ingress, IngressExtras, NodeConfig, TurnResult, start_local,
-};
+use kronik_sched::{BlobsConfig, BodyPolicy, Ingress, IngressExtras, NodeConfig, TurnResult};
 
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
 
@@ -106,57 +108,16 @@ impl Proc {
             meta.to_pb()
         })
     }
-
-    fn stored(&self, dir: &Path, blob: &pb::BlobRef) -> Vec<u8> {
-        self.rt.block_on(async {
-            let store = BlobStore::open(
-                Env::real(tokio::runtime::Handle::current()),
-                dir,
-                StoreConfig::default(),
-            )
-            .await
-            .unwrap();
-            let reader = store
-                .reader(&Space::Main, &BlobMeta::from_pb(blob).unwrap(), &NoKeys)
-                .await
-                .unwrap();
-            reader.verify(&NoKeys).await.unwrap();
-            reader
-                .read_at(0, blob.size as usize)
-                .await
-                .unwrap()
-                .to_vec()
-        })
-    }
 }
 
 fn answer(r: &TurnResult) -> String {
     assert!(r.committed(), "{r:?}");
-    match &r.outcome.output {
-        Some(pb::outcome::Output::Http(h)) => {
-            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
-                Some(pb::body::Value::Inline(s)) => match &s.value {
-                    Some(pb::sealable::Value::Plain(b)) => String::from_utf8_lossy(b).into_owned(),
-                    other => panic!("{other:?}"),
-                },
-                other => panic!("not inline: {other:?}"),
-            }
-        }
-        other => panic!("{other:?}"),
-    }
+    http_text(r)
 }
 
 fn blob_answer(r: &TurnResult) -> pb::BlobRef {
     assert!(r.committed(), "{r:?}");
-    match &r.outcome.output {
-        Some(pb::outcome::Output::Http(h)) => {
-            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
-                Some(pb::body::Value::Blob(blob)) => blob.clone(),
-                other => panic!("not a blob: {other:?}"),
-            }
-        }
-        other => panic!("{other:?}"),
-    }
+    http_blob(r)
 }
 
 /// A blob the guest writes is the response: the turn's record holds only
@@ -259,25 +220,13 @@ fn without_a_blob_store_blob_functions_trap() {
 
 /// Answers every request with 200 "ok" and counts them. A peer of the
 /// node, outside its `Env`, so it runs on an OS thread of its own.
-#[allow(clippy::disallowed_methods)]
 fn counting_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-    use std::io::{BufRead as _, BufReader, Write as _};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
+    use std::io::Write as _;
     let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = count.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
-                line.clear();
-            }
-            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut stream = stream;
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-        }
+    let addr = http::serve(move |_, w| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = w.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
     });
     (addr, count)
 }
@@ -340,58 +289,31 @@ type Sunk = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
 /// A peer for the effect tests: `GET /bytes/<n>` answers `n` bytes of the
 /// `write` pattern; `POST /sink` keeps the request's head and body and
 /// answers 201.
-#[allow(clippy::disallowed_methods)]
 fn peer() -> (String, Sunk) {
-    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
+    use std::io::Write as _;
     let sunk = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = sunk.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let seen = seen.clone();
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut head = String::new();
-                let mut line = String::new();
-                while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
-                    head.push_str(&line);
-                    line.clear();
+    let addr = http::serve(move |req, stream| {
+        if let Some(n) = req.path.strip_prefix("/bytes/") {
+            let n: u64 = n.parse().unwrap();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n"
+            );
+            let mut at = 0;
+            while at < n {
+                let end = (at + 65_536).min(n);
+                let part: Vec<u8> = (at..end).map(pattern).collect();
+                if stream.write_all(&part).is_err() {
+                    return;
                 }
-                let len: usize = head
-                    .lines()
-                    .find_map(|l| {
-                        let (name, value) = l.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse().unwrap())
-                    })
-                    .unwrap_or(0);
-                let mut body = vec![0; len];
-                reader.read_exact(&mut body).unwrap();
-                let path = head.split_whitespace().nth(1).unwrap_or("").to_owned();
-                let mut stream = stream;
-                if let Some(n) = path.strip_prefix("/bytes/") {
-                    let n: u64 = n.parse().unwrap();
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n"
-                    );
-                    let mut at = 0;
-                    while at < n {
-                        let end = (at + 65_536).min(n);
-                        let part: Vec<u8> = (at..end).map(pattern).collect();
-                        if stream.write_all(&part).is_err() {
-                            return;
-                        }
-                        at = end;
-                    }
-                } else {
-                    seen.lock().unwrap().push((head, body));
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                    );
-                }
-            });
+                at = end;
+            }
+        } else {
+            seen.lock().unwrap().push((req.head, req.body));
+            let _ = stream.write_all(
+                b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            );
         }
     });
     (addr, sunk)
@@ -668,101 +590,52 @@ fn a_turn_that_fills_the_store_itself_stops_waiting() {
 /// Real files. Renames into `objects/` (naming a blob) fail with an I/O
 /// error while `fail` is set; otherwise they, and the syncs of `objects/`
 /// directories, are recorded in `events` in order.
-struct ObjectsFs {
-    inner: Arc<dyn kronik_core::env::Fs>,
+fn objects_fs(
+    fs: Arc<dyn kronik_core::env::Fs>,
     events: Arc<std::sync::Mutex<Vec<String>>>,
     fail: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl kronik_core::env::Fs for ObjectsFs {
-    fn create_dir_all(
-        &self,
-        path: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
-        self.inner.create_dir_all(path)
-    }
-    fn open(
-        &self,
-        path: std::path::PathBuf,
-        mode: kronik_core::env::OpenMode,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<Arc<dyn kronik_core::env::File>>>
-    {
-        self.inner.open(path, mode)
-    }
-    fn exists(
-        &self,
-        path: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<bool>> {
-        self.inner.exists(path)
-    }
-    fn read_dir(
-        &self,
-        dir: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<Vec<String>>> {
-        self.inner.read_dir(dir)
-    }
-    fn rename(
-        &self,
-        from: std::path::PathBuf,
-        to: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
-        if to.components().any(|c| c.as_os_str() == "objects") {
-            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Box::pin(async { Err(std::io::Error::other("injected EIO")) });
+) -> Arc<dyn kronik_core::env::Fs> {
+    hooked(fs, move |call| {
+        let objects = |path: &Path| path.components().any(|c| c.as_os_str() == "objects");
+        match call {
+            FsCall::Rename { to, .. } if objects(to) => {
+                if fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Then::Fail(std::io::Error::other("injected EIO"));
+                }
+                events
+                    .lock()
+                    .unwrap()
+                    .push(format!("named {}", to.display()));
             }
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("named {}", to.display()));
+            FsCall::SyncDir(dir) if objects(dir) => {
+                events
+                    .lock()
+                    .unwrap()
+                    .push(format!("synced {}", dir.display()));
+            }
+            _ => {}
         }
-        self.inner.rename(from, to)
-    }
-    fn remove_file(
-        &self,
-        path: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
-        self.inner.remove_file(path)
-    }
-    fn sync_dir(
-        &self,
-        dir: std::path::PathBuf,
-    ) -> kronik_core::env::BoxFuture<'static, std::io::Result<()>> {
-        if dir.components().any(|c| c.as_os_str() == "objects") {
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("synced {}", dir.display()));
-        }
-        self.inner.sync_dir(dir)
-    }
+        Then::Forward
+    })
 }
 
-/// A node with blobs whose files go through [`ObjectsFs`]; `media` deployed.
+/// A node with blobs whose files go through [`objects_fs`]; `media` deployed.
 fn start_on_objects_fs(
     dir: &Path,
     events: Arc<std::sync::Mutex<Vec<String>>>,
     fail: Arc<std::sync::atomic::AtomicBool>,
 ) -> Proc {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(async {
-        let mut env = Env::real(tokio::runtime::Handle::current());
-        env.fs = Arc::new(ObjectsFs {
-            inner: env.fs.clone(),
-            events,
-            fail,
-        });
-        let config = NodeConfig {
+    let p = start_proc_env(
+        dir,
+        NodeConfig {
             concurrency: 8,
             blobs: Some(BlobsConfig::default()),
             ..NodeConfig::default()
-        };
-        start_local(env, dir, config).await.unwrap()
-    });
-    let p = Proc { rt, node };
+        },
+        |env| {
+            env.fs = objects_fs(env.fs.clone(), events, fail);
+        },
+    );
     p.deploy_file(MEDIA);
     p
 }
@@ -939,7 +812,6 @@ fn version_3_rows_match_only_the_legacy_hash_of_an_inline_body() {
 /// M25 §6.2: an upload's lease lasts until the turn's result arrives (its
 /// record, which references the blob, is applied by then), and a saved
 /// answer ends it at once.
-#[allow(clippy::disallowed_methods)]
 #[test]
 fn an_upload_lease_lasts_until_the_turns_result() {
     let dir = tempfile::tempdir().unwrap();
@@ -955,22 +827,7 @@ fn an_upload_lease_lasts_until_the_turns_result() {
             .count()
     };
     // A server that answers after 500 ms keeps the turn running.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        use std::io::{BufRead as _, BufReader, Write as _};
-        for stream in listener.incoming().flatten() {
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
-                line.clear();
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let mut stream = stream;
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-        }
-    });
+    let addr = slow_server(Duration::from_millis(500));
     let mut slow = http(
         "fetch",
         "",

@@ -15,7 +15,6 @@ use kronik_fork::diff::{DiffOptions, Mode};
 use kronik_fork::proposal::Proposals;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::NodeConfig;
 use prost::Message as _;
 
 const SECRET: &str = "VALUE-fork-8e31d0";
@@ -292,13 +291,7 @@ fn a_fork_refuses_a_fetch_record_that_lacks_its_secret_version_without_a_reason(
     }
     let _ = std::fs::remove_dir_all(branch.join("sql"));
     let _ = std::fs::remove_dir_all(dir.path().join("snapshots"));
-    let p = Proc::open(
-        dir.path(),
-        NodeConfig {
-            concurrency: 8,
-            ..NodeConfig::default()
-        },
-    );
+    let p = Proc::reopen(dir.path());
     // A 503 for a certificate that is not there yet is not the answer under test.
     p.rt.block_on(async {
         tokio::time::timeout(

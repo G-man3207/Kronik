@@ -11,12 +11,12 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use common::{Proc, audit, start_proc, wait_turn};
+use common::{Proc, audit, http_blob, http_text, start_proc, wait_turn};
 use kronik_blob::{BlobId, BlobStore, Space, StoreConfig};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
-use kronik_sched::{BlobsConfig, NodeConfig, TurnResult, start_local};
+use kronik_sched::{BlobsConfig, NodeConfig, TurnResult};
 
 const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/media.wasm");
 
@@ -82,41 +82,9 @@ impl Proc {
     /// A blob the media guest writes as the response of a request of
     /// `subject`: the default subject of its turn, so the blob's.
     fn write(&self, subject: &str) -> pb::BlobRef {
-        let input = pb::HttpInput {
-            method: "POST".into(),
-            path: "/media/a/write".into(),
-            query: "size=200000&chunk=65536".into(),
-            body: Some(pb::Body {
-                value: Some(pb::body::Value::Inline(pb::Sealable {
-                    subject: Some(subject.into()),
-                    value: Some(pb::sealable::Value::Plain(Vec::new())),
-                })),
-            }),
-            ..Default::default()
-        };
-        let r: TurnResult = self.rt.block_on(async {
-            wait_turn(
-                self.node
-                    .ingress(
-                        ActorRef::parse("media/a").unwrap(),
-                        input,
-                        Some(subject.into()),
-                    )
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-        });
+        let r = self.run("write", "size=200000&chunk=65536", subject);
         assert!(r.committed(), "{r:?}");
-        match &r.outcome.output {
-            Some(pb::outcome::Output::Http(h)) => {
-                match h.body.as_ref().and_then(|b| b.value.clone()) {
-                    Some(pb::body::Value::Blob(blob)) => blob,
-                    other => panic!("not a blob: {other:?}"),
-                }
-            }
-            other => panic!("{other:?}"),
-        }
+        http_blob(&r)
     }
 
     fn path(&self, dir: &Path, space: &Space, blob: &pb::BlobRef) -> PathBuf {
@@ -479,7 +447,10 @@ fn the_first_pass_after_an_erasure_deletes_the_subjects_loose_plain_files() {
     p.rt.block_on(p.node.blob_gc(kronik_blob::SweepOptions::default()))
         .unwrap();
     assert_eq!(files_of(dir.path(), "user:1"), Vec::<bool>::new());
-    assert!(lease.is_live(), "the lease did not keep it");
+    assert!(
+        store.leases().holders().contains(&"upload"),
+        "the lease did not keep it"
+    );
 }
 
 /// The erasure is pending in `privacy status` until a collector pass after
@@ -525,36 +496,16 @@ fn an_erasure_is_pending_until_the_collector_is_done_with_its_subjects_loose_fil
     assert_eq!(pending(), 0);
     assert!(dir.path().join("blobs/erasures-swept").exists());
     drop(p);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let pending = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let config = NodeConfig {
+    let p = start_proc(
+        dir.path(),
+        NodeConfig {
             concurrency: 8,
             blobs: Some(BlobsConfig::default()),
             ..NodeConfig::default()
-        };
-        let node = start_local(env, dir.path(), config).await.unwrap();
-        node.pending_erasures().await.unwrap()
-    });
-    assert_eq!(pending, 0, "remembered over a restart");
-}
-
-/// The text of a turn's HTTP answer.
-fn answer_text(r: &TurnResult) -> String {
-    match &r.outcome.output {
-        Some(pb::outcome::Output::Http(h)) => match h.body.as_ref().and_then(|b| b.value.clone()) {
-            Some(pb::body::Value::Inline(s)) => match s.value {
-                Some(pb::sealable::Value::Plain(bytes)) => String::from_utf8(bytes).unwrap(),
-                other => panic!("not plain: {other:?}"),
-            },
-            other => panic!("not inline: {other:?}"),
         },
-        other => panic!("{r:?}: {other:?}"),
-    }
+    );
+    let pending = p.rt.block_on(p.node.pending_erasures()).unwrap();
+    assert_eq!(pending, 0, "remembered over a restart");
 }
 
 /// Review of B19 (B14's quota across an erasure; ADR 0119 as amended
@@ -584,7 +535,7 @@ fn an_erased_subjects_blobs_stop_counting_against_the_holders_quota() {
     let put = |size: u64, subject: &str| {
         let r = p.run("put", &format!("size={size}"), subject);
         assert!(r.committed(), "{r:?}");
-        answer_text(&r)
+        http_text(&r)
     };
     // user:1's two blobs, about 2 MiB of the 2.5 MiB quota.
     let first = put(1 << 20, "user:1");
@@ -620,25 +571,19 @@ fn an_erased_subjects_blobs_stop_counting_against_the_holders_quota() {
         let _ = std::fs::remove_file(main.join(f));
     }
     let _ = std::fs::remove_dir_all(dir.path().join("snapshots"));
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let rebuilt = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
-        let config = NodeConfig {
+    let p = start_proc(
+        dir.path(),
+        NodeConfig {
             concurrency: 8,
             blobs: Some(BlobsConfig::default()),
             ..NodeConfig::default()
-        };
-        let node = start_local(env, dir.path(), config).await.unwrap();
-        let db = node.store().db();
-        (
-            db.charged_bytes("media", "a").unwrap(),
-            db.erased_for_charge("media", "a", erased).unwrap(),
-        )
-    });
+        },
+    );
+    let db = p.node.store().db();
+    let rebuilt = (
+        db.charged_bytes("media", "a").unwrap(),
+        db.erased_for_charge("media", "a", erased).unwrap(),
+    );
     assert_eq!(
         rebuilt,
         (charged, true),

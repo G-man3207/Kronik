@@ -15,33 +15,11 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::time::Duration;
 
-use common::free_port;
+use common::{command, free_port};
 use serde_json::Value;
-
-const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
-
-fn command() -> Command {
-    let mut c = Command::new(KRONIK);
-    for var in [
-        "KRONIK_CONFIG",
-        "KRONIK_DATA_DIR",
-        "KRONIK_HTTP_LISTEN",
-        "KRONIK_ADMIN_LISTEN",
-        "KRONIK_API_SOCKET",
-        "KRONIK_API_LISTEN",
-        "KRONIK_TOKEN",
-        "KRONIK_MASTER_KEY_FILE",
-    ] {
-        c.env_remove(var);
-    }
-    // The tests' temporary file system may have less than the reserve.
-    c.env("KRONIK_DISK_RESERVE", "0B");
-    c.stdin(Stdio::null());
-    c
-}
 
 /// `kronik serve` with every directory in a temporary one; killed when
 /// dropped.

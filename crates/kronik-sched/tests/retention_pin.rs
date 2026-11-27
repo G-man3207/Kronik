@@ -10,13 +10,11 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read};
-use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use common::audit;
+use common::{audit, http, msg};
 use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
@@ -31,50 +29,13 @@ const COUNTER: &str = concat!(
 /// A server that reads a request and answers nothing for two minutes; the
 /// count of requests it read.
 fn hanging_server() -> (String, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
     let seen = Arc::new(AtomicUsize::new(0));
     let count = seen.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let count = count.clone();
-            std::thread::spawn(move || {
-                let mut r = BufReader::new(stream);
-                let mut len = 0usize;
-                loop {
-                    let mut line = String::new();
-                    if r.read_line(&mut line).unwrap_or(0) == 0 {
-                        return;
-                    }
-                    let line = line.trim_end().to_ascii_lowercase();
-                    if line.is_empty() {
-                        break;
-                    }
-                    if let Some(v) = line.strip_prefix("content-length:") {
-                        len = v.trim().parse().unwrap_or(0);
-                    }
-                }
-                let mut body = vec![0; len];
-                let _ = r.read_exact(&mut body);
-                count.fetch_add(1, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_secs(120));
-            });
-        }
+    let addr = http::serve(move |_, _| {
+        count.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_secs(120));
     });
     (addr, seen)
-}
-
-fn msg(name: &str, body: &str) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-        }),
-        blobs: vec![],
-        retained_compensation_source: None,
-    }
 }
 
 async fn send(node: &Node, actor: &str, name: &str, body: &str) {

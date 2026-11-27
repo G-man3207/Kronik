@@ -82,17 +82,7 @@ fn the_privacy_mode_is_recorded_and_survives_restart_and_rebuild() {
             })
         );
 
-        // A reason is required, and the mode is "on" or "off".
-        let (s, v) = d.call(
-            "POST",
-            "/v1/privacy/mode",
-            json!({"mode": "on", "reason": " "}),
-        );
-        assert_eq!(
-            (s, v["error"]["code"].as_str()),
-            (400, Some("REASON_REQUIRED")),
-            "{v}"
-        );
+        // The mode is "on" or "off".
         let (s, v) = d.call(
             "POST",
             "/v1/privacy/mode",

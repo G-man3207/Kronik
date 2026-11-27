@@ -1,16 +1,9 @@
 //! Host-side cryptography with secret values that never enter guest memory.
 
-use hmac::{KeyInit, Mac};
-
 /// HMAC-SHA256 of `data` under `key`.
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    // HMAC accepts keys of any length.
-    let mut mac = match hmac::Hmac::<sha2::Sha256>::new_from_slice(key) {
-        Ok(m) => m,
-        Err(_) => return Vec::new(),
-    };
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    ring::hmac::sign(&key, data).as_ref().to_vec()
 }
 
 /// An Ed25519 signature of `data` with the 32-byte seed in `secret` (raw, or

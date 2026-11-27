@@ -1033,6 +1033,42 @@ mod tests {
         })
     }
 
+    /// `GET /v1/events`, with no bearer or event id and a 5 s timeout, on a
+    /// socket whose server answers `raw`.
+    fn answer(raw: &[u8]) -> Result<Response, Failure> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let server = serve(&path, raw.to_vec());
+        let response = request(
+            &Endpoint::Unix(path),
+            "GET",
+            "/v1/events",
+            None,
+            None,
+            None,
+            Duration::from_secs(5),
+        );
+        server.join().unwrap();
+        response
+    }
+
+    /// A stream of `/v1/events/stream`, with no bearer or event id and never
+    /// cancelled, on a socket whose server answers `raw`.
+    fn streamed(raw: &[u8]) -> Result<StreamResponse, Failure> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let server = serve(&path, raw.to_vec());
+        let response = stream(
+            &Endpoint::Unix(path),
+            "/v1/events/stream",
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        server.join().unwrap();
+        response
+    }
+
     /// One `name: value` field of a raw head line, case-insensitively.
     fn field(line: &str, name: &str) -> Option<String> {
         let (field, value) = line.strip_suffix("\r\n")?.split_once(':')?;
@@ -1274,20 +1310,7 @@ mod tests {
             ),
             (b"HTTP/1.0 200 OK\r\n\r\nall of it", 200, &b"all of it"[..]),
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("api.sock");
-            let server = serve(&path, raw.to_vec());
-            let response = request(
-                &Endpoint::Unix(path),
-                "GET",
-                "/v1/events",
-                None,
-                None,
-                None,
-                Duration::from_secs(5),
-            )
-            .unwrap();
-            server.join().unwrap();
+            let response = answer(raw).unwrap();
             assert_eq!(response.status, status, "{}", String::from_utf8_lossy(raw));
             assert_eq!(response.body, body, "{}", String::from_utf8_lossy(raw));
         }
@@ -1296,22 +1319,7 @@ mod tests {
     /// N4: a body cut short is a broken connection (retried by `wait`).
     #[test]
     fn a_request_body_cut_short_is_a_broken_connection() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("api.sock");
-        let server = serve(
-            &path,
-            b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nshort".to_vec(),
-        );
-        let r = request(
-            &Endpoint::Unix(path),
-            "GET",
-            "/v1/events",
-            None,
-            None,
-            None,
-            Duration::from_secs(5),
-        );
-        server.join().unwrap();
+        let r = answer(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nshort");
         assert!(
             matches!(&r, Err(Failure::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof),
             "{r:?}"
@@ -1321,19 +1329,7 @@ mod tests {
     #[test]
     fn requests_reject_malformed_responses() {
         for raw in [&b"SSH-2.0-OpenSSH\r\n\r\n"[..], b"HTTP/1.1 OK\r\n\r\n"] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("api.sock");
-            let server = serve(&path, raw.to_vec());
-            let r = request(
-                &Endpoint::Unix(path),
-                "GET",
-                "/v1/events",
-                None,
-                None,
-                None,
-                Duration::from_secs(5),
-            );
-            server.join().unwrap();
+            let r = answer(raw);
             assert!(
                 matches!(r, Err(Failure::Malformed(_))),
                 "{}: {r:?}",
@@ -1411,22 +1407,8 @@ mod tests {
             assert_eq!(received, body);
             server.join().unwrap();
         }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("api.sock");
-        let server = serve(
-            &path,
-            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
-        );
-        let response = stream(
-            &Endpoint::Unix(path),
-            "/v1/events/stream",
-            None,
-            None,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap();
+        let response = streamed(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\n\r\n{}").unwrap();
         assert_eq!(response.status, 403);
-        server.join().unwrap();
     }
 
     #[test]
@@ -1437,17 +1419,7 @@ mod tests {
             b"HTTP/1.1 private\r\n\r\n",
             b"HTTP/1.1 200 OK\r\nprivate malformed\r\n\r\n",
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("api.sock");
-            let server = serve(&path, raw.to_vec());
-            let r = stream(
-                &Endpoint::Unix(path),
-                "/v1/events/stream",
-                None,
-                None,
-                Arc::new(AtomicBool::new(false)),
-            );
-            server.join().unwrap();
+            let r = streamed(raw);
             assert!(
                 r.is_err(),
                 "{}: {:?}",
@@ -1457,35 +1429,14 @@ mod tests {
         }
         // The response head stays bounded.
         let raw = format!("HTTP/1.1 200 OK\r\n{}\r\n", "X: value\r\n".repeat(10000));
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("api.sock");
-        let server = serve(&path, raw.into_bytes());
-        let r = stream(
-            &Endpoint::Unix(path),
-            "/v1/events/stream",
-            None,
-            None,
-            Arc::new(AtomicBool::new(false)),
-        );
-        server.join().unwrap();
+        let r = streamed(raw.as_bytes());
         assert!(r.is_err());
         for raw in [
             &b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort"[..],
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nz\r\n",
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nxx",
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("api.sock");
-            let server = serve(&path, raw.to_vec());
-            let mut response = stream(
-                &Endpoint::Unix(path),
-                "/v1/events/stream",
-                None,
-                None,
-                Arc::new(AtomicBool::new(false)),
-            )
-            .unwrap();
-            server.join().unwrap();
+            let mut response = streamed(raw).unwrap();
             assert!(
                 response.body.read_to_end(&mut Vec::new()).is_err(),
                 "{}",

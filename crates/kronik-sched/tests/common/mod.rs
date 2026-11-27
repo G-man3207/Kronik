@@ -8,13 +8,17 @@
 // Each test binary uses only part of this module.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
+pub mod http;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kronik_blob::{BlobMeta, BlobStore, NoKeys, Space, StoreConfig};
 use kronik_core::authority::AuthLease;
 use kronik_core::env::Env;
 use kronik_core::error::ApiError;
+use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{DeployResult, Ingress, Node, NodeConfig, TurnResult, start_local};
@@ -36,15 +40,45 @@ pub fn audit() -> pb::Audit {
     }
 }
 
+/// An operator's plain-text message `name` with `body`.
+pub fn msg(name: &str, body: impl AsRef<[u8]>) -> pb::Message {
+    pb::Message {
+        name: name.into(),
+        content_type: "text/plain".into(),
+        body: Some(pb::Sealable {
+            subject: None,
+            value: Some(pb::sealable::Value::Plain(body.as_ref().to_vec())),
+        }),
+        blobs: vec![],
+        retained_compensation_source: None,
+    }
+}
+
+/// The bytes of the test guest `name` (`tests/guests/<name>.wasm`).
+pub fn guest(name: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/../../tests/guests/{name}.wasm",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
+}
+
 /// Starts a node with `config` in `dir` on a new two-worker runtime.
 pub fn start_proc(dir: &Path, config: NodeConfig) -> Proc {
+    start_proc_env(dir, config, |_| {})
+}
+
+/// [`start_proc`], with `wrap` changing the node's environment first (a
+/// test clock or file system).
+pub fn start_proc_env(dir: &Path, config: NodeConfig, wrap: impl FnOnce(&mut Env)) -> Proc {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
     let node = rt.block_on(async {
-        let env = Env::real(tokio::runtime::Handle::current());
+        let mut env = Env::real(tokio::runtime::Handle::current());
+        wrap(&mut env);
         start_local(env, dir, config).await.unwrap()
     });
     Proc { rt, node }
@@ -55,6 +89,35 @@ pub async fn wait_turn(ingress: Ingress) -> Result<TurnResult, ApiError> {
     match ingress {
         Ingress::Started(w) | Ingress::Joined(w) => w.wait().await,
         Ingress::Done(r) => Ok(*r),
+    }
+}
+
+/// The plain text of an HTTP answer's inline body; panics on any other answer.
+pub fn http_text(r: &TurnResult) -> String {
+    match &r.outcome.output {
+        Some(pb::outcome::Output::Http(h)) => {
+            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
+                Some(pb::body::Value::Inline(s)) => match &s.value {
+                    Some(pb::sealable::Value::Plain(b)) => String::from_utf8_lossy(b).into_owned(),
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The blob of an HTTP answer's body; panics on any other answer.
+pub fn http_blob(r: &TurnResult) -> pb::BlobRef {
+    match &r.outcome.output {
+        Some(pb::outcome::Output::Http(h)) => {
+            match h.body.as_ref().and_then(|b| b.value.as_ref()) {
+                Some(pb::body::Value::Blob(blob)) => blob.clone(),
+                other => panic!("not a blob: {other:?}"),
+            }
+        }
+        other => panic!("{other:?}"),
     }
 }
 
@@ -70,6 +133,88 @@ impl Proc {
         self.rt
             .block_on(self.node.deploy(&bytes, audit(), false, self.owner()))
             .unwrap()
+    }
+
+    /// Every record of the log up to the applied LSN.
+    pub fn records(&self) -> Vec<Record> {
+        let mut out = Vec::new();
+        self.rt
+            .block_on(self.node.reader().read(1, self.node.applied_lsn(), |c| {
+                out.push(c.record);
+                Ok(())
+            }))
+            .unwrap();
+        out
+    }
+
+    /// `actor`'s value of key `k`, as text.
+    pub fn kv(&self, actor: &str, k: &str) -> Option<String> {
+        let a = ActorRef::parse(actor).unwrap();
+        self.node
+            .store()
+            .db()
+            .kv_get(&a.kind, &a.key, k)
+            .unwrap()
+            .map(|v| String::from_utf8(v).unwrap())
+    }
+
+    /// How many turns are open: begun, and not ended by a record.
+    pub fn open_turns(&self) -> usize {
+        self.node.store().db().open_turns().unwrap().len()
+    }
+
+    /// Waits up to 30 s for `f`; panics naming `what` after that.
+    pub fn wait_until(&self, what: &str, f: impl Fn(&Proc) -> bool) {
+        for _ in 0..3000 {
+            if f(self) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// The bytes of `blob`, read and verified from the store in `dir`.
+    pub fn stored(&self, dir: &Path, blob: &pb::BlobRef) -> Vec<u8> {
+        self.rt.block_on(async {
+            let store = BlobStore::open(
+                Env::real(tokio::runtime::Handle::current()),
+                dir,
+                StoreConfig::default(),
+            )
+            .await
+            .unwrap();
+            let reader = store
+                .reader(&Space::Main, &BlobMeta::from_pb(blob).unwrap(), &NoKeys)
+                .await
+                .unwrap();
+            reader.verify(&NoKeys).await.unwrap();
+            reader
+                .read_at(0, blob.size as usize)
+                .await
+                .unwrap()
+                .to_vec()
+        })
+    }
+
+    /// A blob of `bytes` written into the node's store as the gateway
+    /// writes an upload, made durable, its lease ended; no record
+    /// references it.
+    pub fn write_upload(&self, bytes: &[u8]) -> pb::BlobRef {
+        let store = self.node.blob_store().unwrap().clone();
+        self.rt.block_on(async move {
+            let mut w = store
+                .writer(Space::Main, None, u64::MAX, store.leases().take("upload"))
+                .await
+                .unwrap();
+            w.write(bytes).await.unwrap();
+            let meta = w.finish().await.unwrap();
+            store
+                .ensure_durable(&Space::Main, &[meta.id])
+                .await
+                .unwrap();
+            meta.to_pb()
+        })
     }
 }
 
@@ -163,6 +308,54 @@ pub fn point_open_turn_at(
         break;
     }
     assert!(found, "open turn {execution_id} was not in the log");
+}
+
+/// Waits up to 20 s until a turn parked by an armed `BeforeCommit` hold
+/// (`reached` exists) has a recorded effect of `kind` with status `Ok`,
+/// and returns that open turn.
+pub fn wait_parked(p: &Proc, reached: &Path, kind: &str) -> kronik_store::db::OpenTurn {
+    for _ in 0..2000 {
+        // `db()`'s guard lives to the semicolon; locking it again here deadlocks.
+        let turns = p.node.store().db().open_turns().unwrap();
+        let ready = turns.into_iter().find(|t| {
+            reached.exists()
+                && p.node
+                    .store()
+                    .db()
+                    .open_effects(&t.execution_id)
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.kind == kind && e.status == pb::EffectStatus::Ok as i32)
+        });
+        if let Some(turn) = ready {
+            return turn;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the turn never parked with a recorded {kind}");
+}
+
+/// Installs `wasm` and points the open turn `execution_id` (its
+/// `TurnBegin` at `lsn` in `segment`) at it; checks the rewritten
+/// `TurnBegin` and returns the new code hash.
+pub fn repoint_open_turn(
+    dir: &Path,
+    execution_id: &str,
+    wasm: &[u8],
+    lsn: u64,
+    segment: u64,
+) -> Vec<u8> {
+    let hash = install_component(dir, wasm);
+    point_open_turn_at(dir, execution_id, &hash, lsn, segment);
+    let begin = log_records(dir)
+        .into_iter()
+        .find_map(|r| match r {
+            Record::TurnBegin(b) if b.execution_id == execution_id => Some(b),
+            _ => None,
+        })
+        .expect("the rewritten TurnBegin");
+    assert_eq!(begin.code_hash, hash);
+    hash
 }
 
 pub fn text_frame(text: &str) -> pb::Frame {

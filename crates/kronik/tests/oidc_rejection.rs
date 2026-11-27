@@ -13,15 +13,14 @@ mod common;
 #[path = "../../kronik-api/tests/common/oidc_provider.rs"]
 mod oidc_provider;
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use common::{command, read_answer};
 use serde_json::{Value, json};
-
-const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 
 /// Modes the fixture can mint, and that the callback must reject. `signature`
 /// is a key that is not the published one. `algorithm` is RS384. `azp` lists
@@ -38,80 +37,6 @@ const REJECTED: [&str; 9] = [
     "nbf",
     "jku",
 ];
-
-fn command() -> Command {
-    let mut command = Command::new(KRONIK);
-    for var in [
-        "KRONIK_CONFIG",
-        "KRONIK_DATA_DIR",
-        "KRONIK_HTTP_LISTEN",
-        "KRONIK_ADMIN_LISTEN",
-        "KRONIK_API_SOCKET",
-        "KRONIK_API_LISTEN",
-        "KRONIK_TOKEN",
-        "KRONIK_MASTER_KEY_FILE",
-        "KRONIK_MASTER_KEY",
-    ] {
-        command.env_remove(var);
-    }
-    command.env("KRONIK_DISK_RESERVE", "0B");
-    command.stdin(Stdio::null());
-    command
-}
-
-struct Answer {
-    status: u16,
-    body: Vec<u8>,
-}
-
-fn read_answer(reader: impl Read) -> Answer {
-    let mut reader = BufReader::new(reader);
-    let mut head = String::new();
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
-            break;
-        }
-        head.push_str(&line);
-    }
-    let status = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|status| status.parse().ok())
-        .unwrap_or_else(|| panic!("no status in {head:?}"));
-    let headers: Vec<(String, String)> = head
-        .lines()
-        .skip(1)
-        .filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
-        .collect();
-    let header = |name: &str| {
-        headers
-            .iter()
-            .find(|(header, _)| header == name)
-            .map(|(_, value)| value.as_str())
-    };
-    let mut body = Vec::new();
-    if header("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
-        loop {
-            let mut size = String::new();
-            reader.read_line(&mut size).unwrap();
-            let size = usize::from_str_radix(size.trim(), 16).unwrap();
-            let mut chunk = vec![0; size + 2];
-            reader.read_exact(&mut chunk).unwrap();
-            if size == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..size]);
-        }
-    } else if let Some(len) = header("content-length") {
-        body = vec![0; len.parse().unwrap()];
-        reader.read_exact(&mut body).unwrap();
-    } else {
-        reader.read_to_end(&mut body).unwrap();
-    }
-    Answer { status, body }
-}
 
 struct Daemon {
     child: Option<Child>,

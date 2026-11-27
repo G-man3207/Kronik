@@ -27,6 +27,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use kronik_core::env::Clock;
+use kronik_core::sync::lock;
 
 use crate::config::Rate;
 
@@ -70,7 +71,7 @@ impl RateLimiter {
         loop {
             let now = clock.monotonic();
             let wait = {
-                let mut g = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = lock(&self.windows);
                 let started = self.started;
                 let window = g.entry(key.to_owned()).or_insert_with(|| Window {
                     rate,

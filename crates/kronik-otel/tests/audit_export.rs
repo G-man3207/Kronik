@@ -139,21 +139,11 @@ fn a_released_hold_records_a_gap_and_the_node_keeps_serving() {
             .unwrap(),
     );
     let settings = Settings {
-        sink: Sink::parse(&url, None).unwrap(),
-        batch_records: 4,
-        interval: Duration::from_millis(10),
-        file_max_bytes: 1 << 20,
-        headers_env: None,
-        from_now: false,
-        max_hold: Duration::ZERO,
         // More than any disk has free: the hold is always released.
         hold_release: u64::MAX,
+        ..export_settings(Sink::parse(&url, None).unwrap(), 4, 1 << 20)
     };
-    let mapper = std::sync::Arc::new(Mapper {
-        keys: Keys::Plain,
-        sealer: node.sealer().clone(),
-        branch: "main".into(),
-    });
+    let mapper = mapper(&node);
     let wasm = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/guests/counter.wasm"
@@ -323,6 +313,21 @@ fn grant(rt: &tokio::runtime::Runtime, node: &Node, host: &str, reason: &str) {
     .unwrap();
 }
 
+/// Export settings with a 10 ms interval, no headers, no `from = "now"`,
+/// and zero `max_hold` and `hold_release`.
+fn export_settings(sink: Sink, batch_records: u64, file_max_bytes: u64) -> Settings {
+    Settings {
+        sink,
+        batch_records,
+        interval: Duration::from_millis(10),
+        file_max_bytes,
+        headers_env: None,
+        from_now: false,
+        max_hold: Duration::ZERO,
+        hold_release: 0,
+    }
+}
+
 fn mapper(node: &Node) -> Arc<Mapper> {
     Arc::new(Mapper {
         keys: Keys::Plain,
@@ -348,16 +353,7 @@ fn retries_keep_the_key_but_an_identical_rewind_reaches_the_receiver_again() {
         .block_on(start(
             node.clone(),
             cursors.clone(),
-            Settings {
-                sink: Sink::Webhook(url),
-                batch_records: 1000,
-                interval: Duration::from_millis(10),
-                file_max_bytes: 1024,
-                headers_env: None,
-                from_now: false,
-                max_hold: Duration::ZERO,
-                hold_release: 0,
-            },
+            export_settings(Sink::Webhook(url), 1000, 1024),
             mapper(&node),
             node.local_operator_authority().unwrap(),
         ))
@@ -448,16 +444,7 @@ fn source_gap_coverage_survives_a_failed_checkpoint_but_not_a_new_incarnation() 
         });
         (rt, node)
     };
-    let settings = || Settings {
-        sink: Sink::File(out.path().to_path_buf()),
-        batch_records: 1000,
-        interval: Duration::from_millis(10),
-        file_max_bytes: 1 << 20,
-        headers_env: None,
-        from_now: false,
-        max_hold: Duration::ZERO,
-        hold_release: 0,
-    };
+    let settings = || export_settings(Sink::File(out.path().to_path_buf()), 1000, 1 << 20);
     let gaps = |rt: &tokio::runtime::Runtime, node: &Node| {
         let mut gaps = Vec::new();
         rt.block_on(node.reader().read(1, node.applied_lsn(), |c| {
@@ -703,16 +690,7 @@ fn source_gap_coverage_survives_a_failed_checkpoint_but_not_a_new_incarnation() 
 /// per batch and a file per batch, until it is caught up.
 fn export(rt: &tokio::runtime::Runtime, node: &Arc<Node>, dir: &Path, sink: Sink) {
     let cursors = Arc::new(rt.block_on(Cursors::load(node.env().clone(), dir)).unwrap());
-    let settings = Settings {
-        sink,
-        batch_records: 1,
-        interval: Duration::from_millis(10),
-        file_max_bytes: 1,
-        headers_env: None,
-        from_now: false,
-        max_hold: Duration::ZERO,
-        hold_release: 0,
-    };
+    let settings = export_settings(sink, 1, 1);
     let stream = rt
         .block_on(start(
             node.clone(),
@@ -792,16 +770,7 @@ fn an_initially_unavailable_file_sink_retries_without_blocking_the_node() {
         rt.block_on(Cursors::load(node.env().clone(), data.path()))
             .unwrap(),
     );
-    let settings = Settings {
-        sink: sink.clone(),
-        batch_records: 1,
-        interval: Duration::from_millis(10),
-        file_max_bytes: 1 << 20,
-        headers_env: None,
-        from_now: false,
-        max_hold: Duration::ZERO,
-        hold_release: 0,
-    };
+    let settings = export_settings(sink.clone(), 1, 1 << 20);
     let stream = rt
         .block_on(start(
             node.clone(),
@@ -1051,16 +1020,7 @@ fn changed_persisted_reason_holds_a_pending_delivery_until_explicit_rewind() {
         .block_on(start(
             node.clone(),
             cursors.clone(),
-            Settings {
-                sink: Sink::Webhook(url),
-                batch_records: 1000,
-                interval: Duration::from_millis(10),
-                file_max_bytes: 1024,
-                headers_env: None,
-                from_now: false,
-                max_hold: Duration::ZERO,
-                hold_release: 0,
-            },
+            export_settings(Sink::Webhook(url), 1000, 1024),
             mapper(&node),
             original.clone(),
         ))

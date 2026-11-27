@@ -13,7 +13,7 @@ mod common;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{Proc, audit, slow_server, start_proc, wait_turn};
+use common::{Proc, audit, http_blob, slow_server, start_proc, wait_turn};
 use kronik_blob::{Space, SweepOptions};
 use kronik_core::ids::ActorRef;
 use kronik_proto::log::v1 as pb;
@@ -103,34 +103,7 @@ impl Proc {
             idempotency_key,
         ));
         assert!(r.committed(), "{r:?}");
-        match &r.outcome.output {
-            Some(pb::outcome::Output::Http(h)) => {
-                match h.body.as_ref().and_then(|b| b.value.as_ref()) {
-                    Some(pb::body::Value::Blob(blob)) => blob.clone(),
-                    other => panic!("not a blob: {other:?}"),
-                }
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    /// A blob in the store that no record references (a crash before
-    /// commit, a rejected upload), its writer's lease ended.
-    fn loose(&self, bytes: &[u8]) -> pb::BlobRef {
-        let store = self.node.blob_store().unwrap().clone();
-        self.rt.block_on(async move {
-            let mut w = store
-                .writer(Space::Main, None, u64::MAX, store.leases().take("upload"))
-                .await
-                .unwrap();
-            w.write(bytes).await.unwrap();
-            let meta = w.finish().await.unwrap();
-            store
-                .ensure_durable(&Space::Main, &[meta.id])
-                .await
-                .unwrap();
-            meta.to_pb()
-        })
+        http_blob(&r)
     }
 
     fn exists(&self, blob: &pb::BlobRef) -> bool {
@@ -196,7 +169,7 @@ fn the_collector_keeps_what_records_responses_and_snapshots_keep() {
     let p = start(dir.path());
     let response = p.blob_turn(300_000, "");
     let saved = p.blob_turn(200_000, "k1");
-    let loose = p.loose(b"no record references this");
+    let loose = p.write_upload(b"no record references this");
 
     // The dry run lists only the loose file, and why; nothing is deleted.
     let unrooted = dry(&p);

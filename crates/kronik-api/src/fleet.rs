@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use kronik_core::error::{ApiError, ErrorCode};
+use kronik_core::sync::lock;
 use kronik_fleet::enrollment::{
     self, ControllerClient, ControllerConfig, EnrollmentPhase, EnrollmentPlan, EnrollmentRecord,
     FleetError, FleetIdentity,
@@ -119,19 +120,10 @@ fn next_epoch(record: Option<&EnrollmentRecord>) -> Result<u64, ApiError> {
         .ok_or_else(|| bad("fleet epoch exhausted"))
 }
 fn token_name(record: &EnrollmentRecord) -> Result<String, ApiError> {
-    let bytes = record.request_id.as_bytes();
-    if bytes.len() != 64 {
-        return Err(internal("invalid fleet request identity"));
-    }
-    let mut request = [0; 32];
-    for (byte, pair) in request.iter_mut().zip(bytes.as_chunks::<2>().0) {
-        let nibble = |value| match value {
-            b'0'..=b'9' => Ok(value - b'0'),
-            b'a'..=b'f' => Ok(value - b'a' + 10),
-            _ => Err(internal("invalid fleet request identity")),
-        };
-        *byte = nibble(pair[0])? << 4 | nibble(pair[1])?;
-    }
+    let request: [u8; 32] = digest_bytes(&record.request_id)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| internal("invalid fleet request identity"))?;
     kronik_proto::control::fleet_token_name(record.epoch, &request).map_err(internal)
 }
 fn validate_caller(token_id: &str, reason: &str) -> Result<(), ApiError> {
@@ -828,16 +820,14 @@ impl Fleet {
                         .await
                         .map_err(|_| FleetError::Persistence)?;
                     if record.phase == EnrollmentPhase::Active {
-                        *completed.lock().unwrap_or_else(|e| e.into_inner()) = Some(admitting);
+                        *lock(&completed) = Some(admitting);
                     }
                     Ok(())
                 })
             },
         );
         let accepted = enrollment.await.map_err(fleet_error)?;
-        let admitting = completed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let admitting = lock(&completed)
             .take()
             .ok_or_else(|| internal("fleet completion missing"))?;
         Ok(FleetStatus::acknowledged(accepted, admitting))
@@ -1472,6 +1462,45 @@ mod tests {
         )
         .unwrap()
         .authority
+    }
+
+    /// An `admin` token named `name` and the authority captured from its
+    /// bearer on `POST /v1/fleet/enroll`: an ordinary enroller.
+    fn admin_enroller(
+        store: &Arc<TokenStore>,
+        name: &str,
+        seed: u8,
+        reason: &str,
+        wall_ms: u64,
+    ) -> (tokens::TokenMeta, kronik_core::authority::AuthLease) {
+        let (token, bearer) = store
+            .create(
+                name,
+                [crate::auth::Scope::Admin].into(),
+                [seed; 32],
+                &Change {
+                    by: "unix:uid=0",
+                    reason,
+                    wall_ms,
+                },
+                false,
+            )
+            .unwrap();
+        let authority = crate::auth::Authenticator::capture(
+            &tokens::TokenAuthenticator::new(store.clone()),
+            &crate::ApiRequest {
+                method: "POST".into(),
+                path: "/v1/fleet/enroll".into(),
+                query: String::new(),
+                body: Vec::new(),
+                token_id: String::new(),
+                bearer,
+            },
+            crate::auth::Scope::Admin,
+        )
+        .unwrap()
+        .authority;
+        (token, authority)
     }
 
     fn controller_ca(
@@ -3147,7 +3176,6 @@ mod tests {
 
     #[tokio::test]
     async fn real_tls_controller_and_ordinary_admin_revocation_share_the_native_pipeline() {
-        use crate::auth::{Authenticator as _, Scope};
         use std::io::{Read as _, Write as _};
         use std::os::unix::fs::DirBuilderExt as _;
         use std::time::Duration;
@@ -3297,33 +3325,13 @@ mod tests {
         .await
         .unwrap();
         let api = Arc::new(api.with_fleet(fleet.clone()));
-        let (first, bearer) = tokens
-            .create(
-                "tls-first",
-                [Scope::Admin].into(),
-                [23; 32],
-                &Change {
-                    by: "unix:uid=0",
-                    reason: "admit original TLS enroller",
-                    wall_ms: env.clock.wall_ms(),
-                },
-                false,
-            )
-            .unwrap();
-        let original = tokens::TokenAuthenticator::new(tokens.clone())
-            .capture(
-                &crate::ApiRequest {
-                    method: "POST".into(),
-                    path: "/v1/fleet/enroll".into(),
-                    query: String::new(),
-                    body: Vec::new(),
-                    token_id: String::new(),
-                    bearer,
-                },
-                Scope::Admin,
-            )
-            .unwrap()
-            .authority;
+        let (first, original) = admin_enroller(
+            &tokens,
+            "tls-first",
+            23,
+            "admit original TLS enroller",
+            env.clock.wall_ms(),
+        );
         let held = fleet.enrollment_http.clone().acquire_owned().await.unwrap();
         let mut initial = request(Some("denied-once"), false);
         initial.url = url.clone();
@@ -3396,33 +3404,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let (next, bearer) = tokens
-            .create(
-                "tls-next",
-                [Scope::Admin].into(),
-                [24; 32],
-                &Change {
-                    by: "unix:uid=0",
-                    reason: "independently admit fresh TLS enrollment",
-                    wall_ms: env.clock.wall_ms(),
-                },
-                false,
-            )
-            .unwrap();
-        let next_authority = tokens::TokenAuthenticator::new(tokens.clone())
-            .capture(
-                &crate::ApiRequest {
-                    method: "POST".into(),
-                    path: "/v1/fleet/enroll".into(),
-                    query: String::new(),
-                    body: Vec::new(),
-                    token_id: String::new(),
-                    bearer,
-                },
-                Scope::Admin,
-            )
-            .unwrap()
-            .authority;
+        let (next, next_authority) = admin_enroller(
+            &tokens,
+            "tls-next",
+            24,
+            "independently admit fresh TLS enrollment",
+            env.clock.wall_ms(),
+        );
         let mut fresh = request(Some("fresh-once"), false);
         fresh.url = url.clone();
         assert!(
@@ -3524,37 +3512,15 @@ mod tests {
 
     #[tokio::test]
     async fn requested_http_capacity_wait_does_not_stall_revoke_or_send_for_a_revoked_enroller() {
-        use crate::auth::{Authenticator as _, Scope};
         let (_dir, fleet, network, _entropy) = setup().await;
         let held = fleet.enrollment_http.clone().acquire_owned().await.unwrap();
-        let (token, bearer) = fleet
-            .tokens
-            .create(
-                "capacity-enroller",
-                [Scope::Admin].into(),
-                [29; 32],
-                &Change {
-                    by: "unix:uid=0",
-                    reason: "admit bounded enrollment",
-                    wall_ms: fleet.node.env().clock.wall_ms(),
-                },
-                false,
-            )
-            .unwrap();
-        let original = tokens::TokenAuthenticator::new(fleet.tokens.clone())
-            .capture(
-                &crate::ApiRequest {
-                    method: "POST".into(),
-                    path: "/v1/fleet/enroll".into(),
-                    query: String::new(),
-                    body: Vec::new(),
-                    token_id: String::new(),
-                    bearer,
-                },
-                Scope::Admin,
-            )
-            .unwrap()
-            .authority;
+        let (token, original) = admin_enroller(
+            &fleet.tokens,
+            "capacity-enroller",
+            29,
+            "admit bounded enrollment",
+            fleet.node.env().clock.wall_ms(),
+        );
         network.reply.store(true, Ordering::SeqCst);
         let work = {
             let fleet = fleet.clone();
@@ -3639,36 +3605,14 @@ mod tests {
 
     #[tokio::test]
     async fn revoked_ordinary_enroller_cannot_activate_a_durable_requested_operation() {
-        use crate::auth::{Authenticator as _, Scope};
         let (_dir, fleet, network, _entropy) = setup().await;
-        let (token, bearer) = fleet
-            .tokens
-            .create(
-                "enroller",
-                [Scope::Admin].into(),
-                [23; 32],
-                &Change {
-                    by: "unix:uid=0",
-                    reason: "admit exact enroller",
-                    wall_ms: fleet.node.env().clock.wall_ms(),
-                },
-                false,
-            )
-            .unwrap();
-        let captured = tokens::TokenAuthenticator::new(fleet.tokens.clone())
-            .capture(
-                &crate::ApiRequest {
-                    method: "POST".into(),
-                    path: "/v1/fleet/enroll".into(),
-                    query: String::new(),
-                    body: Vec::new(),
-                    token_id: String::new(),
-                    bearer,
-                },
-                Scope::Admin,
-            )
-            .unwrap();
-        let original = captured.authority;
+        let (token, original) = admin_enroller(
+            &fleet.tokens,
+            "enroller",
+            23,
+            "admit exact enroller",
+            fleet.node.env().clock.wall_ms(),
+        );
         network.reply.store(true, Ordering::SeqCst);
         let hold = Arc::new(tokio::sync::Semaphore::new(0));
         *network.hold.lock().unwrap() = Some(hold.clone());

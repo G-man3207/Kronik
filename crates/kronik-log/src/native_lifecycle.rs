@@ -2,6 +2,8 @@
 use super::*;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use kronik_core::sync::lock;
 use tokio::sync::Notify;
 
 struct Binding {
@@ -49,11 +51,7 @@ impl Log {
         publication: Arc<Mutex<()>>,
         ownership: Option<Arc<std::fs::File>>,
     ) -> Result<Arc<NativeWriterState>, LogError> {
-        let mut binding = self
-            .native_writer
-            .binding
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut binding = lock(&self.native_writer.binding);
         if !self.native_writer.is_open() {
             return Err(LogError::Stopped("native writer already ended".into()));
         }
@@ -114,21 +112,14 @@ impl<T> NativeInbox<T> {
         if self.closed {
             return;
         }
-        let binding = self
-            .life
-            .binding
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let binding = lock(&self.life.binding);
         let mut publish = || {
             self.life.open.store(false, Ordering::Release);
             self.receiver.close();
             self.life.changed.notify_waiters();
         };
         if let Some(bound) = binding.as_ref() {
-            let _publication = bound
-                .publication
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _publication = lock(&bound.publication);
             publish();
         } else {
             // Keep the binding mutex through this store. A later binder observes

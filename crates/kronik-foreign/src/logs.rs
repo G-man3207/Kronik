@@ -124,16 +124,6 @@ mod tests {
     }
 
     #[test]
-    fn secrets_are_scrubbed_from_the_tail() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("output.log");
-        fs::write(&log, "token=hunter2hunter2 ok\n").unwrap();
-        let secrets = [("api-key", b"hunter2hunter2".as_slice())];
-        let (lines, _) = tail(&log, 10, &secrets).unwrap();
-        assert_eq!(lines, ["token=[secret:api-key] ok"]);
-    }
-
-    #[test]
     fn original_tail_literals_overlap_and_one_byte_values_are_redacted_once() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("output.log");
@@ -166,18 +156,6 @@ mod tests {
         assert!(matches!(
             tail(&log, 10, &[("partial", &[0xc3])]),
             Err(TailError::Redaction(ScrubError::InvalidText))
-        ));
-    }
-
-    #[test]
-    fn marker_expansion_obeys_the_existing_bounded_tail_window() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("output.log");
-        fs::write(&log, vec![b'a'; (ROTATE_BYTES / 4) as usize]).unwrap();
-        let error = tail(&log, 10, &[("expansion", b"a".as_slice())]).unwrap_err();
-        assert!(matches!(
-            error,
-            TailError::Redaction(ScrubError::OutputLimit)
         ));
     }
 

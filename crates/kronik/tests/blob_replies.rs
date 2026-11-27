@@ -14,13 +14,14 @@
 mod blob_fixtures;
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use blob_fixtures::{pattern, pattern_sum};
+use common::{Answer, read_answer};
 use kronik_api::openapi::TURN_SCHEMA;
 use serde_json::{Value, json};
 
@@ -33,23 +34,9 @@ struct Daemon {
     http: String,
 }
 
-/// An HTTP response: status, head and body.
-struct Response {
-    status: u16,
-    head: String,
-    body: Vec<u8>,
-}
-
-impl Response {
+impl Answer {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
-    }
-
-    fn header(&self, name: &str) -> Option<&str> {
-        self.head.lines().find_map(|line| {
-            let (k, v) = line.split_once(':')?;
-            k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
-        })
     }
 }
 
@@ -149,7 +136,7 @@ impl Daemon {
     }
 
     /// `POST <path>` to the gateway, with `user` as the request's subject.
-    fn post(&self, path: &str, user: Option<&str>) -> Response {
+    fn post(&self, path: &str, user: Option<&str>) -> Answer {
         let mut s = TcpStream::connect(&self.http).unwrap();
         let user = user.map_or(String::new(), |u| format!("x-user-id: {u}\r\n"));
         write!(
@@ -158,7 +145,7 @@ impl Daemon {
              connection: close\r\n\r\n"
         )
         .unwrap();
-        read_response(s).unwrap()
+        read_answer(s)
     }
 
     /// [`Daemon::post`] that must answer 200; its body as text.
@@ -186,52 +173,6 @@ impl Drop for Daemon {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-/// One HTTP/1.1 response, with a `content-length` or a chunked body.
-fn read_response(stream: impl Read) -> std::io::Result<Response> {
-    let mut r = BufReader::new(stream);
-    let mut head = String::new();
-    loop {
-        let mut line = String::new();
-        if r.read_line(&mut line)? == 0 || line == "\r\n" {
-            break;
-        }
-        head.push_str(&line);
-    }
-    let status = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| std::io::Error::other(format!("no status in {head:?}")))?;
-    let mut response = Response {
-        status,
-        head,
-        body: Vec::new(),
-    };
-    if response
-        .header("transfer-encoding")
-        .is_some_and(|v| v.eq_ignore_ascii_case("chunked"))
-    {
-        loop {
-            let mut size = String::new();
-            r.read_line(&mut size)?;
-            let size = usize::from_str_radix(size.trim(), 16).map_err(std::io::Error::other)?;
-            let mut chunk = vec![0; size + 2];
-            r.read_exact(&mut chunk)?;
-            if size == 0 {
-                break;
-            }
-            response.body.extend_from_slice(&chunk[..size]);
-        }
-    } else if let Some(len) = response.header("content-length") {
-        let mut body = vec![0; len.parse().map_err(std::io::Error::other)?];
-        r.read_exact(&mut body)?;
-        response.body = body;
-    } else {
-        r.read_to_end(&mut response.body)?;
-    }
-    Ok(response)
 }
 
 /// The blob of the `call` operation's answer `reply blob <hash> <size>`,

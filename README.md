@@ -112,7 +112,9 @@ scripts/ci.sh
 hygiene, test, docs, book, examples, ui, ts, sdks, dst, deny, musl, foreign,
 s3, identity and action. `scripts/ci.sh clippy test` runs a subset.
 [CONTRIBUTING.md](CONTRIBUTING.md) has the conventions and what each step
-needs. [AGENTS.md](AGENTS.md) is the same list for automated contributors.
+needs. `npm ci` at the repository root installs a pre-commit hook that runs
+formatting, hygiene and `cargo deny`. [AGENTS.md](AGENTS.md) is the same list
+for automated contributors.
 
 CI, nightly, isolation and release workflows start only when someone runs
 them (`workflow_dispatch`). Only the GitHub Action demo runs on push and

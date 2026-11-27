@@ -19,15 +19,24 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-/// The developer's settings that `kronik` reads from the environment.
-const SETTINGS_ENV: [&str; 7] = [
+/// The settings `kronik` reads from the environment, removed from every
+/// command the tests run so that the developer's shell cannot change
+/// them: the union of the lists the test files kept on their own.
+pub const SETTINGS_ENV: [&str; 14] = [
     "KRONIK_CONFIG",
     "KRONIK_DATA_DIR",
     "KRONIK_HTTP_LISTEN",
     "KRONIK_ADMIN_LISTEN",
     "KRONIK_API_SOCKET",
+    "KRONIK_API_LISTEN",
     "KRONIK_MASTER_KEY_FILE",
+    "KRONIK_MASTER_KEY",
     "KRONIK_TOKEN",
+    "KRONIK_URL",
+    "KRONIK_OTEL_ENDPOINT",
+    "KRONIK_AUDIT_SINK",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
 ];
 
 /// `kronik` without the developer's settings, with no disk reserve (the
@@ -212,6 +221,156 @@ pub fn try_api(
     Some((status, serde_json::from_slice(&buf).ok()?))
 }
 
+/// One HTTP answer, parsed by [`read_answer`].
+pub struct Answer {
+    pub status: u16,
+    /// Lower-case names, trimmed values, in order.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Answer {
+    /// The first value of header `name`, case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// One HTTP/1.1 answer from `reader`: a chunked body, a `content-length`
+/// one, or everything to the end. Panics on a malformed answer.
+pub fn read_answer(reader: impl std::io::Read) -> Answer {
+    let mut reader = BufReader::new(reader);
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+            break;
+        }
+        head.push_str(&line);
+    }
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .unwrap_or_else(|| panic!("no status in {head:?}"));
+    let headers: Vec<(String, String)> = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+        .collect();
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.as_str())
+    };
+    let mut body = Vec::new();
+    if header("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
+        loop {
+            let mut size = String::new();
+            reader.read_line(&mut size).unwrap();
+            let size = usize::from_str_radix(size.trim(), 16).unwrap();
+            let mut chunk = vec![0; size + 2];
+            reader.read_exact(&mut chunk).unwrap();
+            if size == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..size]);
+        }
+    } else if let Some(len) = header("content-length") {
+        body = vec![0; len.parse().unwrap()];
+        reader.read_exact(&mut body).unwrap();
+    } else {
+        reader.read_to_end(&mut body).unwrap();
+    }
+    Answer {
+        status,
+        headers,
+        body,
+    }
+}
+
+/// Every record of the `main` branch's log under `<dir>/data`, read while
+/// the daemon runs (only fsynced records exist) or after it died.
+pub fn log_records(dir: &Path) -> Vec<kronik_proto::Record> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let env = kronik_core::env::Env::real(tokio::runtime::Handle::current());
+        let reader = kronik_log::LogReader::new(env, dir.join("data/branches/main/log"), "main");
+        let mut out = Vec::new();
+        reader
+            .read(1, u64::MAX, |c| {
+                out.push(c.record);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        out
+    })
+}
+
+/// Every file under `dir`, recursively, whose bytes contain `needle`.
+pub fn files_containing(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(p) = todo.pop() {
+        if p.is_dir() {
+            todo.extend(std::fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()));
+        } else if std::fs::read(&p).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle)) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Ships the data directory `data` to the bucket `url` once, the way a
+/// node does every few seconds (`kronik_ship::ship_once`), without a
+/// running node.
+pub fn ship_now(data: &Path, url: &str) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let remote = kronik_ship::Remote::open(url, None).unwrap();
+        let mut state = kronik_ship::ShipState::load(data).unwrap();
+        kronik_ship::ship_once(&remote, data, "main", &mut state)
+            .await
+            .unwrap();
+    });
+}
+
+/// Whether the snapshot at `lsn`, the code and the active segment as it
+/// is now reach the bucket, by `<data>/ship.json`: polls every 200 ms, up
+/// to 225 times (45 s).
+pub fn wait_until_shipped(data: &Path, lsn: u64) -> bool {
+    for _ in 0..225 {
+        if let Ok(text) = std::fs::read_to_string(data.join("ship.json"))
+            && let Ok(v) = serde_json::from_str::<Value>(&text)
+            && v["snapshots"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|n| n.as_u64() == Some(lsn)))
+            && v["code"].as_array().is_some_and(|a| !a.is_empty())
+            && let Some(start) = v["active"][0].as_u64()
+            && let Some(size) = v["active"][1].as_u64()
+            && std::fs::metadata(data.join(format!("branches/main/log/{start:020}.seg")))
+                .is_ok_and(|m| m.len() == size)
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
 /// `kronik serve` as a child process, with its data in `<dir>/data`, its
 /// API socket at `<dir>/api.sock` and its stderr appended to
 /// `<dir>/serve.log`; killed when dropped.
@@ -228,7 +387,7 @@ impl Daemon {
     /// and passes `--config` with it; with `None`: `--data-dir <dir>/data`.
     /// Always: `--http-listen 127.0.0.1:0 --admin-listen 127.0.0.1:0
     /// --api-socket <dir>/api.sock`, `KRONIK_DISK_RESERVE=0B`,
-    /// `KRONIK_LOG=info`, `KRONIK_TOKEN` removed, stdin and stdout null.
+    /// `KRONIK_LOG=info`, [`SETTINGS_ENV`] removed, stdin and stdout null.
     /// Callers add arguments or override env before `spawn`.
     pub fn command(bin: impl AsRef<OsStr>, dir: &Path, config: Option<&str>) -> Command {
         let mut command = Command::new(bin);
@@ -236,9 +395,11 @@ impl Daemon {
             .arg("serve")
             .env("KRONIK_DISK_RESERVE", "0B")
             .env("KRONIK_LOG", "info")
-            .env_remove("KRONIK_TOKEN")
             .stdin(Stdio::null())
             .stdout(Stdio::null());
+        for var in SETTINGS_ENV {
+            command.env_remove(var);
+        }
         match config {
             Some(config) => {
                 let path = dir.join("kronik.toml");

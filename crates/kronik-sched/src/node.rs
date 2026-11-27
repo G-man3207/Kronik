@@ -1307,12 +1307,6 @@ impl Node {
         crate::pool::node_instances(self.cfg.concurrency, crate::pool::available_cpus())
     }
 
-    /// The isolated replay workers the node's instance pool has room for,
-    /// each with its calls (F5).
-    pub fn replay_worker_limit(&self) -> usize {
-        crate::pool::replay_workers_in(self.instance_pool())
-    }
-
     pub fn applied_lsn(&self) -> Lsn {
         self.store.applied.get()
     }
@@ -6018,7 +6012,9 @@ fn reused(key: &str) -> ApiError {
     )
 }
 
-fn body_subject(msg: Option<&pb::Message>) -> Option<String> {
+/// The subject tag on a message body: live delivery uses it as the
+/// receiving turn's default subject, and so does replay.
+pub fn body_subject(msg: Option<&pb::Message>) -> Option<String> {
     msg.and_then(|m| m.body.as_ref())
         .and_then(|b| b.subject.clone())
 }

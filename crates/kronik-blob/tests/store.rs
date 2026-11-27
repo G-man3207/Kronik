@@ -6,14 +6,15 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{TestKeys, content, derived, object, open, open_with, put, put_in};
 use kronik_blob::format::{self, FRAME_SIZE, FrameKey, HEADER_LEN, Header, SEALED_OVERHEAD};
 use kronik_blob::{BlobError, BlobMeta, BlobStore, NoKeys, Space, StoreConfig};
-use kronik_core::env::{BoxFuture, Env, File, Fs, OpenMode};
+use kronik_core::env::Env;
+use kronik_core::env::test_fs::{FsCall, Then, hooked};
 
 const SIZES: [usize; 8] = [
     0,
@@ -466,48 +467,20 @@ async fn a_forks_space_reads_main_and_writes_its_own() {
     ));
 }
 
-/// Real files, with `sync_dir` calls counted.
-struct CountingFs {
-    inner: Arc<dyn Fs>,
-    syncs: Mutex<Vec<PathBuf>>,
-}
-
-impl Fs for CountingFs {
-    fn create_dir_all(&self, path: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.create_dir_all(path)
-    }
-    fn open(
-        &self,
-        path: PathBuf,
-        mode: OpenMode,
-    ) -> BoxFuture<'static, std::io::Result<Arc<dyn File>>> {
-        self.inner.open(path, mode)
-    }
-    fn exists(&self, path: PathBuf) -> BoxFuture<'static, std::io::Result<bool>> {
-        self.inner.exists(path)
-    }
-    fn read_dir(&self, dir: PathBuf) -> BoxFuture<'static, std::io::Result<Vec<String>>> {
-        self.inner.read_dir(dir)
-    }
-    fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.rename(from, to)
-    }
-    fn remove_file(&self, path: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.inner.remove_file(path)
-    }
-    fn sync_dir(&self, dir: PathBuf) -> BoxFuture<'static, std::io::Result<()>> {
-        self.syncs.lock().unwrap().push(dir.clone());
-        self.inner.sync_dir(dir)
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn one_directory_sync_covers_every_name_before_it() {
     let dir = tempfile::tempdir().unwrap();
     let real = Env::real(tokio::runtime::Handle::current());
-    let fs = Arc::new(CountingFs {
-        inner: real.fs.clone(),
-        syncs: Mutex::new(Vec::new()),
+    // Real files, with the directories passed to `sync_dir` recorded.
+    let syncs = Arc::new(Mutex::new(Vec::new()));
+    let fs = hooked(real.fs.clone(), {
+        let syncs = syncs.clone();
+        move |call| {
+            if let FsCall::SyncDir(dir) = call {
+                syncs.lock().unwrap().push(dir.clone());
+            }
+            Then::Forward
+        }
     });
     let env = Env {
         fs: fs.clone(),
@@ -548,17 +521,17 @@ async fn one_directory_sync_covers_every_name_before_it() {
     let b = write(same[1].clone()).await;
     let c = write(elsewhere.clone().unwrap()).await;
     let shard_of = |m: &BlobMeta| dir.path().join("blobs/objects").join(m.id.shard());
-    fs.syncs.lock().unwrap().clear();
+    syncs.lock().unwrap().clear();
     store.ensure_durable(&Space::Main, &[a.id]).await.unwrap();
-    assert_eq!(*fs.syncs.lock().unwrap(), [shard_of(&a)]);
+    assert_eq!(*syncs.lock().unwrap(), [shard_of(&a)]);
     // b was named before that sync: already durable.
     store
         .ensure_durable(&Space::Main, &[b.id, a.id])
         .await
         .unwrap();
-    assert_eq!(fs.syncs.lock().unwrap().len(), 1);
+    assert_eq!(syncs.lock().unwrap().len(), 1);
     store.ensure_durable(&Space::Main, &[c.id]).await.unwrap();
-    assert_eq!(*fs.syncs.lock().unwrap(), [shard_of(&a), shard_of(&c)]);
+    assert_eq!(*syncs.lock().unwrap(), [shard_of(&a), shard_of(&c)]);
     // A claim of a durable object needs no sync; a claim of one whose name
     // is not durable yet waits for it.
     let again = write(same[0].clone()).await;
@@ -566,14 +539,14 @@ async fn one_directory_sync_covers_every_name_before_it() {
         .ensure_durable(&Space::Main, &[again.id])
         .await
         .unwrap();
-    assert_eq!(fs.syncs.lock().unwrap().len(), 2);
+    assert_eq!(syncs.lock().unwrap().len(), 2);
     let d = write(content(999, 33)).await;
     let claim = write(content(999, 33)).await;
     store
         .ensure_durable(&Space::Main, &[claim.id])
         .await
         .unwrap();
-    assert_eq!(fs.syncs.lock().unwrap().last(), Some(&shard_of(&d)));
+    assert_eq!(syncs.lock().unwrap().last(), Some(&shard_of(&d)));
 }
 
 /// Review B-H1: a writer holds no file until its first frame is complete,
@@ -724,8 +697,11 @@ async fn a_kept_alive_lease_outlives_its_ttl_while_held() {
     kept.add(meta.id);
     kept.keep_alive(&env);
     env.clock.sleep(Duration::from_millis(400)).await;
-    assert!(!plain.is_live(), "an unrenewed lease expires");
-    assert!(kept.is_live(), "a kept-alive lease does not");
+    assert_eq!(
+        store.leases().holders(),
+        ["kept"],
+        "an unrenewed lease expires, a kept-alive lease does not"
+    );
     assert!(store.leases().is_leased(&meta.id));
     drop(kept);
     drop(plain);

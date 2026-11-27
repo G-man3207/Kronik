@@ -94,18 +94,6 @@ async fn reseal_seals_off_mode_history_and_an_identity_replay_is_empty() {
         &api,
         "POST",
         "/v1/privacy/reseal",
-        json!({"reason": " ", "dry_run": true}),
-    )
-    .await;
-    assert_eq!(
-        (s, v["error"]["code"].as_str()),
-        (400, Some("REASON_REQUIRED")),
-        "{v}"
-    );
-    let (s, v) = call(
-        &api,
-        "POST",
-        "/v1/privacy/reseal",
         json!({"reason": "seal history"}),
     )
     .await;

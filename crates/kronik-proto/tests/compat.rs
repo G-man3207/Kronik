@@ -14,7 +14,10 @@ fn fixture(name: &str, record: &Record) -> Vec<u8> {
         let hex: String = record.encode().iter().map(|b| format!("{b:02x}")).collect();
         std::fs::write(&path, hex + "\n").unwrap();
     }
-    let text = std::fs::read_to_string(&path).unwrap();
+    unhex(&std::fs::read_to_string(&path).unwrap())
+}
+
+fn unhex(text: &str) -> Vec<u8> {
     let text = text.trim();
     (0..text.len())
         .step_by(2)
@@ -751,13 +754,7 @@ fn native_origin_message_is_data_only_and_field10_is_not_an_old_reader_write_fen
     // Existing approved future carrier: action, known original audit, then NativeAuthorityOrigin field10.
     // This reader deliberately does NOT attach field10; decoding is not permission to emit/import it.
     let text = "0a0d6f70657261746f722e6e6f7465221c0a0e746f6b656e3a6f726967696e616c12086f726967696e616c18075231122f0a0a756e69783a7569643d30121f6e617469766520617574686f7269747920696e697469616c697a6174696f6e1801";
-    let wire: Vec<u8> = text
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-        .collect();
+    let wire = unhex(text);
     let Record::AuditEvent(old) = Record::decode(kronik_proto::kind::AUDIT_EVENT, &wire).unwrap()
     else {
         panic!("actual old-layout Record40 decoder")

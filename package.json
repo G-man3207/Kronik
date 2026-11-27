@@ -1,0 +1,11 @@
+{
+  "name": "kronik-hooks",
+  "private": true,
+  "description": "Git hooks only. The daemon, the CLI and the actors do not depend on this package.",
+  "scripts": {
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "husky": "9.1.7"
+  }
+}

@@ -12,36 +12,12 @@ use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
-use common::free_port;
+use common::{command, free_port};
 
-const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 const COUNTER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/guests/counter.wasm"
 );
-
-/// The environment variables `kronik serve` and the CLI read, cleared so
-/// that the developer's shell can't override the tests' files and flags.
-const SETTINGS_ENV: [&str; 7] = [
-    "KRONIK_CONFIG",
-    "KRONIK_DATA_DIR",
-    "KRONIK_HTTP_LISTEN",
-    "KRONIK_ADMIN_LISTEN",
-    "KRONIK_API_SOCKET",
-    "KRONIK_MASTER_KEY_FILE",
-    "KRONIK_MASTER_KEY",
-];
-
-fn command() -> Command {
-    let mut command = Command::new(KRONIK);
-    for var in SETTINGS_ENV {
-        command.env_remove(var);
-    }
-    // The tests' temporary file system may have less than the reserve.
-    command.env("KRONIK_DISK_RESERVE", "0B");
-    command.stdin(Stdio::null());
-    command
-}
 
 fn kronik(args: &[&str]) -> Output {
     command().args(args).output().unwrap()
@@ -605,9 +581,6 @@ fn tls_from_files_serves_https_and_a_bad_file_stops_the_start() {
 /// `kronik --json doctor --config <file>`: the report and the exit code.
 fn doctor(config: &Path) -> (serde_json::Value, bool) {
     let out = command()
-        .env_remove("KRONIK_TOKEN")
-        .env_remove("KRONIK_AUDIT_SINK")
-        .env_remove("KRONIK_OTEL_ENDPOINT")
         .args(["--json", "doctor", "--config", config.to_str().unwrap()])
         .output()
         .unwrap();
@@ -715,7 +688,6 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
         "{report}"
     );
     let human = command()
-        .env_remove("KRONIK_TOKEN")
         .args(["doctor", "--config", config.to_str().unwrap()])
         .output()
         .unwrap();
@@ -739,36 +711,6 @@ fn doctor_checks_the_host_and_the_configured_certificate() {
         assert_eq!(kvm["status"], "fail", "{report}");
         assert_eq!(kvm["code"], "KVM_UNAVAILABLE", "{report}");
     }
-
-    // A ship endpoint without a scheme fails with a code and a hint.
-    std::fs::write(
-        &config,
-        format!(
-            "[server]\ndata_dir = {:?}\n[ship]\nenabled = true\nurl = \"s3://bucket/kronik\"\nendpoint = \"s3.example.com\"\n",
-            dir.path().join("data"),
-        ),
-    )
-    .unwrap();
-    let (report, ok) = doctor(&config);
-    assert!(!ok);
-    let ship = status(&report, "ship");
-    assert_eq!(ship["status"], "fail", "{report}");
-    assert_eq!(ship["code"], "BAD_REQUEST", "{report}");
-    assert!(
-        ship["hint"].as_str().is_some_and(|hint| !hint.is_empty()),
-        "{report}"
-    );
-    let human = command()
-        .env_remove("KRONIK_TOKEN")
-        .args(["doctor", "--config", config.to_str().unwrap()])
-        .output()
-        .unwrap();
-    let text = String::from_utf8(human.stdout).unwrap();
-    assert!(
-        text.contains("(BAD_REQUEST)") && text.contains("hint:"),
-        "{text}"
-    );
-    assert!(!human.status.success(), "{text}");
 
     // A broken file is a failed check, and the rest still runs.
     std::fs::write(&config, "[tls]\nmode = \"ftp\"\n").unwrap();

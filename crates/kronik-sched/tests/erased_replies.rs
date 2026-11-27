@@ -22,13 +22,13 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Write;
+use std::net::TcpStream;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{Proc, audit, start_proc};
+use common::{Proc, audit, http, msg, start_proc};
 use kronik_core::error::ApiError;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
@@ -67,16 +67,9 @@ struct Server {
 
 impl Server {
     fn start() -> Server {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
         let state = Arc::new((Mutex::new(Gates::default()), Condvar::new()));
         let st = state.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let st = st.clone();
-                std::thread::spawn(move || serve(stream, st));
-            }
-        });
+        let addr = http::serve(move |req, w| serve(req, w, &st));
         Server { addr, state }
     }
 
@@ -108,59 +101,31 @@ impl Server {
     }
 }
 
-fn serve(stream: TcpStream, st: Arc<(Mutex<Gates>, Condvar)>) {
-    let mut w = stream.try_clone().unwrap();
-    let mut r = BufReader::new(stream);
-    loop {
-        let mut line = String::new();
-        if r.read_line(&mut line).unwrap_or(0) == 0 {
-            return;
-        }
-        let path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
-        let mut len = 0usize;
-        loop {
-            let mut h = String::new();
-            if r.read_line(&mut h).unwrap_or(0) == 0 {
-                return;
-            }
-            let h = h.trim_end().to_ascii_lowercase();
-            if h.is_empty() {
-                break;
-            }
-            if let Some(v) = h.strip_prefix("content-length:") {
-                len = v.trim().parse().unwrap_or(0);
+fn serve(req: http::Request, w: &mut TcpStream, st: &(Mutex<Gates>, Condvar)) {
+    let http::Request { path, .. } = req;
+    let (m, cv) = st;
+    {
+        let mut g = m.lock().unwrap();
+        g.seen.push(path.clone());
+        cv.notify_all();
+        if path.ends_with("/extra") {
+            // Never answered: the daemon stops while its turn waits.
+            loop {
+                g = cv.wait(g).unwrap();
             }
         }
-        let mut body = vec![0; len];
-        if r.read_exact(&mut body).is_err() {
-            return;
-        }
-        let (m, cv) = &*st;
-        {
-            let mut g = m.lock().unwrap();
-            g.seen.push(path.clone());
-            cv.notify_all();
-            if path.ends_with("/extra") {
-                // Never answered: the daemon stops while its turn waits.
-                loop {
-                    g = cv.wait(g).unwrap();
-                }
+        if path == "/hang" {
+            while !g.released {
+                g = cv.wait(g).unwrap();
             }
-            if path == "/hang" {
-                while !g.released {
-                    g = cv.wait(g).unwrap();
-                }
-            }
-        }
-        let reply = "ok";
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n\r\n{reply}",
-            reply.len()
-        );
-        if w.write_all(resp.as_bytes()).is_err() {
-            return;
         }
     }
+    let reply = "ok";
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n\r\n{reply}",
+        reply.len()
+    );
+    let _ = w.write_all(resp.as_bytes());
 }
 
 // ---------------------------------------------------------------- daemon
@@ -178,19 +143,6 @@ fn start(dir: &Path, hold_after_call: bool) -> Proc {
             ..NodeConfig::default()
         },
     )
-}
-
-fn msg(name: &str, body: &str) -> pb::Message {
-    pb::Message {
-        name: name.into(),
-        content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-        }),
-        blobs: vec![],
-        retained_compensation_source: None,
-    }
 }
 
 fn reply_text(outcome: Option<&pb::Outcome>) -> String {
@@ -274,15 +226,6 @@ impl Proc {
             .unwrap()
     }
 
-    /// Waits up to 30 s for `f`.
-    fn wait_until(&self, what: &str, f: impl Fn(&Proc) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !f(self) {
-            assert!(Instant::now() < deadline, "timed out waiting for {what}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
     /// How many turns `counter/<key>` committed or failed.
     fn turns(&self, key: &str) -> u64 {
         self.node
@@ -291,21 +234,6 @@ impl Proc {
             .actor("counter", key)
             .unwrap()
             .map_or(0, |a| a.turns)
-    }
-
-    fn open_turns(&self) -> usize {
-        self.node.store().db().open_turns().unwrap().len()
-    }
-
-    fn records(&self) -> Vec<Record> {
-        let mut out = Vec::new();
-        self.rt
-            .block_on(self.node.reader().read(1, self.node.applied_lsn(), |c| {
-                out.push(c.record);
-                Ok(())
-            }))
-            .unwrap();
-        out
     }
 
     /// The turn records of `counter/<key>`.
@@ -324,7 +252,7 @@ impl Proc {
     fn block(&self, server: &Server, key: &str) -> Pending {
         self.send_detached(
             &format!("counter/{key}"),
-            msg("fetch-ok", &format!("GET {}", server.url("/hang"))),
+            msg("fetch-ok", format!("GET {}", server.url("/hang"))),
         )
     }
 

@@ -11,40 +11,17 @@ mod common;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use common::free_port;
+use common::{command, free_port};
 use serde_json::Value;
 
-const KRONIK: &str = env!("CARGO_BIN_EXE_kronik");
 const GUESTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests");
 
 fn guest(name: &str) -> String {
     format!("{GUESTS}/{name}.wasm")
-}
-
-/// A `kronik` command with no setting from the developer's shell.
-fn command() -> Command {
-    let mut c = Command::new(KRONIK);
-    for var in [
-        "KRONIK_CONFIG",
-        "KRONIK_DATA_DIR",
-        "KRONIK_HTTP_LISTEN",
-        "KRONIK_ADMIN_LISTEN",
-        "KRONIK_API_SOCKET",
-        "KRONIK_API_LISTEN",
-        "KRONIK_TOKEN",
-        "KRONIK_URL",
-        "KRONIK_MASTER_KEY_FILE",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-    ] {
-        c.env_remove(var);
-    }
-    c.stdin(Stdio::null());
-    c
 }
 
 struct Daemon {

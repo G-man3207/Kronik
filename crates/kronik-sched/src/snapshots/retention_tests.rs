@@ -7,26 +7,10 @@
 use std::sync::Arc;
 
 use super::*;
-use kronik_core::env::Env;
+use crate::test_support::{COUNTER, audit, env, run};
 use kronik_core::ids::ActorRef;
 
-const COUNTER: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/guests/counter.wasm"
-);
 const NOTES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/guests/notes.wasm");
-
-fn env() -> Env {
-    Env::real(tokio::runtime::Handle::current())
-}
-
-fn audit() -> pb::Audit {
-    pb::Audit {
-        token_id: "test".into(),
-        reason: "test".into(),
-        wall_time_ms: 0,
-    }
-}
 
 fn message(name: &str, text: &str) -> pb::Message {
     pb::Message {
@@ -127,20 +111,11 @@ async fn age(node: &Node) {
     }
 }
 
-/// One life of a node: the runtime is dropped when it ends, which stops the
-/// node's tasks and closes its databases, as a kill does. (The hooks are
-/// thread-local: the test thread polls everything the hooks reach.)
-fn life<T>(future: impl std::future::Future<Output = T>) -> T {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let out = runtime.block_on(future);
-    drop(runtime);
-    out
-}
-
 /// Nothing to repair, and the data is there.
 fn assert_hello_survives(dir: &Path) {
     assert_eq!(prepare_state(dir, "main").unwrap(), None);
-    life(async {
+    // The hooks are thread-local: the test thread polls everything the hooks reach.
+    run(async {
         let node = start(dir).await;
         let list = reply(&send(&node, "notes/n", "list", "").await);
         assert_eq!(list.matches("hello").count(), 1, "{list}");
@@ -150,7 +125,7 @@ fn assert_hello_survives(dir: &Path) {
 #[test]
 fn a_crash_after_the_raise_deletes_nothing_and_the_next_pass_finishes() {
     let dir = tempfile::tempdir().unwrap();
-    life(async {
+    run(async {
         let node = start(dir.path()).await;
         let note = history(&node).await;
         let storage = node.storage_config().unwrap().clone();
@@ -183,7 +158,7 @@ fn a_crash_after_the_raise_deletes_nothing_and_the_next_pass_finishes() {
 #[test]
 fn a_crash_after_a_delete_leaves_a_log_every_database_reaches() {
     let dir = tempfile::tempdir().unwrap();
-    let (note, first) = life(async {
+    let (note, first) = run(async {
         let node = start(dir.path()).await;
         let note = history(&node).await;
         let storage = node.storage_config().unwrap().clone();
@@ -212,7 +187,7 @@ fn a_crash_after_a_delete_leaves_a_log_every_database_reaches() {
     assert_hello_survives(dir.path());
 
     // And the rest of the pass, on the restarted node.
-    life(async {
+    run(async {
         let node = start(dir.path()).await;
         let storage = node.storage_config().unwrap().clone();
         let later = node.compact(&storage).unwrap();
@@ -247,7 +222,7 @@ async fn markers_after(node: &Node, after: Lsn) -> usize {
 fn a_snapshot_is_durable_before_its_marker() {
     use crate::durable::test_ops::{Op, watch};
     let dir = tempfile::tempdir().unwrap();
-    life(async {
+    run(async {
         let node = start(dir.path()).await;
         history(&node).await;
         let branch = node.branch().to_owned();
