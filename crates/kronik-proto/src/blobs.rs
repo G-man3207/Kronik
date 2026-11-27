@@ -300,17 +300,25 @@ mod tests {
         assert_eq!(parse_hash(&r.hash).unwrap(), (false, [0xab; 32]));
         let k = keyed_ref(0x01, 1, "user:1", 1);
         assert_eq!(parse_hash(&k.hash).unwrap(), (true, [0x01; 32]));
-        for bad in [
-            String::new(),
-            "b3:".into(),
-            "sha256:00".into(),
-            format!("b3:{}", "AB".repeat(32)),
-            format!("b3:{}", "ab".repeat(31)),
-            format!("b3:{}", "ab".repeat(33)),
-            format!("b3:{}g0", "ab".repeat(31)),
-            format!("B3:{}", "ab".repeat(32)),
+        for (bad, why) in [
+            (String::new(), "not b3: or b3s:"),
+            ("b3:".into(), "0 hex characters, not 64"),
+            ("sha256:00".into(), "not b3: or b3s:"),
+            (format!("b3:{}", "AB".repeat(32)), "not lowercase hex"),
+            (format!("b3:{}", "Ab".repeat(32)), "not lowercase hex"),
+            (format!("b3:{}", "é".repeat(32)), "not lowercase hex"),
+            (
+                format!("b3:{}", "ab".repeat(31)),
+                "62 hex characters, not 64",
+            ),
+            (
+                format!("b3:{}", "ab".repeat(33)),
+                "66 hex characters, not 64",
+            ),
+            (format!("b3:{}g0", "ab".repeat(31)), "not lowercase hex"),
+            (format!("B3:{}", "ab".repeat(32)), "not b3: or b3s:"),
         ] {
-            assert!(parse_hash(&bad).is_err(), "{bad:?}");
+            assert_eq!(parse_hash(&bad), Err(why.into()), "{bad:?}");
         }
     }
 
