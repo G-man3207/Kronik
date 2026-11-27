@@ -836,10 +836,6 @@ impl Authenticator for TokenAuthenticator {
             None => self.store.capture_local(req, required),
         }
     }
-
-    fn changes(&self) -> Option<Arc<tokio::sync::Notify>> {
-        Some(self.store.changes())
-    }
 }
 
 #[cfg(test)]

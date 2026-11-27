@@ -112,26 +112,13 @@ pub trait Authenticator: Send + Sync {
             session: None,
         })
     }
-    fn token_source(&self, req: &ApiRequest) -> Result<Option<String>, ApiError> {
-        let identity = self.caller(req)?.token_id;
-        Ok(identity.starts_with("token:").then_some(identity))
-    }
+
+    /// The lease the default [`Authenticator::capture`] pairs with the caller.
     fn authority(
         &self,
-        _req: &ApiRequest,
-        _required: Scope,
-    ) -> Result<kronik_core::authority::AuthLease, ApiError> {
-        Err(ApiError::new(
-            ErrorCode::Unauthenticated,
-            "This authenticator cannot admit mutations",
-        ))
-    }
-    fn changes(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
-        None
-    }
-    fn expires_at_ms(&self, _req: &ApiRequest) -> Option<u64> {
-        None
-    }
+        req: &ApiRequest,
+        required: Scope,
+    ) -> Result<kronik_core::authority::AuthLease, ApiError>;
 }
 
 /// The local socket: file permissions decide who connects, and that caller
