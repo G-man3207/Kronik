@@ -110,7 +110,7 @@ impl Proc {
         }
     }
 
-    fn records(&self, upto: u64) -> Vec<kronik_log::Committed> {
+    fn log_through(&self, upto: u64) -> Vec<kronik_log::Committed> {
         let mut out = Vec::new();
         self.rt
             .block_on(self.node.reader().read(1, upto, |c| {
@@ -125,7 +125,7 @@ impl Proc {
     /// only the applied ones (a snapshot's append resolves after its fsync,
     /// before its apply).
     fn markers(&self) -> usize {
-        self.records(u64::MAX)
+        self.log_through(u64::MAX)
             .iter()
             .filter(|c| matches!(c.record, Record::SnapshotMarker(_)))
             .count()
@@ -213,7 +213,7 @@ fn snapshots_are_consistent_under_concurrent_turns_and_startup_uses_them() {
     );
     assert!(m.files.iter().any(|f| f.path == "secrets.db"));
     // The snapshot's state is exactly the log's up to its LSN.
-    let upto = p.records(m.lsn);
+    let upto = p.log_through(m.lsn);
     assert_eq!(rebuilt_hash(&upto), m.state_hash);
     let snap_dir = dir
         .path()
@@ -227,7 +227,7 @@ fn snapshots_are_consistent_under_concurrent_turns_and_startup_uses_them() {
         m.state_hash
     );
     // The log records it.
-    let after = p.records(p.node.applied_lsn());
+    let after = p.log_through(p.node.applied_lsn());
     assert!(after.iter().any(|c| matches!(&c.record, Record::SnapshotMarker(s) if s.lsn == m.lsn && s.snapshot_id == m.id)));
     // The same LSN twice gives the existing snapshot.
     let again = p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
@@ -279,12 +279,12 @@ fn a_snapshot_during_an_open_sql_turn_succeeds() {
     p.send("notes/n", "add", "applied");
     let held = park_sql_call(&p);
     let m = p.rt.block_on(p.node.snapshot("manual", p.owner())).unwrap();
-    assert_eq!(rebuilt_hash(&p.records(m.lsn)), m.state_hash);
+    assert_eq!(rebuilt_hash(&p.log_through(m.lsn)), m.state_hash);
     // The integrity hash (GET /v1/integrity) is the applied state's too
     // (v0.1 re-review M2).
     let applied = p.node.applied_lsn();
     let integrity = p.node.store().state_hash().unwrap();
-    assert_eq!(integrity, rebuilt_hash(&p.records(applied)));
+    assert_eq!(integrity, rebuilt_hash(&p.log_through(applied)));
     // Its copy is gone again.
     let sql = dir.path().join("branches/main/sql");
     assert_eq!(sql_files(&sql, ".hash-copy-"), Vec::<String>::new());
@@ -1041,7 +1041,7 @@ fn record_long_gap(dir: &Path) -> Vec<String> {
             assert!(r.committed(), "{r:?}");
         }
     }
-    let last = p.records(u64::MAX).last().unwrap().lsn;
+    let last = p.log_through(u64::MAX).last().unwrap().lsn;
     p.rt.block_on(p.node.store().applied.wait(last));
     assert!(last - snapshot.lsn > 8_192, "{last}");
     let segments = kronik_log::segment_starts(&dir.join("branches/main/log")).unwrap();
@@ -1063,7 +1063,7 @@ fn a_turn_spans_segments(p: &Proc, dir: &Path) -> bool {
     let segments = kronik_log::segment_starts(&dir.join("branches/main/log")).unwrap();
     let segment = |lsn: u64| segments.iter().rposition(|s| *s <= lsn);
     let mut begun = std::collections::HashMap::new();
-    p.records(u64::MAX).iter().any(|c| match &c.record {
+    p.log_through(u64::MAX).iter().any(|c| match &c.record {
         Record::TurnBegin(b) => {
             begun.insert(b.execution_id.clone(), c.lsn);
             false

@@ -265,37 +265,6 @@ impl Proc {
             let _ = node.send(actor, m, audit(), false, original).await;
         });
     }
-
-    fn kv(&self, actor: &str, k: &str) -> Option<String> {
-        let a = ActorRef::parse(actor).unwrap();
-        self.node
-            .store()
-            .db()
-            .kv_get(&a.kind, &a.key, k)
-            .unwrap()
-            .map(|v| String::from_utf8(v).unwrap())
-    }
-
-    fn wait_until(&self, what: &str, f: impl Fn(&Proc) -> bool) {
-        for _ in 0..1000 {
-            if f(self) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("timed out waiting for {what}");
-    }
-
-    fn records(&self) -> Vec<Record> {
-        let mut out = Vec::new();
-        self.rt
-            .block_on(self.node.reader().read(1, self.node.applied_lsn(), |c| {
-                out.push(c.record);
-                Ok(())
-            }))
-            .unwrap();
-        out
-    }
 }
 
 fn turn_records(records: &[Record]) -> Vec<pb::TurnRecord> {

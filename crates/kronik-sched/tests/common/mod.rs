@@ -14,9 +14,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kronik_blob::{BlobMeta, BlobStore, NoKeys, Space, StoreConfig};
 use kronik_core::authority::AuthLease;
 use kronik_core::env::Env;
 use kronik_core::error::ApiError;
+use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
 use kronik_sched::{DeployResult, Ingress, Node, NodeConfig, TurnResult, start_local};
@@ -95,6 +97,68 @@ impl Proc {
         self.rt
             .block_on(self.node.deploy(&bytes, audit(), false, self.owner()))
             .unwrap()
+    }
+
+    /// Every record of the log up to the applied LSN.
+    pub fn records(&self) -> Vec<Record> {
+        let mut out = Vec::new();
+        self.rt
+            .block_on(self.node.reader().read(1, self.node.applied_lsn(), |c| {
+                out.push(c.record);
+                Ok(())
+            }))
+            .unwrap();
+        out
+    }
+
+    /// `actor`'s value of key `k`, as text.
+    pub fn kv(&self, actor: &str, k: &str) -> Option<String> {
+        let a = ActorRef::parse(actor).unwrap();
+        self.node
+            .store()
+            .db()
+            .kv_get(&a.kind, &a.key, k)
+            .unwrap()
+            .map(|v| String::from_utf8(v).unwrap())
+    }
+
+    /// How many turns are open: begun, and not ended by a record.
+    pub fn open_turns(&self) -> usize {
+        self.node.store().db().open_turns().unwrap().len()
+    }
+
+    /// Waits up to 30 s for `f`; panics naming `what` after that.
+    pub fn wait_until(&self, what: &str, f: impl Fn(&Proc) -> bool) {
+        for _ in 0..3000 {
+            if f(self) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// The bytes of `blob`, read and verified from the store in `dir`.
+    pub fn stored(&self, dir: &Path, blob: &pb::BlobRef) -> Vec<u8> {
+        self.rt.block_on(async {
+            let store = BlobStore::open(
+                Env::real(tokio::runtime::Handle::current()),
+                dir,
+                StoreConfig::default(),
+            )
+            .await
+            .unwrap();
+            let reader = store
+                .reader(&Space::Main, &BlobMeta::from_pb(blob).unwrap(), &NoKeys)
+                .await
+                .unwrap();
+            reader.verify(&NoKeys).await.unwrap();
+            reader
+                .read_at(0, blob.size as usize)
+                .await
+                .unwrap()
+                .to_vec()
+        })
     }
 }
 

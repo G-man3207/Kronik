@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use common::{Proc, audit, http, slow_server, start_proc, wait_turn};
-use kronik_blob::{BlobMeta, BlobStore, NoKeys, Space, StoreConfig};
+use kronik_blob::{BlobStore, Space, StoreConfig};
 use kronik_core::env::Env;
 use kronik_core::env::test_fs::{FsCall, Then, hooked};
 use kronik_core::ids::ActorRef;
@@ -105,28 +105,6 @@ impl Proc {
                 .await
                 .unwrap();
             meta.to_pb()
-        })
-    }
-
-    fn stored(&self, dir: &Path, blob: &pb::BlobRef) -> Vec<u8> {
-        self.rt.block_on(async {
-            let store = BlobStore::open(
-                Env::real(tokio::runtime::Handle::current()),
-                dir,
-                StoreConfig::default(),
-            )
-            .await
-            .unwrap();
-            let reader = store
-                .reader(&Space::Main, &BlobMeta::from_pb(blob).unwrap(), &NoKeys)
-                .await
-                .unwrap();
-            reader.verify(&NoKeys).await.unwrap();
-            reader
-                .read_at(0, blob.size as usize)
-                .await
-                .unwrap()
-                .to_vec()
         })
     }
 }

@@ -16,8 +16,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use common::{Proc, audit, http, start_proc};
-use kronik_blob::{BlobMeta, BlobStore, NoKeys, Space, StoreConfig};
-use kronik_core::env::Env;
 use kronik_core::ids::ActorRef;
 use kronik_proto::Record;
 use kronik_proto::log::v1 as pb;
@@ -133,28 +131,6 @@ impl Proc {
             Record::TurnRecord(t) => t,
             other => panic!("{other:?}"),
         }
-    }
-
-    fn stored(&self, dir: &Path, blob: &pb::BlobRef) -> Vec<u8> {
-        self.rt.block_on(async {
-            let store = BlobStore::open(
-                Env::real(tokio::runtime::Handle::current()),
-                dir,
-                StoreConfig::default(),
-            )
-            .await
-            .unwrap();
-            let reader = store
-                .reader(&Space::Main, &BlobMeta::from_pb(blob).unwrap(), &NoKeys)
-                .await
-                .unwrap();
-            reader.verify(&NoKeys).await.unwrap();
-            reader
-                .read_at(0, blob.size as usize)
-                .await
-                .unwrap()
-                .to_vec()
-        })
     }
 }
 
