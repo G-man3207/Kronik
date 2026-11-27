@@ -1255,16 +1255,7 @@ fn a_rebase_uses_recordings_only_and_its_dry_run_writes_nothing() {
             .with_rebase(Duration::from_secs(2))
             .with_model(Some(model(&model_addr))),
     );
-    let branches = || {
-        let mut b: Vec<_> = std::fs::read_dir(dir.path().join("branches"))
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name())
-            .collect();
-        b.sort();
-        b
-    };
-    let before = branches();
+    let before = branch_names(dir.path());
     // Overrides would be ignored: they are refused, like stubs (H8).
     let err =
         p.rt.block_on(props.rebase(
@@ -1292,7 +1283,11 @@ fn a_rebase_uses_recordings_only_and_its_dry_run_writes_nothing() {
     assert!(err.message.contains("simulator overrides"), "{err}");
     let (_, dry) = rebase_of(&p, &props, epoch, true);
     assert!(dry);
-    assert_eq!(branches(), before, "the dry run wrote a branch directory");
+    assert_eq!(
+        branch_names(dir.path()),
+        before,
+        "the dry run wrote a branch directory"
+    );
     assert!(
         seen.lock().unwrap().is_empty(),
         "the dry run asked the model"
@@ -1782,21 +1777,6 @@ fn a_rebase_promote_dry_run_writes_and_changes_nothing() {
         .with_rebase(Duration::from_secs(2));
     p.settle();
     let branch = dir.path().join("branches").join(&r.id);
-    let files = |d: &std::path::Path| {
-        let mut out = Vec::new();
-        let mut stack = vec![d.to_path_buf()];
-        while let Some(d) = stack.pop() {
-            for e in std::fs::read_dir(&d).unwrap().flatten() {
-                if e.path().is_dir() {
-                    stack.push(e.path());
-                } else {
-                    out.push((e.path(), std::fs::read(e.path()).unwrap()));
-                }
-            }
-        }
-        out.sort();
-        out
-    };
     let before = files(&branch);
     let meta = p.rt.block_on(props.get(&r.id)).unwrap();
     // Unapproved: the dry run answers APPROVAL_REQUIRED, without writing.

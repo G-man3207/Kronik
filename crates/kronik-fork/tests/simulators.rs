@@ -421,11 +421,7 @@ fn a_dry_run_proposal_calls_no_model_and_writes_nothing() {
             .unwrap()
             .with_model(Some(model(&model_addr))),
     );
-    let branches = |p: &std::path::Path| {
-        std::fs::read_dir(p.join("branches"))
-            .map(|d| d.count())
-            .unwrap_or(0)
-    };
+    let branches = |p: &std::path::Path| branch_names(p).len();
     let before = branches(dir.path());
     let err =
         p.rt.block_on(props.propose(
@@ -440,24 +436,6 @@ fn a_dry_run_proposal_calls_no_model_and_writes_nothing() {
     assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
     assert_eq!(seen.lock().unwrap().len(), 0, "no model call");
     assert_eq!(branches(dir.path()), before, "nothing under branches/");
-}
-
-/// Every file under `dir` with its bytes.
-fn files(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-    let mut out = Vec::new();
-    let mut todo = vec![dir.to_path_buf()];
-    while let Some(d) = todo.pop() {
-        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            let path = e.path();
-            if path.is_dir() {
-                todo.push(path);
-            } else {
-                out.push((path.clone(), std::fs::read(&path).unwrap()));
-            }
-        }
-    }
-    out.sort();
-    out
 }
 
 /// Review L1 (I12): `promote --dry-run` replays and catches up without

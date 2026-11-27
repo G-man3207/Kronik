@@ -609,15 +609,10 @@ fn tally_route(p: &Proc) -> Option<String> {
 
 /// Proposal directories under `branches/`.
 fn proposal_dirs(dir: &std::path::Path) -> usize {
-    std::fs::read_dir(dir.join("branches"))
-        .map(|d| {
-            d.filter(|e| {
-                e.as_ref()
-                    .is_ok_and(|e| e.file_name().to_string_lossy().starts_with("p-"))
-            })
-            .count()
-        })
-        .unwrap_or(0)
+    branch_names(dir)
+        .iter()
+        .filter(|n| n.starts_with("p-"))
+        .count()
 }
 
 /// Two kinds of one set cannot both take a new route: propose and the

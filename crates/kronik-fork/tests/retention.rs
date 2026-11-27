@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Proc, audit, diff_json, guest, propose_request, tempdir};
+use common::{Proc, audit, branch_names, diff_json, guest, propose_request, tempdir};
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::Lsn;
 use kronik_fork::diff::DiffOptions;
@@ -45,15 +45,6 @@ fn first_turn(p: &Proc) -> Lsn {
     }))
     .unwrap();
     found.expect("a turn")
-}
-
-fn branch_names(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(dir.join("branches"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    names
 }
 
 /// Two turns whose logical times differ, without sleeping: a restart sets

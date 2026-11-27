@@ -386,8 +386,9 @@ pub fn wait_until(what: &str, done: impl Fn() -> bool) {
     panic!("never: {what}");
 }
 
-/// Every file under `dir` that contains `needle`.
-pub fn files_with(dir: &Path, needle: &[u8]) -> Vec<std::path::PathBuf> {
+/// Every file under `dir`, recursively, with its bytes, sorted by path;
+/// files that cannot be read (gone meanwhile) are left out.
+pub fn files(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -395,14 +396,34 @@ pub fn files_with(dir: &Path, needle: &[u8]) -> Vec<std::path::PathBuf> {
             let path = e.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if std::fs::read(&path)
-                .is_ok_and(|bytes| bytes.windows(needle.len()).any(|w| w == needle))
-            {
-                out.push(path);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                out.push((path, bytes));
             }
         }
     }
+    out.sort();
     out
+}
+
+/// Every file under `dir` that contains `needle`.
+pub fn files_with(dir: &Path, needle: &[u8]) -> Vec<std::path::PathBuf> {
+    files(dir)
+        .into_iter()
+        .filter(|(_, bytes)| bytes.windows(needle.len()).any(|w| w == needle))
+        .map(|(path, _)| path)
+        .collect()
+}
+
+/// The names under `dir/branches`, sorted; empty if there is none.
+pub fn branch_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir.join("branches"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 /// Every turn record in main's log after `after`.

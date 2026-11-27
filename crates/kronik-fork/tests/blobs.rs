@@ -956,10 +956,8 @@ fn the_upgrade_check_replays_blob_turns_and_leaves_no_space_behind() {
         .unwrap();
     assert!(checked.report.passed, "{:?}", checked.report);
     assert!(checked.report.root_inputs >= 3, "{:?}", checked.report);
-    let spaces: Vec<String> = std::fs::read_dir(dir.path().join("branches"))
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
+    let spaces: Vec<String> = branch_names(dir.path())
+        .into_iter()
         .filter(|name| name.starts_with("upgrade-"))
         .collect();
     assert!(spaces.is_empty(), "the check left {spaces:?}");
