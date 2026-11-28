@@ -24,7 +24,7 @@ use zeroize::Zeroizing;
 
 use crate::auth::{Authenticator, Caller, Scope};
 use crate::tokens::{TokenAuthenticator, TokenStore};
-use crate::{ApiRequest, Query, reason};
+use crate::{ApiRequest, Query, bad, reason};
 
 const LOGIN_COOKIE: &str = "__Host-kronik-login";
 const SESSION_COOKIE: &str = "__Host-kronik-session";
@@ -51,10 +51,6 @@ pub struct Config {
 pub struct Binding {
     pub subject: String,
     pub token: String,
-}
-
-fn bad(message: &'static str) -> ApiError {
-    ApiError::new(ErrorCode::BadRequest, message)
 }
 
 fn denied() -> ApiError {
@@ -626,7 +622,7 @@ impl BrowserAuth {
                 kronik_proto::log::v1::audit_event::Operation::AuthConfig(admission.config);
             operation
                 .validate()
-                .map_err(|error| crate::bad(error.to_string()))?;
+                .map_err(|error| bad(error.to_string()))?;
             let kronik_proto::log::v1::audit_event::Operation::AuthConfig(config) = operation
             else {
                 return Err(crate::internal(

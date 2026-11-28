@@ -13,7 +13,7 @@ use kronik_sched::secrets::CertifiedSecretSnapshot;
 use kronik_sched::{Node, ShardReader};
 use serde::{Deserialize, Serialize};
 
-use crate::{Api, ApiResponse, Query, Result, internal, json, ok, reason};
+use crate::{Api, ApiResponse, Query, Result, bad, internal, json, ok, reason};
 
 /// Canonical HTTP endpoints served by the event streaming transport.
 pub const STREAM_PATHS: [&str; 2] = ["/v1/events/stream", "/v1/events/ws"];
@@ -376,9 +376,6 @@ impl Api {
     }
 }
 
-fn bad(message: &str) -> ApiError {
-    ApiError::new(ErrorCode::BadRequest, message)
-}
 fn range_gone() -> ApiError {
     ApiError::new(
         ErrorCode::AuditRangeGone,
