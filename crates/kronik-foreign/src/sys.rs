@@ -1,5 +1,5 @@
 //! Syscalls without a safe binding in the workspace's dependencies: network
-//! namespaces (create, delete, connect inside one) and the effective uid
+//! namespaces (create, delete, connect inside one)
 //! (docs/design/m7-foreign.md §6).
 //!
 //! Each namespace operation runs on a short-lived thread of its own, never
@@ -10,16 +10,15 @@
 //! lives on through its bind mount, a socket keeps the namespace it was
 //! created in.
 
-// Allowlisted: unshare(2), setns(2), mount(2), umount2(2) and geteuid(2) have
-// no safe binding in libc, and adding a crate for them is not worth its
-// surface.
+// Allowlisted: unshare(2), setns(2), mount(2) and umount2(2) have no safe
+// binding in libc, and adding a crate for them is not worth its surface.
 #![allow(unsafe_code)]
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -28,8 +27,7 @@ use crate::subid::{COUNT, Range};
 
 /// Whether the process runs with effective uid 0.
 pub fn is_root() -> bool {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() == 0 }
+    rustix::process::geteuid().is_root()
 }
 
 fn cstr(path: &Path) -> io::Result<CString> {
@@ -1277,8 +1275,7 @@ pub fn enter_userns(path: &Path, maps: &(IdMap, IdMap)) -> io::Result<()> {
             path.display()
         )));
     }
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let me = unsafe { libc::geteuid() };
+    let me = rustix::process::geteuid().as_raw();
     let safe = |map: &IdMap, owner: u32| {
         map.len() == 2
             && map[0] == [0, owner, 1]
@@ -1290,8 +1287,7 @@ pub fn enter_userns(path: &Path, maps: &(IdMap, IdMap)) -> io::Result<()> {
                 .checked_add(map[1][2])
                 .is_some_and(|end| !(map[1][1]..end).contains(&owner))
     };
-    // SAFETY: getegid has no preconditions and cannot fail.
-    if !safe(&maps.0, me) || !safe(&maps.1, unsafe { libc::getegid() }) {
+    if !safe(&maps.0, me) || !safe(&maps.1, rustix::process::getegid().as_raw()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "unsafe namespace map",
@@ -2165,10 +2161,6 @@ pub(crate) fn jail_mounts(jail: &MicrovmJail<'_>, kvm: &Path) -> io::Result<()> 
     Ok(())
 }
 
-/// The system call number of `openat2` (Linux 5.6): the same on every
-/// architecture that uses the generic table, x86-64 and aarch64 included.
-const SYS_OPENAT2: libc::c_long = 437;
-
 /// Opens the entry `name` of the directory `dir`, a socket that a process the
 /// daemon does not trust can rename or replace, without following a symbolic
 /// link, and returns a descriptor that stands for the entry itself (`O_PATH`)
@@ -2193,40 +2185,23 @@ pub fn open_socket_entry(dir: &Path, name: &str, owner: u32) -> io::Result<Owned
 
 /// [`open_socket_entry`] in a directory the caller has open, for one that it
 /// reached without following links (see [`open_socket_directory`]).
-pub fn open_socket_entry_at(dir: &impl AsRawFd, name: &str, owner: u32) -> io::Result<OwnedFd> {
+pub fn open_socket_entry_at(dir: &impl AsFd, name: &str, owner: u32) -> io::Result<OwnedFd> {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{name:?} is not the plain name of a socket"),
         ));
     }
-    let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    // SAFETY: open_how is a plain C struct; zero is a valid value for every field.
-    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
-    how.flags = (libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64;
-    how.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_BENEATH;
-    // SAFETY: `name` is a NUL-terminated string and `how` a live open_how of the
-    // size passed; the kernel only reads them.
-    let raw = unsafe {
-        libc::syscall(
-            SYS_OPENAT2,
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            &raw const how,
-            std::mem::size_of::<libc::open_how>(),
-        )
-    };
-    if raw < 0 {
-        return Err(explain_openat2(io::Error::last_os_error()));
-    }
-    // SAFETY: openat2 returned a new descriptor that nothing else owns.
-    let entry = unsafe { OwnedFd::from_raw_fd(raw as libc::c_int) };
-    // SAFETY: stat is a plain C struct that fstat fills in for a live descriptor.
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    check(
-        unsafe { libc::fstat(entry.as_raw_fd(), &raw mut stat) },
-        "fstat",
-    )?;
+    use rustix::fs::{Mode, OFlags, ResolveFlags};
+    let entry = rustix::fs::openat2(
+        dir,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS | ResolveFlags::BENEATH,
+    )
+    .map_err(|error| explain_openat2(error.into()))?;
+    let stat = rustix::fs::fstat(&entry)?;
     if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2282,69 +2257,24 @@ pub struct SocketDirectory {
 /// a socket: root's, and closed to others or sticky (in a sticky directory
 /// only an entry's owner can rename or remove it, and the next directory on
 /// the way must again be root's).
-fn passable(stat: &libc::stat) -> bool {
+fn passable(stat: &rustix::fs::Stat) -> bool {
     stat.st_uid == 0 && (stat.st_mode & 0o022 == 0 || stat.st_mode & 0o1000 != 0)
 }
 
 /// Whether only root can make an entry in a directory with this `stat`:
 /// root's and closed to others, sticky or not.
-fn root_only(stat: &libc::stat) -> bool {
+fn root_only(stat: &rustix::fs::Stat) -> bool {
     stat.st_uid == 0 && stat.st_mode & 0o022 == 0
 }
 
-fn stat_of(fd: &impl AsRawFd) -> io::Result<libc::stat> {
-    // SAFETY: stat is a plain C struct that fstat fills in for a live descriptor.
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    check(
-        unsafe { libc::fstat(fd.as_raw_fd(), &raw mut stat) },
-        "fstat",
-    )?;
-    Ok(stat)
-}
-
-/// `openat(dir, name, O_PATH | O_NOFOLLOW)`: the entry itself, a link as a link.
-fn open_entry(dir: &impl AsRawFd, name: &std::ffi::OsStr) -> io::Result<OwnedFd> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let name =
-        CString::new(name.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    // SAFETY: a NUL-terminated name; the kernel only reads it.
-    let raw = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if raw < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: openat returned a new descriptor that nothing else owns.
-    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
-}
-
-/// The target of the link that `link` (opened with `O_PATH | O_NOFOLLOW`) is.
-fn link_target(link: &impl AsRawFd) -> io::Result<PathBuf> {
+/// The target of the link that `link` (opened with `O_PATH | O_NOFOLLOW`)
+/// is: `readlinkat` with an empty path reads the link itself.
+fn link_target(link: &OwnedFd) -> io::Result<PathBuf> {
     use std::os::unix::ffi::OsStringExt as _;
-    let mut buffer = vec![0u8; libc::PATH_MAX as usize];
-    // SAFETY: an empty path makes readlinkat read the link `link` stands for;
-    // it writes at most `buffer.len()` bytes into the buffer.
-    let read = unsafe {
-        libc::readlinkat(
-            link.as_raw_fd(),
-            c"".as_ptr(),
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-        )
-    };
-    if read < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let read = read as usize;
-    if read >= buffer.len() {
-        return Err(io::Error::other("a symbolic link's target is too long"));
-    }
-    buffer.truncate(read);
-    Ok(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+    let target = rustix::fs::readlinkat(link, c"", Vec::new())?;
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(
+        target.into_bytes(),
+    )))
 }
 
 /// Opens `dir` the way root reaches a socket that a user it does not trust
@@ -2388,7 +2318,7 @@ pub fn open_socket_directory(dir: &Path) -> io::Result<SocketDirectory> {
     let mut shown = PathBuf::from("/");
     let mut links = 0;
     while let Some(name) = pending.pop_front() {
-        let here = stat_of(&current)?;
+        let here = rustix::fs::fstat(&current)?;
         if !passable(&here) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -2404,8 +2334,13 @@ pub fn open_socket_directory(dir: &Path) -> io::Result<SocketDirectory> {
                 ),
             ));
         }
-        let entry = open_entry(&current, &name)?;
-        let stat = stat_of(&entry)?;
+        let entry = rustix::fs::openat(
+            &current,
+            &name,
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        let stat = rustix::fs::fstat(&entry)?;
         match stat.st_mode & libc::S_IFMT {
             libc::S_IFDIR => {
                 current = entry;
@@ -2447,7 +2382,7 @@ pub fn open_socket_directory(dir: &Path) -> io::Result<SocketDirectory> {
             }
         }
     }
-    let stat = stat_of(&current)?;
+    let stat = rustix::fs::fstat(&current)?;
     Ok(SocketDirectory {
         fd: current,
         owner: stat.st_uid,
@@ -2478,8 +2413,7 @@ pub fn peer_uid(socket: &impl AsRawFd) -> io::Result<u32> {
 
 /// The effective user id of this process.
 pub fn euid() -> u32 {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() }
+    rustix::process::geteuid().as_raw()
 }
 
 /// Closes every descriptor from `from` through `to`. `close_range` does it in
@@ -2726,8 +2660,7 @@ mod tests {
 
     #[test]
     fn credential_sentinels_are_rejected_before_any_identity_change() {
-        // SAFETY: credential reads have no preconditions.
-        let before = unsafe { (libc::geteuid(), libc::getegid()) };
+        let before = (euid(), rustix::process::getegid().as_raw());
         let dir = tempfile::tempdir().unwrap();
         let pin = dir.path().join("must-not-exist");
         let range = Range {
@@ -2739,8 +2672,7 @@ mod tests {
             assert!(pin_userns(uid, gid, range, range, &pin).is_err());
         }
         assert!(!pin.exists());
-        // SAFETY: as above.
-        assert_eq!(unsafe { (libc::geteuid(), libc::getegid()) }, before);
+        assert_eq!((euid(), rustix::process::getegid().as_raw()), before);
     }
 
     /// A service identity as root: in a child, the uid, the gid and exactly

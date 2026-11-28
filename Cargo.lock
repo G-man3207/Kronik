@@ -2074,6 +2074,7 @@ dependencies = [
  "kronik-proto",
  "libc",
  "oci-client",
+ "rustix",
  "rustls",
  "ruzstd",
  "serde",
