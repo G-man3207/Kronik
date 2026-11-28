@@ -2398,6 +2398,61 @@ mod tests {
     }
 
     #[test]
+    fn model_scope_refuses_a_snapshot_with_an_unknown_or_uncovered_scope() {
+        let published: Arc<[pb::SecretRef]> = Arc::from([pb::SecretRef {
+            name: "key".into(),
+            version: 2,
+            version_hash: vec![2; 16],
+            ..Default::default()
+        }]);
+        let value = || Arc::new(Zeroizing::new(b"secret".to_vec()));
+        let snapshot = |values: usize, references: Option<Arc<[pb::SecretRef]>>| {
+            kronik_sched::secrets::CertifiedSecretSnapshot {
+                values: (0..values).map(|_| ("key".into(), value())).collect(),
+                references,
+                fingerprint: [1; 32],
+            }
+        };
+        // A known scope is the snapshot's references, for every prepared
+        // scope they cover.
+        let known = snapshot(1, Some(published.clone()));
+        assert_eq!(model_scope(&known, Some(&published)).unwrap(), published);
+        assert_eq!(model_scope(&known, Some(&[])).unwrap(), published);
+        // Without references, or with references that do not name every
+        // value, the scope is unknown and no model call may be answered.
+        assert_eq!(
+            model_scope(&snapshot(1, None), Some(&[])),
+            Err(ScrubError::SourceScopeUnavailable)
+        );
+        assert_eq!(
+            model_scope(&snapshot(2, Some(published.clone())), Some(&published)),
+            Err(ScrubError::SourceScopeUnavailable)
+        );
+    }
+
+    #[test]
+    fn model_scope_refuses_a_prepared_scope_the_snapshot_does_not_cover() {
+        let reference = |version: u8| pb::SecretRef {
+            name: "key".into(),
+            version: u32::from(version),
+            version_hash: vec![version; 16],
+            ..Default::default()
+        };
+        let snapshot = kronik_sched::secrets::CertifiedSecretSnapshot {
+            values: vec![("key".into(), Arc::new(Zeroizing::new(b"secret".to_vec())))],
+            references: Some(Arc::from([reference(2)])),
+            fingerprint: [1; 32],
+        };
+        // Prepared against version 1, a value the snapshot does not hold.
+        assert_eq!(
+            model_scope(&snapshot, Some(&[reference(1)])),
+            Err(ScrubError::SourceScopeUnavailable)
+        );
+        let covered: Arc<[pb::SecretRef]> = Arc::from([reference(2)]);
+        assert_eq!(model_scope(&snapshot, Some(&covered)).unwrap(), covered);
+    }
+
+    #[test]
     fn prepared_examples_use_the_actual_original_prefix_without_rematching_markers() {
         let reference = pb::SecretRef {
             name: "upper".into(),
