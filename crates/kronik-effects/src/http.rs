@@ -1688,4 +1688,23 @@ mod tests {
             Err(ScrubError::InvalidText)
         );
     }
+
+    /// Each message is a code that kronik-foreign's log reader and
+    /// kronik-fork's simulators put in a SECRET_UNAVAILABLE error: it is
+    /// all a client learns about the failure.
+    #[test]
+    fn scrub_error_messages_are_their_codes() {
+        for (error, code) in [
+            (ScrubError::OutputLimit, "REDACTION_OUTPUT_LIMIT"),
+            (ScrubError::PatternLimit, "REDACTION_PATTERN_LIMIT"),
+            (ScrubError::MatcherUnavailable, "REDACTION_UNAVAILABLE"),
+            (ScrubError::InvalidText, "REDACTION_INVALID_TEXT"),
+            (
+                ScrubError::SourceScopeUnavailable,
+                "REDACTION_SOURCE_SCOPE_UNAVAILABLE",
+            ),
+        ] {
+            assert_eq!(error.to_string(), code);
+        }
+    }
 }
