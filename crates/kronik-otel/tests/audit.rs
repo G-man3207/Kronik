@@ -107,13 +107,6 @@ fn all_expected() -> Vec<Expected> {
         .collect()
 }
 
-fn sealed_body(text: &str) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: Some(SUBJECT.into()),
-        value: Some(pb::sealable::Value::Plain(text.as_bytes().to_vec())),
-    })
-}
-
 fn operator_turn(source: pb::MessageSource, reveal: bool) -> pb::TurnRecord {
     let mut effects = Vec::new();
     if reveal {
@@ -122,20 +115,18 @@ fn operator_turn(source: pb::MessageSource, reveal: bool) -> pb::TurnRecord {
             kind: "secret.reveal".into(),
             target: "secret-reveal:api-key".into(),
             status: pb::EffectStatus::Ok as i32,
-            request: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(
-                    pb::RevealEffectRequest {
-                        secret: Some(pb::SecretRef {
-                            name: "api-key".into(),
-                            version: 3,
-                            version_hash: vec![0x11; 16],
-                            ..Default::default()
-                        }),
-                    }
-                    .encode_to_vec(),
-                )),
-            }),
+            request: Some(pb::Sealable::new_plain(
+                None,
+                pb::RevealEffectRequest {
+                    secret: Some(pb::SecretRef {
+                        name: "api-key".into(),
+                        version: 3,
+                        version_hash: vec![0x11; 16],
+                        ..Default::default()
+                    }),
+                }
+                .encode_to_vec(),
+            )),
             // Guest text can hold the value: never exported.
             error: SECRET_VALUE.into(),
             ..Default::default()
@@ -152,7 +143,7 @@ fn operator_turn(source: pb::MessageSource, reveal: bool) -> pb::TurnRecord {
                 source: source as i32,
                 msg: Some(pb::Message {
                     name: "increment".into(),
-                    body: sealed_body(BODY),
+                    body: Some(pb::Sealable::new_plain(Some(SUBJECT.into()), BODY)),
                     ..Default::default()
                 }),
                 resend_of: if source == pb::MessageSource::DeadLetterResend {

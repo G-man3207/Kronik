@@ -195,10 +195,7 @@ pub fn message(name: &str, body: &str) -> pb::Message {
     pb::Message {
         name: name.into(),
         content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-        }),
+        body: Some(pb::Sealable::new_plain(None, body.as_bytes().to_vec())),
         blobs: vec![],
         retained_compensation_source: None,
     }

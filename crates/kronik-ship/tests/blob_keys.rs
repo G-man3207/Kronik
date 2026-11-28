@@ -51,10 +51,10 @@ fn subject_blob(rt: &Runtime, node: &Node, subject: &str) -> pb::BlobRef {
         path: "/media/a/write".into(),
         query: "size=100000&chunk=65536".into(),
         body: Some(pb::Body {
-            value: Some(pb::body::Value::Inline(pb::Sealable {
-                subject: Some(subject.into()),
-                value: Some(pb::sealable::Value::Plain(Vec::new())),
-            })),
+            value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                Some(subject.into()),
+                Vec::new(),
+            ))),
         }),
         ..Default::default()
     };

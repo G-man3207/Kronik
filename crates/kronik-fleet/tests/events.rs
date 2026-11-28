@@ -490,10 +490,10 @@ fn operator_turn() -> pb::TurnRecord {
                 audit: audit(),
                 msg: Some(pb::Message {
                     name: "increment".into(),
-                    body: Some(pb::Sealable {
-                        subject: Some("subject-PII-NEEDLE".into()),
-                        value: Some(pb::sealable::Value::Plain(b"BODY-NEEDLE".to_vec())),
-                    }),
+                    body: Some(pb::Sealable::new_plain(
+                        Some("subject-PII-NEEDLE".into()),
+                        b"BODY-NEEDLE",
+                    )),
                     ..Default::default()
                 }),
                 ..Default::default()
