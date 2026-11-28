@@ -1485,46 +1485,36 @@ impl Api {
             ("GET", ["v1", "tokens"]) => self.tokens(),
             ("POST", ["v1", "tokens", name, "revoke"]) => self.token_revoke(req, name).await,
             ("GET", ["v1", "audit"]) => self.audit_lines(&q).await,
-            _ => match self.route_m3(req, segs.as_slice(), &q, caller).await {
-                Some(r) => r,
-                None => match self.route_m7(req, segs.as_slice(), &q).await {
-                    Some(r) => r,
-                    None if segs.get(1) == Some(&"simulators") => {
-                        match self.route_m12(req, segs.as_slice()).await {
-                            Some(r) => r,
-                            None => Err(ApiError::new(
-                                ErrorCode::NotImplemented,
-                                format!("no endpoint {} {}", req.method, req.path),
-                            )),
-                        }
-                    }
-                    None => match self.route_privacy(req, segs.as_slice()).await {
-                        Some(r) => r,
-                        None => match self.route_m6(req, segs.as_slice()).await {
-                            Some(r) => r,
-                            None if segs.get(1) == Some(&"blobs") => {
-                                match self.route_blobs(req, segs.as_slice(), &q, caller).await {
-                                    Some(r) => r,
-                                    None => Err(ApiError::new(
-                                        ErrorCode::NotImplemented,
-                                        format!("no endpoint {} {}", req.method, req.path),
-                                    )),
-                                }
-                            }
-                            None => match self.route_preview(req, segs.as_slice(), caller).await {
-                                Some(r) => r,
-                                None => match self.route_export(req, segs.as_slice()).await {
-                                    Some(r) => r,
-                                    None => Err(ApiError::new(
-                                        ErrorCode::NotImplemented,
-                                        format!("no endpoint {} {}", req.method, req.path),
-                                    )),
-                                },
-                            },
-                        },
-                    },
-                },
-            },
+            _ => {
+                if let Some(r) = self.route_m3(req, segs.as_slice(), &q, caller).await {
+                    return r;
+                }
+                if let Some(r) = self.route_m7(req, segs.as_slice(), &q).await {
+                    return r;
+                }
+                if let Some(r) = self.route_m12(req, segs.as_slice()).await {
+                    return r;
+                }
+                if let Some(r) = self.route_privacy(req, segs.as_slice()).await {
+                    return r;
+                }
+                if let Some(r) = self.route_m6(req, segs.as_slice()).await {
+                    return r;
+                }
+                if let Some(r) = self.route_blobs(req, segs.as_slice(), &q, caller).await {
+                    return r;
+                }
+                if let Some(r) = self.route_preview(req, segs.as_slice(), caller).await {
+                    return r;
+                }
+                if let Some(r) = self.route_export(req, segs.as_slice()).await {
+                    return r;
+                }
+                Err(ApiError::new(
+                    ErrorCode::NotImplemented,
+                    format!("no endpoint {} {}", req.method, req.path),
+                ))
+            }
         }
     }
 
