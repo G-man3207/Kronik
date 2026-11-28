@@ -348,10 +348,7 @@ mod tests {
     use super::*;
 
     fn val(subject: Option<&str>, v: &str) -> Option<pb::Sealable> {
-        Some(pb::Sealable {
-            subject: subject.map(str::to_owned),
-            value: Some(pb::sealable::Value::Plain(v.as_bytes().to_vec())),
-        })
+        Some(pb::Sealable::new_plain(subject.map(str::to_owned), v))
     }
 
     fn turn(

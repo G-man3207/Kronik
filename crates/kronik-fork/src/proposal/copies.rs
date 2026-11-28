@@ -280,10 +280,7 @@ mod tests {
         };
         let e = pb::EffectRecord {
             kind: "foreign.http".into(),
-            request: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(req.encode_to_vec())),
-            }),
+            request: Some(pb::Sealable::new_plain(None, req.encode_to_vec())),
             ..Default::default()
         };
         let wire = recorded_request(&e).expect("a request");
