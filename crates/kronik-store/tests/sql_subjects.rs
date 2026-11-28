@@ -66,10 +66,10 @@ fn turn(lsn: u64, ddl: &[String], sql_changes: Vec<pb::SqlChangeset>) -> Committ
                     method: "POST".into(),
                     path: "/notes".into(),
                     body: Some(pb::Body {
-                        value: Some(pb::body::Value::Inline(pb::Sealable {
-                            subject: None,
-                            value: Some(pb::sealable::Value::Plain(Vec::new())),
-                        })),
+                        value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                            None,
+                            Vec::new(),
+                        ))),
                     }),
                     ..Default::default()
                 })),
@@ -249,10 +249,7 @@ fn sealable_changes(changes: SubjectChanges) -> Vec<pb::SqlChangeset> {
     changes
         .into_iter()
         .map(|(subject, cs)| pb::SqlChangeset {
-            changeset: Some(pb::Sealable {
-                subject,
-                value: Some(pb::sealable::Value::Plain(cs)),
-            }),
+            changeset: Some(pb::Sealable::new_plain(subject, cs)),
         })
         .collect()
 }
@@ -385,10 +382,7 @@ fn seal_changes(
     changes
         .iter()
         .map(|(subject, cs)| {
-            let mut value = pb::Sealable {
-                subject: subject.clone(),
-                value: Some(pb::sealable::Value::Plain(cs.clone())),
-            };
+            let mut value = pb::Sealable::new_plain(subject.clone(), cs.clone());
             sealer
                 .seal_value(&mut value, &|b: &mut [u8]| b.fill(9), lsn)
                 .unwrap();

@@ -1098,10 +1098,7 @@ mod erasure_lock_tests {
                         ..Default::default()
                     }),
                     sql_changes: vec![pb::SqlChangeset {
-                        changeset: Some(pb::Sealable {
-                            subject: Some("user:1".into()),
-                            value: Some(pb::sealable::Value::Plain(bytes)),
-                        }),
+                        changeset: Some(pb::Sealable::new_plain(Some("user:1".into()), bytes)),
                     }],
                     ..Default::default()
                 }),
@@ -1110,10 +1107,7 @@ mod erasure_lock_tests {
         let reply = pb::Outcome {
             kind: pb::OutcomeKind::Committed as i32,
             output: Some(pb::outcome::Output::Reply(pb::Message {
-                body: Some(pb::Sealable {
-                    subject: Some("user:1".into()),
-                    value: Some(pb::sealable::Value::Plain(b"reply".to_vec())),
-                }),
+                body: Some(pb::Sealable::new_plain(Some("user:1".into()), b"reply")),
                 ..Default::default()
             })),
             ..Default::default()

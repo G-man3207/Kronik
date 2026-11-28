@@ -4980,10 +4980,7 @@ mod tests {
             subject: Some("user:1".into()),
             value: Some(pb::sealable::Value::Sealed(pb::Sealed::default())),
         });
-        let garbage = Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(vec![0x0e, 0xff, 0x16, 0x07])),
-        });
+        let garbage = Some(pb::Sealable::new_plain(None, vec![0x0e, 0xff, 0x16, 0x07]));
         for (ordinal, request) in [(1, sealed), (2, garbage)] {
             r.effects.push(pb::EffectRecord {
                 ordinal,
@@ -5033,10 +5030,7 @@ mod tests {
                 to: Some(callee.clone()),
                 msg: Some(pb::Message {
                     name: "undo".into(),
-                    body: Some(pb::Sealable {
-                        subject: None,
-                        value: Some(pb::sealable::Value::Plain(Vec::new())),
-                    }),
+                    body: Some(pb::Sealable::new_plain(None, Vec::new())),
                     ..Default::default()
                 }),
                 ordinal: 1,
@@ -5081,10 +5075,7 @@ mod tests {
                         message_id: call_id.clone(),
                         msg: Some(pb::Message {
                             name: "increment".into(),
-                            body: Some(pb::Sealable {
-                                subject: None,
-                                value: Some(pb::sealable::Value::Plain(Vec::new())),
-                            }),
+                            body: Some(pb::Sealable::new_plain(None, Vec::new())),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -5432,10 +5423,7 @@ mod tests {
                 pb::StateOp::Delete as i32
             },
             key: key.into(),
-            value: value.map(|v| pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(v.to_vec())),
-            }),
+            value: value.map(|v| pb::Sealable::new_plain(None, v.to_vec())),
         };
         let turn_at = |exec: &str, key: &str, time: u64, writes: Vec<pb::StateWrite>| {
             let mut t = turn(exec, exec, http_input());
@@ -5628,10 +5616,7 @@ mod tests {
     }
 
     fn tagged(subject: &str, text: &str) -> Option<pb::Sealable> {
-        Some(pb::Sealable {
-            subject: Some(subject.into()),
-            value: Some(pb::sealable::Value::Plain(text.as_bytes().to_vec())),
-        })
+        Some(pb::Sealable::new_plain(Some(subject.into()), text))
     }
 
     fn message(source: pb::MessageSource, id: &str, subject: &str) -> Option<pb::Input> {
@@ -6484,10 +6469,7 @@ mod tests {
         let mut db = StateDb::open(Connection::open_in_memory().unwrap()).unwrap();
         let msg = |name: &str, hash: &str| pb::Message {
             name: name.into(),
-            body: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(name.as_bytes().to_vec())),
-            }),
+            body: Some(pb::Sealable::new_plain(None, name.as_bytes().to_vec())),
             blobs: vec![pb::BlobRef {
                 hash: hash.into(),
                 size: 1,
@@ -6566,10 +6548,7 @@ mod tests {
         r.writes = vec![pb::StateWrite {
             op: pb::StateOp::Set as i32,
             key: "count".into(),
-            value: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(value.to_vec())),
-            }),
+            value: Some(pb::Sealable::new_plain(None, value.to_vec())),
         }];
         t
     }

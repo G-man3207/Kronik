@@ -26,10 +26,7 @@ fn committed(lsn: u64, record: Record) -> Committed {
 }
 
 fn plain(subject: Option<&str>, v: &[u8]) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: subject.map(String::from),
-        value: Some(pb::sealable::Value::Plain(v.to_vec())),
-    })
+    Some(pb::Sealable::new_plain(subject.map(String::from), v))
 }
 
 fn text(t: &str) -> pb::Frame {
