@@ -1307,15 +1307,13 @@ async fn quoted_history_omits_decoded_unknown_credentials_but_preserves_real_pre
         ordinal: 1,
         kind: "secret.reveal".into(),
         status: pb::EffectStatus::Ok as i32,
-        request: Some(pb::Sealable {
-            value: Some(pb::sealable::Value::Plain(
-                pb::RevealEffectRequest {
-                    secret: Some(reference),
-                }
-                .encode_to_vec(),
-            )),
-            ..Default::default()
-        }),
+        request: Some(pb::Sealable::new_plain(
+            None,
+            pb::RevealEffectRequest {
+                secret: Some(reference),
+            }
+            .encode_to_vec(),
+        )),
         ..Default::default()
     };
     let mut exchange = pb::EffectRecord {
@@ -1323,21 +1321,16 @@ async fn quoted_history_omits_decoded_unknown_credentials_but_preserves_real_pre
         kind: "http.fetch".into(),
         status: pb::EffectStatus::Ok as i32,
         fingerprint,
-        request: Some(pb::Sealable {
-            value: Some(pb::sealable::Value::Plain(request.encode_to_vec())),
-            ..Default::default()
-        }),
-        response: Some(pb::Sealable {
-            value: Some(pb::sealable::Value::Plain(
-                pb::HttpEffectResponse {
-                    status: 200,
-                    body: b"[secret:older]".to_vec(),
-                    ..Default::default()
-                }
-                .encode_to_vec(),
-            )),
-            ..Default::default()
-        }),
+        request: Some(pb::Sealable::new_plain(None, request.encode_to_vec())),
+        response: Some(pb::Sealable::new_plain(
+            None,
+            pb::HttpEffectResponse {
+                status: 200,
+                body: b"[secret:older]".to_vec(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )),
         ..Default::default()
     };
     let input = pb::Input {
@@ -1361,17 +1354,15 @@ async fn quoted_history_omits_decoded_unknown_credentials_but_preserves_real_pre
         credential.as_bytes().to_vec(),
         format!("\"{}\"", credential.replace('k', "\\u006b")).into_bytes(),
     ] {
-        exchange.response = Some(pb::Sealable {
-            value: Some(pb::sealable::Value::Plain(
-                pb::HttpEffectResponse {
-                    status: 200,
-                    body,
-                    ..Default::default()
-                }
-                .encode_to_vec(),
-            )),
-            ..Default::default()
-        });
+        exchange.response = Some(pb::Sealable::new_plain(
+            None,
+            pb::HttpEffectResponse {
+                status: 200,
+                body,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ));
         let original = exchange.encode_to_vec();
         assert!(
             model_examples(

@@ -1697,10 +1697,7 @@ mod tests {
     }
 
     fn plain(b: Vec<u8>) -> Option<pb::Sealable> {
-        Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(b)),
-        })
+        Some(pb::Sealable::new_plain(None, b))
     }
 
     fn exchange() -> pb::EffectRecord {
@@ -1834,10 +1831,7 @@ mod tests {
         write.writes.push(pb::StateWrite {
             op: pb::StateOp::Set as i32,
             key: "k".into(),
-            value: Some(pb::Sealable {
-                subject: Some("user:a".into()),
-                value: Some(pb::sealable::Value::Plain(b"v".to_vec())),
-            }),
+            value: Some(pb::Sealable::new_plain(Some("user:a".into()), b"v")),
         });
         assert!(turn_tainted(&write));
         let mut sql = clean.clone();

@@ -402,10 +402,7 @@ mod tests {
     #[test]
     fn production_values_shaped_like_pseudonyms_are_replaced() {
         let p = no_pii();
-        let tagged = || pb::Sealable {
-            subject: Some("user:1".into()),
-            value: Some(pb::sealable::Value::Plain(SHAPED.to_vec())),
-        };
+        let tagged = || pb::Sealable::new_plain(Some("user:1".into()), SHAPED.to_vec());
         let pseudonym = p.sealer.pseudonym("user:1", SHAPED).unwrap();
         assert_ne!(pseudonym.as_bytes(), SHAPED);
         let mut v = tagged();
@@ -436,10 +433,10 @@ mod tests {
                     writes: vec![pb::StateWrite {
                         key: "k".into(),
                         op: pb::StateOp::Set as i32,
-                        value: Some(pb::Sealable {
-                            subject: Some("user:1".into()),
-                            value: Some(pb::sealable::Value::Plain(SHAPED.to_vec())),
-                        }),
+                        value: Some(pb::Sealable::new_plain(
+                            Some("user:1".into()),
+                            SHAPED.to_vec(),
+                        )),
                     }],
                     ..http_turn("counter", "a", "r1".into())
                 },
@@ -472,10 +469,7 @@ mod tests {
             no_pii: false,
         };
         let write = |key: &str, value: &[u8]| {
-            let mut v = pb::Sealable {
-                subject: Some("user:1".into()),
-                value: Some(pb::sealable::Value::Plain(value.to_vec())),
-            };
+            let mut v = pb::Sealable::new_plain(Some("user:1".into()), value.to_vec());
             sealer
                 .seal_value(&mut v, &|b: &mut [u8]| b.fill(3), 1)
                 .unwrap();
@@ -557,10 +551,7 @@ mod tests {
     #[test]
     fn plain_forks_see_recorded_values() {
         let p = ForkPrivacy::plain();
-        let mut v = pb::Sealable {
-            subject: Some("user:1".into()),
-            value: Some(pb::sealable::Value::Plain(b"alice".to_vec())),
-        };
+        let mut v = pb::Sealable::new_plain(Some("user:1".into()), b"alice");
         assert!(!p.reveal(&mut v));
         assert_eq!(v.value, Some(pb::sealable::Value::Plain(b"alice".to_vec())));
     }
@@ -633,10 +624,7 @@ mod tests {
                         sql_changes: changes
                             .into_iter()
                             .map(|(subject, cs)| pb::SqlChangeset {
-                                changeset: Some(pb::Sealable {
-                                    subject,
-                                    value: Some(pb::sealable::Value::Plain(cs)),
-                                }),
+                                changeset: Some(pb::Sealable::new_plain(subject, cs)),
                             })
                             .collect(),
                         ..http_turn("notes", "n", format!("r{lsn}"))
@@ -751,10 +739,7 @@ mod tests {
             .changesets
             .iter()
             .map(|(subject, cs)| {
-                let mut value = pb::Sealable {
-                    subject: subject.clone(),
-                    value: Some(pb::sealable::Value::Plain(cs.clone())),
-                };
+                let mut value = pb::Sealable::new_plain(subject.clone(), cs.clone());
                 sealer
                     .seal_value(&mut value, &|b: &mut [u8]| b.fill(3), 2)
                     .unwrap();

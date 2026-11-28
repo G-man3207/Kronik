@@ -1455,10 +1455,7 @@ fn send_now_op(e: &pb::EffectRecord) -> Option<ConnOp> {
         dropped: Vec::new(),
         delivered,
         kind: kronik_proto::connection::frame_kind_name(r.kind),
-        data: Some(pb::Sealable {
-            subject: request.subject.clone(),
-            value: Some(pb::sealable::Value::Plain(r.data)),
-        }),
+        data: Some(pb::Sealable::new_plain(request.subject.clone(), r.data)),
         event: r.event,
         id: r.id,
         code: None,
@@ -3242,10 +3239,7 @@ fn continuous_state(
         let side = |rows: Vec<kronik_store::db::KvRow>| -> BTreeMap<String, Value> {
             rows.into_iter()
                 .map(|r| {
-                    let v = pb::Sealable {
-                        subject: r.subject,
-                        value: Some(pb::sealable::Value::Plain(r.value)),
-                    };
+                    let v = pb::Sealable::new_plain(r.subject, r.value);
                     (r.k, sealable_json(sealer, Some(&v)))
                 })
                 .collect()
@@ -3738,10 +3732,9 @@ mod tests {
             status: 200,
             headers: vec![],
             body: Some(pb::Body {
-                value: Some(pb::body::Value::Inline(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(b"text".to_vec())),
-                })),
+                value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                    None, b"text",
+                ))),
             }),
         };
         let a = blob(0xaa, 10, None);
@@ -3778,10 +3771,7 @@ mod tests {
                 kind: "actor.call".into(),
                 target: "actor:counter/b".into(),
                 status: status as i32,
-                request: Some(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(request.encode_to_vec())),
-                }),
+                request: Some(pb::Sealable::new_plain(None, request.encode_to_vec())),
                 ..Default::default()
             }
         };
@@ -3905,10 +3895,7 @@ mod tests {
                 fingerprint: fingerprint.to_vec(),
                 status: pb::EffectStatus::Ok as i32,
                 grounding: grounding as i32,
-                request: Some(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(request.encode_to_vec())),
-                }),
+                request: Some(pb::Sealable::new_plain(None, request.encode_to_vec())),
                 ..Default::default()
             }
         }
@@ -4140,10 +4127,7 @@ mod tests {
     /// subject's value; other turns are left alone.
     #[test]
     fn sql_turns_show_no_values() {
-        let row = || pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(b"ROW-1".to_vec())),
-        };
+        let row = || pb::Sealable::new_plain(None, b"ROW-1");
         let turn = |sql| ForkTurn {
             erased: false,
             id: "f:1".into(),
@@ -4185,12 +4169,7 @@ mod tests {
     #[test]
     fn connection_operations_compare_without_seqs_and_send_now_is_no_grounding() {
         let conn = |n: u8| format!("c-{}", format!("{n:x}").repeat(32));
-        let tagged = |b: &[u8]| {
-            Some(pb::Sealable {
-                subject: Some("user:1".into()),
-                value: Some(pb::sealable::Value::Plain(b.to_vec())),
-            })
-        };
+        let tagged = |b: &[u8]| Some(pb::Sealable::new_plain(Some("user:1".into()), b.to_vec()));
         let send_now = |seq: u64, text: &str, grounding: pb::Grounding| pb::EffectRecord {
             ordinal: 1,
             kind: SEND_NOW.into(),
