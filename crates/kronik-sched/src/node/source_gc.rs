@@ -3,19 +3,15 @@ use crate::node::Node;
 use kronik_core::authority::Authority;
 use kronik_core::error::{ApiError, ErrorCode};
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 
 fn unavailable(message: impl std::fmt::Display) -> ApiError {
     ApiError::new(ErrorCode::Unavailable, message.to_string())
 }
-fn io(error: std::io::Error) -> ApiError {
-    unavailable(error)
-}
 fn same_directory(path: &Path, original: &File) -> Result<(), ApiError> {
     use std::os::unix::fs::MetadataExt;
-    let actual = fs::metadata(path).map_err(io)?;
-    let held = original.metadata().map_err(io)?;
+    let actual = fs::metadata(path).map_err(unavailable)?;
+    let held = original.metadata().map_err(unavailable)?;
     if !actual.is_dir()
         || !held.is_dir()
         || actual.dev() != held.dev()
@@ -28,7 +24,7 @@ fn same_directory(path: &Path, original: &File) -> Result<(), ApiError> {
     Ok(())
 }
 impl Node {
-    fn native_source_directory(&self) -> Result<(PathBuf, Arc<File>), ApiError> {
+    pub(crate) fn check_native_source_directory(&self) -> Result<(), ApiError> {
         self.native_execution.check()?;
         let storage = self
             .cfg
@@ -39,19 +35,16 @@ impl Node {
             .lifecycle
             .ownership()
             .ok_or_else(|| unavailable("native source has no original directory ownership"))?;
-        let root = fs::canonicalize(&storage.data_dir).map_err(io)?;
+        let root = fs::canonicalize(&storage.data_dir).map_err(unavailable)?;
         same_directory(&root, &original)?;
         if !fs::canonicalize(self.reader().dir())
-            .map_err(io)?
+            .map_err(unavailable)?
             .starts_with(&root)
         {
             return Err(unavailable(
                 "native WAL is outside its original owned source directory",
             ));
         }
-        Ok((root, original))
-    }
-    pub(crate) fn check_native_source_directory(&self) -> Result<(), ApiError> {
-        self.native_source_directory().map(|_| ())
+        Ok(())
     }
 }
