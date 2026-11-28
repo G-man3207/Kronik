@@ -399,6 +399,49 @@ fn deploy_checks() {
     assert_eq!(err.code, ErrorCode::ActorNotFound);
 }
 
+/// A grant writes its in-forks mode to the log as `compute` or `recorded`.
+/// The field is never empty: empty is a grant written before the mode
+/// existed (ADR 0112), and it reads as compute.
+#[test]
+fn a_grant_records_its_in_forks_mode_and_never_an_empty_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = start(dir.path());
+    p.deploy_file(COUNTER);
+    for (host, mode) in [
+        ("one.example", kronik_effects::InForks::Compute),
+        ("two.example", kronik_effects::InForks::Recorded),
+    ] {
+        p.rt.block_on(p.node.grant(
+            "counter",
+            &format!("http:{host}"),
+            None,
+            None,
+            mode,
+            audit(),
+            false,
+            p.owner(),
+        ))
+        .unwrap();
+    }
+    let modes: Vec<(String, String)> = p
+        .records()
+        .into_iter()
+        .filter_map(|record| match record {
+            Record::Grant(grant) if grant.op == pb::GrantOp::Grant as i32 => {
+                Some((grant.capability, grant.in_forks))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        modes,
+        [
+            ("http:one.example".to_owned(), "compute".to_owned()),
+            ("http:two.example".to_owned(), "recorded".to_owned()),
+        ]
+    );
+}
+
 #[test]
 fn turns_are_deterministic_and_hide_the_execution_id() {
     let dir = tempfile::tempdir().unwrap();

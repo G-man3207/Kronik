@@ -510,29 +510,22 @@ pub struct ScrubLimits {
     pub pattern_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ScrubError {
+    #[error("REDACTION_OUTPUT_LIMIT")]
     OutputLimit,
+    #[error("REDACTION_PATTERN_LIMIT")]
     PatternLimit,
+    #[error("REDACTION_UNAVAILABLE")]
     MatcherUnavailable,
+    #[error("REDACTION_INVALID_TEXT")]
     InvalidText,
+    #[error("REDACTION_SOURCE_SCOPE_UNAVAILABLE")]
     SourceScopeUnavailable,
 }
-
-impl std::fmt::Display for ScrubError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::OutputLimit => "REDACTION_OUTPUT_LIMIT",
-            Self::PatternLimit => "REDACTION_PATTERN_LIMIT",
-            Self::MatcherUnavailable => "REDACTION_UNAVAILABLE",
-            Self::InvalidText => "REDACTION_INVALID_TEXT",
-            Self::SourceScopeUnavailable => "REDACTION_SOURCE_SCOPE_UNAVAILABLE",
-        })
-    }
-}
-
-impl std::error::Error for ScrubError {}
 
 #[derive(Clone, Copy)]
 struct ScrubMatch {
@@ -1687,5 +1680,24 @@ mod tests {
             scrub_str("é", &secret, limits(64)),
             Err(ScrubError::InvalidText)
         );
+    }
+
+    /// Each message is a code that kronik-foreign's log reader and
+    /// kronik-fork's simulators put in a SECRET_UNAVAILABLE error: it is
+    /// all a client learns about the failure.
+    #[test]
+    fn scrub_error_messages_are_their_codes() {
+        for (error, code) in [
+            (ScrubError::OutputLimit, "REDACTION_OUTPUT_LIMIT"),
+            (ScrubError::PatternLimit, "REDACTION_PATTERN_LIMIT"),
+            (ScrubError::MatcherUnavailable, "REDACTION_UNAVAILABLE"),
+            (ScrubError::InvalidText, "REDACTION_INVALID_TEXT"),
+            (
+                ScrubError::SourceScopeUnavailable,
+                "REDACTION_SOURCE_SCOPE_UNAVAILABLE",
+            ),
+        ] {
+            assert_eq!(error.to_string(), code);
+        }
     }
 }
