@@ -967,62 +967,17 @@ fn scope_covers_values(
         })
 }
 
-/// Certify the exact combined matcher input without copying its value bytes.
-/// The snapshot and held identities must come from their genuine host
-/// acquisition paths; this checks metadata coverage, not authority or a new
-/// hash-of-data proof. Unknown metadata remains UNKNOWN even for empty values.
-pub fn combined_secret_scope(
+/// The snapshot's secret scope, without copying its value bytes: its
+/// references when they name exactly its values, in order; `None`
+/// (unknown) otherwise, even for empty values. This checks metadata
+/// coverage, not authority.
+pub fn snapshot_secret_scope(
     snapshot: &crate::secrets::CertifiedSecretSnapshot,
-    held_values: &[(String, Arc<Zeroizing<Vec<u8>>>)],
-    held_references: Option<&[pb::SecretRef]>,
-) -> Result<Option<Arc<[pb::SecretRef]>>, ScrubError> {
-    let (Some(original), Some(held)) = (&snapshot.references, held_references) else {
-        return Ok(None);
-    };
-    if !scope_covers_values(&snapshot.values, original) || !scope_covers_values(held_values, held) {
-        return Ok(None);
-    }
-    if held.is_empty() {
-        return Ok(Some(original.clone()));
-    }
-    let mut identities = Vec::new();
-    identities
-        .try_reserve_exact(original.len())
-        .map_err(|_| ScrubError::MatcherUnavailable)?;
-    for reference in original.iter() {
-        identities.push(crate::scrub::scope_identity(reference)?);
-    }
-    identities.sort_unstable();
-    let mut additional = Vec::new();
-    additional
-        .try_reserve_exact(held.len())
-        .map_err(|_| ScrubError::MatcherUnavailable)?;
-    for reference in held {
-        let identity = crate::scrub::scope_identity(reference)?;
-        if identities.binary_search(&identity).is_err() {
-            additional.push((identity, reference));
-        }
-    }
-    if additional.is_empty() {
-        return Ok(Some(original.clone()));
-    }
-    additional.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    additional.dedup_by(|a, b| a.0 == b.0);
-    let count = original
-        .len()
-        .checked_add(additional.len())
-        .ok_or(ScrubError::MatcherUnavailable)?;
-    let mut merged = Vec::new();
-    merged
-        .try_reserve_exact(count)
-        .map_err(|_| ScrubError::MatcherUnavailable)?;
-    merged.extend(original.iter().cloned());
-    merged.extend(
-        additional
-            .into_iter()
-            .map(|(_, reference)| reference.clone()),
-    );
-    Ok(Some(Arc::from(merged)))
+) -> Option<Arc<[pb::SecretRef]>> {
+    snapshot
+        .references
+        .clone()
+        .filter(|references| scope_covers_values(&snapshot.values, references))
 }
 
 /// What the node can say of the current version of a secret for a new effect.
@@ -3200,52 +3155,54 @@ mod secret_tests {
     use super::*;
 
     #[test]
-    fn combined_scope_preserves_current_and_historical_identity_coverage() {
+    fn a_snapshot_scope_is_its_references_only_when_they_name_its_values() {
         let value = Arc::new(Zeroizing::new(b"credential".to_vec()));
-        let identity = |version| pb::SecretRef {
+        let published: Arc<[pb::SecretRef]> = Arc::from([pb::SecretRef {
             name: "key".into(),
-            version,
-            version_hash: vec![version as u8; 16],
+            version: 2,
+            version_hash: vec![2; 16],
             ..Default::default()
-        };
-        let published: Arc<[pb::SecretRef]> = Arc::from([identity(2)]);
+        }]);
         let snapshot = crate::secrets::CertifiedSecretSnapshot {
             values: vec![("key".into(), value.clone())],
             references: Some(published.clone()),
             fingerprint: [1; 32],
         };
-        let held = vec![("key".into(), value.clone())];
-        let scope = combined_secret_scope(&snapshot, &held, Some(&[identity(2)]))
-            .unwrap()
-            .unwrap();
-        assert_eq!(scope.as_ref(), published.as_ref());
-        let held = vec![("key".into(), value.clone()), ("key".into(), value)];
-        let scope = combined_secret_scope(&snapshot, &held, Some(&[identity(1), identity(1)]))
-            .unwrap()
-            .unwrap();
-        assert_eq!(scope.len(), 2);
-        assert!(scope.iter().any(|reference| reference.version == 1));
-        assert!(scope.iter().any(|reference| reference.version == 2));
-        assert!(
-            combined_secret_scope(&snapshot, &held, None)
-                .unwrap()
-                .is_none()
+        assert_eq!(
+            snapshot_secret_scope(&snapshot).unwrap().as_ref(),
+            published.as_ref()
         );
-        assert!(
-            combined_secret_scope(&snapshot, &held, Some(&[]))
-                .unwrap()
-                .is_none()
-        );
+        // One reference for two values: unknown.
+        let uncovered = crate::secrets::CertifiedSecretSnapshot {
+            values: vec![("key".into(), value.clone()), ("key".into(), value.clone())],
+            references: Some(published.clone()),
+            fingerprint: [1; 32],
+        };
+        assert!(snapshot_secret_scope(&uncovered).is_none());
+        // A reference that names another secret, or that has no identity of
+        // its own, covers no value either.
+        let renamed = crate::secrets::CertifiedSecretSnapshot {
+            values: vec![("other".into(), value.clone())],
+            references: Some(published),
+            fingerprint: [1; 32],
+        };
+        assert!(snapshot_secret_scope(&renamed).is_none());
+        let unresolved = crate::secrets::CertifiedSecretSnapshot {
+            values: vec![("key".into(), value)],
+            references: Some(Arc::from([pb::SecretRef {
+                name: "key".into(),
+                version_hash: vec![2; 16],
+                ..Default::default()
+            }])),
+            fingerprint: [1; 32],
+        };
+        assert!(snapshot_secret_scope(&unresolved).is_none());
         let unknown = crate::secrets::CertifiedSecretSnapshot {
             values: Vec::new(),
             references: None,
             fingerprint: [2; 32],
         };
-        assert!(
-            combined_secret_scope(&unknown, &[], Some(&[]))
-                .unwrap()
-                .is_none()
-        );
+        assert!(snapshot_secret_scope(&unknown).is_none());
     }
 
     fn test_message(bytes: &[u8]) -> pb::Message {
