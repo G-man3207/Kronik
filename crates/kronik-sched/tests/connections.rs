@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    Proc, audit, log_records, open_request, repoint_open_turn, start_proc, text_frame, wait_parked,
-    wait_turn,
+    Proc, audit, log_records, msg, open_request, repoint_open_turn, start_proc, text_frame,
+    wait_parked, wait_turn,
 };
 use kronik_core::error::ErrorCode;
 use kronik_core::ids::ActorRef;
@@ -157,13 +157,6 @@ fn connection_routes_conflict_with_the_routes_that_answer_the_same_requests() {
     );
 }
 
-fn plain(subject: Option<&str>, b: &[u8]) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: subject.map(String::from),
-        value: Some(pb::sealable::Value::Plain(b.to_vec())),
-    })
-}
-
 /// Text of a frame's data.
 fn data(f: &pb::Frame) -> String {
     match f.data.as_ref().and_then(|d| d.value.as_ref()) {
@@ -228,13 +221,7 @@ impl Proc {
         self.rt
             .block_on(self.node.send(
                 ActorRef::parse(actor).unwrap(),
-                pb::Message {
-                    name: name.into(),
-                    content_type: "text/plain".into(),
-                    body: plain(None, body.as_bytes()),
-                    blobs: vec![],
-                    retained_compensation_source: None,
-                },
+                msg(name, body),
                 audit(),
                 false,
                 self.node.local_operator_authority().unwrap(),

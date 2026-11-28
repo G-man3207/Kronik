@@ -201,10 +201,7 @@ impl World {
                 .changesets
                 .into_iter()
                 .map(|(subject, cs)| pb::SqlChangeset {
-                    changeset: Some(pb::Sealable {
-                        subject,
-                        value: Some(pb::sealable::Value::Plain(cs)),
-                    }),
+                    changeset: Some(pb::Sealable::new_plain(subject, cs)),
                 })
                 .collect();
         }
@@ -232,10 +229,7 @@ impl World {
 }
 
 fn sealable(b: &[u8]) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: None,
-        value: Some(pb::sealable::Value::Plain(b.to_vec())),
-    })
+    Some(pb::Sealable::new_plain(None, b))
 }
 
 fn message(name: &str, body: &[u8]) -> pb::Input {
@@ -287,10 +281,10 @@ fn http(method: &str, pattern: &str, id: &str, body: &[u8]) -> pb::Input {
                 value: sealable(b"application/json"),
             }],
             body: Some(pb::Body {
-                value: Some(pb::body::Value::Inline(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(body.to_vec())),
-                })),
+                value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                    None,
+                    body.to_vec(),
+                ))),
             }),
             ..Default::default()
         })),

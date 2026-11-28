@@ -57,10 +57,10 @@ impl Proc {
             path: format!("/media/a/{op}"),
             query: query.into(),
             body: Some(pb::Body {
-                value: Some(pb::body::Value::Inline(pb::Sealable {
-                    subject: Some(subject.into()),
-                    value: Some(pb::sealable::Value::Plain(Vec::new())),
-                })),
+                value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                    Some(subject.into()),
+                    Vec::new(),
+                ))),
             }),
             ..Default::default()
         };
@@ -267,12 +267,10 @@ fn a_turn_across_its_subjects_erasure_writes_no_blob_of_it() {
         path: "/media/a/fetch-write".into(),
         query: "size=5000".into(),
         body: Some(pb::Body {
-            value: Some(pb::body::Value::Inline(pb::Sealable {
-                subject: Some("user:1".into()),
-                value: Some(pb::sealable::Value::Plain(
-                    format!("http://{addr}/doc").into_bytes(),
-                )),
-            })),
+            value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                Some("user:1".into()),
+                format!("http://{addr}/doc").into_bytes(),
+            ))),
         }),
         ..Default::default()
     };

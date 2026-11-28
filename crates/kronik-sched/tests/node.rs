@@ -38,13 +38,6 @@ fn start(dir: &Path) -> Proc {
     )
 }
 
-fn plain(b: &[u8]) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: None,
-        value: Some(pb::sealable::Value::Plain(b.to_vec())),
-    })
-}
-
 fn http(method: &str, path: &str, op: Option<&str>, key: &str, body: &[u8]) -> pb::HttpInput {
     let mut params = vec![pb::Param {
         name: "key".into(),
@@ -63,7 +56,7 @@ fn http(method: &str, path: &str, op: Option<&str>, key: &str, body: &[u8]) -> p
         path: path.into(),
         params,
         body: Some(pb::Body {
-            value: Some(pb::body::Value::Inline(plain(body).unwrap())),
+            value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(None, body))),
         }),
         ..Default::default()
     }

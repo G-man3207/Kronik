@@ -67,10 +67,10 @@ fn http(op: &str, query: &str, idempotency_key: &str) -> pb::HttpInput {
         path: format!("/media/a/{op}"),
         query: query.into(),
         body: Some(pb::Body {
-            value: Some(pb::body::Value::Inline(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(Vec::new())),
-            })),
+            value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                None,
+                Vec::new(),
+            ))),
         }),
         idempotency_key: idempotency_key.into(),
         request_hash: if idempotency_key.is_empty() {
