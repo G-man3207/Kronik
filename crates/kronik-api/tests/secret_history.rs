@@ -28,26 +28,11 @@ const SECOND: &str = "second-value-2222";
 const THIRD: &str = "third-value-3333";
 
 async fn call(api: &Api, method: &str, path: &str, body: Value) -> Value {
-    let (path, query) = path.split_once('?').unwrap_or((path, ""));
     // The secret-coverage window of a rotation answers 503 SECRET_UNAVAILABLE
     // for a moment (ADR 0108); a bounded retry is what a client does.
     for _ in 0..200 {
-        let r = api
-            .handle(ApiRequest {
-                method: method.into(),
-                path: path.into(),
-                query: query.into(),
-                body: if body.is_null() {
-                    vec![]
-                } else {
-                    body.to_string().into_bytes()
-                },
-                token_id: "unix:uid=0".into(),
-                bearer: None,
-            })
-            .await;
-        let v: Value = serde_json::from_slice(&r.body).unwrap();
-        if r.status == 200 {
+        let (status, v) = common::call(api, method, path, body.clone()).await;
+        if status == 200 {
             return v;
         }
         assert_eq!(
