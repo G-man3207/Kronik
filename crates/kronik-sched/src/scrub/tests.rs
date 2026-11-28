@@ -4,10 +4,7 @@ use kronik_effects::http::{
 };
 
 fn body(value: &[u8]) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: None,
-        value: Some(pb::sealable::Value::Plain(value.to_vec())),
-    })
+    Some(pb::Sealable::new_plain(None, value))
 }
 
 fn msg(value: &[u8]) -> pb::Message {
@@ -674,10 +671,7 @@ fn historical_http_identity_is_inventory_but_not_prepared_coverage() {
         ordinal: 1,
         kind: kind.into(),
         status: pb::EffectStatus::Ok as i32,
-        request: Some(pb::Sealable {
-            value: Some(pb::sealable::Value::Plain(bytes)),
-            ..Default::default()
-        }),
+        request: Some(pb::Sealable::new_plain(None, bytes)),
         ..Default::default()
     };
     // Version-0 identities remain inventory: the prepared prefix rejects them.

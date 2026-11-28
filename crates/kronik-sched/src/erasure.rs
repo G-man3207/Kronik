@@ -270,10 +270,7 @@ mod tests {
     use super::*;
 
     fn value(subject: &str) -> pb::Sealable {
-        pb::Sealable {
-            subject: Some(subject.into()),
-            value: Some(pb::sealable::Value::Plain(b"personal".to_vec())),
-        }
+        pb::Sealable::new_plain(Some(subject.into()), b"personal")
     }
 
     /// A value born before an erasure predates it; one born after its record

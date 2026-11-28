@@ -13,10 +13,7 @@ use crate::test_support::{COUNTER, audit};
 use crate::{NodeConfig, start_local};
 
 fn plain(bytes: &[u8]) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: None,
-        value: Some(pb::sealable::Value::Plain(bytes.to_vec())),
-    })
+    Some(pb::Sealable::new_plain(None, bytes))
 }
 
 fn turn(exec: &str, key: &str, logical: u64, timers: Vec<pb::TimerOp>) -> Record {

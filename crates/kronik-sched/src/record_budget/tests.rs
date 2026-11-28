@@ -1,10 +1,7 @@
 use super::*;
 
 fn tagged(bytes: &[u8]) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: Some("user:1".into()),
-        value: Some(pb::sealable::Value::Plain(bytes.to_vec())),
-    })
+    Some(pb::Sealable::new_plain(Some("user:1".into()), bytes))
 }
 
 fn message(bytes: &[u8]) -> pb::Message {

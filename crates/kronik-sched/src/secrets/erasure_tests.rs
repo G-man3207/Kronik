@@ -44,10 +44,7 @@ fn effect(subject: Option<&str>, request: Vec<u8>) -> pb::EffectRecord {
         target: "http:127.0.0.1".into(),
         fingerprint: vec![3; 32],
         grounding: pb::Grounding::Live as i32,
-        request: Some(pb::Sealable {
-            subject: subject.map(str::to_owned),
-            value: Some(pb::sealable::Value::Plain(request)),
-        }),
+        request: Some(pb::Sealable::new_plain(subject.map(str::to_owned), request)),
         ..Default::default()
     }
 }
@@ -705,10 +702,10 @@ async fn wrote(node: &Node, id: u32, subject: &str, k: &str, value: &[u8]) -> u6
         vec![pb::StateWrite {
             op: pb::StateOp::Set as i32,
             key: k.into(),
-            value: Some(pb::Sealable {
-                subject: Some(subject.into()),
-                value: Some(pb::sealable::Value::Plain(value.to_vec())),
-            }),
+            value: Some(pb::Sealable::new_plain(
+                Some(subject.into()),
+                value.to_vec(),
+            )),
         }],
     )
     .await

@@ -20,10 +20,10 @@ fn message(name: &str, body: &str, subject: Option<&str>) -> pb::Message {
     pb::Message {
         name: name.into(),
         content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: subject.map(str::to_owned),
-            value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-        }),
+        body: Some(pb::Sealable::new_plain(
+            subject.map(str::to_owned),
+            body.as_bytes().to_vec(),
+        )),
         blobs: Vec::new(),
         retained_compensation_source: None,
     }
@@ -56,10 +56,10 @@ async fn a_copied_value_of_a_come_back_subject_is_the_tombstone() {
             writes: vec![pb::StateWrite {
                 key: "n".into(),
                 op: pb::StateOp::Set as i32,
-                value: Some(pb::Sealable {
-                    subject: Some("user:1".into()),
-                    value: Some(pb::sealable::Value::Plain(needle.to_vec())),
-                }),
+                value: Some(pb::Sealable::new_plain(
+                    Some("user:1".into()),
+                    needle.to_vec(),
+                )),
             }],
             ..Default::default()
         })
@@ -94,10 +94,7 @@ async fn a_copied_value_of_a_come_back_subject_is_the_tombstone() {
     );
 
     // The subject comes back: a post-erasure value creates key version 1.
-    let mut fresh = pb::Sealable {
-        subject: Some("user:1".into()),
-        value: Some(pb::sealable::Value::Plain(b"NEW".to_vec())),
-    };
+    let mut fresh = pb::Sealable::new_plain(Some("user:1".into()), b"NEW");
     node.sealer().seal_value(&mut fresh, &fill, 1).unwrap();
     let version = match fresh.value.as_ref() {
         Some(pb::sealable::Value::Sealed(s)) => s.key_version,
@@ -178,10 +175,10 @@ async fn a_fork_seal_in_flight_is_not_outrun_by_an_erasure() {
         writes: vec![pb::StateWrite {
             key: "n".into(),
             op: pb::StateOp::Set as i32,
-            value: Some(pb::Sealable {
-                subject: Some("user:1".into()),
-                value: Some(pb::sealable::Value::Plain(b"FORK-NEEDLE".to_vec())),
-            }),
+            value: Some(pb::Sealable::new_plain(
+                Some("user:1".into()),
+                b"FORK-NEEDLE",
+            )),
         }],
         ..Default::default()
     });
@@ -529,18 +526,16 @@ fn an_open_turns_recorded_value_of_an_erased_subject_is_not_served_again() {
                     })),
                 }),
             };
-            let response = pb::Sealable {
-                subject: Some("user:1".into()),
-                value: Some(pb::sealable::Value::Plain(
-                    pb::HttpEffectResponse {
-                        status: 200,
-                        headers: Vec::new(),
-                        body: b"NEEDLE-RECORDED".to_vec(),
-                        body_blob: None,
-                    }
-                    .encode_to_vec(),
-                )),
-            };
+            let response = pb::Sealable::new_plain(
+                Some("user:1".into()),
+                pb::HttpEffectResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"NEEDLE-RECORDED".to_vec(),
+                    body_blob: None,
+                }
+                .encode_to_vec(),
+            );
             node.commit(Record::TurnBegin(begin)).await.unwrap();
             node.commit(Record::EffectResult(pb::EffectResult {
                 execution_id: execution_id.clone(),
@@ -825,10 +820,10 @@ fn sql_record(id: &str, ddl: Vec<String>, changes: SubjectChanges) -> Record {
                 method: "POST".into(),
                 path: "/notes".into(),
                 body: Some(pb::Body {
-                    value: Some(pb::body::Value::Inline(pb::Sealable {
-                        subject: None,
-                        value: Some(pb::sealable::Value::Plain(Vec::new())),
-                    })),
+                    value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                        None,
+                        Vec::new(),
+                    ))),
                 }),
                 ..Default::default()
             })),
@@ -844,10 +839,7 @@ fn sql_record(id: &str, ddl: Vec<String>, changes: SubjectChanges) -> Record {
         sql_changes: changes
             .into_iter()
             .map(|(subject, cs)| pb::SqlChangeset {
-                changeset: Some(pb::Sealable {
-                    subject,
-                    value: Some(pb::sealable::Value::Plain(cs)),
-                }),
+                changeset: Some(pb::Sealable::new_plain(subject, cs)),
             })
             .collect(),
         ..Default::default()
