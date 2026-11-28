@@ -44,10 +44,7 @@ pub fn message(name: &str, body: &[u8]) -> pb::Input {
             msg: Some(pb::Message {
                 name: name.into(),
                 content_type: "text/plain".into(),
-                body: Some(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(body.to_vec())),
-                }),
+                body: Some(pb::Sealable::new_plain(None, body.to_vec())),
                 blobs: vec![],
                 retained_compensation_source: None,
             }),
