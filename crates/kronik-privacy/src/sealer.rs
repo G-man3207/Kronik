@@ -943,10 +943,7 @@ mod tests {
     }
 
     fn val(subject: Option<&str>, v: &[u8]) -> pb::Sealable {
-        pb::Sealable {
-            subject: subject.map(str::to_owned),
-            value: Some(pb::sealable::Value::Plain(v.to_vec())),
-        }
+        pb::Sealable::new_plain(subject.map(str::to_owned), v)
     }
 
     #[test]
@@ -1327,10 +1324,7 @@ mod blob_key_tests {
         let s = sealer();
         s.set_on(true);
         // A value sealed first creates version 1; blobs use it too.
-        let mut value = pb::Sealable {
-            subject: Some("user:1".into()),
-            value: Some(pb::sealable::Value::Plain(b"x".to_vec())),
-        };
+        let mut value = pb::Sealable::new_plain(Some("user:1".into()), b"x");
         s.seal_value(&mut value, &fill(3), 1).unwrap();
         let first = s.blob_keys("user:1", &fill(4), 2).unwrap();
         assert_eq!(first.key_version, 1);

@@ -60,10 +60,7 @@ impl Pair {
     }
 }
 fn plain(bytes: &[u8]) -> pb::Sealable {
-    pb::Sealable {
-        subject: Some("user:1".into()),
-        value: Some(pb::sealable::Value::Plain(bytes.to_vec())),
-    }
+    pb::Sealable::new_plain(Some("user:1".into()), bytes)
 }
 fn version(value: &pb::Sealable) -> u32 {
     match value.value.as_ref().unwrap() {
