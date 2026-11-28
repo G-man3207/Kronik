@@ -959,12 +959,10 @@ impl World {
             let msg = pb::Message {
                 name: "configure".into(),
                 content_type: "application/json".into(),
-                body: Some(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(
-                        br#"{"target":"http://payments/relay"}"#.to_vec(),
-                    )),
-                }),
+                body: Some(pb::Sealable::new_plain(
+                    None,
+                    br#"{"target":"http://payments/relay"}"#,
+                )),
                 blobs: vec![],
                 retained_compensation_source: None,
             };

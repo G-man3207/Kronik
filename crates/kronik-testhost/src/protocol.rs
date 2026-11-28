@@ -198,10 +198,7 @@ fn client_frame(body: Option<String>, body_base64: Option<String>) -> Result<pb:
     Ok(pb::Frame {
         kind: kind as i32,
         // The hub tags it with the connection's subject.
-        data: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(bytes)),
-        }),
+        data: Some(pb::Sealable::new_plain(None, bytes)),
         ..Default::default()
     })
 }

@@ -417,10 +417,7 @@ fn index_record(
 fn text_frame(text: &str) -> pb::Frame {
     pb::Frame {
         kind: pb::frame::Kind::Text as i32,
-        data: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(text.as_bytes().to_vec())),
-        }),
+        data: Some(pb::Sealable::new_plain(None, text.as_bytes().to_vec())),
         event: String::new(),
         id: String::new(),
     }
