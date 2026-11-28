@@ -27,9 +27,7 @@ use kronik_runtime::{
     FetchRequest, GateError, Program, SendNowOutcome, SendNowRequest, TurnLimits, TurnRequest,
 };
 use kronik_sched::body_subject;
-use kronik_sched::effects::{
-    map_call_outcome, outcome_of_fetch, outcome_of_send_now, plain, tagged,
-};
+use kronik_sched::effects::{map_call_outcome, outcome_of_fetch, outcome_of_send_now};
 use kronik_sched::host::{SqlHandle, SqlTurn};
 use kronik_store::Store;
 use kronik_store::db::message_input;
@@ -1375,10 +1373,7 @@ impl Runner {
                     .changesets
                     .into_iter()
                     .map(|(subject, cs)| pb::SqlChangeset {
-                        changeset: Some(pb::Sealable {
-                            subject,
-                            value: Some(pb::sealable::Value::Plain(cs)),
-                        }),
+                        changeset: Some(pb::Sealable::new_plain(subject, cs)),
                     })
                     .collect();
             }
@@ -1660,10 +1655,7 @@ fn a_sealed_value_of_an_erased_subject_is_subject_erased_not_a_missing_key() {
         kronik_privacy::keystore::Keystore::open_owned(&owner, &master).unwrap(),
     );
     sealer.set_on(true);
-    let mut value = pb::Sealable {
-        subject: Some("user:1".into()),
-        value: Some(pb::sealable::Value::Plain(b"x".to_vec())),
-    };
+    let mut value = pb::Sealable::new_plain(Some("user:1".into()), b"x");
     sealer
         .seal_value(&mut value, &|b: &mut [u8]| b.fill(3), 1)
         .unwrap();
@@ -2792,7 +2784,10 @@ impl ReplayGate {
             if foreign { "foreign" } else { "http" },
             recorded_target.host
         );
-        let encoded = tagged(&req.subject, request.encode_to_vec());
+        let encoded = Some(pb::Sealable::new_plain(
+            req.subject.clone(),
+            request.encode_to_vec(),
+        ));
         // Production admits a new fetch with room for its request and a
         // result without a body; the same refusal keeps a replay identical.
         let need = kronik_sched::record_budget::fetch_need(request.encoded_len());
@@ -3033,7 +3028,8 @@ impl ReplayGate {
                         status: pb::EffectStatus::Ok as i32,
                         grounding: pb::Grounding::Synthetic as i32,
                         simulator: kronik_effects::simulator::label::MODEL.into(),
-                        response: plain(
+                        response: Some(pb::Sealable::new_plain(
+                            None,
                             pb::HttpEffectResponse {
                                 status: u32::from(a.status),
                                 headers: a
@@ -3045,7 +3041,7 @@ impl ReplayGate {
                                 body_blob: None,
                             }
                             .encode_to_vec(),
-                        ),
+                        )),
                         ..Default::default()
                     };
                     let mut rec = rec;
@@ -3286,9 +3282,8 @@ impl ReplayGate {
         let sealer = &self.runner.setup.privacy.sealer;
         // As in production: its request and the largest reply must fit in
         // what is left of the turn's effect bytes (ADR 0145).
-        let request_bytes = tagged(&msg_subject, encoded.clone())
-            .as_ref()
-            .map_or(0, |s| s.encoded_len()) as u64;
+        let request_bytes =
+            pb::Sealable::new_plain(msg_subject.clone(), encoded.clone()).encoded_len() as u64;
         let reply_bytes_most = self
             .config()
             .limits(&to.kind)
@@ -3333,7 +3328,7 @@ impl ReplayGate {
             kind: "actor.call".into(),
             target: format!("actor:{to}"),
             fingerprint: sealer.effect_fingerprint(msg_subject.as_deref(), plain),
-            request: tagged(&msg_subject, encoded),
+            request: Some(pb::Sealable::new_plain(msg_subject.clone(), encoded)),
             grounding: pb::Grounding::Live as i32,
             blobs,
             ..Default::default()
@@ -3632,7 +3627,7 @@ impl ReplayGate {
         let out = match result {
             Ok(o) => {
                 rec.status = pb::EffectStatus::Ok as i32;
-                rec.response = plain(o.clone());
+                rec.response = Some(pb::Sealable::new_plain(None, o.clone()));
                 CryptoOutcome::Ok(o)
             }
             Err(e) => {
@@ -3667,8 +3662,8 @@ impl ReplayGate {
             target: target.clone(),
             fingerprint: fp.clone(),
             status: status as i32,
-            request: tagged(
-                &req.subject,
+            request: Some(pb::Sealable::new_plain(
+                req.subject.clone(),
                 send_now_request(
                     &req.connection,
                     if matches!(
@@ -3682,7 +3677,7 @@ impl ReplayGate {
                     &req.frame,
                 )
                 .encode_to_vec(),
-            ),
+            )),
             delivery: "unsafe".into(),
             grounding: grounding as i32,
             ..Default::default()
