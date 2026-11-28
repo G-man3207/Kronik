@@ -264,10 +264,7 @@ fn msg_with(blobs: Vec<pb::BlobRef>) -> pb::Message {
     pb::Message {
         name: "m".into(),
         content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(b"x".to_vec())),
-        }),
+        body: Some(pb::Sealable::new_plain(None, b"x")),
         blobs,
         retained_compensation_source: None,
     }

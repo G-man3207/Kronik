@@ -18,10 +18,7 @@ fn set(kind: &str, key: &str, root: &str, k: &str, v: &str) -> pb::TurnRecord {
         writes: vec![pb::StateWrite {
             op: pb::StateOp::Set as i32,
             key: k.into(),
-            value: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(v.as_bytes().to_vec())),
-            }),
+            value: Some(pb::Sealable::new_plain(None, v.as_bytes().to_vec())),
         }],
         outcome: Some(pb::Outcome {
             kind: pb::OutcomeKind::Committed as i32,
@@ -309,10 +306,10 @@ fn an_erasure_in_the_window_removes_the_subjects_dead_letters_after_the_switch()
             }),
             msg: Some(pb::Message {
                 name: "note".into(),
-                body: Some(pb::Sealable {
-                    subject: Some("alice".into()),
-                    value: Some(pb::sealable::Value::Plain(b"alice's data".to_vec())),
-                }),
+                body: Some(pb::Sealable::new_plain(
+                    Some("alice".into()),
+                    b"alice's data",
+                )),
                 ..Default::default()
             }),
             message_id: "m-alice".into(),
