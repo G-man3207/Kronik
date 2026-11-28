@@ -13,10 +13,7 @@ use super::{
 };
 
 fn plain(b: &[u8]) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: None,
-        value: Some(pb::sealable::Value::Plain(b.to_vec())),
-    })
+    Some(pb::Sealable::new_plain(None, b))
 }
 
 fn actor() -> Option<pb::ActorRef> {
@@ -1178,10 +1175,7 @@ fn effect_result_with(body: Vec<u8>) -> Record {
     Record::EffectResult(pb::EffectResult {
         execution_id: "e".into(),
         effect: Some(pb::EffectRecord {
-            response: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(body)),
-            }),
+            response: Some(pb::Sealable::new_plain(None, body)),
             ..effect()
         }),
     })

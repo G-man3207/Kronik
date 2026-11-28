@@ -196,10 +196,7 @@ fn synthetic_http(
             status: pb::EffectStatus::Ok as i32,
             grounding: pb::Grounding::Synthetic as i32,
             simulator: simulator.into(),
-            response: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(response.encode_to_vec())),
-            }),
+            response: Some(pb::Sealable::new_plain(None, response.encode_to_vec())),
             ..Default::default()
         },
     }
@@ -438,12 +435,7 @@ mod tests {
     }
 
     fn recorded(lsn: u64, url: &str, body: &str, answer: &str) -> (u64, pb::EffectRecord) {
-        let plain = |b: Vec<u8>| {
-            Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(b)),
-            })
-        };
+        let plain = |b: Vec<u8>| Some(pb::Sealable::new_plain(None, b));
         (
             lsn,
             pb::EffectRecord {
@@ -477,10 +469,7 @@ mod tests {
     #[test]
     fn neighbor_picks_the_most_similar_request_on_the_route() {
         let mut sealed = recorded(9, "http://a/v1/charges/1", r#"{"amount": 5}"#, "sealed");
-        sealed.1.response = Some(pb::Sealable {
-            subject: Some("user:1".into()),
-            value: Some(pb::sealable::Value::Plain(b"x".to_vec())),
-        });
+        sealed.1.response = Some(pb::Sealable::new_plain(Some("user:1".into()), b"x"));
         let n = RecordedNeighbor::new([
             recorded(
                 1,

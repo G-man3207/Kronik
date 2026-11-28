@@ -12,12 +12,10 @@ fn fixture(root: &std::path::Path) -> (Arc<Keystore>, Sealer) {
     (ks, sealer)
 }
 fn plain() -> pb::Sealable {
-    pb::Sealable {
-        subject: Some(SUBJECT.into()),
-        value: Some(pb::sealable::Value::Plain(
-            br#"{"issuer":"https://issuer.test","subject":"verified-user"}"#.to_vec(),
-        )),
-    }
+    pb::Sealable::new_plain(
+        Some(SUBJECT.into()),
+        br#"{"issuer":"https://issuer.test","subject":"verified-user"}"#,
+    )
 }
 fn prepare(sealer: &Sealer, floor: Option<u32>) -> PreparedSubjectKey {
     sealer
