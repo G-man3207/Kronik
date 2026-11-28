@@ -366,7 +366,9 @@ impl Node {
     pub async fn reseal_progress(&self) -> crate::ResealProgress {
         match self.cfg.storage.as_ref() {
             Some(s) => {
-                let mut progress = crate::reseal::reseal_progress(&s.data_dir);
+                // The journal through the node's file system, as at start.
+                let fixes = self.journaled_fixes(&s.data_dir).await.unwrap_or_default();
+                let mut progress = crate::reseal::reseal_progress(&s.data_dir, &fixes);
                 progress.pending_blobs = self.pending_blob_reuploads().await;
                 progress
             }
