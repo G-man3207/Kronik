@@ -2374,7 +2374,7 @@ impl Acc {
     }
 
     fn response(&mut self, root_lsn: Lsn, prod: (Lsn, &pb::TurnRecord), fork: Option<&ForkTurn>) {
-        let Some(pb::input::Kind::Http(h)) = prod.1.input.as_ref().and_then(|i| i.kind.as_ref())
+        let Some(pb::input::Kind::Http(_)) = prod.1.input.as_ref().and_then(|i| i.kind.as_ref())
         else {
             return;
         };
@@ -2444,15 +2444,7 @@ impl Acc {
             );
         }
         // The route pattern, never the path: paths can hold user data.
-        let route = format!(
-            "{} {}",
-            h.method,
-            if h.route.is_empty() {
-                "(no route)"
-            } else {
-                &h.route
-            }
-        );
+        let route = input_label(prod.1.input.as_ref());
         push_capped(
             &mut self.responses.items,
             MAX_ITEMS,
