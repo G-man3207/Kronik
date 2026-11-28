@@ -3676,15 +3676,25 @@ int main(void) {
             io::ErrorKind::WouldBlock
         );
         drop(entry);
-        // Links, files, directories and FIFOs in its place are not sockets.
+        // Links, files, directories and FIFOs in its place are not sockets. A
+        // relative link among them: `RESOLVE_BENEATH` alone refuses a link to
+        // an absolute path, so only a relative one shows that no link is
+        // followed.
         symlink(&moved, dir.path().join("link.sock")).unwrap();
+        symlink("moved.sock", dir.path().join("relative.sock")).unwrap();
         symlink(dir.path(), dir.path().join("dirlink.sock")).unwrap();
         fs::write(dir.path().join("file.sock"), b"x").unwrap();
         fs::create_dir(dir.path().join("dir.sock")).unwrap();
         let fifo = std::process::Command::new("mkfifo")
             .arg(dir.path().join("fifo.sock"))
             .status();
-        let mut bad = vec!["link.sock", "dirlink.sock", "file.sock", "dir.sock"];
+        let mut bad = vec![
+            "link.sock",
+            "relative.sock",
+            "dirlink.sock",
+            "file.sock",
+            "dir.sock",
+        ];
         if matches!(fifo, Ok(status) if status.success()) {
             bad.push("fifo.sock");
         }
@@ -3692,12 +3702,13 @@ int main(void) {
             let error = open_socket_entry(dir.path(), name, me).unwrap_err();
             assert_ne!(error.kind(), io::ErrorKind::NotFound, "{name}: {error}");
         }
-        // Another user's socket, a missing entry, and names that are not plain.
+        // Another user's socket, a missing entry, and names that are not plain
+        // (one with a NUL byte included): refused before any system call.
         let error = open_socket_entry(dir.path(), "moved.sock", me + 1).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
         let error = open_socket_entry(dir.path(), "absent.sock", me).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
-        for name in ["", ".", "..", "a/b", "/etc/passwd"] {
+        for name in ["", ".", "..", "a/b", "/etc/passwd", "a\0b"] {
             let error = open_socket_entry(dir.path(), name, me).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{name:?}");
         }
