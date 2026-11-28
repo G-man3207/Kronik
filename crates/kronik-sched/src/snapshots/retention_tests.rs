@@ -16,10 +16,7 @@ fn message(name: &str, text: &str) -> pb::Message {
     pb::Message {
         name: name.into(),
         content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(text.as_bytes().to_vec())),
-        }),
+        body: Some(pb::Sealable::new_plain(None, text.as_bytes().to_vec())),
         blobs: Vec::new(),
         retained_compensation_source: None,
     }

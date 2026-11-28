@@ -36,10 +36,7 @@ fn call(
             source: pb::MessageSource::Call as i32,
             msg: Some(pb::Message {
                 name: "increment".into(),
-                body: Some(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(Vec::new())),
-                }),
+                body: Some(pb::Sealable::new_plain(None, Vec::new())),
                 ..Default::default()
             }),
             message_id: format!("m{n}"),
@@ -181,10 +178,7 @@ async fn a_turn_running_in_the_drain_is_not_quiet() {
             msg: Some(pb::Message {
                 name: "spin".into(),
                 content_type: "text/plain".into(),
-                body: Some(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(b"20000000".to_vec())),
-                }),
+                body: Some(pb::Sealable::new_plain(None, b"20000000")),
                 ..Default::default()
             }),
             message_id: "spin".into(),
@@ -382,10 +376,7 @@ async fn connection_dead_letter(node: &Node) -> u64 {
                 }],
                 headers: vec![pb::Header {
                     name: "sec-websocket-protocol".into(),
-                    value: Some(pb::Sealable {
-                        subject: None,
-                        value: Some(pb::sealable::Value::Plain(b"room.v1".to_vec())),
-                    }),
+                    value: Some(pb::Sealable::new_plain(None, b"room.v1")),
                 }],
                 route: "/room/{key}/ws".into(),
                 ..Default::default()
@@ -404,10 +395,7 @@ async fn connection_dead_letter(node: &Node) -> u64 {
             &id,
             pb::Frame {
                 kind: pb::frame::Kind::Text as i32,
-                data: Some(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(b"fail".to_vec())),
-                }),
+                data: Some(pb::Sealable::new_plain(None, b"fail")),
                 ..Default::default()
             },
         )

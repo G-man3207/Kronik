@@ -763,10 +763,7 @@ fn the_first_cycle_leaves_the_certificate_the_start_made_alone() {
 // `erasure_tests.rs`: a secret in the ledger and a turn whose record cites it.
 
 pub(super) fn plain(bytes: Vec<u8>) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: None,
-        value: Some(pb::sealable::Value::Plain(bytes)),
-    })
+    Some(pb::Sealable::new_plain(None, bytes))
 }
 
 pub(super) fn begin(node: &Node) -> pb::TurnBegin {

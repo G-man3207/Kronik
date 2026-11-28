@@ -37,10 +37,10 @@ fn begin(node: &Node, execution: char) -> pb::TurnBegin {
                 method: "GET".into(),
                 path: "/source".into(),
                 body: Some(pb::Body {
-                    value: Some(pb::body::Value::Inline(pb::Sealable {
-                        subject: None,
-                        value: Some(pb::sealable::Value::Plain(Vec::new())),
-                    })),
+                    value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                        None,
+                        Vec::new(),
+                    ))),
                 }),
                 ..Default::default()
             })),
@@ -351,10 +351,7 @@ async fn a_call_succeeds_after_the_log_start_moves_past_one() {
             pb::Message {
                 name: "call".into(),
                 content_type: "text/plain".into(),
-                body: Some(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(b"counter/b increment".to_vec())),
-                }),
+                body: Some(pb::Sealable::new_plain(None, b"counter/b increment")),
                 ..Default::default()
             },
             pb::Audit::default(),
