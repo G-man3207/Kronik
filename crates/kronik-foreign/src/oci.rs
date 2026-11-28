@@ -1143,23 +1143,6 @@ fn utf8_path<'a>(path: &'a Path, what: &str) -> Result<&'a str, ImageError> {
         .ok_or_else(|| invalid(format!("{what} {} is not UTF-8", path.display())))
 }
 
-/// Docker's default capabilities minus `CAP_NET_RAW`.
-const ROOT_CAPS: [&str; 13] = [
-    "CAP_CHOWN",
-    "CAP_DAC_OVERRIDE",
-    "CAP_FSETID",
-    "CAP_FOWNER",
-    "CAP_MKNOD",
-    "CAP_SETGID",
-    "CAP_SETUID",
-    "CAP_SETFCAP",
-    "CAP_SETPCAP",
-    "CAP_NET_BIND_SERVICE",
-    "CAP_SYS_CHROOT",
-    "CAP_KILL",
-    "CAP_AUDIT_WRITE",
-];
-
 /// Generates the OCI runtime spec (`config.json`) for runsc and runc from
 /// the image config and the overrides. Resolves the image user inside
 /// `rootfs` and creates a missing working directory there, like Docker.
@@ -1191,7 +1174,10 @@ pub fn runtime_spec(
     let cwd = format!("/{}", utf8_path(&workdir, "working directory")?);
 
     let caps: Vec<&str> = if uid == 0 {
-        ROOT_CAPS.to_vec()
+        kronik_guest_init::CAPABILITIES
+            .iter()
+            .map(|(name, _)| *name)
+            .collect()
     } else {
         Vec::new()
     };
@@ -2336,11 +2322,27 @@ mod tests {
         let (mut image, rootfs) = spec_image(&tmp);
         image.config["config"]["User"] = json!("");
         let spec = runtime_spec(&image, &rootfs, &Overrides::default()).unwrap();
-        let caps = spec.json["process"]["capabilities"]["effective"]
-            .as_array()
-            .unwrap();
-        assert_eq!(caps.len(), 13);
-        assert!(!caps.contains(&json!("CAP_NET_RAW")));
+        // Docker's default set without `CAP_NET_RAW`, in Docker's order. The
+        // names come from `kronik_guest_init::CAPABILITIES`, whose order this
+        // pins: the guest only looks names up, so nothing else needs it.
+        let expected = json!([
+            "CAP_CHOWN",
+            "CAP_DAC_OVERRIDE",
+            "CAP_FSETID",
+            "CAP_FOWNER",
+            "CAP_MKNOD",
+            "CAP_SETGID",
+            "CAP_SETUID",
+            "CAP_SETFCAP",
+            "CAP_SETPCAP",
+            "CAP_NET_BIND_SERVICE",
+            "CAP_SYS_CHROOT",
+            "CAP_KILL",
+            "CAP_AUDIT_WRITE",
+        ]);
+        for set in ["bounding", "effective", "permitted"] {
+            assert_eq!(spec.json["process"]["capabilities"][set], expected, "{set}");
+        }
         assert_eq!(spec.json["linux"]["resources"], json!({}));
         assert_eq!(
             spec.json["linux"]["namespaces"][1],
