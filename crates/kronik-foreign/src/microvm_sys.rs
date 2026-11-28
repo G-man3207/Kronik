@@ -215,6 +215,54 @@ mod tests {
         let before = std::fs::metadata(&destination).unwrap().mtime();
         set_mtime(&link, 17).unwrap();
         assert_eq!(std::fs::symlink_metadata(&link).unwrap().mtime(), 17);
+        assert_eq!(std::fs::symlink_metadata(&link).unwrap().atime(), 0);
         assert_eq!(std::fs::metadata(&destination).unwrap().mtime(), before);
+    }
+
+    #[test]
+    fn allocation_reserves_the_drive_and_refuses_a_size_above_the_kernel_limit() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let file = File::create(dir.path().join("data.ext4")).unwrap();
+        allocate(&file, 4 << 20).unwrap();
+        let metadata = file.metadata().unwrap();
+        assert_eq!(metadata.len(), 4 << 20);
+        assert!(metadata.blocks() * 512 >= 4 << 20);
+        assert_eq!(
+            allocate(&file, u64::MAX).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_copy_from_another_file_system_is_copied_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("destination");
+        // No file system shares extents with procfs, so FICLONE is refused
+        // and the copy falls back to reading and writing.
+        let expected = std::fs::read("/proc/version").unwrap();
+        assert_eq!(
+            copy(Path::new("/proc/version"), &destination).unwrap(),
+            expected.len() as u64
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_nul_byte_in_a_path_is_refused_as_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("staging");
+        std::fs::write(&source, b"new").unwrap();
+        let with_nul = dir.path().join("drive\0name");
+        assert_eq!(
+            publish(&source, &with_nul).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            set_mtime(&with_nul, 17).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // The staging file is the only entry: nothing was created or moved.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
