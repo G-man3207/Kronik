@@ -8,7 +8,7 @@ use kronik_core::authority::AuthLease;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use kronik_core::env::{Env, OpenMode};
+use kronik_core::env::Env;
 use kronik_core::error::{ApiError, ErrorCode};
 use kronik_core::ids::Lsn;
 use kronik_privacy::sealer::{ResealOp, Sealer};
@@ -122,18 +122,11 @@ fn retention_path(data: &Path) -> PathBuf {
 /// shorter retention. Best effort: a failure is a warning, and a missing
 /// file means the default (30 days).
 pub(crate) async fn publish_keystore_retention(env: &Env, data: &Path, retention_ms: u64) {
-    let dir = privacy_dir(data);
     let path = retention_path(data);
-    let temp = path.with_extension("tmp");
     let write = async {
-        env.fs.create_dir_all(dir.clone()).await?;
-        let file = env.fs.open(temp.clone(), OpenMode::ReadWriteCreate).await?;
-        file.set_len(0).await?;
-        file.write_at(0, bytes::Bytes::from(retention_ms.to_string().into_bytes()))
-            .await?;
-        file.sync_data().await?;
-        env.fs.rename(temp, path).await?;
-        env.fs.sync_dir(dir).await
+        env.fs.create_dir_all(privacy_dir(data)).await?;
+        let temp = path.with_extension("tmp");
+        crate::durable::replace(&*env.fs, temp, path, retention_ms.to_string().into_bytes()).await
     };
     if let Err(e) = write.await {
         tracing::warn!(error = %e, "could not record keystore backup retention");

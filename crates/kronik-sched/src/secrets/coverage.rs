@@ -18,7 +18,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use bytes::Bytes as IoBytes;
 use serde::{Deserialize, Serialize};
 
 use kronik_core::env::{Env, OpenMode};
@@ -109,34 +108,7 @@ pub async fn persist(env: &Env, data_dir: &Path, watermark: &CoverageWatermark) 
         return;
     }
     let temp = path.with_extension("json.tmp");
-    let write = async {
-        let file = env
-            .fs
-            .open(temp.clone(), OpenMode::ReadWriteCreate)
-            .await
-            .map_err(|error| format!("open: {error}"))?;
-        file.set_len(0)
-            .await
-            .map_err(|error| format!("len: {error}"))?;
-        file.write_at(0, IoBytes::from(bytes))
-            .await
-            .map_err(|error| format!("write: {error}"))?;
-        file.sync_data()
-            .await
-            .map_err(|error| format!("sync: {error}"))?;
-        env.fs
-            .rename(temp, path.clone())
-            .await
-            .map_err(|error| format!("rename: {error}"))?;
-        if let Some(dir) = path.parent() {
-            env.fs
-                .sync_dir(dir.to_owned())
-                .await
-                .map_err(|error| format!("sync dir: {error}"))?;
-        }
-        Ok::<(), String>(())
-    };
-    if let Err(error) = write.await {
+    if let Err(error) = crate::durable::replace(&*env.fs, temp, path.clone(), bytes).await {
         warn(&path, &format!("watermark write: {error}")).await;
     }
 }
