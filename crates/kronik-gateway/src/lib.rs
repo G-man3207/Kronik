@@ -1806,10 +1806,7 @@ impl Gateway {
         // (I9). With a subject, path, query and parameter values go into
         // the sealable fields; the route pattern and the method are not
         // user data and stay plain.
-        let tagged = |bytes: Vec<u8>| pb::Sealable {
-            subject: subject.clone(),
-            value: Some(pb::sealable::Value::Plain(bytes)),
-        };
+        let tagged = |bytes: Vec<u8>| pb::Sealable::new_plain(subject.clone(), bytes);
         let sealed = subject.is_some();
         let (path, sealed_path) = if sealed {
             (String::new(), Some(tagged(req.path.into_bytes())))
@@ -1996,10 +1993,10 @@ mod tests {
             })
         };
         let plain = |b: &str| {
-            Some(pb::Sealable {
-                subject: Some("user:2".into()),
-                value: Some(pb::sealable::Value::Plain(b.as_bytes().to_vec())),
-            })
+            Some(pb::Sealable::new_plain(
+                Some("user:2".into()),
+                b.as_bytes().to_vec(),
+            ))
         };
         let answered = |headers: Vec<pb::Header>, body| {
             turn_response(&TurnResult {
