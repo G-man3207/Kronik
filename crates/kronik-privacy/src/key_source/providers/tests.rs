@@ -450,3 +450,36 @@ fn oauth_access_tokens_must_be_usable_as_headers() {
         assert!(access_token(&response).is_err());
     }
 }
+
+#[test]
+fn secret_values_have_one_accepted_encoding_of_at_most_64_kib() {
+    // Every value is round-tripped, the largest one included.
+    let mut lengths: Vec<usize> = (0..=64).collect();
+    lengths.extend([65_535, 65_536]);
+    for len in lengths {
+        let value: Vec<u8> = (0..len).map(|i| i as u8).collect();
+        let decoded = secret_base64(&STANDARD.encode(&value)).unwrap();
+        assert_eq!(&*decoded, &value, "{len} bytes");
+    }
+    // One byte more is refused while its encoding still fits the length cap.
+    for len in [65_537, 65_538] {
+        assert!(
+            secret_base64(&STANDARD.encode(vec![0; len])).is_none(),
+            "{len} bytes"
+        );
+    }
+    for refused in [
+        "Zg",   // no padding
+        "Zg=",  // one pad byte where two are needed
+        "Zh==", // trailing bits set: a second encoding of `Zg==`
+        "Zm9=", // the same, of `Zm8=`
+        "Zg==Zg=",
+        "Zg==\n",
+        "Zg= ",
+        "Z\u{e9}==",
+        "====",
+        "Z===",
+    ] {
+        assert!(secret_base64(refused).is_none(), "{refused:?}");
+    }
+}

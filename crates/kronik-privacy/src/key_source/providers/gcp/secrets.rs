@@ -53,18 +53,8 @@ fn fetched(path: &str, expected: Option<&str>, response: &Value) -> Result<Fetch
         .and_then(|p| p.get("data"))
         .and_then(Value::as_str)
         .ok_or(BackendError::Invalid)?;
-    // Secret Manager limits an individual value to 64 KiB; cap before decoding too.
-    if encoded.len() > 65_536_usize.div_ceil(3) * 4 {
-        return Err(BackendError::Invalid);
-    }
-    let mut value = Zeroizing::new(vec![0; encoded.len() / 4 * 3 + 3]);
-    let len = STANDARD
-        .decode_slice(encoded, &mut value)
-        .map_err(|_| BackendError::Invalid)?;
-    if len > 65_536 {
-        return Err(BackendError::Invalid);
-    }
-    value.truncate(len);
+    // Secret Manager limits an individual value to 64 KiB.
+    let value = secret_base64(encoded).ok_or(BackendError::Invalid)?;
     Ok(Fetched {
         value,
         source_version: id.into(),

@@ -299,33 +299,8 @@ fn fetched(
     let mut value = match (response.get("SecretString"), response.get("SecretBinary")) {
         (Some(Value::String(s)), None) => Zeroizing::new(s.as_bytes().to_vec()),
         (None, Some(Value::String(s))) => {
-            // Secrets Manager limits decoded binary values to 64 KiB; failures wipe partial output.
-            if s.len() % 4 != 0 || s.len() > 87_384 {
-                return Err(BackendError::Invalid);
-            }
-            let padding = if s.ends_with("==") {
-                2
-            } else if s.ends_with('=') {
-                1
-            } else {
-                0
-            };
-            let size = s.len() / 4 * 3 - padding;
-            if size > 65_536 {
-                return Err(BackendError::Invalid);
-            }
-            let mut value = Zeroizing::new(vec![0; size]);
-            let decoded = STANDARD
-                .decode_slice(s, &mut value)
-                .map_err(|_| BackendError::Invalid)?;
-            if decoded != size {
-                return Err(BackendError::Invalid);
-            }
-            let encoded = Zeroizing::new(STANDARD.encode(&value));
-            if encoded.as_str() != s {
-                return Err(BackendError::Invalid);
-            }
-            value
+            // Secrets Manager limits decoded binary values to 64 KiB.
+            secret_base64(s).ok_or(BackendError::Invalid)?
         }
         _ => return Err(BackendError::Invalid),
     };
