@@ -60,11 +60,14 @@ fn operator_tokens_and_secrets_match_original_text_once() {
 #[test]
 fn literal_marker_is_not_an_output_provenance_exemption() {
     let secrets = [("A", b"a".as_slice()), ("E", b"e".as_slice())];
+    let matcher = plan(&secrets);
     let mut generated = body(b"a");
-    sealable(&mut generated, &secrets).unwrap();
+    let mut remaining = MAX_JSON_OUTPUT_BYTES;
+    sealable_budget(&mut generated, &matcher, &mut remaining).unwrap();
     assert_eq!(bytes(&generated), b"[secret:A]");
     let mut literal = body(b"[secret:A]");
-    sealable(&mut literal, &secrets).unwrap();
+    let mut remaining = MAX_JSON_OUTPUT_BYTES;
+    sealable_budget(&mut literal, &matcher, &mut remaining).unwrap();
     assert_eq!(bytes(&literal), b"[s[secret:E]cr[secret:E]t:A]");
 }
 
@@ -338,7 +341,7 @@ fn reply_free_name_type_and_body_share_one_plan() {
         }),
         ..Default::default()
     };
-    call_response(&mut response, &plan(&secrets), 4096).unwrap();
+    message_budget(&mut response.reply, &plan(&secrets), &mut 4096).unwrap();
     let reply = response.reply.unwrap();
     assert_eq!(reply.name, "[secret:N]");
     assert_eq!(reply.content_type, "[secret:N]");
