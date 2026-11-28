@@ -67,10 +67,7 @@ fn http(op: &str, query: &str, body: pb::body::Value) -> pb::HttpInput {
 }
 
 fn inline(bytes: &[u8]) -> pb::body::Value {
-    pb::body::Value::Inline(pb::Sealable {
-        subject: None,
-        value: Some(pb::sealable::Value::Plain(bytes.to_vec())),
-    })
+    pb::body::Value::Inline(pb::Sealable::new_plain(None, bytes))
 }
 
 fn ingress(p: &Proc, input: pb::HttpInput) -> TurnResult {
@@ -984,10 +981,10 @@ fn a_replay_across_an_erasure_decides_the_quota_as_production_did() {
     let put = |size: u64, subject: &str| {
         let input = pb::HttpInput {
             body: Some(pb::Body {
-                value: Some(pb::body::Value::Inline(pb::Sealable {
-                    subject: Some(subject.into()),
-                    value: Some(pb::sealable::Value::Plain(Vec::new())),
-                })),
+                value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                    Some(subject.into()),
+                    Vec::new(),
+                ))),
             }),
             ..http("put", &format!("size={size}"), inline(b""))
         };

@@ -39,10 +39,7 @@ use serde_json::Value;
 const WORD: &str = "quokka";
 
 fn plain_as(subject: Option<&str>, b: &[u8]) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: subject.map(str::to_owned),
-        value: Some(pb::sealable::Value::Plain(b.to_vec())),
-    })
+    Some(pb::Sealable::new_plain(subject.map(str::to_owned), b))
 }
 
 /// The request that opens `/room/<key>/ws` (WebSocket, offering `room.v1`)
