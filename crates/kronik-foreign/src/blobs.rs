@@ -126,11 +126,6 @@ impl BlobStore {
         Self { root: root.into() }
     }
 
-    /// The store's root directory.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     /// Where the blob with `digest` lives. Rejects anything but
     /// `sha256:<64 lowercase hex>`, so a digest never names another path.
     pub fn path(&self, digest: &str) -> Result<PathBuf, ImageError> {
