@@ -1640,17 +1640,23 @@ mod tests {
                 matches!(SecretStore::validate_legacy_key(&s.conn(), &MasterKey::from_bytes([7; 32]).unwrap()), Err(PrivacyError::InvalidStoredVersion(v)) if v == version)
             );
         }
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn.execute(
-            "INSERT INTO secrets VALUES ('token', -1, x'', x'', x'', 0, '', '', NULL)",
-            [],
-        )
-        .unwrap();
-        assert!(matches!(
-            SecretStore::open(conn, &MasterKey::from_bytes([7; 32]).unwrap()),
-            Err(PrivacyError::InvalidStoredVersion(-1))
-        ));
+        // Opening refuses any stored version outside 1..=MAX_SECRET_VERSION.
+        for version in [
+            -1,
+            i64::try_from(kronik_proto::secret::MAX_SECRET_VERSION + 1).unwrap(),
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute(
+                "INSERT INTO secrets VALUES ('token', ?1, x'', x'', x'', 0, '', '', NULL)",
+                [version],
+            )
+            .unwrap();
+            assert!(matches!(
+                SecretStore::open(conn, &MasterKey::from_bytes([7; 32]).unwrap()),
+                Err(PrivacyError::InvalidStoredVersion(v)) if v == version
+            ));
+        }
     }
 
     #[test]
