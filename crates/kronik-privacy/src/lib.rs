@@ -493,15 +493,7 @@ impl std::fmt::Debug for SecretValue {
 }
 
 /// Whether `name` is a valid secret name.
-pub fn valid_name(name: &str) -> bool {
-    let b = name.as_bytes();
-    !b.is_empty()
-        && b.len() <= 64
-        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
-        && b.iter().all(|c| {
-            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'.' | b'-')
-        })
-}
+pub use kronik_proto::secret::valid_secret_name as valid_name;
 
 // Historical SQLite column names are retained for format compatibility only.
 // Both deleted_wall_ms slots hold local application diagnostics, never a Meta28 audit clock.
@@ -1805,6 +1797,16 @@ mod tests {
             s.set_at("Bad Name", 1, b"x", [0; 24], 0, "t", "r"),
             Err(PrivacyError::InvalidName(_))
         ));
+        // The name rule's bounds: 1 to 64 bytes, a letter or a digit first,
+        // then letters, digits, `_`, `.` and `-`.
+        let longest = "a".repeat(64);
+        for name in ["a", "0", "9a0_.-", longest.as_str()] {
+            assert!(valid_name(name), "{name:?}");
+        }
+        for name in ["", "A", "-a", "a b", "a/b", "é", "a\u{0}"] {
+            assert!(!valid_name(name), "{name:?}");
+        }
+        assert!(!valid_name(&format!("{longest}a")));
     }
 
     #[test]
