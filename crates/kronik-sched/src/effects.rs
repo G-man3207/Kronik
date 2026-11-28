@@ -714,14 +714,14 @@ pub fn legacy_http_disclosure(
     Ok(record)
 }
 
-/// Disclosure of an EXACT verified v0 call. `retained_source` is supplied
-/// only by the private genuine-EffectResult witness path, never a locator
-/// taken from guest data. The old receipt is not appended or rewritten.
+/// Disclosure of an EXACT verified v0 call. A successful call whose
+/// compensation holds a secret is refused (`Unavailable`): there is no pinned
+/// source of the original cleanup to retain instead. The old receipt is not
+/// appended or rewritten.
 pub fn legacy_call_disclosure(
     mut record: pb::EffectRecord,
     mut source: pb::CallEffectRequest,
     matcher: &CompiledScrubber<'_>,
-    retained_source: Option<pb::ActorSource>,
 ) -> Result<(pb::EffectRecord, Option<pb::Message>), GateError> {
     fn withhold(message: &mut pb::Message) -> Result<(), GateError> {
         crate::scrub::wipe_message(message);
@@ -781,21 +781,12 @@ pub fn legacy_call_disclosure(
         {
             return Err(GateError::Prerequisite(ErrorCode::Unavailable));
         }
-        if status == pb::EffectStatus::Ok && unsafe_compensation && retained_source.is_none() {
+        if status == pb::EffectStatus::Ok && unsafe_compensation {
             return Err(GateError::Prerequisite(ErrorCode::Unavailable));
         }
+        // An unsafe compensation of a successful call was refused above.
         let cleanup = if status == pb::EffectStatus::Ok {
-            source.compensate.take().map(|mut message| {
-                if unsafe_compensation {
-                    crate::scrub::wipe_message(&mut message);
-                    pb::Message {
-                        retained_compensation_source: retained_source,
-                        ..Default::default()
-                    }
-                } else {
-                    message
-                }
-            })
+            source.compensate.take()
         } else {
             None
         };
@@ -2270,9 +2261,9 @@ impl TurnFx {
                 .ok_or_else(|| {
                     GateError::Host("The verified legacy call result is missing".into())
                 })?;
-            // The genuine retained-source pin is a prerequisite for an
-            // unsafe successful legacy cleanup, not a fresh effect fallback.
-            let (record, cleanup) = legacy_call_disclosure(record, source, &matcher, None)?;
+            // An unsafe successful legacy cleanup is refused, never a fresh
+            // effect fallback.
+            let (record, cleanup) = legacy_call_disclosure(record, source, &matcher)?;
             self.remember_compensation(ordinal, &to, cleanup);
             let outcome = outcome_of_call(&record);
             self.push_recorded(record);
@@ -3487,7 +3478,7 @@ mod secret_tests {
     }
 
     #[test]
-    fn unsafe_legacy_cleanup_requires_pinned_original_source_and_preserves_original_receipt() {
+    fn unsafe_successful_legacy_cleanup_is_refused_and_a_safe_one_is_kept() {
         let secrets = [("S", b"ab".as_slice())];
         let matcher = CompiledScrubber::new(&secrets, 1024).unwrap();
         let source = pb::CallEffectRequest {
@@ -3516,27 +3507,27 @@ mod secret_tests {
             ),
             ..Default::default()
         };
-        let bytes = original.encode_to_vec();
         assert!(matches!(
-            legacy_call_disclosure(original.clone(), source.clone(), &matcher, None),
+            legacy_call_disclosure(original.clone(), source.clone(), &matcher),
             Err(GateError::Prerequisite(ErrorCode::Unavailable))
         ));
-        let witness = pb::ActorSource {
-            shard: None,
-            lsn: 12,
-            branch: "main".into(),
+        // A successful call whose message holds the secret and whose
+        // compensation does not: the compensation is kept as it is, and the
+        // receipt is projected.
+        let source = pb::CallEffectRequest {
+            msg: Some(test_message(b"ab")),
+            compensate: Some(test_message(b"safe")),
+            ..source
         };
+        let original = pb::EffectRecord {
+            fingerprint: crate::scrub::legacy_call_source_fingerprint(&source).unwrap(),
+            request: plain(source.encode_to_vec()),
+            ..original
+        };
+        let bytes = original.encode_to_vec();
         let (projection, cleanup) =
-            legacy_call_disclosure(original.clone(), source, &matcher, Some(witness.clone()))
-                .unwrap();
-        let cleanup = cleanup.unwrap();
-        assert_eq!(cleanup.retained_compensation_source, Some(witness));
-        assert!(
-            cleanup.name.is_empty()
-                && cleanup.content_type.is_empty()
-                && cleanup.body.is_none()
-                && cleanup.blobs.is_empty()
-        );
+            legacy_call_disclosure(original.clone(), source, &matcher).unwrap();
+        assert_eq!(cleanup, Some(test_message(b"safe")));
         assert_eq!(
             projection.status,
             pb::EffectStatus::HostRedactionFailure as i32

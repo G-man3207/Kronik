@@ -79,20 +79,9 @@ fn backend_error(error: BackendError) -> ApiError {
     }
 }
 
-/// The word for the log when a provider call failed: `None` for the answers
-/// that are not a failure of the backend (a name that does not exist, a caller
-/// whose lease ended).
-fn failure_reason(error: BackendError) -> Option<&'static str> {
-    match error {
-        BackendError::Unavailable => Some("unavailable"),
-        BackendError::Denied => Some("denied"),
-        BackendError::Invalid => Some("invalid"),
-        BackendError::VersionGone => Some("version-gone"),
-        BackendError::NotFound | BackendError::Unauthorized => None,
-    }
-}
-/// The `result` label of `kronik_secret_fetch_total`, and the error that
-/// `kronik secret backends` and `kronik doctor` show.
+/// The `result` label of `kronik_secret_fetch_total`, the `reason` of the
+/// `secret fetch failed` line, and the error that `kronik secret backends`
+/// and `kronik doctor` show.
 fn fetch_result(error: BackendError) -> &'static str {
     match error {
         BackendError::Unavailable => "unavailable",
@@ -847,10 +836,11 @@ impl SecretCache {
         // `fetched` reports a backend that the node does not trust (not
         // configured, another binding, a reference it does not allow) as
         // `Invalid`; the operator should read what is wrong.
-        let reason = if error == BackendError::Invalid && !self.trusted(scope) {
-            Some("binding")
-        } else {
-            failure_reason(error)
+        let reason = match error {
+            BackendError::Invalid if !self.trusted(scope) => Some("binding"),
+            // A name that does not exist is not a failure of the backend.
+            BackendError::NotFound => None,
+            _ => Some(fetch_result(error)),
         };
         let mut state = lock(&self.state);
         let key = (scope.clone(), version.map(str::to_owned));

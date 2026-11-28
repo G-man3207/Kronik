@@ -1254,7 +1254,8 @@ fn a_crash_re_run_of_a_reveal_gets_the_recorded_version_and_waits_while_the_back
 /// Criterion 3, step 6: when the backend destroyed the version a recorded
 /// `secret.reveal` names, the crash re-run of that turn fails with
 /// `SECRET_VERSION_GONE`: it never starts the guest, sends nothing, and does
-/// not fall back to the value of the current version.
+/// not fall back to the value of the current version. The log says why, with
+/// the word the metric and `kronik secret backends` use: `version_gone`.
 ///
 /// The node's scrub-only copy of version 1 (ADR 0142) does not change this:
 /// a copy never answers an effect. (The reads that scrub after such a
@@ -1329,6 +1330,22 @@ fn a_crash_re_run_of_a_reveal_fails_with_secret_version_gone_when_the_backend_de
     assert_no_needle(dir.path(), &[], &[VALUE_1, VALUE_2]);
     // The crash left the turn open; recovery has closed it as failed.
     assert_closed_when_quiet(&d, "after the failed re-run of a reveal");
+    // The operator finds the cause in the log: the line names the recorded
+    // version, and its reason is the word the metric and `kronik secret
+    // backends` use.
+    let lines = fetch_failures(&d);
+    let parts = [
+        "name=stripe",
+        "backend=bao",
+        "version=1",
+        "reason=version_gone",
+    ];
+    assert!(
+        lines
+            .iter()
+            .any(|line| parts.iter().all(|part| line.contains(part))),
+        "no line for the destroyed version: {lines:?}"
+    );
 }
 
 /// A version that the backend destroyed after the node recorded it is still

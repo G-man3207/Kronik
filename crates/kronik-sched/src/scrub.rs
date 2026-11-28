@@ -222,17 +222,6 @@ fn sealable_budget(
     Ok(())
 }
 
-/// Raw guest bytes, before sealing.
-#[cfg(test)]
-fn sealable<N: AsRef<str>, V: AsRef<[u8]>>(
-    s: &mut Option<pb::Sealable>,
-    secrets: &[(N, V)],
-) -> Result<(), ScrubError> {
-    let matcher = CompiledScrubber::new(secrets, MAX_SECRET_PATTERN_BYTES)?;
-    let mut remaining = MAX_JSON_OUTPUT_BYTES;
-    sealable_budget(s, &matcher, &mut remaining)
-}
-
 fn message_fields(
     message: &mut pb::Message,
     matcher: &CompiledScrubber<'_>,
@@ -702,16 +691,6 @@ pub fn call_request(
         return Err(ScrubError::OutputLimit.into());
     }
     Ok(())
-}
-
-#[cfg(test)]
-fn call_response(
-    r: &mut pb::CallEffectResponse,
-    matcher: &CompiledScrubber<'_>,
-    output_bytes: usize,
-) -> Result<(), ScrubError> {
-    let mut remaining = output_bytes;
-    message_budget(&mut r.reply, matcher, &mut remaining)
 }
 
 fn unescape_component(input: &str, result: &mut Vec<u8>) -> Result<(), ScrubError> {
