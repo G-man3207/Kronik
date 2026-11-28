@@ -8,12 +8,11 @@
 )]
 
 use std::io;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
-use kronik_core::env::{BoxFuture, Env, File, Fs, OpenMode};
+use kronik_core::env::Env;
+use kronik_core::env::test_fs::{FsCall, Then, hooked};
 use kronik_otel::cursor::{Control, Cursors, Entry, Generation, Rewind};
 use serde_json::json;
 
@@ -301,100 +300,52 @@ impl Faults {
     }
 }
 
-struct FaultFs {
-    inner: Arc<dyn Fs>,
-    faults: Faults,
-}
-
-struct FaultFile {
-    inner: Arc<dyn File>,
-    faults: Faults,
-}
-
-impl File for FaultFile {
-    fn len(&self) -> BoxFuture<'static, io::Result<u64>> {
-        self.inner.len()
-    }
-    fn read_at(&self, offset: u64, len: usize) -> BoxFuture<'static, io::Result<Vec<u8>>> {
-        self.inner.read_at(offset, len)
-    }
-    fn write_at(&self, offset: u64, data: Bytes) -> BoxFuture<'static, io::Result<()>> {
-        let inner = self.inner.clone();
-        let faults = self.faults.clone();
-        Box::pin(async move {
-            faults.inject(2)?;
-            inner.write_at(offset, data).await
-        })
-    }
-    fn set_len(&self, len: u64) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.set_len(len)
-    }
-    fn sync_data(&self) -> BoxFuture<'static, io::Result<()>> {
-        let inner = self.inner.clone();
-        let faults = self.faults.clone();
-        Box::pin(async move {
-            faults.event("file_sync");
-            faults.inject(3)?;
-            inner.sync_data().await
-        })
-    }
-}
-
-impl Fs for FaultFs {
-    fn create_dir_all(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.create_dir_all(path)
-    }
-    fn open(&self, path: PathBuf, mode: OpenMode) -> BoxFuture<'static, io::Result<Arc<dyn File>>> {
-        let inner = self.inner.clone();
-        let faults = self.faults.clone();
-        Box::pin(async move {
-            faults.inject(1)?;
-            let file = inner.open(path, mode).await?;
-            Ok(Arc::new(FaultFile {
-                inner: file,
-                faults,
-            }) as Arc<dyn File>)
-        })
-    }
-    fn exists(&self, path: PathBuf) -> BoxFuture<'static, io::Result<bool>> {
-        self.inner.exists(path)
-    }
-    fn read_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<Vec<String>>> {
-        self.inner.read_dir(path)
-    }
-    fn remove_file(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        self.inner.remove_file(path)
-    }
-    fn rename(&self, from: PathBuf, to: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        let inner = self.inner.clone();
-        let faults = self.faults.clone();
-        Box::pin(async move {
-            faults.event("rename");
-            faults.inject(4)?;
-            inner.rename(from, to).await?;
-            faults.inject(5)
-        })
-    }
-    fn sync_dir(&self, path: PathBuf) -> BoxFuture<'static, io::Result<()>> {
-        let inner = self.inner.clone();
-        let faults = self.faults.clone();
-        Box::pin(async move {
-            faults.event("dir_sync");
-            faults.inject(6)?;
-            inner.sync_dir(path).await
-        })
-    }
-}
-
+/// Real files that fail once at the point `Faults::point` holds, which
+/// is then cleared: 1 `open`, 2 `write_at`, 3 `sync_data`, 4 `rename`
+/// before it renames, 5 `rename` after it renamed, 6 `sync_dir`.
+/// `sync_data`, `rename` and `sync_dir` are recorded in `Faults::events`
+/// as `file_sync`, `rename` and `dir_sync`.
 fn fault_env() -> (Env, Faults) {
     let mut env = env();
     let faults = Faults {
         point: Arc::new(AtomicU8::new(0)),
         events: Arc::new(Mutex::new(Vec::new())),
     };
-    env.fs = Arc::new(FaultFs {
-        inner: env.fs.clone(),
-        faults: faults.clone(),
+    let real = env.fs.clone();
+    let hook = faults.clone();
+    env.fs = hooked(real.clone(), move |call| {
+        let point = match call {
+            FsCall::Open(..) => 1,
+            FsCall::WriteAt { .. } => 2,
+            FsCall::SyncData(_) => {
+                hook.event("file_sync");
+                3
+            }
+            FsCall::Rename { .. } => {
+                hook.event("rename");
+                4
+            }
+            FsCall::SyncDir(_) => {
+                hook.event("dir_sync");
+                6
+            }
+            _ => return Then::Forward,
+        };
+        if let Err(e) = hook.inject(point) {
+            return Then::Fail(e);
+        }
+        if let FsCall::Rename { from, to } = call
+            && let Err(e) = hook.inject(5)
+        {
+            // Point 5: rename for real, then fail. `hooked` does not
+            // rename again when the `Wait` future fails.
+            let (real, from, to) = (real.clone(), from.clone(), to.clone());
+            return Then::Wait(Box::pin(async move {
+                real.rename(from, to).await?;
+                Err(e)
+            }));
+        }
+        Then::Forward
     });
     (env, faults)
 }
