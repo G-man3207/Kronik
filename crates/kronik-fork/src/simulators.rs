@@ -996,7 +996,7 @@ fn model_scope(
     snapshot: &kronik_sched::secrets::CertifiedSecretSnapshot,
     prepared_scope: Option<&[pb::SecretRef]>,
 ) -> Result<Arc<[pb::SecretRef]>, ScrubError> {
-    let current = kronik_sched::effects::combined_secret_scope(snapshot, &[], Some(&[]))?
+    let current = kronik_sched::effects::snapshot_secret_scope(snapshot)
         .ok_or(ScrubError::SourceScopeUnavailable)?;
     // The cache certificate covers its actual matcher. It cannot certify an
     // additional held historical value absent from that physical source.
