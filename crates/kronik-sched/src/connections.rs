@@ -594,7 +594,7 @@ impl Hub {
             let close = pb::ConnectionClose {
                 cause: pb::CloseCause::Restart as i32,
                 code: u32::from(RESTART_CODE),
-                reason: Some(tagged(subject.clone(), Vec::new())),
+                reason: Some(pb::Sealable::new_plain(subject.clone(), Vec::new())),
                 frames_written: 0,
                 frames_written_known: false,
                 frames_received: 0,
@@ -1198,7 +1198,10 @@ impl Hub {
         let close = pb::ConnectionClose {
             cause: facts.cause as i32,
             code: u32::from(facts.code),
-            reason: Some(tagged(live.subject.clone(), facts.reason.into_bytes())),
+            reason: Some(pb::Sealable::new_plain(
+                live.subject.clone(),
+                facts.reason.into_bytes(),
+            )),
             frames_written: if restart { 0 } else { live.frames_written },
             frames_written_known: !restart,
             frames_received: live.frames_received,
@@ -1407,13 +1410,6 @@ pub struct LiveStats {
     pub queued_bytes: usize,
     /// Open: neither opening nor closing.
     pub open: bool,
-}
-
-fn tagged(subject: Option<String>, bytes: Vec<u8>) -> pb::Sealable {
-    pb::Sealable {
-        subject,
-        value: Some(pb::sealable::Value::Plain(bytes)),
-    }
 }
 
 /// A transport that writes into memory: it takes every queued frame as

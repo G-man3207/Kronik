@@ -29,22 +29,6 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::node::{Node, OperationOrigin};
 
-/// A recorded value of `subject` (the guest's default subject at the
-/// effect); sealed when the record is appended in privacy mode.
-pub fn tagged(subject: &Option<String>, bytes: Vec<u8>) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: subject.clone(),
-        value: Some(pb::sealable::Value::Plain(bytes)),
-    })
-}
-
-pub fn plain(bytes: Vec<u8>) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: None,
-        value: Some(pb::sealable::Value::Plain(bytes)),
-    })
-}
-
 fn not_granted(cap: &str) -> String {
     format!("{}: {cap}", ErrorCode::CapabilityNotGranted.as_str())
 }
@@ -186,8 +170,8 @@ pub fn prepare_inline_fetch_response(
         }
         rec.status = pb::EffectStatus::HostRedactionFailure as i32;
         rec.error = error.to_string();
-        rec.response = tagged(
-            subject,
+        rec.response = Some(pb::Sealable::new_plain(
+            subject.clone(),
             pb::HttpEffectResponse {
                 status: u32::from(status),
                 headers: Vec::new(),
@@ -195,7 +179,7 @@ pub fn prepare_inline_fetch_response(
                 body_blob: None,
             }
             .encode_to_vec(),
-        );
+        ));
         return Ok(FetchOutcome::HostRedactionFailure);
     }
     rec.status = pb::EffectStatus::Ok as i32;
@@ -205,7 +189,10 @@ pub fn prepare_inline_fetch_response(
     {
         rec.blobs.push(blob.clone());
     }
-    rec.response = tagged(subject, response.encode_to_vec());
+    rec.response = Some(pb::Sealable::new_plain(
+        subject.clone(),
+        response.encode_to_vec(),
+    ));
     let body = match response.body_blob {
         Some(blob) => FetchResponseBody::Blob(blob),
         None => FetchResponseBody::Inline(response.body),
@@ -481,7 +468,10 @@ pub fn prepare_call_outcome(
                 .as_ref()
                 .and_then(|reply| reply.body.as_ref())
                 .and_then(|body| body.subject.clone());
-            record.response = tagged(&subject, response.encode_to_vec());
+            record.response = Some(pb::Sealable::new_plain(
+                subject.clone(),
+                response.encode_to_vec(),
+            ));
         }
         return Err(GateError::HostRedactionFailure);
     }
@@ -512,7 +502,10 @@ pub fn prepare_call_outcome(
                 .as_ref()
                 .and_then(|reply| reply.body.as_ref())
                 .and_then(|body| body.subject.clone());
-            record.response = tagged(&subject, response.encode_to_vec());
+            record.response = Some(pb::Sealable::new_plain(
+                subject.clone(),
+                response.encode_to_vec(),
+            ));
             // The reply's references join the call's (M26 §4).
             if let Some(reply) = &response.reply
                 && !reply.blobs.is_empty()
@@ -1704,7 +1697,10 @@ impl TurnFx {
         self.admit(ordinal, kind, need)?;
         let idem = causal::idempotency_key(&self.spec.causal_key, ordinal);
         let mut rec = self.base(ordinal, kind, recorded_cap, fp);
-        rec.request = tagged(&subject, recorded.encode_to_vec());
+        rec.request = Some(pb::Sealable::new_plain(
+            subject.clone(),
+            recorded.encode_to_vec(),
+        ));
         // Its request as recorded must fit in what is left of the turn's
         // effect bytes, or it is not sent (ADR 0145).
         let effect_room = self.effect_room();
@@ -2340,7 +2336,7 @@ impl TurnFx {
         // Its request as recorded and the largest reply the callee may send
         // (its type's message size) must fit in what is left of the turn's
         // effect bytes, or it does not happen (ADR 0145).
-        let request = tagged(&subject, encoded);
+        let request = Some(pb::Sealable::new_plain(subject.clone(), encoded));
         let reply_bytes_most = self
             .spec
             .config
@@ -2622,14 +2618,15 @@ impl TurnFx {
             }
             NewSecret::Found(v) => {
                 let reference = secret_ref(v.meta, String::new())?;
-                rec.request = plain(
+                rec.request = Some(pb::Sealable::new_plain(
+                    None,
                     pb::CryptoEffectRequest {
                         algorithm: alg.into(),
                         secret: Some(reference.clone()),
                         data_hash,
                     }
                     .encode_to_vec(),
-                );
+                ));
                 let result = match algorithm {
                     CryptoAlgorithm::HmacSha256 => {
                         Ok(kronik_effects::crypto::hmac_sha256(&v.value, &data))
@@ -2642,7 +2639,7 @@ impl TurnFx {
                 match result {
                     Ok(out) => {
                         rec.status = pb::EffectStatus::Ok as i32;
-                        rec.response = plain(out.clone());
+                        rec.response = Some(pb::Sealable::new_plain(None, out.clone()));
                         CryptoOutcome::Ok(out)
                     }
                     Err(e) => {
@@ -2680,10 +2677,10 @@ impl TurnFx {
             send_now_fingerprint(&req.connection, &req.frame),
         );
         let request = |seq: u64| {
-            tagged(
-                &req.subject,
+            Some(pb::Sealable::new_plain(
+                req.subject.clone(),
                 send_now_request(&req.connection, seq, &req.frame).encode_to_vec(),
-            )
+            ))
         };
         if !req.live {
             let mut rec = self.base(ordinal, KIND, target, fp);
@@ -2853,12 +2850,13 @@ impl TurnFx {
             }
             NewSecret::Found(v) => {
                 let reference = secret_ref(v.meta, String::new())?;
-                rec.request = plain(
+                rec.request = Some(pb::Sealable::new_plain(
+                    None,
                     pb::RevealEffectRequest {
                         secret: Some(reference.clone()),
                     }
                     .encode_to_vec(),
-                );
+                ));
                 let bytes = Arc::new(Zeroizing::new(v.value));
                 self.remember_secret(&reference, bytes.clone());
                 match std::str::from_utf8(bytes.as_slice()) {
@@ -3024,10 +3022,7 @@ pub fn map_call_outcome(outcome: pb::Outcome) -> Result<CallOutcome, GateError> 
                     Some(pb::body::Value::Blob(blob)) => pb::Message {
                         name,
                         content_type: String::new(),
-                        body: Some(pb::Sealable {
-                            subject: None,
-                            value: Some(pb::sealable::Value::Plain(Vec::new())),
-                        }),
+                        body: Some(pb::Sealable::new_plain(None, Vec::new())),
                         blobs: vec![blob],
                         ..Default::default()
                     },
@@ -3200,7 +3195,7 @@ mod secret_tests {
         pb::Message {
             name: "message".into(),
             content_type: "text/plain".into(),
-            body: plain(bytes.to_vec()),
+            body: Some(pb::Sealable::new_plain(None, bytes.to_vec())),
             ..Default::default()
         }
     }
@@ -3497,14 +3492,15 @@ mod secret_tests {
             target: "actor:worker/destination".into(),
             status: pb::EffectStatus::Ok as i32,
             fingerprint: crate::scrub::legacy_call_source_fingerprint(&source).unwrap(),
-            request: plain(source.encode_to_vec()),
-            response: plain(
+            request: Some(pb::Sealable::new_plain(None, source.encode_to_vec())),
+            response: Some(pb::Sealable::new_plain(
+                None,
                 pb::CallEffectResponse {
                     reply: Some(test_message(b"safe reply")),
                     ..Default::default()
                 }
                 .encode_to_vec(),
-            ),
+            )),
             ..Default::default()
         };
         assert!(matches!(
@@ -3521,7 +3517,7 @@ mod secret_tests {
         };
         let original = pb::EffectRecord {
             fingerprint: crate::scrub::legacy_call_source_fingerprint(&source).unwrap(),
-            request: plain(source.encode_to_vec()),
+            request: Some(pb::Sealable::new_plain(None, source.encode_to_vec())),
             ..original
         };
         let bytes = original.encode_to_vec();
@@ -3556,8 +3552,9 @@ mod secret_tests {
                 kronik_effects::http::parse_url(&source.url).unwrap().host
             ),
             fingerprint: legacy_http_fingerprint(source).unwrap(),
-            request: tagged(&None, source.encode_to_vec()),
-            response: response.map(|response| tagged(&None, response.encode_to_vec()).unwrap()),
+            request: Some(pb::Sealable::new_plain(None, source.encode_to_vec())),
+            response: response
+                .map(|response| pb::Sealable::new_plain(None, response.encode_to_vec())),
             ..Default::default()
         }
     }

@@ -1825,10 +1825,10 @@ impl Node {
         let msg = self
             .recorded_call_message(effect)
             .unwrap_or_else(|| pb::Message {
-                body: Some(pb::Sealable {
-                    subject: effect.request.as_ref().and_then(|r| r.subject.clone()),
-                    value: Some(pb::sealable::Value::Plain(Vec::new())),
-                }),
+                body: Some(pb::Sealable::new_plain(
+                    effect.request.as_ref().and_then(|r| r.subject.clone()),
+                    Vec::new(),
+                )),
                 ..Default::default()
             });
         let mut chain = match caller.input.as_ref().and_then(|i| i.kind.as_ref()) {
@@ -2825,10 +2825,7 @@ impl Node {
                     .changesets
                     .into_iter()
                     .map(|(subject, cs)| pb::SqlChangeset {
-                        changeset: Some(pb::Sealable {
-                            subject,
-                            value: Some(pb::sealable::Value::Plain(cs)),
-                        }),
+                        changeset: Some(pb::Sealable::new_plain(subject, cs)),
                     })
                     .collect();
             }
@@ -4004,10 +4001,10 @@ impl Node {
         // record without one could be written but not read back.
         if http.body.is_none() {
             http.body = Some(pb::Body {
-                value: Some(pb::body::Value::Inline(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(Vec::new())),
-                })),
+                value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                    None,
+                    Vec::new(),
+                ))),
             });
         }
         let waiter = Arc::new(Waiter::default());
@@ -4153,10 +4150,10 @@ impl Node {
         // The log requires a body (an empty one for the request).
         if request.body.is_none() {
             request.body = Some(pb::Body {
-                value: Some(pb::body::Value::Inline(pb::Sealable {
-                    subject: subject.clone(),
-                    value: Some(pb::sealable::Value::Plain(Vec::new())),
-                })),
+                value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                    subject.clone(),
+                    Vec::new(),
+                ))),
             });
         }
         // Opens are not deduplicated at ingress (§4.2).
@@ -4274,10 +4271,7 @@ impl Node {
                     cause: pb::CloseCause::Rebase as i32,
                     code: u32::from(crate::connections::RESTART_CODE),
                     // Empty, tagged with the connection's subject (§4.10).
-                    reason: Some(pb::Sealable {
-                        subject: row.subject.clone(),
-                        value: Some(pb::sealable::Value::Plain(Vec::new())),
-                    }),
+                    reason: Some(pb::Sealable::new_plain(row.subject.clone(), Vec::new())),
                     frames_written: written.get(&row.id).copied().unwrap_or(0),
                     frames_written_known: true,
                     frames_received: 0,
@@ -4301,10 +4295,7 @@ impl Node {
                 code: u32::from(crate::connections::RESTART_CODE),
                 // Empty, tagged with the connection's subject: the close
                 // turn's default subject (§4.10).
-                reason: Some(pb::Sealable {
-                    subject: row.subject.clone(),
-                    value: Some(pb::sealable::Value::Plain(Vec::new())),
-                }),
+                reason: Some(pb::Sealable::new_plain(row.subject.clone(), Vec::new())),
                 frames_written: 0,
                 frames_written_known: false,
                 frames_received: 0,
@@ -4350,10 +4341,7 @@ impl Node {
         authority.check()?;
         // The log requires a message body (an empty one when absent).
         if msg.body.is_none() {
-            msg.body = Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(Vec::new())),
-            });
+            msg.body = Some(pb::Sealable::new_plain(None, Vec::new()));
         }
         self.check_running()?;
         self.check_message(&actor.kind, &msg)?;
