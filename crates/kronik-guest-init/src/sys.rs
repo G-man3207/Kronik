@@ -237,7 +237,10 @@ fn setup_root() -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn loopback_up() -> io::Result<()> {
+/// Sets `lo` up in the calling thread's network namespace. The guest calls it
+/// at boot; kronik-foreign calls it for the network namespaces it creates on
+/// the host.
+pub fn loopback_up() -> io::Result<()> {
     // SAFETY: socket has no pointer parameters.
     let socket = owned(
         unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) },
@@ -1183,8 +1186,11 @@ pub(super) fn run_guest(config: GuestConfig) -> io::Result<()> {
 const END_VM: libc::c_int = libc::LINUX_REBOOT_CMD_RESTART;
 
 /// Ends the VM: syncs the guest file systems, then restarts the machine,
-/// which makes Firecracker exit.
-pub(super) fn power_off() -> io::Result<()> {
+/// which makes Firecracker exit. The PID1 binary calls it on both normal
+/// termination and fatal setup failure. Firecracker has no guest power
+/// management and exits on a restart (see `END_VM`). A failure is returned
+/// instead of pretending the VM stopped.
+pub fn power_off() -> io::Result<()> {
     if std::process::id() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,

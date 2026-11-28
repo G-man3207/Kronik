@@ -6,6 +6,7 @@
 compile_error!("kronik-guest-init requires Linux");
 
 mod sys;
+pub use sys::{loopback_up, power_off};
 
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read};
@@ -176,21 +177,6 @@ pub fn ignored_arguments(args: impl IntoIterator<Item = std::ffi::OsString>) -> 
 pub fn run_guest(config: GuestConfig) -> io::Result<()> {
     config.validate()?;
     sys::run_guest(config)
-}
-
-/// Used by the PID1 binary on both normal termination and fatal setup failure
-/// to end the VM. It restarts the machine, because Firecracker has no guest
-/// power management and exits on a restart (see `sys::END_VM`). A failure is
-/// returned instead of pretending the VM stopped.
-pub fn power_off() -> io::Result<()> {
-    sys::power_off()
-}
-
-/// Sets `lo` up in the calling thread's network namespace. The guest calls it
-/// at boot; kronik-foreign calls it for the network namespaces it creates on
-/// the host.
-pub fn loopback_up() -> io::Result<()> {
-    sys::loopback_up()
 }
 
 #[cfg(test)]
