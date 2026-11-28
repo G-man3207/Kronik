@@ -45,10 +45,7 @@ pub fn msg(name: &str, body: impl AsRef<[u8]>) -> pb::Message {
     pb::Message {
         name: name.into(),
         content_type: "text/plain".into(),
-        body: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(body.as_ref().to_vec())),
-        }),
+        body: Some(pb::Sealable::new_plain(None, body.as_ref().to_vec())),
         blobs: vec![],
         retained_compensation_source: None,
     }
@@ -361,10 +358,7 @@ pub fn repoint_open_turn(
 pub fn text_frame(text: &str) -> pb::Frame {
     pb::Frame {
         kind: pb::frame::Kind::Text as i32,
-        data: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(text.as_bytes().to_vec())),
-        }),
+        data: Some(pb::Sealable::new_plain(None, text.as_bytes().to_vec())),
         ..Default::default()
     }
 }
@@ -383,10 +377,7 @@ pub fn open_request(key: &str, query: &str) -> pb::HttpInput {
         }],
         headers: vec![pb::Header {
             name: "sec-websocket-protocol".into(),
-            value: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(b"room.v1".to_vec())),
-            }),
+            value: Some(pb::Sealable::new_plain(None, b"room.v1")),
         }],
         route: "/room/{key}/ws".into(),
         ..Default::default()

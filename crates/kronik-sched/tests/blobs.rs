@@ -52,10 +52,7 @@ fn http(op: &str, query: &str, body: pb::body::Value) -> pb::HttpInput {
 }
 
 fn inline(bytes: &[u8]) -> pb::body::Value {
-    pb::body::Value::Inline(pb::Sealable {
-        subject: None,
-        value: Some(pb::sealable::Value::Plain(bytes.to_vec())),
-    })
+    pb::body::Value::Inline(pb::Sealable::new_plain(None, bytes.to_vec()))
 }
 
 impl Proc {

@@ -59,10 +59,7 @@ fn until(what: &str, f: impl Fn() -> bool) {
 fn text(t: &str) -> pb::Frame {
     pb::Frame {
         kind: pb::frame::Kind::Text as i32,
-        data: Some(pb::Sealable {
-            subject: None,
-            value: Some(pb::sealable::Value::Plain(t.as_bytes().to_vec())),
-        }),
+        data: Some(pb::Sealable::new_plain(None, t.as_bytes().to_vec())),
         ..Default::default()
     }
 }
