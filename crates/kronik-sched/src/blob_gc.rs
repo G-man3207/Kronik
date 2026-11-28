@@ -31,6 +31,7 @@ use kronik_core::ids::Lsn;
 use kronik_core::sync::lock;
 
 use crate::Node;
+use crate::node::internal;
 
 /// The file a snapshot carries its blob roots in (M26 §7).
 pub const SNAPSHOT_INDEX: &str = "blobs.idx";
@@ -110,10 +111,6 @@ pub(crate) struct GcState {
     /// its blobs' files is done; a pass reads what it is for under it, so it
     /// never deletes, uncounted, a file the erasure is about to count.
     pub(crate) erasing: tokio::sync::Mutex<()>,
-}
-
-fn store_error(e: impl std::fmt::Display) -> ApiError {
-    ApiError::new(ErrorCode::Internal, e.to_string())
 }
 
 fn blob_error(e: BlobError) -> ApiError {
@@ -309,7 +306,7 @@ impl Node {
                 // A snapshot from before blobs has no index: its state
                 // roots no blob.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(store_error(format!("{}: {e}", dir.display()))),
+                Err(e) => return Err(internal(format!("{}: {e}", dir.display()))),
             }
         }
         for fork in forks(&data, self.branch()) {
@@ -346,7 +343,7 @@ impl Node {
                 .store()
                 .db()
                 .erasures()
-                .map_err(store_error)?
+                .map_err(internal)?
                 .into_iter()
                 .collect();
             (loose, store.live_writers(), erased)
@@ -395,8 +392,8 @@ impl Node {
         let mut unrooted = Vec::with_capacity(report.unrooted.len());
         for file in &report.unrooted {
             let hash = file.id.to_string();
-            let row = self.store().db().blob(&hash).map_err(store_error)?;
-            let released = self.store().db().released_by(&hash).map_err(store_error)?;
+            let row = self.store().db().blob(&hash).map_err(internal)?;
+            let released = self.store().db().released_by(&hash).map_err(internal)?;
             let reason = match &row {
                 None => UnrootedReason::Loose,
                 Some(row) if row.erased => UnrootedReason::Erased,
@@ -427,16 +424,12 @@ impl Node {
             store.leases().holders().len() as f64,
         );
         if !options.dry_run {
-            let unrooted = self
-                .store()
-                .db()
-                .unrooted_blobs(floor)
-                .map_err(store_error)?;
+            let unrooted = self.store().db().unrooted_blobs(floor).map_err(internal)?;
             // An erased blob's row stays while the bucket still has its
             // object: privacy status ties the object to its subject through
             // it until the shipper has deleted it (ADR 0122 §4).
             let shipped = kronik_store::ship_blobs::shipped_names(&self.blob_data_dir()?)
-                .map_err(store_error)?;
+                .map_err(internal)?;
             let mut gone = Vec::new();
             for hash in unrooted {
                 let Ok(id) = BlobId::parse(&hash) else {
@@ -447,7 +440,7 @@ impl Node {
                         .store()
                         .db()
                         .blob(&hash)
-                        .map_err(store_error)?
+                        .map_err(internal)?
                         .is_some_and(|row| row.erased)
                 {
                     continue;
@@ -464,7 +457,7 @@ impl Node {
                 .store()
                 .db()
                 .forget_blobs(&gone, floor)
-                .map_err(store_error)?;
+                .map_err(internal)?;
             kronik_metrics::set("kronik_blob_objects", &[], report.objects as f64);
             kronik_metrics::set("kronik_blob_bytes", &[], report.bytes as f64);
             kronik_metrics::set("kronik_blob_gc_candidates", &[], report.candidates as f64);
@@ -515,13 +508,13 @@ impl Node {
                 db.blobs_referenced_through(fork_lsn)
             }
         }
-        .map_err(store_error)?;
+        .map_err(internal)?;
         write_roots_file(
             &fork_dir.join(FORK_ROOTS),
             Some(&format!("fork_lsn {fork_lsn}")),
             &ids,
         )
-        .map_err(store_error)
+        .map_err(internal)
     }
 
     /// `kronik blobs gc --dry-run --verify` (M26 §6.6): the differences
@@ -533,12 +526,13 @@ impl Node {
             return Ok(Vec::new());
         }
         let floor = self.blob_floor()?;
-        let open = self.store().db().open_turns().map_err(store_error)?;
+        let open = self.store().db().open_turns().map_err(internal)?;
         let mut refs = std::collections::BTreeMap::new();
         for turn in open {
-            let c = self.reader().read_at(turn.pos).await.map_err(|e| {
-                store_error(format!("reading the open turn at lsn {}: {e}", turn.lsn))
-            })?;
+            let c =
+                self.reader().read_at(turn.pos).await.map_err(|e| {
+                    internal(format!("reading the open turn at lsn {}: {e}", turn.lsn))
+                })?;
             let hashes: Vec<String> = kronik_proto::blobs::refs(&c.record)
                 .into_iter()
                 .map(|r| r.hash.clone())
@@ -548,7 +542,7 @@ impl Node {
         self.store()
             .db()
             .blob_pin_drift(floor, &refs)
-            .map_err(store_error)
+            .map_err(internal)
     }
 
     /// The last pass that deleted, for `kronik blobs status`.
@@ -651,7 +645,7 @@ impl Node {
         let Some(store) = &self.blobs else {
             return Ok(BlobStatus::default());
         };
-        let (indexed, indexed_bytes) = self.store().db().blob_totals().map_err(store_error)?;
+        let (indexed, indexed_bytes) = self.store().db().blob_totals().map_err(internal)?;
         let below = store.below_reserve();
         Ok(BlobStatus {
             enabled: true,
@@ -691,7 +685,7 @@ impl Node {
         let Some(store) = self.blobs.clone() else {
             return Err(Self::blob_not_found(&hash));
         };
-        let row = self.store().db().blob(&hash).map_err(store_error)?;
+        let row = self.store().db().blob(&hash).map_err(internal)?;
         let present = store
             .contains(&Space::Main, &id)
             .await
@@ -715,11 +709,11 @@ impl Node {
                     kronik_core::env::OpenMode::Read,
                 )
                 .await
-                .map_err(|e| store_error(format!("opening the blob: {e}")))?;
+                .map_err(|e| internal(format!("opening the blob: {e}")))?;
             file_bytes = Some(
                 file.len()
                     .await
-                    .map_err(|e| store_error(format!("reading the blob's length: {e}")))?,
+                    .map_err(|e| internal(format!("reading the blob's length: {e}")))?,
             );
             if let Some(r) = row.as_ref().filter(|r| !r.erased) {
                 let meta = kronik_blob::BlobMeta::from_pb(&kronik_proto::log::v1::BlobRef {
@@ -754,13 +748,13 @@ impl Node {
                     floor,
                 });
             }
-            for (kind, key, lsn) in self.store().db().holders(&hash).map_err(store_error)? {
+            for (kind, key, lsn) in self.store().db().holders(&hash).map_err(internal)? {
                 roots.push(BlobRoot::Held {
                     actor: format!("{kind}/{key}"),
                     lsn,
                 });
             }
-            for pin in self.store().db().blob_pins(&hash).map_err(store_error)? {
+            for pin in self.store().db().blob_pins(&hash).map_err(internal)? {
                 roots.push(BlobRoot::Pin {
                     source: kronik_store::db::blob_source::name(pin.source),
                     owner: pin.owner,
@@ -815,7 +809,7 @@ impl Node {
             .store()
             .db()
             .blob(&hash)
-            .map_err(store_error)?
+            .map_err(internal)?
             .ok_or_else(|| Self::blob_not_found(&hash))?;
         if row.erased {
             return Err(ApiError::new(
