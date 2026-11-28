@@ -96,7 +96,8 @@ pub fn identifier(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
 }
 
-fn token_name(value: &str) -> bool {
+/// Token names: a lowercase letter, then up to 62 lowercase letters, digits and dashes.
+pub fn valid_token_name(value: &str) -> bool {
     (1..=63).contains(&value.len())
         && value.as_bytes()[0].is_ascii_lowercase()
         && value
@@ -285,10 +286,9 @@ pub fn validate_auth_config(config: &pb::AuthConfig) -> Result<(), DecodeError> 
             .trust_roots_sha256
             .iter()
             .any(|root| root.len() != 32)
-        || config
-            .bindings
-            .iter()
-            .any(|binding| binding.principal_hash.len() != 32 || !token_name(&binding.token_name))
+        || config.bindings.iter().any(|binding| {
+            binding.principal_hash.len() != 32 || !valid_token_name(&binding.token_name)
+        })
     {
         return Err(invalid("AuthConfig.digest"));
     }
@@ -337,7 +337,7 @@ pub fn validate_auth_config(config: &pb::AuthConfig) -> Result<(), DecodeError> 
     if config
         .bindings
         .iter()
-        .any(|binding| binding.principal_hash.len() != 32 || !token_name(&binding.token_name))
+        .any(|binding| binding.principal_hash.len() != 32 || !valid_token_name(&binding.token_name))
         || config
             .bindings
             .windows(2)
@@ -362,7 +362,7 @@ pub fn validate_auth_session_revoked(session: &pb::AuthSessionRevoked) -> Result
     if session.session_hash.len() != 32
         || session.principal_hash.len() != 32
         || session.config_digest.len() != 32
-        || !token_name(&session.token_name)
+        || !valid_token_name(&session.token_name)
         || !positive_session_integer(session.expires_at_ms)
     {
         return Err(invalid("AuthSessionRevoked.binding"));
@@ -408,7 +408,7 @@ pub fn validate_auth_oidc_login(login: &pb::AuthOidcLogin) -> Result<(), DecodeE
     use pb::auth_oidc_login::ConfigSource;
     if login.principal_hash.len() != 32
         || login.config_digest.len() != 32
-        || !token_name(&login.token_name)
+        || !valid_token_name(&login.token_name)
     {
         return Err(invalid("AuthOidcLogin.binding"));
     }
@@ -668,7 +668,7 @@ pub fn validate_metadata_webhook_replay_event(event: &pb::AuditEvent) -> Result<
     if event.action != "events.webhook.replay"
         || event.operation.is_some()
         || event.target.len() > 128
-        || registered_name.is_none_or(|name| !token_name(name))
+        || registered_name.is_none_or(|name| !valid_token_name(name))
     {
         return Err(invalid("MetadataWebhookReplay"));
     }

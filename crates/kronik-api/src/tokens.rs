@@ -122,12 +122,7 @@ fn new_secret(random: [u8; 32]) -> Zeroizing<String> {
 
 /// Token names: a lowercase letter, then up to 62 lowercase letters, digits
 /// and dashes.
-pub fn valid_name(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    matches!(bytes.next(), Some(b'a'..=b'z'))
-        && name.len() <= 63
-        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
+pub use kronik_proto::control::valid_token_name as valid_name;
 
 /// `read,fork` -> the scopes, in canonical order.
 pub fn parse_scopes<S: AsRef<str>>(list: &[S]) -> Result<BTreeSet<Scope>, ApiError> {
@@ -1342,6 +1337,7 @@ mod tests {
     #[test]
     fn names_and_scopes_are_checked() {
         assert!(valid_name("agent-1"));
+        assert!(valid_name(&"a".repeat(63)));
         assert!(!valid_name("1agent"));
         assert!(!valid_name("Agent"));
         assert!(!valid_name("a_b"));

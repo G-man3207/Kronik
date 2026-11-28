@@ -241,4 +241,16 @@ mod tests {
         );
         assert!(Caller::local("unix:uid=0").has(Scope::Admin));
     }
+
+    /// A fleet record's scopes must be in `TOKEN_SCOPES` order, the order of
+    /// `Scope`, with the same spellings: kronik-api writes them in `Scope`
+    /// order and the record decoder refuses any other.
+    #[test]
+    fn scopes_match_the_record_schema() {
+        assert_eq!(
+            Scope::ALL.map(Scope::as_str),
+            kronik_proto::control::TOKEN_SCOPES
+        );
+        assert!(Scope::ALL.is_sorted());
+    }
 }

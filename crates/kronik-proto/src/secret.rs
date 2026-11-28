@@ -53,15 +53,20 @@ impl pb::SecretRef {
     }
 }
 
-pub(crate) fn peer_name(name: &str) -> Result<(), DecodeError> {
+/// Secret names: 1 to 64 bytes of lowercase letters, digits, `_`, `.` and
+/// `-`, starting with a letter or a digit.
+pub fn valid_secret_name(name: &str) -> bool {
     let bytes = name.as_bytes();
-    if bytes.is_empty()
-        || bytes.len() > 64
-        || !(bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
-        || !bytes.iter().all(|&byte| {
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes.iter().all(|&byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
         })
-    {
+}
+
+pub(crate) fn peer_name(name: &str) -> Result<(), DecodeError> {
+    if !valid_secret_name(name) {
         return Err(invalid(
             "peer secret name",
             "not a canonical FILE secret name",
