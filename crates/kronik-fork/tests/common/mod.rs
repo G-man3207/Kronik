@@ -319,10 +319,7 @@ pub fn propose_request(wasm: Vec<Vec<u8>>) -> ProposeRequest {
 }
 
 pub fn plain(b: &str) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: None,
-        value: Some(pb::sealable::Value::Plain(b.as_bytes().to_vec())),
-    })
+    Some(pb::Sealable::new_plain(None, b))
 }
 
 /// A plain-text message `name` with `body`.

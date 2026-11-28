@@ -1249,10 +1249,7 @@ fn a_turn_whose_outputs_alone_hold_an_erased_value_is_compared() {
     else {
         panic!("no reply: {:?}", t.outcome)
     };
-    reply.body = Some(pb::Sealable {
-        subject: None,
-        value: Some(pb::sealable::Value::Plain(b"forged".to_vec())),
-    });
+    reply.body = Some(pb::Sealable::new_plain(None, b"forged"));
     append(&rt, dir.path(), t);
     let checked = check_dir(&rt, dir.path(), Duration::from_secs(6 * 3600));
     let text = String::from_utf8_lossy(&checked.diff_bytes);

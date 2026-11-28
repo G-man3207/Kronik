@@ -1646,10 +1646,10 @@ fn fork_replay_keeps_a_compensation_turns_caller_subject() {
         let m = pb::Message {
             name: "call-fail".into(),
             content_type: "text/plain".into(),
-            body: Some(pb::Sealable {
-                subject: subject.map(str::to_owned),
-                value: Some(pb::sealable::Value::Plain(body.as_bytes().to_vec())),
-            }),
+            body: Some(pb::Sealable::new_plain(
+                subject.map(str::to_owned),
+                body.as_bytes().to_vec(),
+            )),
             blobs: vec![],
             retained_compensation_source: None,
         };
