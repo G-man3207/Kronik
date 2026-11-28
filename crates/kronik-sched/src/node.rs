@@ -52,6 +52,14 @@ pub(crate) fn store_err(e: StoreError) -> ApiError {
     }
 }
 
+/// A log read's error: `STORAGE_CORRUPT` for a corrupt record, else internal.
+pub(crate) fn log_err(e: LogError) -> ApiError {
+    match e {
+        LogError::Corrupt(m) => ApiError::new(ErrorCode::StorageCorrupt, m),
+        other => internal(other),
+    }
+}
+
 /// A record the log refused for its size ([`LogError::is_refusal`]):
 /// nothing was written and the writer is healthy, so the node goes on.
 pub(crate) fn refused(e: &LogError) -> ApiError {
@@ -4829,10 +4837,7 @@ impl Node {
                 Ok(())
             })
             .await
-            .map_err(|e| match e {
-                LogError::Corrupt(m) => ApiError::new(ErrorCode::StorageCorrupt, m),
-                other => internal(other),
-            })?;
+            .map_err(log_err)?;
         Ok(roots)
     }
 
@@ -5954,49 +5959,37 @@ impl Node {
         let Some(t) = self.store.db().turn(lsn).map_err(store_err)? else {
             return Ok(None);
         };
-        self.reader
-            .read_at(t.pos)
-            .await
-            .map(Some)
-            .map_err(|e| match e {
-                LogError::Corrupt(m) => ApiError::new(ErrorCode::StorageCorrupt, m),
-                other => internal(other),
-            })
+        self.reader.read_at(t.pos).await.map(Some).map_err(log_err)
     }
 
     /// Logical time of the latest turn with `lsn <= at_most`. `None` when
     /// no turn has been applied at or before that point (logical time has
     /// not started; only turns advance it).
     pub async fn logical_time_at(&self, at_most: Lsn) -> Result<Option<u64>, ApiError> {
-        let Some(t) = self.store.db().latest_turn_at(at_most).map_err(store_err)? else {
-            return Ok(None);
-        };
-        let c = self.reader.read_at(t.pos).await.map_err(|e| match e {
-            LogError::Corrupt(m) => ApiError::new(ErrorCode::StorageCorrupt, m),
-            other => internal(other),
-        })?;
-        Ok(match c.record {
-            Record::TurnRecord(r) => Some(r.logical_time_ms),
-            Record::TurnBegin(b) => Some(b.logical_time_ms),
-            _ => None,
-        })
+        let turn = self.store.db().latest_turn_at(at_most).map_err(store_err)?;
+        self.logical_time_of(turn).await
     }
 
     /// Logical time of the earliest turn with `lsn > after`. `None` when
     /// no later turn has been applied.
     pub async fn logical_time_after(&self, after: Lsn) -> Result<Option<u64>, ApiError> {
-        let Some(t) = self
+        let turn = self
             .store
             .db()
             .earliest_turn_after(after)
-            .map_err(store_err)?
-        else {
+            .map_err(store_err)?;
+        self.logical_time_of(turn).await
+    }
+
+    /// Logical time of the turn `turn` indexes; `None` without one.
+    async fn logical_time_of(
+        &self,
+        turn: Option<kronik_store::db::TurnRef>,
+    ) -> Result<Option<u64>, ApiError> {
+        let Some(t) = turn else {
             return Ok(None);
         };
-        let c = self.reader.read_at(t.pos).await.map_err(|e| match e {
-            LogError::Corrupt(m) => ApiError::new(ErrorCode::StorageCorrupt, m),
-            other => internal(other),
-        })?;
+        let c = self.reader.read_at(t.pos).await.map_err(log_err)?;
         Ok(match c.record {
             Record::TurnRecord(r) => Some(r.logical_time_ms),
             Record::TurnBegin(b) => Some(b.logical_time_ms),
