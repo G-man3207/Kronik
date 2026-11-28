@@ -363,12 +363,10 @@ impl Op {
             path: format!("/{KIND}/{}/{op}", actor.key),
             query,
             body: Some(pb::Body {
-                value: Some(pb::body::Value::Inline(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(
-                        body.unwrap_or_default().into_bytes(),
-                    )),
-                })),
+                value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                    None,
+                    body.unwrap_or_default().into_bytes(),
+                ))),
             }),
             ..Default::default()
         }

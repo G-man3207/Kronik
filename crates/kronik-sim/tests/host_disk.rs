@@ -122,10 +122,7 @@ fn a_simulated_node_writes_nothing_on_the_host() {
                 let msg = pb::Message {
                     name: "increment".into(),
                     content_type: "text/plain".into(),
-                    body: Some(pb::Sealable {
-                        subject: None,
-                        value: Some(pb::sealable::Value::Plain(Vec::new())),
-                    }),
+                    body: Some(pb::Sealable::new_plain(None, Vec::new())),
                     blobs: vec![],
                     retained_compensation_source: None,
                 };
