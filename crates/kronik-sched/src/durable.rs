@@ -3,13 +3,17 @@
 //! file's bytes are durable once the file is fsynced, a name (a file or a
 //! directory created or renamed) once its directory is. Until then a power
 //! loss can take either back; and a process that died left them in the page
-//! cache, where the next process would build on them.
+//! cache, where the next process would build on them. [`replace`] is the
+//! same replacement through the node's `Fs`, for the small files a
+//! simulated node must write on its simulated disk.
 //!
 //! Linux, as the log: a file or a directory is fsynced through a read-only
 //! handle (a directory can only be opened so).
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use kronik_core::env::{Fs, OpenMode};
 
 /// fsyncs `path`: a file's bytes, or the names in a directory.
 pub(crate) fn sync(path: &Path) -> io::Result<()> {
@@ -81,6 +85,26 @@ pub fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     sync(parent(path)).inspect_err(|_| {
         let _ = std::fs::remove_file(path);
     })
+}
+
+/// Replaces `path` whole through the node's file system `fs`, so that a
+/// simulated node writes on its simulated disk: `bytes` written to
+/// `temp`, synced, renamed over `path`, and the directory of `path`
+/// synced. A reader sees the old file or the new one. The directory must
+/// exist.
+pub(crate) async fn replace(
+    fs: &dyn Fs,
+    temp: PathBuf,
+    path: PathBuf,
+    bytes: Vec<u8>,
+) -> io::Result<()> {
+    let dir = parent(&path).to_owned();
+    let file = fs.open(temp.clone(), OpenMode::ReadWriteCreate).await?;
+    file.set_len(0).await?;
+    file.write_at(0, bytes::Bytes::from(bytes)).await?;
+    file.sync_data().await?;
+    fs.rename(temp, path).await?;
+    fs.sync_dir(dir).await
 }
 
 /// What a test watches: the operations of this module under a directory, in

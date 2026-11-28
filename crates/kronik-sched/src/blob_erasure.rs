@@ -57,17 +57,10 @@ async fn read_swept(fs: &dyn Fs, data: &Path) -> Lsn {
 /// Writes the watermark durably: a fixed-width line written over the
 /// previous one, through a part file and a rename.
 async fn write_swept(fs: &dyn Fs, data: &Path, lsn: Lsn) -> std::io::Result<()> {
+    fs.create_dir_all(data.join("blobs")).await?;
     let path = swept_path(data);
-    let dir = data.join("blobs");
-    fs.create_dir_all(dir.clone()).await?;
     let part = path.with_extension("part");
-    let file = fs.open(part.clone(), OpenMode::ReadWriteCreate).await?;
-    file.set_len(0).await?;
-    file.write_at(0, bytes::Bytes::from(format!("{lsn:020}\n")))
-        .await?;
-    file.sync_data().await?;
-    fs.rename(part, path).await?;
-    fs.sync_dir(dir).await
+    crate::durable::replace(fs, part, path, format!("{lsn:020}\n").into_bytes()).await
 }
 
 /// The fork spaces of the data directory: every branch but `branch` that
