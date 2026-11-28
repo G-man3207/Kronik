@@ -86,12 +86,10 @@ fn open(query: &str, subprotocols: &[&str]) -> pb::Input {
     } else {
         vec![pb::Header {
             name: "Sec-WebSocket-Protocol".into(),
-            value: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(
-                    subprotocols.join(" , ").into_bytes(),
-                )),
-            }),
+            value: Some(pb::Sealable::new_plain(
+                None,
+                subprotocols.join(" , ").into_bytes(),
+            )),
         }]
     };
     connection(pb::connection_input::Event::Open(pb::ConnectionOpen {
@@ -101,10 +99,10 @@ fn open(query: &str, subprotocols: &[&str]) -> pb::Input {
             query: query.into(),
             headers,
             body: Some(pb::Body {
-                value: Some(pb::body::Value::Inline(pb::Sealable {
-                    subject: None,
-                    value: Some(pb::sealable::Value::Plain(vec![])),
-                })),
+                value: Some(pb::body::Value::Inline(pb::Sealable::new_plain(
+                    None,
+                    vec![],
+                ))),
             }),
             ..Default::default()
         }),
@@ -253,10 +251,7 @@ async fn connection_inputs_call_the_connection_handler() {
         seq: 0,
         frame: Some(pb::Frame {
             kind: pb::frame::Kind::Text as i32,
-            data: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(b"echo hi".to_vec())),
-            }),
+            data: Some(pb::Sealable::new_plain(None, b"echo hi")),
             ..Default::default()
         }),
     }));

@@ -368,10 +368,7 @@ impl Program {
                     Some((value, subject)) => pb::StateWrite {
                         op: pb::StateOp::Set as i32,
                         key,
-                        value: Some(pb::Sealable {
-                            subject,
-                            value: Some(pb::sealable::Value::Plain(value)),
-                        }),
+                        value: Some(pb::Sealable::new_plain(subject, value)),
                     },
                     None => pb::StateWrite {
                         op: pb::StateOp::Delete as i32,
@@ -521,7 +518,10 @@ fn open_outcome(
                         .into_iter()
                         .map(|h| pb::Header {
                             name: h.name,
-                            value: Some(plain(subject.clone(), h.value.into_bytes())),
+                            value: Some(pb::Sealable::new_plain(
+                                subject.clone(),
+                                h.value.into_bytes(),
+                            )),
                         })
                         .collect(),
                     subject: accept.subject,
@@ -602,7 +602,7 @@ fn committed(
                             format!("response body is {} bytes, the limit is {limit}", b.len()),
                         );
                     }
-                    pb::body::Value::Inline(plain(subject.clone(), b))
+                    pb::body::Value::Inline(pb::Sealable::new_plain(subject.clone(), b))
                 }
                 types::HttpBody::Blob(blob) => match refs.map(|refs| refs.complete(&blob)) {
                     None => {
@@ -629,7 +629,10 @@ fn committed(
                     .into_iter()
                     .map(|h| pb::Header {
                         name: h.name,
-                        value: Some(plain(subject.clone(), h.value.into_bytes())),
+                        value: Some(pb::Sealable::new_plain(
+                            subject.clone(),
+                            h.value.into_bytes(),
+                        )),
                     })
                     .collect(),
                 body: Some(pb::Body { value: Some(body) }),
@@ -658,13 +661,6 @@ fn answer_refs(
         Ok(Ok(Answer::Output(types::Output::Http(r)))) => http(r),
         Ok(Ok(Answer::Open(conn_wit::OpenReply::Refuse(r)))) => http(r),
         _ => Vec::new(),
-    }
-}
-
-fn plain(subject: Option<String>, bytes: Vec<u8>) -> pb::Sealable {
-    pb::Sealable {
-        subject,
-        value: Some(pb::sealable::Value::Plain(bytes)),
     }
 }
 

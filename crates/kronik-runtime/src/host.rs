@@ -901,10 +901,7 @@ pub(crate) fn message_to_pb(
     pb::Message {
         name: m.name,
         content_type: m.content_type,
-        body: Some(pb::Sealable {
-            subject,
-            value: Some(pb::sealable::Value::Plain(m.body)),
-        }),
+        body: Some(pb::Sealable::new_plain(subject, m.body)),
         blobs,
         retained_compensation_source: None,
     }

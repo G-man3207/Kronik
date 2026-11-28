@@ -209,10 +209,7 @@ impl TurnHost {
         Ok((
             pb::Frame {
                 kind: kind as i32,
-                data: Some(pb::Sealable {
-                    subject: self.subject.clone(),
-                    value: Some(pb::sealable::Value::Plain(data)),
-                }),
+                data: Some(pb::Sealable::new_plain(self.subject.clone(), data)),
                 event,
                 id,
             },
@@ -310,10 +307,10 @@ impl wit::Host for TurnHost {
             seqs: Vec::new(),
             op: Some(pb::connection_op::Op::Close(pb::ConnectionCloseRequest {
                 code: u32::from(code),
-                reason: Some(pb::Sealable {
-                    subject: self.subject.clone(),
-                    value: Some(pb::sealable::Value::Plain(reason.into_bytes())),
-                }),
+                reason: Some(pb::Sealable::new_plain(
+                    self.subject.clone(),
+                    reason.into_bytes(),
+                )),
             })),
             dropped,
         });
