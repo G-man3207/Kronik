@@ -110,42 +110,6 @@ fn clear_fix(data: &Path, start: Lsn) -> std::io::Result<()> {
     }
 }
 
-/// The journal's entries: the segment, and the BLAKE3 of the image whose
-/// fix is pending.
-fn pending_fixes(data: &Path) -> std::io::Result<Vec<(Lsn, String)>> {
-    let entries = match std::fs::read_dir(fix_dir(data)) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    let mut fixes = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        let Some(start) = entry
-            .file_name()
-            .to_str()
-            .filter(|n| n.len() == 20)
-            .and_then(|n| n.parse::<Lsn>().ok())
-        else {
-            continue;
-        };
-        let hash = std::fs::read_to_string(entry.path())?;
-        fixes.push((start, hash.trim().to_owned()));
-    }
-    fixes.sort();
-    Ok(fixes)
-}
-
-/// The segments a reseal renamed into place whose `state.db` rows are not
-/// fixed yet: their reseal is not finished.
-pub fn pending_fix_segments(data: &Path) -> BTreeSet<Lsn> {
-    pending_fixes(data)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(start, _)| start)
-        .collect()
-}
-
 fn retention_path(data: &Path) -> PathBuf {
     privacy_dir(data).join("keystore_retention_ms")
 }
@@ -249,11 +213,12 @@ fn save_progress(data: &Path, p: &ProgressFile) -> Result<(), ApiError> {
         .map_err(|e| ApiError::new(ErrorCode::Internal, format!("reseal progress: {e}")))
 }
 
-/// Progress for `GET /v1/privacy`. `data` is the node's data directory.
-pub fn reseal_progress(data: &Path) -> ResealProgress {
+/// Progress for `GET /v1/privacy`. `data` is the node's data directory,
+/// `fixes` the journal's entries ([`Node::journaled_fixes`]).
+pub fn reseal_progress(data: &Path, fixes: &[(Lsn, String)]) -> ResealProgress {
     let p = load_progress(data);
     let mut pending = reupload_segments(data);
-    pending.extend(pending_fix_segments(data));
+    pending.extend(fixes.iter().map(|(start, _)| *start));
     ResealProgress {
         segments_done: p.segments_done,
         segments_total: p.segments_total,
@@ -342,8 +307,9 @@ impl Node {
     }
 
     /// The journal's entries ([`journal_fix`]), read through the node's file
-    /// system: a simulated node never reads the host's.
-    async fn journaled_fixes(&self, data: &Path) -> std::io::Result<Vec<(Lsn, String)>> {
+    /// system: a simulated node never reads the host's. The start's fix and
+    /// privacy status both read the journal here.
+    pub(crate) async fn journaled_fixes(&self, data: &Path) -> std::io::Result<Vec<(Lsn, String)>> {
         let dir = fix_dir(data);
         let names = match self.env.fs.read_dir(dir.clone()).await {
             Ok(names) => names,

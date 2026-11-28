@@ -688,7 +688,7 @@ fn a_reseal_marks_a_segment_durably_before_it_replaces_it() {
             }
         }
         assert_eq!(
-            crate::reseal::reseal_progress(data.path()).pending_segments,
+            node.reseal_progress().await.pending_segments,
             done.segments,
             "a mark per resealed segment"
         );
@@ -868,14 +868,14 @@ async fn reseal_stopped_after_its_rename(node: &Node, data: &Path) {
     drop(stop);
     assert!(stopped.is_err(), "{stopped:?}");
     assert!(!secret_row(node).0, "the row was fixed before the stop");
-    assert!(!crate::reseal::pending_fix_segments(data).is_empty());
+    assert!(!node.journaled_fixes(data).await.unwrap().is_empty());
     assert!(node.reseal_progress().await.pending_segments >= 1);
     assert_eq!(node.pending_erasures().await.unwrap(), 1);
 }
 
 /// After the fix: the row holds no plaintext, the turns are indexed in the
 /// resealed images, and the journal is empty.
-fn assert_fixed(node: &Node, data: &Path) {
+async fn assert_fixed(node: &Node, data: &Path) {
     let (sealed, value) = secret_row(node);
     assert!(sealed, "the row of a resealed value is still plain");
     assert!(!value.windows(PLAIN.len()).any(|w| w == PLAIN));
@@ -885,7 +885,7 @@ fn assert_fixed(node: &Node, data: &Path) {
             .contains("user:7")
     );
     turn_offsets_are_current(node);
-    assert!(crate::reseal::pending_fix_segments(data).is_empty());
+    assert!(node.journaled_fixes(data).await.unwrap().is_empty());
 }
 
 /// A reseal that stopped between renaming a resealed segment into place and
@@ -911,7 +911,7 @@ fn a_reseal_stopped_after_its_rename_is_finished_at_the_next_start() {
             .await
             .unwrap_or_else(|_| panic!("the restart did not finish within {STEP:?}"))
             .unwrap();
-        assert_fixed(&node, data.path());
+        assert_fixed(&node, data.path()).await;
     });
 }
 
@@ -929,9 +929,85 @@ fn a_reseal_stopped_after_its_rename_is_finished_by_the_next_pass() {
         )
         .await
         .unwrap();
-        assert_fixed(&node, data.path());
+        assert_fixed(&node, data.path()).await;
         // The pass resealed the rest: nothing is pending any more.
         assert_eq!(node.pending_erasures().await.unwrap(), 0);
+    });
+}
+
+/// The journal entry of `start` on the host, as a reseal leaves it when it
+/// stops after its rename: a segment whose fix of state.db is pending.
+fn journal_entry(data: &Path, start: kronik_core::ids::Lsn, content: &[u8]) {
+    let dir = data.join("privacy").join("reseal-fix");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{start:020}")), content).unwrap();
+}
+
+/// `privacy status` reads the reseal journal through the node's file system,
+/// as the start's fix does, never the host's copy: a journal the node's file
+/// system does not show is not counted.
+#[test]
+fn privacy_status_reads_the_reseal_journal_through_the_nodes_file_system() {
+    use kronik_core::env::test_fs::{FsCall, Then, hooked};
+    use std::sync::atomic::AtomicUsize;
+
+    let data = tempfile::tempdir().unwrap();
+    run(async {
+        let real = env();
+        let hidden = Arc::new(AtomicBool::new(false));
+        let listings = Arc::new(AtomicUsize::new(0));
+        let env = Env {
+            // Real files, but while `hidden` is set the node's file system
+            // answers that the journal's directory does not exist.
+            fs: hooked(real.fs.clone(), {
+                let (hidden, listings) = (hidden.clone(), listings.clone());
+                move |call| {
+                    if let FsCall::ReadDir(dir) = call
+                        && dir.ends_with("reseal-fix")
+                    {
+                        listings.fetch_add(1, Relaxed);
+                        if hidden.load(Relaxed) {
+                            return Then::Fail(std::io::Error::from(std::io::ErrorKind::NotFound));
+                        }
+                    }
+                    Then::Forward
+                }
+            }),
+            ..real
+        };
+        let node = crate::start_local(env, data.path(), resealing_config(data.path()))
+            .await
+            .unwrap();
+        let image = blake3::hash(b"the resealed image").to_hex().to_string();
+        journal_entry(data.path(), 7, image.as_bytes());
+
+        let before = listings.load(Relaxed);
+        assert_eq!(node.reseal_progress().await.pending_segments, 1);
+        hidden.store(true, Relaxed);
+        assert_eq!(
+            node.reseal_progress().await.pending_segments,
+            0,
+            "a journal the node's file system does not show was counted"
+        );
+        hidden.store(false, Relaxed);
+        assert_eq!(node.reseal_progress().await.pending_segments, 1);
+        // Each answer came from the node's file system.
+        assert_eq!(listings.load(Relaxed) - before, 3);
+    });
+}
+
+/// An entry that is not UTF-8 counts as pending, as the start's fix counts
+/// it: before, privacy status could not read it and reported no journaled
+/// segment at all.
+#[test]
+fn a_journal_entry_that_is_not_utf8_still_counts_as_pending() {
+    let data = tempfile::tempdir().unwrap();
+    run(async {
+        let node = crate::start_local(env(), data.path(), resealing_config(data.path()))
+            .await
+            .unwrap();
+        journal_entry(data.path(), 7, b"\xff\xfe\n");
+        assert_eq!(node.reseal_progress().await.pending_segments, 1);
     });
 }
 
