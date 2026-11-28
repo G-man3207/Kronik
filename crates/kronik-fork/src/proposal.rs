@@ -347,7 +347,7 @@ pub struct JobProgress {
     pub continuous_total: u64,
 }
 
-fn internal(m: impl std::fmt::Display) -> ApiError {
+pub(crate) fn internal(m: impl std::fmt::Display) -> ApiError {
     ApiError::new(ErrorCode::Internal, m.to_string())
 }
 

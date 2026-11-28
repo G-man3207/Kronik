@@ -247,12 +247,6 @@ pub struct Progress {
     pub gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
-impl Progress {
-    fn add(counter: &std::sync::atomic::AtomicU64, n: u64) {
-        counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 /// A turn the fork ran.
 #[derive(Debug, Clone)]
 pub struct ForkTurn {
@@ -681,7 +675,7 @@ impl Runner {
                 && !self.isolated
                 && let Some(progress) = &self.setup.progress
             {
-                Progress::add(&progress.continuous_done, 1);
+                progress.continuous_done.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -2945,6 +2939,7 @@ impl ReplayGate {
             };
             let ctx = ReplayContext { recorded: &[] };
             let neighbor = s
+                .option
                 .neighbor
                 .then(|| setup.simulators.neighbor(&setup.index, &cap));
             // Contract fakes stay synthetic (ADR 0016). They are not neighbor
@@ -2988,7 +2983,7 @@ impl ReplayGate {
             // secret-less GET (ADR 0025). The model is a POST, so it is not
             // asked even if a client was attached.
             if !setup.preview
-                && s.model
+                && s.option.model
                 && let Some(model) = &setup.model
             {
                 let cached = model.has_cached_answer(&cap, &fp).map_err(model_error)?;
@@ -4003,7 +3998,7 @@ impl Shares {
                 turns,
             });
             if let Some(progress) = &setup.progress {
-                Progress::add(&progress.isolated_done, 1);
+                progress.isolated_done.fetch_add(1, Ordering::Relaxed);
             }
         }
         Ok(out)
@@ -4135,7 +4130,7 @@ impl Continuous {
             {
                 self.runner.push(vec![r.lsn], root_pending(r));
                 if let Some(progress) = &self.setup.progress {
-                    Progress::add(&progress.continuous_total, 1);
+                    progress.continuous_total.fetch_add(1, Ordering::Relaxed);
                 }
             }
             // Production's erasures in the window, at their places: the fork
@@ -4327,7 +4322,9 @@ pub async fn both(
             workers
         };
         if let Some(progress) = &setup.progress {
-            Progress::add(&progress.isolated_total, roots.len() as u64);
+            progress
+                .isolated_total
+                .fetch_add(roots.len() as u64, Ordering::Relaxed);
         }
         Shares::new(roots, w, MIN_SPLIT)
     });

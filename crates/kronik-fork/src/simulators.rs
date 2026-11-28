@@ -38,8 +38,6 @@ use crate::stubs::StubRule;
 pub struct TargetSimulators {
     pub stubs: Vec<StubRule>,
     pub contract: Option<ContractFake>,
-    pub neighbor: bool,
-    pub model: bool,
     /// What the diff records about this configuration.
     pub option: SimulatorOption,
 }
@@ -148,6 +146,10 @@ pub fn contract_digest(doc: &[u8]) -> String {
     format!("b3:{}", blake3::hash(doc).to_hex())
 }
 
+/// A recorded effect a simulator replays: its turn's LSN, the effect, and
+/// the turn's original secret-use prefix through that effect.
+pub type RecordedSource<'a> = (Lsn, &'a pb::EffectRecord, Option<Arc<[pb::SecretRef]>>);
+
 /// The simulators of one replay: main's configuration of every target as
 /// of the fork point, with the request's overrides.
 #[derive(Default)]
@@ -202,8 +204,6 @@ impl Simulators {
                 TargetSimulators {
                     stubs: stub_rules(&m.stubs),
                     contract,
-                    neighbor: m.neighbor,
-                    model: m.model,
                     option,
                 },
             );
@@ -227,22 +227,15 @@ impl Simulators {
     /// the input, effects, writes, messages, timers, reply or SQL, and no
     /// SQL at all). State reads are not recorded, so this is not enough
     /// under privacy mode (see [`ModelAccess::privacy`]).
-    // The recorded-effect view a simulator replays: LSN, effect, secrets.
-    #[allow(clippy::type_complexity)]
-    pub fn model_sources<'a>(
-        index: &'a ProductionIndex,
-        target: &str,
-    ) -> Vec<(Lsn, &'a pb::EffectRecord, Option<Arc<[pb::SecretRef]>>)> {
+    pub fn model_sources<'a>(index: &'a ProductionIndex, target: &str) -> Vec<RecordedSource<'a>> {
         Self::recorded_sources(index, target, |turn| !turn_tainted(turn))
     }
 
-    // The recorded-effect view a simulator replays: LSN, effect, secrets.
-    #[allow(clippy::type_complexity)]
     fn recorded_sources<'a>(
         index: &'a ProductionIndex,
         target: &str,
         keep: impl Fn(&pb::TurnRecord) -> bool,
-    ) -> Vec<(Lsn, &'a pb::EffectRecord, Option<Arc<[pb::SecretRef]>>)> {
+    ) -> Vec<RecordedSource<'a>> {
         let mut candidates = Vec::new();
         for item in index.records.iter() {
             let Record::TurnRecord(turn) = &item.record else {
@@ -752,9 +745,6 @@ impl ModelCache {
         ModelCache::default()
     }
 
-    // The recorded-effect view a simulator replays: LSN, effect, secrets.
-    #[allow(clippy::type_complexity)]
-    #[allow(clippy::type_complexity)]
     fn slot(&self, key: &str, source_fingerprint: [u8; 32]) -> Result<Arc<Slot>, ApiError> {
         let mut slots = lock(&self.slots);
         if let Some(slot) = slots.get(key) {
@@ -1008,10 +998,8 @@ fn model_scope(
 
 /// Optional subject-free exchanges, using their original source identity
 /// prefix. Unknown/ambiguous examples are omitted, never marked complete.
-// The recorded-effect view a simulator replays: LSN, effect, secrets.
-#[allow(clippy::type_complexity)]
 pub fn model_examples(
-    recorded: &[(Lsn, &pb::EffectRecord, Option<Arc<[pb::SecretRef]>>)],
+    recorded: &[RecordedSource<'_>],
     max: usize,
     matcher: &CompiledScrubber<'_>,
     current_scope: Option<&[pb::SecretRef]>,

@@ -24,7 +24,7 @@ use kronik_sched::Node;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::proposal::{Proposals, write_atomic};
+use crate::proposal::{Proposals, internal, write_atomic};
 
 /// How often a watch evaluates its guards.
 pub const INTERVAL: Duration = Duration::from_secs(5);
@@ -106,10 +106,6 @@ pub struct Watches {
     /// Held while a watch decides and acts, and by `stop`: once `stop`
     /// returns, the watch writes no record and rolls nothing back.
     acting: tokio::sync::Mutex<()>,
-}
-
-fn internal(m: impl std::fmt::Display) -> ApiError {
-    ApiError::new(ErrorCode::Internal, m.to_string())
 }
 
 fn log_err(e: LogError) -> ApiError {
