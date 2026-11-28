@@ -1,8 +1,8 @@
 //! The small Linux-only syscall boundary of the Firecracker backend.
-// Allowlisted: KVM admission, reserved disk allocation and reflink copies have
-// no safe binding in this crate's existing dependencies.
+// Allowlisted: the KVM admission ioctls have no safe binding; the file operations below go through rustix.
 #![allow(unsafe_code)]
 
+use rustix::io::Errno;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -61,13 +61,7 @@ pub(crate) fn kvm() -> io::Result<()> {
 /// Reserve the entire finite guest data drive, so future guest writes cannot
 /// consume an unaccounted sparse-file allocation below the host's reserve.
 pub(crate) fn allocate(file: &File, bytes: u64) -> io::Result<()> {
-    let length = libc::off_t::try_from(bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "disk is too large"))?;
-    // SAFETY: the descriptor is valid and the checked range is nonnegative.
-    let error = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, length) };
-    if error != 0 {
-        return Err(io::Error::from_raw_os_error(error));
-    }
+    rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, bytes)?;
     file.set_len(bytes)
 }
 
@@ -92,20 +86,14 @@ pub(crate) fn copy_from(mut input: File, destination: &Path) -> io::Result<u64> 
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(destination)?;
-    // SAFETY: both descriptors are open regular files; FICLONE writes only the
-    // new destination and shares source extents copy-on-write.
-    let cloned = unsafe { libc::ioctl(output.as_raw_fd(), 0x4004_9409 as _, input.as_raw_fd()) };
-    let bytes = if cloned == 0 {
-        input.metadata()?.len()
-    } else {
-        let error = io::Error::last_os_error();
-        if !matches!(
-            error.raw_os_error(),
-            Some(libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL | libc::ENOTTY)
-        ) {
-            return Err(error);
+    // FICLONE writes only the new destination and shares the source's extents
+    // copy-on-write; a file system without reflinks gets a plain copy.
+    let bytes = match rustix::fs::ioctl_ficlone(&output, &input) {
+        Ok(()) => input.metadata()?.len(),
+        Err(Errno::OPNOTSUPP | Errno::XDEV | Errno::INVAL | Errno::NOTTY) => {
+            io::copy(&mut input, &mut output)?
         }
-        io::copy(&mut input, &mut output)?
+        Err(error) => return Err(error.into()),
     };
     output.sync_all()?;
     Ok(bytes)
@@ -148,65 +136,36 @@ pub(crate) fn copy_reserved(source: &Path, destination: &Path) -> io::Result<u64
 
 /// Publish an owned staging file without replacing a drive created meanwhile.
 pub(crate) fn publish(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt as _;
-    let source = CString::new(source.as_os_str().as_bytes())?;
-    let destination = CString::new(destination.as_os_str().as_bytes())?;
-    // The system call itself, not libc's `renameat2` wrapper: the static
-    // release binary links against zig's musl, which has none (an undefined
-    // symbol at link time), while the system call exists on every kernel the
-    // daemon supports (Linux 3.15 and later).
-    // SAFETY: both terminated paths live through the call; NOREPLACE protects
-    // an existing actor drive even when another creator wins the race.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            destination.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    // NOREPLACE protects an existing actor drive even when another creator
+    // wins the race. rustix makes the renameat2 system call itself: zig's
+    // musl, which links the static release, has no renameat2 wrapper.
+    Ok(renameat_with(
+        CWD,
+        source,
+        CWD,
+        destination,
+        RenameFlags::NOREPLACE,
+    )?)
 }
 
 /// Preserve an OCI entry's timestamp without following a final symlink.
 pub(crate) fn set_mtime(path: &Path, seconds: u64) -> io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt as _;
-    let seconds = libc::time_t::try_from(seconds)
+    use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
+    let seconds = i64::try_from(seconds)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "OCI mtime is out of range"))?;
-    let path = CString::new(path.as_os_str().as_bytes())?;
-    let times = [
-        libc::timespec {
+    let times = Timestamps {
+        last_access: Timespec {
             tv_sec: 0,
             tv_nsec: 0,
         },
-        libc::timespec {
+        last_modification: Timespec {
             tv_sec: seconds,
             tv_nsec: 0,
         },
-    ];
-    // SAFETY: the path and two initialized timespecs remain valid; the caller
-    // already confined the entry beneath its private unpack root.
-    let result = unsafe {
-        libc::utimensat(
-            libc::AT_FDCWD,
-            path.as_ptr(),
-            times.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
     };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    // The caller already confined the entry beneath its private unpack root.
+    Ok(utimensat(CWD, path, &times, AtFlags::SYMLINK_NOFOLLOW)?)
 }
 
 #[cfg(test)]
@@ -256,6 +215,54 @@ mod tests {
         let before = std::fs::metadata(&destination).unwrap().mtime();
         set_mtime(&link, 17).unwrap();
         assert_eq!(std::fs::symlink_metadata(&link).unwrap().mtime(), 17);
+        assert_eq!(std::fs::symlink_metadata(&link).unwrap().atime(), 0);
         assert_eq!(std::fs::metadata(&destination).unwrap().mtime(), before);
+    }
+
+    #[test]
+    fn allocation_reserves_the_drive_and_refuses_a_size_above_the_kernel_limit() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let file = File::create(dir.path().join("data.ext4")).unwrap();
+        allocate(&file, 4 << 20).unwrap();
+        let metadata = file.metadata().unwrap();
+        assert_eq!(metadata.len(), 4 << 20);
+        assert!(metadata.blocks() * 512 >= 4 << 20);
+        assert_eq!(
+            allocate(&file, u64::MAX).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_copy_from_another_file_system_is_copied_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("destination");
+        // No file system shares extents with procfs, so FICLONE is refused
+        // and the copy falls back to reading and writing.
+        let expected = std::fs::read("/proc/version").unwrap();
+        assert_eq!(
+            copy(Path::new("/proc/version"), &destination).unwrap(),
+            expected.len() as u64
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_nul_byte_in_a_path_is_refused_as_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("staging");
+        std::fs::write(&source, b"new").unwrap();
+        let with_nul = dir.path().join("drive\0name");
+        assert_eq!(
+            publish(&source, &with_nul).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            set_mtime(&with_nul, 17).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // The staging file is the only entry: nothing was created or moved.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
