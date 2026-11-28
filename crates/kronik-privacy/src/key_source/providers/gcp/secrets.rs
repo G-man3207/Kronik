@@ -310,10 +310,20 @@ mod tests {
 
     #[test]
     fn value_and_cursor_bounds_fail_closed() {
-        let response = json!({"name":format!("{PATH}/versions/1"),"payload":{"data":STANDARD.encode(vec![0; 65_537])}});
-        assert!(matches!(
-            fetched(PATH, None, &response),
-            Err(BackendError::Invalid)
-        ));
+        // 64 KiB is the largest value.
+        let response = json!({"name":format!("{PATH}/versions/1"),"payload":{"data":STANDARD.encode(vec![0; 65_536])}});
+        assert_eq!(fetched(PATH, None, &response).unwrap().value.len(), 65_536);
+        // `Zh==` carries trailing bits, so it is a second encoding of "f".
+        for data in [
+            STANDARD.encode(vec![0; 65_537]),
+            "Zh==".to_owned(),
+            "Zg".to_owned(),
+        ] {
+            let response = json!({"name":format!("{PATH}/versions/1"),"payload":{"data":data}});
+            assert!(matches!(
+                fetched(PATH, None, &response),
+                Err(BackendError::Invalid)
+            ));
+        }
     }
 }

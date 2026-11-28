@@ -513,8 +513,17 @@ mod tests {
     #[test]
     fn binary_decode_rejects_oversized_output_and_a_malformed_final_quantum() {
         let reference = Reference::parse(ARN, "us-east-1").unwrap();
+        // 64 KiB is the largest decoded value.
         let mut r = json!({"ARN":ARN,"Name":"team/service","VersionId":VERSION,
-            "SecretBinary":STANDARD.encode(vec![7; 65_537])});
+            "SecretBinary":STANDARD.encode(vec![7; 65_536])});
+        assert_eq!(
+            fetched(&reference, "us-east-1", None, &r)
+                .unwrap()
+                .value
+                .len(),
+            65_536
+        );
+        r["SecretBinary"] = json!(STANDARD.encode(vec![7; 65_537]));
         assert!(matches!(
             fetched(&reference, "us-east-1", None, &r),
             Err(BackendError::Invalid)
