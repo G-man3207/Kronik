@@ -510,29 +510,22 @@ pub struct ScrubLimits {
     pub pattern_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ScrubError {
+    #[error("REDACTION_OUTPUT_LIMIT")]
     OutputLimit,
+    #[error("REDACTION_PATTERN_LIMIT")]
     PatternLimit,
+    #[error("REDACTION_UNAVAILABLE")]
     MatcherUnavailable,
+    #[error("REDACTION_INVALID_TEXT")]
     InvalidText,
+    #[error("REDACTION_SOURCE_SCOPE_UNAVAILABLE")]
     SourceScopeUnavailable,
 }
-
-impl std::fmt::Display for ScrubError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::OutputLimit => "REDACTION_OUTPUT_LIMIT",
-            Self::PatternLimit => "REDACTION_PATTERN_LIMIT",
-            Self::MatcherUnavailable => "REDACTION_UNAVAILABLE",
-            Self::InvalidText => "REDACTION_INVALID_TEXT",
-            Self::SourceScopeUnavailable => "REDACTION_SOURCE_SCOPE_UNAVAILABLE",
-        })
-    }
-}
-
-impl std::error::Error for ScrubError {}
 
 #[derive(Clone, Copy)]
 struct ScrubMatch {
