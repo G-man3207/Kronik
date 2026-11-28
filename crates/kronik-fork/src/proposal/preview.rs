@@ -634,17 +634,9 @@ impl Proposals {
     /// many.
     pub async fn expire_previews(&self) -> usize {
         let now = self.now();
-        let expired: Vec<(String, Arc<Served>)> = {
-            let mut map = lock(&self.previews);
-            let ids: Vec<String> = map
-                .iter()
-                .filter(|(_, s)| s.expires_ms <= now)
-                .map(|(id, _)| id.clone())
-                .collect();
-            ids.into_iter()
-                .filter_map(|id| map.remove(&id).map(|s| (id, s)))
-                .collect()
-        };
+        let expired: Vec<(String, Arc<Served>)> = lock(&self.previews)
+            .extract_if(.., |_, s| s.expires_ms <= now)
+            .collect();
         for (id, served) in &expired {
             let mut state = served.state.lock().await;
             state.meta.preview = None;
