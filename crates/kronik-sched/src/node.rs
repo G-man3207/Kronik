@@ -5687,7 +5687,7 @@ impl Node {
             rate: rate.map(|r| r.to_pb()),
             audit: Some(audit),
             // Explicit: an empty field is an older record and means compute.
-            in_forks: in_forks.to_record(),
+            in_forks: in_forks.as_str().to_owned(),
         });
         let lsn = self
             .commit_config_authorized(guard, epoch, record, authority)

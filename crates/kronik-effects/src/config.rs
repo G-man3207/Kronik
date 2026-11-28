@@ -310,12 +310,6 @@ impl InForks {
         }
     }
 
-    /// A new grant's wire value. Never empty: empty is reserved for records
-    /// written before the field existed.
-    pub fn to_record(self) -> String {
-        self.as_str().to_owned()
-    }
-
     /// `compute` or `recorded`. Anything else is not a mode.
     pub fn parse(text: &str) -> Option<Self> {
         match text {
