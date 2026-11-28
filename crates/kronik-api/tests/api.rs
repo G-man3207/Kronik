@@ -24,6 +24,16 @@ async fn endpoints() {
     assert_eq!(s, 200);
     assert_eq!(v["status"], "ok");
 
+    // No router serves these, also under a prefix a later router owns.
+    for path in ["/v1/nothing", "/v1/simulators/a/b", "/v1/blobs/a/b/c"] {
+        let (s, v) = call(&api, "GET", path, Value::Null).await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (501, Some("NOT_IMPLEMENTED")),
+            "{path}: {v}"
+        );
+    }
+
     // Dry run writes nothing.
     let (s, v) = call(
         &api,

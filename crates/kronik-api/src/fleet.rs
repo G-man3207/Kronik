@@ -17,6 +17,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::bad;
 use crate::tokens::{self, FleetToken, TokenStore};
 
 #[derive(Clone)]
@@ -89,9 +90,6 @@ pub struct Fleet {
 const CUSTODY_RECOVERY_HINT: &str =
     "Use local fleet revoke, then enroll with a fresh one-time credential.";
 
-fn bad(message: &str) -> ApiError {
-    ApiError::new(ErrorCode::BadRequest, message)
-}
 fn internal(_: impl std::fmt::Display) -> ApiError {
     ApiError::new(
         ErrorCode::Internal,
