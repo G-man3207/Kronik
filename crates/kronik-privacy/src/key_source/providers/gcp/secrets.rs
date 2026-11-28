@@ -53,18 +53,8 @@ fn fetched(path: &str, expected: Option<&str>, response: &Value) -> Result<Fetch
         .and_then(|p| p.get("data"))
         .and_then(Value::as_str)
         .ok_or(BackendError::Invalid)?;
-    // Secret Manager limits an individual value to 64 KiB; cap before decoding too.
-    if encoded.len() > 65_536_usize.div_ceil(3) * 4 {
-        return Err(BackendError::Invalid);
-    }
-    let mut value = Zeroizing::new(vec![0; encoded.len() / 4 * 3 + 3]);
-    let len = STANDARD
-        .decode_slice(encoded, &mut value)
-        .map_err(|_| BackendError::Invalid)?;
-    if len > 65_536 {
-        return Err(BackendError::Invalid);
-    }
-    value.truncate(len);
+    // Secret Manager limits an individual value to 64 KiB.
+    let value = secret_base64(encoded).ok_or(BackendError::Invalid)?;
     Ok(Fetched {
         value,
         source_version: id.into(),
@@ -310,10 +300,20 @@ mod tests {
 
     #[test]
     fn value_and_cursor_bounds_fail_closed() {
-        let response = json!({"name":format!("{PATH}/versions/1"),"payload":{"data":STANDARD.encode(vec![0; 65_537])}});
-        assert!(matches!(
-            fetched(PATH, None, &response),
-            Err(BackendError::Invalid)
-        ));
+        // 64 KiB is the largest value.
+        let response = json!({"name":format!("{PATH}/versions/1"),"payload":{"data":STANDARD.encode(vec![0; 65_536])}});
+        assert_eq!(fetched(PATH, None, &response).unwrap().value.len(), 65_536);
+        // `Zh==` carries trailing bits, so it is a second encoding of "f".
+        for data in [
+            STANDARD.encode(vec![0; 65_537]),
+            "Zh==".to_owned(),
+            "Zg".to_owned(),
+        ] {
+            let response = json!({"name":format!("{PATH}/versions/1"),"payload":{"data":data}});
+            assert!(matches!(
+                fetched(PATH, None, &response),
+                Err(BackendError::Invalid)
+            ));
+        }
     }
 }

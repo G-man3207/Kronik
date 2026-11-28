@@ -540,6 +540,22 @@ fn stored_wall(wall: i64) -> Result<u64, PrivacyError> {
     u64::try_from(wall).map_err(|_| PrivacyError::InvalidTimestamp)
 }
 
+/// Refuses a store with a stored secret version outside
+/// `1..=MAX_SECRET_VERSION`.
+fn check_stored_versions(conn: &Connection) -> Result<(), PrivacyError> {
+    let invalid: Option<i64> = conn
+        .query_row(
+            "SELECT version FROM secrets WHERE version <= 0 OR version > ?1 LIMIT 1",
+            [sql_version(kronik_proto::secret::MAX_SECRET_VERSION)?],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match invalid {
+        Some(version) => Err(PrivacyError::InvalidStoredVersion(version)),
+        None => Ok(()),
+    }
+}
+
 fn deletion_floor(
     conn: &Connection,
     name: &str,
@@ -941,16 +957,7 @@ impl SecretStore {
         if !conn.is_readonly("main")? {
             return Err(PrivacyError::SecretStoreUnowned);
         }
-        let invalid: Option<i64> = conn
-            .query_row(
-                "SELECT version FROM secrets WHERE version <= 0 OR version > ?1 LIMIT 1",
-                [sql_version(kronik_proto::secret::MAX_SECRET_VERSION)?],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(version) = invalid {
-            return Err(PrivacyError::InvalidStoredVersion(version));
-        }
+        check_stored_versions(&conn)?;
         let (has_check, has_floor_table, has_copy_table): (bool, bool, bool) = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='key_check'), \
              EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='secret_deletion_floors'), \
@@ -1017,16 +1024,7 @@ impl SecretStore {
         };
         {
             let conn = store.conn();
-            let invalid: Option<i64> = conn
-                .query_row(
-                    "SELECT version FROM secrets WHERE version <= 0 OR version > ?1 LIMIT 1",
-                    [sql_version(kronik_proto::secret::MAX_SECRET_VERSION)?],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(version) = invalid {
-                return Err(PrivacyError::InvalidStoredVersion(version));
-            }
+            check_stored_versions(&conn)?;
             let mut floors = conn.prepare(
                 "SELECT name, through_version, deleted_wall_ms FROM secret_deletion_floors",
             )?;
@@ -1640,17 +1638,23 @@ mod tests {
                 matches!(SecretStore::validate_legacy_key(&s.conn(), &MasterKey::from_bytes([7; 32]).unwrap()), Err(PrivacyError::InvalidStoredVersion(v)) if v == version)
             );
         }
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn.execute(
-            "INSERT INTO secrets VALUES ('token', -1, x'', x'', x'', 0, '', '', NULL)",
-            [],
-        )
-        .unwrap();
-        assert!(matches!(
-            SecretStore::open(conn, &MasterKey::from_bytes([7; 32]).unwrap()),
-            Err(PrivacyError::InvalidStoredVersion(-1))
-        ));
+        // Opening refuses any stored version outside 1..=MAX_SECRET_VERSION.
+        for version in [
+            -1,
+            i64::try_from(kronik_proto::secret::MAX_SECRET_VERSION + 1).unwrap(),
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute(
+                "INSERT INTO secrets VALUES ('token', ?1, x'', x'', x'', 0, '', '', NULL)",
+                [version],
+            )
+            .unwrap();
+            assert!(matches!(
+                SecretStore::open(conn, &MasterKey::from_bytes([7; 32]).unwrap()),
+                Err(PrivacyError::InvalidStoredVersion(v)) if v == version
+            ));
+        }
     }
 
     #[test]

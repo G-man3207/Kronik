@@ -57,15 +57,8 @@ BEGIN UPDATE keystore_revision SET revision = revision + 1 WHERE id = 1; END;
 /// The start of an exported backup; also its associated data.
 const BACKUP_MAGIC: &[u8; 8] = b"KRKSTOR1";
 
-/// The longest subject accepted, in bytes.
-pub const MAX_SUBJECT_BYTES: usize = kronik_proto::blobs::MAX_SUBJECT_BYTES;
-
-/// Whether `subject` can be a subject: 1 to [`MAX_SUBJECT_BYTES`] bytes of
-/// printable ASCII without spaces, such as `user:123`. The log format checks
-/// the subjects of blob references with the same rule.
-pub fn valid_subject(subject: &str) -> bool {
-    kronik_proto::blobs::valid_subject(subject)
-}
+/// The subject rule the keystore shares with the log format.
+pub use kronik_proto::blobs::{MAX_SUBJECT_BYTES, valid_subject};
 
 /// One version of a subject's key.
 #[derive(Clone)]

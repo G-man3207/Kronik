@@ -579,15 +579,24 @@ fn completed_reader_rejects_wrong_recorded_keys_and_invalid_versions() {
         open_reader(&stage, &MasterKey::from_bytes([8; 32]).unwrap()),
         Err(PrivacyError::KeyMismatch(_))
     ));
-    source
-        .conn()
-        .execute("UPDATE secrets SET version=0 WHERE name='token'", [])
-        .unwrap();
-    let stage = source.stage_encrypted_snapshot(dir.path()).unwrap();
-    assert!(matches!(
-        open_reader(&stage, &master),
-        Err(PrivacyError::InvalidStoredVersion(0))
-    ));
+    // A version outside 1..=MAX_SECRET_VERSION is refused at open.
+    for version in [
+        0,
+        i64::try_from(kronik_proto::secret::MAX_SECRET_VERSION + 1).unwrap(),
+    ] {
+        source
+            .conn()
+            .execute(
+                "UPDATE secrets SET version=?1 WHERE name='token'",
+                [version],
+            )
+            .unwrap();
+        let stage = source.stage_encrypted_snapshot(dir.path()).unwrap();
+        assert!(matches!(
+            open_reader(&stage, &master),
+            Err(PrivacyError::InvalidStoredVersion(v)) if v == version
+        ));
+    }
 }
 
 #[test]

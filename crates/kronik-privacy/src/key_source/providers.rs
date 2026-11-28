@@ -331,6 +331,22 @@ fn pem(data: &[u8], label: &str) -> Result<Vec<Vec<u8>>, String> {
     }
     Ok(out)
 }
+/// A provider's standard-base64 secret value of at most 64 KiB, in a
+/// buffer wiped on drop, also when decoding fails half-way. `STANDARD`
+/// requires canonical padding and zero trailing bits, so a value has
+/// exactly one accepted encoding; any other text gives `None`.
+fn secret_base64(encoded: &str) -> Option<Zeroizing<Vec<u8>>> {
+    if encoded.len() > 65_536_usize.div_ceil(3) * 4 {
+        return None;
+    }
+    let mut value = Zeroizing::new(vec![0; base64::decoded_len_estimate(encoded.len())]);
+    let len = STANDARD.decode_slice(encoded, &mut value).ok()?;
+    if len > 65_536 {
+        return None;
+    }
+    value.truncate(len);
+    Some(value)
+}
 async fn tls_env(
     env: &Env,
     ca: Option<&Path>,
