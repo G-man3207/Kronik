@@ -38,8 +38,6 @@ use crate::stubs::StubRule;
 pub struct TargetSimulators {
     pub stubs: Vec<StubRule>,
     pub contract: Option<ContractFake>,
-    pub neighbor: bool,
-    pub model: bool,
     /// What the diff records about this configuration.
     pub option: SimulatorOption,
 }
@@ -206,8 +204,6 @@ impl Simulators {
                 TargetSimulators {
                     stubs: stub_rules(&m.stubs),
                     contract,
-                    neighbor: m.neighbor,
-                    model: m.model,
                     option,
                 },
             );

@@ -2945,6 +2945,7 @@ impl ReplayGate {
             };
             let ctx = ReplayContext { recorded: &[] };
             let neighbor = s
+                .option
                 .neighbor
                 .then(|| setup.simulators.neighbor(&setup.index, &cap));
             // Contract fakes stay synthetic (ADR 0016). They are not neighbor
@@ -2988,7 +2989,7 @@ impl ReplayGate {
             // secret-less GET (ADR 0025). The model is a POST, so it is not
             // asked even if a client was attached.
             if !setup.preview
-                && s.model
+                && s.option.model
                 && let Some(model) = &setup.model
             {
                 let cached = model.has_cached_answer(&cap, &fp).map_err(model_error)?;
