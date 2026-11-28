@@ -231,10 +231,7 @@ mod tests {
     fn frame(kind: pb::frame::Kind, data: &str, event: &str, id: &str) -> pb::Frame {
         pb::Frame {
             kind: kind as i32,
-            data: Some(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(data.as_bytes().to_vec())),
-            }),
+            data: Some(pb::Sealable::new_plain(None, data.as_bytes().to_vec())),
             event: event.into(),
             id: id.into(),
         }

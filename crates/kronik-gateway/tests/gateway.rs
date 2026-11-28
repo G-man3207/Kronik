@@ -658,10 +658,7 @@ async fn a_configured_idempotency_header_is_the_only_one_read() {
 }
 
 fn plain(b: &[u8]) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: None,
-        value: Some(pb::sealable::Value::Plain(b.to_vec())),
-    })
+    Some(pb::Sealable::new_plain(None, b))
 }
 
 /// One preview, `v-1`, whose code answers every request with a cookie and

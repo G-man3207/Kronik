@@ -238,10 +238,7 @@ where
                     Some(Ok(Message::Text(text))) => {
                         let frame = pb::Frame {
                             kind: pb::frame::Kind::Text as i32,
-                            data: Some(pb::Sealable {
-                                subject: None,
-                                value: Some(pb::sealable::Value::Plain(text.as_bytes().to_vec())),
-                            }),
+                            data: Some(pb::Sealable::new_plain(None, text.as_bytes().to_vec())),
                             ..Default::default()
                         };
                         admitting = Some(admit(hub.clone(), conn.clone(), frame));
@@ -249,10 +246,7 @@ where
                     Some(Ok(Message::Binary(bytes))) => {
                         let frame = pb::Frame {
                             kind: pb::frame::Kind::Binary as i32,
-                            data: Some(pb::Sealable {
-                                subject: None,
-                                value: Some(pb::sealable::Value::Plain(bytes.to_vec())),
-                            }),
+                            data: Some(pb::Sealable::new_plain(None, bytes.to_vec())),
                             ..Default::default()
                         };
                         admitting = Some(admit(hub.clone(), conn.clone(), frame));
