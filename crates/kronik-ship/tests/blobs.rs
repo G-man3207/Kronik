@@ -77,10 +77,7 @@ impl Proc {
             op,
             query,
             key,
-            pb::body::Value::Inline(pb::Sealable {
-                subject: None,
-                value: Some(pb::sealable::Value::Plain(Vec::new())),
-            }),
+            pb::body::Value::Inline(pb::Sealable::new_plain(None, Vec::new())),
         )
     }
 

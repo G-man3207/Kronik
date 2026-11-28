@@ -216,10 +216,7 @@ fn fixed_keystore_metadata(path: &Path) -> [(u64, SystemTime); 2] {
 }
 
 fn sealed_newest(sealer: &Sealer, bytes: &[u8], nonce: u8, wall: u64) -> pb::Sealable {
-    let mut value = pb::Sealable {
-        subject: Some("user:revision".into()),
-        value: Some(pb::sealable::Value::Plain(bytes.to_vec())),
-    };
+    let mut value = pb::Sealable::new_plain(Some("user:revision".into()), bytes.to_vec());
     sealer
         .seal_value(&mut value, &|out| out.fill(nonce), wall)
         .unwrap();

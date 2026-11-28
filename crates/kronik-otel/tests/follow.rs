@@ -122,10 +122,7 @@ impl Fixture {
         let msg = pb::Message {
             name: name.into(),
             content_type: "text/plain".into(),
-            body: Some(pb::Sealable {
-                value: Some(pb::sealable::Value::Plain(body.to_vec())),
-                ..Default::default()
-            }),
+            body: Some(pb::Sealable::new_plain(None, body.to_vec())),
             ..Default::default()
         };
         self.rt

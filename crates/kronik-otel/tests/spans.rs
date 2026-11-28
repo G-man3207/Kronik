@@ -54,13 +54,6 @@ fn actor(s: &str) -> ActorRef {
     }
 }
 
-fn plain(b: &str) -> Option<pb::Sealable> {
-    Some(pb::Sealable {
-        subject: None,
-        value: Some(pb::sealable::Value::Plain(b.as_bytes().to_vec())),
-    })
-}
-
 fn message(name: &str) -> Option<pb::Message> {
     Some(pb::Message {
         name: name.into(),
@@ -77,7 +70,7 @@ fn http(route: &str, headers: &[(&str, &str)]) -> pb::Input {
                 .iter()
                 .map(|(n, v)| pb::Header {
                     name: (*n).into(),
-                    value: plain(v),
+                    value: Some(pb::Sealable::new_plain(None, *v)),
                 })
                 .collect(),
             ..Default::default()
@@ -1117,10 +1110,10 @@ fn turn_and_effect_attributes() {
 fn no_needle_leaves_in_an_export_request() {
     const N: &str = "NEEDLE";
     let sealed = |v: &str| {
-        Some(pb::Sealable {
-            subject: Some(format!("user-{N}-subject")),
-            value: Some(pb::sealable::Value::Plain(v.as_bytes().to_vec())),
-        })
+        Some(pb::Sealable::new_plain(
+            Some(format!("user-{N}-subject")),
+            v.as_bytes().to_vec(),
+        ))
     };
     let body = |v: &str| {
         Some(pb::Body {
